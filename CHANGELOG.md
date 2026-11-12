@@ -104,6 +104,16 @@ Spec references are IEEE 1800-2023 clauses.
   in the design through SV `bind` directives; `sim_replay_control` (6.60)
   runs initial blocks again when their domain powers up; `save_upf` (6.42)
   writes the power intent of a scope.
+- UPF (IEEE 1801-2024): `(* UPF_... *)` attributes in the HDL (5.6) are read
+  by `msim -upf` and `mlint -upf`, below UPF commands in precedence (5.7);
+  the Table 8 model-only and instance-only rules are errors.
+- UPF (IEEE 1801-2024): `create_abstract_power_source` (6.16) switches a
+  supply set between input supply sets, with ack ports.
+- UPF (IEEE 1801-2024): value conversion methods (`create_vcm`, 6.30) with
+  `connect_supply_net -vcm`: tables for one-bit, real, integer and enum HDL
+  ports, VCM lists, and ports of type `upfSupplyTypeT` without conversion
+  (4.10); UPF libraries (`create_upf_library`, `use_upf_library`,
+  `load_upf_library`; 5.11, 6.29, 6.36, 6.63).
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.

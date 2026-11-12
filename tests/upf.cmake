@@ -23,8 +23,11 @@ endforeach()
 # (6.34, 6.58, 6.59); power models, applied by name and to every instance of
 # a model, with a parameter, and a legacy one (6.3, 6.9, 6.11, 6.31, 6.32);
 # checkers bound into the design by the power intent (6.12); initial blocks
-# replayed at power-up (6.60).
-foreach(t logic transitions attributes simctl pmodel bindchk replay)
+# replayed at power-up (6.60); attributes written in the HDL (5.6, 5.7); an
+# abstract power source (6.16); value conversion methods in UPF libraries,
+# for real, enum, integer and upfSupplyTypeT ports (4.10, 5.11, 6.29, 6.30,
+# 6.36, 6.63).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -202,6 +205,30 @@ if(NOT rc EQUAL 0 OR NOT saved MATCHES "\ncreate_logic_net zz\n" OR saved MATCHE
   message(FATAL_ERROR "save_upf -scope u_core: ${rc} ${err}\n${saved}")
 endif()
 
+# Table 8 (5.6): attributes only for models or only for instances; a bad
+# value of an HDL attribute.
+upf_error_in(hdlattr e_t8a "set_port_attributes -ports {u_c/y} -is_isolated" "UPF_is_isolated can only be given for model ports, with -model (5.6, Table 8)")
+upf_error_in(hdlattr e_t8b "set_port_attributes -model core -ports {y} -driver_supply SS" "UPF_driver_supply can only be given for instance ports (5.6, Table 8)")
+upf_error_in(hdlattr e_t8c "set_design_attributes -elements {u_m} -is_hard_macro TRUE" "UPF_is_hard_macro can only be given for models, with -models (5.6, Table 8)")
+upf_error_in(hdlattr e_t8d "set_design_attributes -models {macro} -attribute {UPF_driver_supply SS}" "UPF_driver_supply can only be given for instances (5.6, Table 8)")
+file(READ ${D}/hdlattr.sv hdl)
+string(REPLACE "(* UPF_clamp_value = \"1\" *) output logic [3:0] y" "(* UPF_is_analog = \"maybe\" *) output logic [3:0] y" hdl "${hdl}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hdlattr_bad.sv "${hdl}")
+execute_process(COMMAND ${MSIM} ${CMAKE_CURRENT_BINARY_DIR}/hdlattr_bad.sv -upf ${D}/hdlattr.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "hdlattr_bad.sv:12: attribute UPF_is_analog cannot be \"maybe\" [(]5.6[)]")
+  message(FATAL_ERROR "a bad HDL attribute was not reported: ${rc}\n${out}${err}")
+endif()
+
+# Errors of create_abstract_power_source.
+upf_error_in(source e_ps1 "create_abstract_power_source a/b -output_supply_set {out SS_CORE}" "a power source name is a simple name (6.16)")
+upf_error_in(source e_ps2 "create_abstract_power_source P2 -output_supply_set {out SS_CORE} -input_supply_set {i SS_HI} -on_state {ON j {1}}" "-on_state ON: j is not an input supply set of P2")
+upf_error_in(source e_ps3 "create_abstract_power_source P3 -output_supply_set {out SS_CORE} -input_supply_set {i SS_HI} -control_port {c hi} -on_state {ON i {hi}}" "hi is not a control port of power source P3 (6.16)")
+upf_error_in(source e_ps4 "create_abstract_power_source P4 -output_supply_set {out SS_CORE} -input_supply_set {i SS_HI} -ack_port {a ack}" "power source P4 has ack ports but no -supply_set (6.16)")
+upf_error_in(source e_ps5 "create_abstract_power_source PS -update -ack_port {a ack}" "create_abstract_power_source -update only adds -power_switch (6.16)")
+upf_error_in(source e_ps6 "create_abstract_power_source P5 -output_supply_set {out} -input_supply_set {i SS_HI}" "supply set handle out is not associated with a supply set that has functions (6.16)")
+upf_error_in(source e_ps7 "create_power_switch SW -output_supply_port {o VCORE} -input_supply_port {i VHI} -control_port {c lo} -on_state {on i {c}}\ncreate_abstract_power_source PS -update -power_switch SW" "power switch SW of power source PS does not use its control hi (6.16)")
+
 # -power_top names the instance the UPF describes; it wins over set_design_top.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
@@ -240,3 +267,30 @@ foreach(want
     message(FATAL_ERROR "mlint lint_bad.upf: missing: ${want}\n${out}${err}")
   endif()
 endforeach()
+
+# Errors of UPF libraries and VCMs. The copies of vcm.upf read vcm_lib.upf
+# next to them.
+file(COPY ${D}/vcm_lib.upf DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/vcm_bad_lib.upf "create_vcm X -vcms {vlib::REAL}\n")
+upf_error_in(vcm e_vcm1 "create_vcm V1" "create_vcm needs one of -table, -function, -model or -vcms (6.30)")
+upf_error_in(vcm e_vcm2 "create_vcm V2 -function p::f -model m" "only one of -table, -function, -model and -vcms (6.30)")
+upf_error_in(vcm e_vcm3 "create_vcm V3 -function p::f -hdl_type {sv real}" "create_vcm -hdl_type is only for -table (6.30)")
+upf_error_in(vcm e_vcm4 "create_vcm V4 -hdl_type {sv real} -conversion_direction hdl2upf -table {{{0 1} {OFF}} {{0.5 2} {FULL_ON}}}" "-table rows 1 and 2 overlap (6.30.3)")
+upf_error_in(vcm e_vcm5 "create_vcm V5 -hdl_type {sv real} -conversion_direction upf2hdl -table {{{FULL_ON} {*}} {{OFF} {0}}}" "-table has no row for the supply state PARTIAL_ON (6.30.4)")
+upf_error_in(vcm e_vcm6 "create_vcm V6 -hdl_type {sv real} -conversion_direction hdl2upf -table {{{* *} {OFF}}}" "{* *} is not a range (6.30.3)")
+upf_error_in(vcm e_vcm7 "create_vcm V7 -hdl_type {sv integer} -conversion_direction upf2hdl -table {{{FULL_ON} {*}} {{OFF} {0}} {{PARTIAL_ON} {0}} {{UNDETERMINED} {0}}}" "'*' is not an integer (6.30.5)")
+upf_error_in(vcm e_vcm8 "create_vcm V8 -hdl_type {sv logic} -conversion_direction hdl2upf -table {{0 OFF} {1 FULL_ON}}" "-table has no row for the HDL value X (6.30.7)")
+upf_error_in(vcm e_vcm9 "create_vcm V9 -hdl_type {sv real} -conversion_direction hdl2upf -table {{{1 2} {ON}}}" "'ON' is not a value of upfSupplyStateE")
+upf_error_in(vcm e_vcm10 "create_vcm R2U -vcms {vlib::R2U}\nconnect_supply_net VR -ports {u_ana/vr} -vcm R2U" "VCM R2U is in UPF libraries IEEE and vlib")
+upf_error_in(vcm e_vcm11 "create_vcm V11 -vcms {vlib::R2U vlib::REAL}" "both convert from HDL type real (6.30)")
+upf_error_in(vcm e_vcm12 "create_vcm V12 -vcms {nope}" "no VCM 'nope' for -vcms (6.30)")
+upf_error_in(vcm e_vcm13 "create_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm REAL" "is an integer port (input), and VCM vlib::REAL has no upf2hdl conversion for it")
+upf_error_in(vcm e_vcm14 "create_vcm F -function p::f\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_ana/vi} -vcm F" "converts with an HDL function, which msim does not run yet")
+upf_error_in(vcm e_vcm15 "create_vcm V15 -vcms {.::R2U}" "'.' names the library being created, and this is not in create_upf_library (6.29)")
+upf_error_in(vcm e_lib1 "create_upf_library L1 -contents {create_supply_net X}" "create_supply_net inside create_upf_library L1; a UPF library holds only create_vcm and use_upf_library (6.29)")
+upf_error_in(vcm e_lib2 "create_upf_library vlib -contents {}" "UPF library vlib already exists (6.29)")
+upf_error_in(vcm e_lib3 "use_upf_library nolib" "use_upf_library: no UPF library nolib (6.63)")
+upf_error_in(vcm e_lib4 "load_upf_library vcm_bad_lib.upf" "create_vcm in a UPF library file; only create_upf_library is allowed (6.36)")
+upf_error_in(vcm e_lib5 "connect_supply_net VR -ports {u_ana/vr} -vcm zlib::R2U" "no UPF library zlib (5.11)")
+upf_error_in(vcm e_lib6 "connect_supply_net VR -ports {u_ana/vr} -vcm vlib::NOPE" "UPF library vlib has no VCM NOPE (6.30)")
+upf_error_in(vcm e_lib7 "create_upf_library L7 -contents {create_vcm A -vcms {vlib::R2U}}\nconnect_supply_net VR -ports {u_ana/vr} -vcm A" "no VCM 'A'")

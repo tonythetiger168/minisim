@@ -1,0 +1,24 @@
+# Power intent for hdlattr.sv: attributes in the HDL (5.6) and their
+# precedence against UPF commands (5.7).
+upf_version 4.0
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_SW -elements {u_m u_c}
+create_supply_port VDD
+create_supply_port VSW
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSW
+create_supply_net VSS
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VSW -ports {VSW}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS -function {power VDD} -function {ground VSS}
+create_supply_set SS_SW -function {power VSW} -function {ground VSS}
+associate_supply_set SS -handle PD_TOP.primary
+associate_supply_set SS_SW -handle PD_SW.primary
+# no -clamp_value: each port's UPF_clamp_value decides
+set_isolation ISO -domain PD_SW -elements {u_c} -applies_to outputs -isolation_supply SS \
+    -isolation_signal iso -isolation_sense high
+# the same precedence as the HDL attribute: the UPF command wins
+set_port_attributes -model core -ports {z} -clamp_value 0
