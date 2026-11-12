@@ -55,6 +55,13 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `msim -cm <metrics>` now selects the code coverage metrics written. It takes
+  three notations: VCS `line+branch+cond+tgl+fsm`, Xcelium `b:e:t:f` or
+  `all`, and Questa `bcesftx`. `msim -cm_hier <file>` selects the part of
+  the design by instance, module or file. It reads VCS `+tree`/`-tree`
+  lines and Xcelium covfile `select_coverage` / `deselect_coverage`
+  commands. Before this, `-cm` wrote every metric. Covergroups and
+  assertions are always written.
 - `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
   `RDC006` (an asynchronous reset made by combinational logic of several
   flops). `-cdc-report` lists the reset synchronizers, their length and how
