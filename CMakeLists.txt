@@ -360,38 +360,6 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mdft
            COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mdft.cmake)
-  # Scan insertion and memory BIST: the results are simulated with msim.
-  add_test(NAME mdft_insert_scan
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/dft_scan
-                   -P ${CMAKE_SOURCE_DIR}/tests/dft_scan.cmake)
-  add_test(NAME mdft_mbist
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DIVERILOG=${IVERILOG} -DVVP=${VVP} -DOUT=${CMAKE_BINARY_DIR}/dft_mbist
-                   -P ${CMAKE_SOURCE_DIR}/tests/dft_mbist.cmake)
-
-  # Boundary scan and IJTAG: generated RTL and testbenches run on msim.
-  add_test(NAME mdft_jtag
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_jtag
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_jtag.cmake)
-
-  add_test(NAME mdft_lbist
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist.cmake)
-
-  add_test(NAME mdft_edt
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_edt
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_edt.cmake)
-  # Logic BIST coverage, checked against the wrapper's signature in simulation.
-  # (The EDT response and diagnosis tests need matpg, which is a paid tool; they
-  # come back when mdft itself is split.)
-  add_test(NAME mdft_lbist_cov
-           COMMAND ${CMAKE_COMMAND} -DMDFT=$<TARGET_FILE:mdft> -DMSIM=$<TARGET_FILE:msim>
-                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdft_lbist_cov
-                   -P ${CMAKE_SOURCE_DIR}/tests/mdft_lbist_cov.cmake)
   if(Python3_FOUND AND IVERILOG AND VVP)
     add_test(NAME mregress_spec_icarus
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/mregress.py -spec ${CMAKE_SOURCE_DIR}/tests/spec

@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Removed
+- `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
+  IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
+  a paid tool. What stays is what `mdft` always was first: the RTL
+  scan-readiness rules DFT001..DFT006 and the flop count per clock domain,
+  before a design is changed for test. `src/dft/` and the fault engine
+  headers those flows read go with them.
 - The implementation and signoff tools leave this repository. `msynth`,
   `mpnr`, `msta`, `mrcx`, `mequiv`, `mformal`, `matpg`, `memu`, `mfpga`,
   `mhls`, `mspice`, `mchar`, `mpv`, `mpower`, `mpopt`, `msdc`, `mlibc`,
@@ -19,10 +25,6 @@ Spec references are IEEE 1800-2023 clauses.
     when the paid layer is not installed beside it.
   - `msim -keyfile` still opens IEEE 1735 envelopes; only `msimprotect`,
     which writes them, has gone.
-  - `mdft` is unchanged and still does scan insertion, MBIST, boundary scan,
-    IJTAG, EDT, LBIST and diagnosis. Its paid flows share one binary with the
-    free checks, so splitting it is a separate piece of work; until then the
-    fault engine headers it reads stay here too.
 
 ### Changed
 - `mchar` measures input pin power: `internal_power` groups without a
