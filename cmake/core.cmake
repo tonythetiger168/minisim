@@ -51,6 +51,7 @@ set(MINISIM_CORE_HEADERS
     upf_vct.hpp
     upf_rt.inc
     vpi.inc
+    vpi_code.inc
     wave_reader.hpp)
 
 add_library(minisim_core INTERFACE)
