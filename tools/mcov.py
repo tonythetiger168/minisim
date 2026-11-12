@@ -1072,69 +1072,194 @@ def item_label(k):
     return k[1]
 
 
+def test_layout(db):
+    """The items of a run as a layout and a hit mask: the same items as
+    test_items, but a signal's toggle edges are one segment of 2 * width bits
+    (rise bits, then fall bits) instead of a tuple per bit. Returns (singles,
+    toggles, mask, nbits): singles are the keys of one-bit items, toggles
+    (name, width) pairs; the mask has the singles first (padded to a byte),
+    then each toggle segment padded to a byte."""
+    singles, hit = test_items_no_toggles(db)
+    nb = (len(singles) + 7) // 8
+    buf = bytearray(nb)
+    for i in hit:
+        buf[i >> 3] |= 1 << (i & 7)
+    parts = [bytes(buf)]
+    toggles = []
+    nbits = len(singles)
+    for name, (w, r, f) in db["toggles"].items():
+        toggles.append((name, w))
+        nbits += 2 * w
+        parts.append((r | (f << w)).to_bytes((2 * w + 7) // 8, "little"))
+    return singles, toggles, int.from_bytes(b"".join(parts), "little"), nbits
+
+
+def test_items_no_toggles(db):
+    """(keys, indexes of the covered ones) of every item of test_items but the toggles."""
+    keys, hit = [], []
+    def add(k, h):
+        if h:
+            hit.append(len(keys))
+        keys.append(k)
+    for k, h in db["lines"].items():
+        add(("l",) + k, h > 0)
+    for k, (t, f) in db["branches"].items():
+        add(("b",) + k + (1,), t > 0)
+        add(("b",) + k + (0,), f > 0)
+    for k, (_, _, hits) in db["conds"].items():
+        for i, h in enumerate(hits):
+            add(("c",) + k + (i,), h > 0)
+    for k, m in db["fsms"].items():
+        for v, (_, h) in m["states"].items():
+            add(("s",) + k + (v,), h > 0)
+        for t, (h, _) in m["trans"].items():
+            add(("x",) + k + t, h > 0)
+    for g, (_, _, items) in db["cgs"].items():
+        for i, it in items.items():
+            al = max(1, it[3])
+            for b, h in it[5].items():
+                add(("g", g, i, b), h >= al)
+    for name, a in db["asserts"].items():
+        add(("a", name), bool(a[2]) and not (a[3] and a[0] != "cover"))
+    return keys, hit
+
+
+def _layout_digest(singles, toggles):
+    import hashlib
+    h = hashlib.blake2b(digest_size=16)
+    h.update(repr(singles).encode())
+    h.update(repr(toggles).encode())
+    return h.digest()
+
+
+def _rank_mask(path):
+    """In a worker: (digest of the run's layout, its hit mask, its item count).
+    The layout itself stays in the worker; runs of one design share it."""
+    singles, toggles, mask, nbits = test_layout(load(path))
+    return _layout_digest(singles, toggles), mask, nbits
+
+
+def _remap(mask, src, dst):
+    """A mask over layout src as a mask over layout dst (dst has every item of src)."""
+    s_singles, s_togs = src
+    d_singles, d_togs, d_index, d_togoff = dst
+    out = bytearray((d_togoff[-1] + 7) // 8 if d_togoff else (len(d_singles) + 7) // 8)
+    low = mask & ((1 << len(s_singles)) - 1)
+    i = 0
+    while low:
+        if low & 1:
+            j = d_index[s_singles[i]]
+            out[j >> 3] |= 1 << (j & 7)
+        low >>= 1
+        i += 1
+    m = int.from_bytes(out, "little")
+    off = (len(s_singles) + 7) // 8 * 8
+    for name, w in s_togs:
+        seg = (mask >> off) & ((1 << (2 * w)) - 1)
+        if seg:
+            m |= seg << d_togoff[d_index[("T", name, w)]]
+        off += (2 * w + 7) // 8 * 8
+    return m
+
+
 def rank_tests(paths, jobs=0):
-    """Greedy order of the tests by what each adds. Returns (rows, total items,
-    index, masks): rows are (path, covered, unique, added, cumulative), in
-    rank order; a test's items are the bits of an int, so adding a test is one
-    AND-NOT and a popcount."""
-    jobs = max(1, min(jobs or cpu_count(), len(paths) // 2))
-    loaded = None
-    if jobs > 1:
+    """Greedy order of the tests by what each adds. Returns (rows, total
+    items): rows are (path, covered, unique, added, cumulative), in rank
+    order. Each worker loads its runs and builds their hit masks against the
+    run's own layout; the masks of runs with another layout (another design
+    version) are remapped onto the union once per layout. The greedy pass is
+    lazy: what a test adds only shrinks as tests are taken."""
+    import heapq
+    jobs = max(1, min(jobs or cpu_count(), len(paths)))
+    got = None
+    if jobs > 1 and len(paths) > 1:
         import concurrent.futures as cf
         try:
             with cf.ProcessPoolExecutor(max_workers=jobs) as pool:
-                loaded = list(pool.map(_rank_load, paths, chunksize=max(1, len(paths) // (jobs * 4))))
+                got = list(pool.map(_rank_mask, paths, chunksize=max(1, len(paths) // (jobs * 4))))
         except SystemExit:
             raise
         except Exception:
-            loaded = None
-    if loaded is None:
-        loaded = [_rank_load(p) for p in paths]
-    index = {}
-    for _, all_, _ in loaded:           # in input order: the numbering does not depend on -j
-        for k in all_:
-            if k not in index:
-                index[k] = len(index)
-    masks = []
-    for _, _, hit in loaded:
-        nb = (len(index) + 7) // 8
-        buf = bytearray(nb)
-        for k in hit:
-            i = index[k]
-            buf[i >> 3] |= 1 << (i & 7)
-        masks.append(int.from_bytes(buf, "little"))
+            got = None
+    if got is None:
+        got = [_rank_mask(p) for p in paths]
+    digests = list(dict.fromkeys(g[0] for g in got))
+    if len(digests) == 1:
+        masks = [g[1] for g in got]
+        total = got[0][2]
+    else:
+        # Union of the layouts, in input order, then each run's mask moved onto it.
+        layouts = {}
+        for p, g in zip(paths, got):
+            if g[0] not in layouts:
+                sg, tg, _, _ = test_layout(load(p))
+                layouts[g[0]] = (sg, tg)
+        d_singles, d_index = [], {}
+        for sg, _ in layouts.values():
+            for k in sg:
+                if k not in d_index:
+                    d_index[k] = len(d_singles)
+                    d_singles.append(k)
+        d_togoff = []
+        off = (len(d_singles) + 7) // 8 * 8
+        total = len(d_singles)
+        for _, tg in layouts.values():
+            for name, w in tg:
+                k = ("T", name, w)
+                if k not in d_index:
+                    d_index[k] = len(d_togoff)
+                    d_togoff.append(off)
+                    off += (2 * w + 7) // 8 * 8
+                    total += 2 * w
+        d_togoff.append(off)
+        dst = (d_singles, None, d_index, d_togoff)
+        masks = [_remap(g[1], layouts[g[0]], dst) for g in got]
     once = twice = 0
     for m in masks:
         twice |= once & m
         once |= m
     only = once & ~twice
-    left = list(range(len(paths)))
+    cnt = [popcount(m) for m in masks]
+    heap = [(-c, i) for i, c in enumerate(cnt)]
+    heapq.heapify(heap)
     cum, rows = 0, []
-    while left:
-        best = max(left, key=lambda i: (popcount(masks[i] & ~cum), -i))   # ties: input order
-        gain = popcount(masks[best] & ~cum)
-        cum |= masks[best]
-        rows.append((paths[best], popcount(masks[best]), popcount(masks[best] & only), gain, popcount(cum)))
-        left.remove(best)
-    return rows, len(index), index, masks
+    while heap:
+        _, i = heapq.heappop(heap)
+        gain = popcount(masks[i] & ~cum)
+        if heap and (-gain, i) > heap[0]:   # stale: someone else may add more now
+            heapq.heappush(heap, (-gain, i))
+            continue
+        cum |= masks[i]
+        rows.append((paths[i], cnt[i], popcount(masks[i] & only), gain, popcount(cum)))
+    return rows, total
+
+
+def item_tests(paths, item):
+    """[(label, [tests that cover it])] of the items whose label is item or starts with it."""
+    loaded = [test_items(load(p)) for p in paths]
+    index = {}
+    for all_, _ in loaded:
+        for k in all_:
+            index.setdefault(k, len(index))
+    hits = [set(hit) for _, hit in loaded]
+    out = []
+    for k in index:
+        lab = item_label(k)
+        if lab == item or lab.startswith(item + " ") or lab.startswith(item + "[") or lab.startswith(item + ":"):
+            out.append((lab, [p for p, h in zip(paths, hits) if k in h]))
+    return out
 
 
 def rank_main(a):
-    rows, total, index, masks = rank_tests(a.dbs, a.j)
     if a.item:
-        rx = a.item
-        found = False
-        for k, i in index.items():
-            lab = item_label(k)
-            if not (lab == rx or lab.startswith(rx + " ") or lab.startswith(rx + "[") or lab.startswith(rx + ":")):
-                continue
-            found = True
-            who = [a.dbs[t] for t, m in enumerate(masks) if (m >> i) & 1]
+        found = item_tests(a.dbs, a.item)
+        for lab, who in found:
             print(f"{lab}: " + (", ".join(who) if who else "no test"))
         if not found:
             print(f"mcov: no coverage item matches '{a.item}'", file=sys.stderr)
             return 1
         return 0
+    rows, total = rank_tests(a.dbs, a.j)
     w = max([len(r[0]) for r in rows] + [4])
     print(f"{'Rank':>4}  {'Test':<{w}}  {'Covers':>8}  {'Only it':>8}  {'Adds':>8}  {'Total':>16}")
     for n, (p, c, u, g, cum) in enumerate(rows, 1):
