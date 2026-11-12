@@ -197,6 +197,13 @@ Spec references are IEEE 1800-2023 clauses.
   library's cells; the `mpnr` test places, routes and DRC-checks one.
 - `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
   and transitions of FSMs), in the totals, the history and `mplan init`.
+- `mregress -farm`: runs go to a compute farm instead of the local machine:
+  `lsf` (bsub -K), `slurm` (srun), `sge` (qsub -sync y), `ssh:HOST[*N],...`
+  or `cmd:TEMPLATE` for any other launcher. `-farm-opts`, `-farm-cpus`
+  (cores per job and msim -threads), `-farm-retries` (a job that never ran
+  is submitted again), `-farm-wait`, `-farm-dry`. The time limit runs on the
+  farm host, so queue time does not count; results come back through the
+  shared run directory.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,

@@ -152,6 +152,7 @@ failures grouped by their first error line:
 ```sh
 mregress tests.list -sim msim -j 8 -seeds 3     # or -sim vcs / xrun / questa / iverilog
 mregress tests.list -rerun                      # repeat only the failures
+mregress tests.list -farm lsf '-farm-opts=-q regress'   # on a farm: lsf, slurm, sge, ssh:hosts, or cmd:TEMPLATE
 mregress -spec tests/spec -sim iverilog         # the spec suite on another simulator
 ```
 
