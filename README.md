@@ -272,6 +272,21 @@ that removes items the tests did cover, and one without a reason. Kinds:
 `file`, `line`, `branch`, `cond`, `toggle`, `fsm`, `state`, `trans`, `cg`,
 `assert`; names take `*` and `?`.
 
+**Condition modes** (as VCS `-cm_cond`): `msim -cm_cond full` records every
+combination of the term values of a condition of up to 8 terms (2^n vectors)
+instead of the n + 1 sensitized ones; `-cm_cond allops` also covers `&` and
+`|` of one-bit operands (`assign y = (a & b) | c;`). Join them as
+`-cm_cond full+allops`. Both work with `-compile`.
+
+**Per instance.** The database also keeps each module instance's own lines,
+decisions and condition vectors. `mcov report -instances` prints one row per
+instance (line, branch, condition, toggle, FSM state and transition, for that
+instance's own code and signals), the HTML report gets an Instances table,
+and with `-detail` every condition shows its vectors per instance, so that a
+vector reached in one instance of a module but not in another shows up.
+`inst tb.dut.u_dbg` in an exclusion file leaves out an instance and all below
+it; code another instance of the same module runs stays counted.
+
 **Which test covers what.** With one database per test, `mcov rank` orders
 the tests so that each next one adds the most items not yet covered, and
 shows what only one test covers and which tests add nothing:
@@ -810,6 +825,8 @@ and reports the fault coverage of the chosen algorithm. See
 ```sh
 mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
 mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
+```
+
 `mdft` also does IEEE 1149.1 boundary scan and IEEE 1687 IJTAG
 ([docs/JTAG.md](docs/JTAG.md)); every flow can write SVF and a self-checking
 testbench that `msim` runs:
@@ -939,6 +956,21 @@ A model is ordinary C against [`include/mvp.h`](include/mvp.h):
 to interrupt, `mvp_bus_read` / `mvp_bus_write` to be a master. A TLM-2.0
 target goes behind the same bridge with `mvp_tlm.h`. A memory and a 16550-style
 UART are bundled in `mvp/models/`. See [docs/VPROTO.md](docs/VPROTO.md).
+
+### Support agents: `msupport`
+
+Each product has an AI support agent that answers users' questions from that
+product's documentation, can run a short example on the product's own tool in
+a sandbox, and files a ticket when the documentation does not answer. One
+JSON file per product in `support/products/`; the model is Claude through the
+Anthropic SDK. Built and tested, not online yet. See
+[docs/SUPPORT.md](docs/SUPPORT.md).
+
+```sh
+python3 tools/msupport.py -list
+python3 tools/msupport.py -product msim "How do I write an FST waveform?"
+python3 tools/msupport.py -serve 8080            # a local web page and JSON API
+```
 
 ## Known limits
 

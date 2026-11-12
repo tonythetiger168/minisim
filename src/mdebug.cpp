@@ -19,10 +19,12 @@
 // changed, combinational logic at that time.
 #include <climits>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
 
+#include "fsm_extract.hpp"
 #include "lintir.hpp"
 #include "slang/ast/expressions/ConversionExpression.h"
 #include "slang/ast/expressions/LiteralExpressions.h"
@@ -1465,6 +1467,292 @@ struct Tool {
         }
         return o + "]";
     }
+    // -------------------------------------------------------------- FSMs
+    // State machines come from the shared extractor (src/fsm_extract.hpp),
+    // the one msim -cov and mlint use.
+    std::vector<ExtractedFsm> fsms;
+
+    static std::string stateName(const ExtractedFsm& f, uint64_t v) {
+        for (auto& [val, name] : f.states)
+            if (val == v) return name.empty() || std::isdigit((unsigned char)name[0]) ? std::to_string(v) : name;
+        return std::to_string(v);
+    }
+    static bool isState(const ExtractedFsm& f, uint64_t v) {
+        for (auto& st : f.states) if (st.first == v) return true;
+        return false;
+    }
+    // The register's values in the waveform: (time, value) with unknown = ~0.
+    std::vector<std::pair<uint64_t, uint64_t>> stateSeq(const ExtractedFsm& f) {
+        std::vector<std::pair<uint64_t, uint64_t>> seq;
+        const Wave* w = haveVcd && f.var ? vcd.find(path(*f.var)) : nullptr;
+        if (!w) return seq;
+        for (size_t i = 0; i < w->ch.size(); i++) {
+            const std::string b = w->bits((int)i);
+            uint64_t v = 0;
+            bool unk = b.size() > 64;
+            for (char c : b) { if (c != '0' && c != '1') unk = true; v = (v << 1) | (c == '1'); }
+            seq.push_back({w->ch[i].t, unk ? ~0ull : v});
+        }
+        return seq;
+    }
+
+    // -fsm [NAME]: the state machines under an instance (or one register):
+    // states, transitions and where they are written; with a waveform, the
+    // state at -at T, how often each transition ran, the ones that never did
+    // and any value that is not a state.
+    bool fsm(const std::string& name, std::optional<uint64_t> at) {
+        bool any = false;
+        for (const ExtractedFsm& f : fsms) {
+            if (!f.var || f.states.empty()) continue;
+            const std::string reg = path(*f.var);
+            if (!name.empty() && reg != name && reg.rfind(name + ".", 0) != 0) continue;
+            any = true;
+            std::cout << reg << "  (" << f.module << ", " << f.w << " bit" << (f.w == 1 ? "" : "s") << ", " << f.states.size()
+                      << " states" << (f.onehot ? ", one-hot" : "") << ")  " << db.src.at(db.src.where(f.var->location)) << "\n";
+            std::cout << "  states:";
+            for (auto& [v, n] : f.states) {
+                bool rst = std::find(f.resetStates.begin(), f.resetStates.end(), v) != f.resetStates.end();
+                // A name that is a literal (2'h1) says no more than the value.
+                bool lit = n.empty() || std::isdigit((unsigned char)n[0]);
+                std::cout << " " << (lit ? std::to_string(v) : n + "=" + std::to_string(v)) << (rst ? "(reset)" : "");
+            }
+            std::cout << "\n";
+            auto seq = stateSeq(f);
+            const Wave* w = haveVcd ? vcd.find(reg) : nullptr;
+            // Transitions seen: from -> to, count and first time.
+            std::map<std::pair<uint64_t, uint64_t>, std::pair<size_t, uint64_t>> seen;
+            std::map<uint64_t, size_t> visits;
+            for (size_t i = 0; i < seq.size(); i++) {
+                if (seq[i].second == ~0ull) continue;
+                visits[seq[i].second]++;
+                if (i && seq[i - 1].second != ~0ull) {
+                    auto [it, fresh] = seen.try_emplace({seq[i - 1].second, seq[i].second}, 0, seq[i].first);
+                    it->second.first++;
+                }
+            }
+            std::set<std::pair<uint64_t, uint64_t>> known;
+            for (const auto& t : f.trans) {
+                if (t.from == t.to || !known.insert({t.from, t.to}).second) continue;
+                std::cout << "  " << stateName(f, t.from) << " -> " << stateName(f, t.to) << "  "
+                          << db.src.at(db.src.where(t.loc)) << (t.reset ? "  (reset)" : "");
+                if (w) {
+                    auto it = seen.find({t.from, t.to});
+                    if (it == seen.end()) std::cout << "  never taken";
+                    else std::cout << "  taken " << it->second.first << (it->second.first == 1 ? " time" : " times") << ", first @" << it->second.second;
+                }
+                std::cout << "\n";
+            }
+            if (!w) {
+                if (haveVcd) std::cout << "  (not in the waveform)\n";
+                continue;
+            }
+            for (auto& [k, v] : seen)
+                if (!known.count(k))
+                    std::cout << "  " << stateName(f, k.first) << " -> " << stateName(f, k.second) << "  taken " << v.first
+                              << (v.first == 1 ? " time" : " times") << ", first @" << v.second
+                              << (isState(f, k.first) && isState(f, k.second) ? "  (not a transition found in the source)\n" : "  (a value that is not a state)\n");
+            for (auto& [v, n] : f.states)
+                if (!visits.count(v)) std::cout << "  state " << (n.empty() ? std::to_string(v) : n) << " never entered\n";
+            for (auto& [t, v] : seq)
+                if (v != ~0ull && !isState(f, v)) { std::cout << "  value " << v << " @" << t << " is not a state\n"; break; }
+            uint64_t t = at ? *at : vcd.end;
+            int ci = w->at(t);
+            if (ci >= 0) {
+                uint64_t v = seq[ci].second;
+                std::cout << "  @" << t << ": " << (v == ~0ull ? std::string("x") : stateName(f, v)) << "  (since " << seq[ci].first << ")";
+                // The road to it: the last states before.
+                int from = std::max(0, ci - 5);
+                std::cout << "  after";
+                for (int i = from; i < ci; i++)
+                    std::cout << " " << (seq[i].second == ~0ull ? std::string("x") : stateName(f, seq[i].second)) << "@" << seq[i].first;
+                if (from == ci) std::cout << " nothing";
+                std::cout << "\n";
+            }
+        }
+        if (!any) {
+            std::cerr << "mdebug: no state machine " << (name.empty() ? "in the design" : "at " + name) << "\n";
+            return name.empty();
+        }
+        return true;
+    }
+
+    std::string fsmsJson() {
+        std::string o = "[";
+        for (const ExtractedFsm& f : fsms) {
+            auto ix = f.var ? db.sigIx.find(f.var) : db.sigIx.end();
+            if (ix == db.sigIx.end() || f.states.empty()) continue;
+            o += std::string(o.size() > 1 ? ",\n" : "") + "{\"sig\":" + std::to_string(ix->second) + ",\"states\":[";
+            for (size_t i = 0; i < f.states.size(); i++) {
+                bool rst = std::find(f.resetStates.begin(), f.resetStates.end(), f.states[i].first) != f.resetStates.end();
+                o += std::string(i ? "," : "") + "[" + std::to_string(f.states[i].first) + "," +
+                     js(stateName(f, f.states[i].first)) + "," + (rst ? "1" : "0") + "]";
+            }
+            o += "],\"trans\":[";
+            std::set<std::pair<uint64_t, uint64_t>> known;
+            bool first = true;
+            for (const auto& t : f.trans) {
+                if (t.from == t.to || !known.insert({t.from, t.to}).second) continue;
+                Where wh = db.src.where(t.loc);
+                o += std::string(first ? "" : ",") + "[" + std::to_string(t.from) + "," + std::to_string(t.to) + "," + (t.reset ? "1" : "0") +
+                     "," + std::to_string(wh.file) + "," + std::to_string(wh.line) + "]";
+                first = false;
+            }
+            o += "]}";
+        }
+        return o + "]";
+    }
+
+    // ------------------------------------------------------------- script
+    // -script FILE (- for stdin): one command per line, one JSON object per
+    // answer line. The design and the waveform are loaded once, so a script
+    // or another program can ask many questions of one mdebug process.
+    std::string drvJson(const Driver& d) {
+        Where w = db.src.where(d.loc);
+        return "{\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) +
+               ",\"text\":" + js(text(d)) + ",\"kind\":" + js(label(d)) + ",\"when\":" + js(when(d)) +
+               ",\"target\":" + js(path(*d.target)) + "}";
+    }
+    int script(std::istream& in, std::ostream& out) {
+        int bad = 0;
+        std::string ln;
+        while (std::getline(in, ln)) {
+            std::istringstream is(ln);
+            std::vector<std::string> a;
+            for (std::string t; is >> t;) a.push_back(t);
+            if (a.empty() || a[0][0] == '#') continue;
+            if (a[0] == "quit" || a[0] == "exit") break;
+            auto num = [&](size_t i) -> std::optional<uint64_t> {
+                if (i >= a.size()) return std::nullopt;
+                return std::strtoull(a[i].c_str(), nullptr, 10);
+            };
+            // What the query functions print is captured, never mixed into the answers.
+            std::ostringstream txt, err;
+            std::streambuf* so = std::cout.rdbuf(txt.rdbuf());
+            std::streambuf* se = std::cerr.rdbuf(err.rdbuf());
+            bool ok = true, asText = false;
+            std::string body;
+            const std::string& c = a[0];
+            auto sig = [&]() -> const Symbol* {
+                if (a.size() < 2) { std::cerr << "mdebug: " << c << " needs a signal\n"; return nullptr; }
+                return find(a[1]);
+            };
+            auto needWave = [&](const Symbol* s) -> const Wave* {
+                if (!haveVcd) { std::cerr << "mdebug: " << c << " needs -vcd <file>\n"; return nullptr; }
+                const Wave* w = vcd.find(path(*s));
+                if (!w) std::cerr << "mdebug: " << path(*s) << " is not in the waveform\n";
+                return w;
+            };
+            if (c == "drivers" || c == "loads") {
+                const Symbol* s = sig();
+                if (!s) ok = false;
+                else {
+                    body = "\"signal\":" + js(path(*s)) + ",\"" + c + "\":[";
+                    auto& v = c == "drivers" ? db.driversOf[s] : db.loadsOf[s];
+                    for (size_t i = 0; i < v.size(); i++) {
+                        const Driver& d = db.drivers[v[i]];
+                        std::string o = drvJson(d);
+                        if (c == "loads") {
+                            bool data = std::find(d.reads.begin(), d.reads.end(), s) != d.reads.end();
+                            o.insert(o.size() - 1, std::string(",\"control\":") + (data ? "false" : "true"));
+                        }
+                        body += (i ? "," : "") + o;
+                    }
+                    body += "]";
+                }
+            } else if (c == "value") {
+                const Symbol* s = sig();
+                const Wave* w = s ? needWave(s) : nullptr;
+                if (!w) ok = false;
+                else {
+                    uint64_t t = num(2).value_or(vcd.end);
+                    int i = w->at(t);
+                    body = "\"signal\":" + js(path(*s)) + ",\"time\":" + std::to_string(t) + ",\"value\":" +
+                           js(i < 0 ? "x" : showBits(w->bits(i))) + ",\"bits\":" + js(i < 0 ? "" : w->bits(i)) +
+                           ",\"since\":" + std::to_string(i < 0 ? 0 : w->ch[i].t);
+                }
+            } else if (c == "changes") {
+                const Symbol* s = sig();
+                const Wave* w = s ? needWave(s) : nullptr;
+                if (!w) ok = false;
+                else {
+                    uint64_t t0 = num(2).value_or(0), t1 = num(3).value_or(vcd.end);
+                    const size_t cap = 10000;
+                    size_t n = 0;
+                    bool more = false;
+                    body = "\"signal\":" + js(path(*s)) + ",\"changes\":[";
+                    for (int i = std::max(0, w->at(t0)); i < (int)w->ch.size() && w->ch[i].t <= t1; i++) {
+                        if (w->ch[i].t < t0) continue;
+                        if (n == cap) { more = true; break; }
+                        body += std::string(n++ ? "," : "") + "[" + std::to_string(w->ch[i].t) + "," + js(w->bits(i)) + "]";
+                    }
+                    body += std::string("],\"more\":") + (more ? "true" : "false");
+                }
+            } else if (c == "scopes") {
+                body = "\"scopes\":[";
+                for (size_t i = 0; i < db.scopes.size(); i++) {
+                    Where w = db.src.where(db.scopes[i].loc);
+                    body += std::string(i ? "," : "") + "{\"path\":" + js(db.scopes[i].path) + ",\"def\":" + js(db.scopes[i].def) +
+                            ",\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) + "}";
+                }
+                body += "]";
+            } else if (c == "signals") {
+                // signals, or signals SCOPE: the ones directly inside it.
+                const std::string pre = a.size() > 1 ? a[1] + "." : "";
+                body = "\"signals\":[";
+                bool first = true;
+                for (auto* s : db.signals) {
+                    const std::string p = path(*s);
+                    if (!pre.empty() && (p.rfind(pre, 0) != 0 || p.find('.', pre.size()) != std::string::npos)) continue;
+                    Where w = db.src.where(s->location);
+                    body += std::string(first ? "" : ",") + "{\"path\":" + js(p) + ",\"type\":" + js(s->getType().toString()) +
+                            ",\"file\":" + js(w.file < 0 ? "" : db.src.files[w.file].name) + ",\"line\":" + std::to_string(w.line) + "}";
+                    first = false;
+                }
+                body += "]";
+            } else if (c == "end") {
+                if (!haveVcd) { std::cerr << "mdebug: end needs -vcd <file>\n"; ok = false; }
+                else body = "\"end\":" + std::to_string(vcd.end) + ",\"timescale\":" + js(vcd.timescale);
+            } else if (c == "active") {
+                asText = true;
+                ok = a.size() > 1 ? activeTrace(a[1], num(2), (int)num(3).value_or(3)) : (std::cerr << "mdebug: active needs a signal\n", false);
+            } else if (c == "trace") {
+                asText = true;
+                ok = a.size() > 1 ? trace(a[1], (int)num(2).value_or(2)) : (std::cerr << "mdebug: trace needs a signal\n", false);
+            } else if (c == "blocks") {
+                asText = true;
+                ok = a.size() > 1 ? blocks(a[1]) : (std::cerr << "mdebug: blocks needs an instance\n", false);
+            } else if (c == "fsm") {
+                // fsm, fsm NAME, fsm NAME T
+                asText = true;
+                bool nameIsTime = a.size() == 2 && std::isdigit((unsigned char)a[1][0]);
+                ok = fsm(a.size() > 1 && !nameIsTime ? a[1] : "", nameIsTime ? num(1) : num(2));
+            } else if (c == "help") {
+                body = "\"commands\":[\"drivers SIG\",\"loads SIG\",\"value SIG [T]\",\"changes SIG [T0 [T1]]\",\"active SIG [T [DEPTH]]\","
+                       "\"trace SIG [DEPTH]\",\"blocks INST\",\"fsm [NAME] [T]\",\"scopes\",\"signals [SCOPE]\",\"end\",\"quit\"]";
+            } else {
+                std::cerr << "mdebug: unknown command '" << c << "' (help lists them)\n";
+                ok = false;
+            }
+            std::cout.rdbuf(so);
+            std::cerr.rdbuf(se);
+            std::string e = err.str();
+            while (!e.empty() && e.back() == '\n') e.pop_back();
+            if (e.rfind("mdebug: ", 0) == 0) e = e.substr(8);
+            out << "{\"cmd\":" << js(ln) << ",\"ok\":" << (ok ? "true" : "false");
+            if (!ok) { out << ",\"error\":" << js(e); bad++; }
+            if (!body.empty()) out << "," << body;
+            if (asText && ok) {
+                out << ",\"text\":[";
+                std::istringstream ts(txt.str());
+                bool first = true;
+                for (std::string l; std::getline(ts, l);) { out << (first ? "" : ",") << js(l); first = false; }
+                out << "]";
+            }
+            out << "}" << std::endl;   // flushed: the caller may be waiting on a pipe
+        }
+        return bad;
+    }
+
     std::string casesJson() {
         std::string o = "[";
         for (size_t i = 0; i < cases.size(); i++) {
@@ -1495,6 +1783,7 @@ struct Tool {
         for (auto* s : db.signals) sw.push_back(db.src.where(s->location));
         for (auto& s : db.scopes) { sd.push_back(db.src.where(s.loc)); si.push_back(db.src.where(s.inst)); }
         for (auto& d : db.drivers) dw.push_back(db.src.where(d.loc));
+        const std::string fsmText = fsmsJson();
         os << "{\"version\":" << js(MINISIM_VERSION) << ",\n\"files\":[";
         for (size_t i = 0; i < db.src.files.size(); i++) {
             auto& f = db.src.files[i];
@@ -1549,7 +1838,7 @@ struct Tool {
                << parts(d) << ",\"g\":" << guardsJson(d) << ",\"rhs\":" << (d.rhs && d.whole ? exprJson(*d.rhs) : "null") << "}";
             first = false;
         }
-        os << "],\n\"cases\":" << casesJson();
+        os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText;
         if (haveVcd) {
             os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale) << ",\"waves\":{";
             first = true;
@@ -1613,6 +1902,12 @@ void usage() {
                  "  -threads N       threads for parsing and for reading the waveform\n"
                  "                   (default: every logical core; the output is the same for any N)\n"
                  "  -scopes          list the instances    -signals  list the signals\n"
+                 "  -fsm [NAME]      the state machines (all, under an instance, or one register): states,\n"
+                 "                   transitions and their lines; with -vcd, the state at -at T, how often\n"
+                 "                   each transition ran, the ones never taken and values that are not states\n"
+                 "  -script FILE     run commands from FILE (- for the standard input), one per line, and\n"
+                 "                   answer each with one line of JSON: drivers, loads, value, changes,\n"
+                 "                   active, trace, blocks, fsm, scopes, signals, end, help, quit\n"
                  "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
@@ -1630,7 +1925,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
-    std::string vcdPath, htmlPath, jsonPath;
+    std::string vcdPath, htmlPath, jsonPath, scriptPath;
     int depth = -1;
     std::optional<uint64_t> at;
     size_t maxChanges = 20000;
@@ -1650,6 +1945,14 @@ int main(int argc, char** argv) {
             std::cout << "mdebug " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
             return 0;
         }
+        if (a == "-fsm") {
+            // -fsm, or -fsm NAME: an instance or a state register.
+            std::string arg;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
+            queries.push_back({"fsm", arg, -1, std::nullopt});
+            continue;
+        }
+        if (a == "-script") { scriptPath = next("a file, or - for the standard input"); continue; }
         if (a == "-blocks") { queries.push_back({"blocks", next("an instance"), -1, std::nullopt}); continue; }
         if (a == "-drivers" || a == "-loads" || a == "-trace" || a == "-active") {
             queries.push_back({a.substr(1), next("a signal"), -1, std::nullopt});
@@ -1668,7 +1971,7 @@ int main(int argc, char** argv) {
         if (a == "-sv" || a == "-sverilog") continue;
         fwd.push_back(a);
     }
-    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && fwd.size() == 1) { usage(); return 2; }
+    if (queries.empty() && htmlPath.empty() && jsonPath.empty() && scriptPath.empty() && fwd.size() == 1) { usage(); return 2; }
     // Every instance gets its own symbols, so tb.a.q and tb.b.q are two signals.
     fwd.push_back("--disable-instance-caching");
     fwd.push_back("--threads");   // the front end parses files in parallel
@@ -1684,6 +1987,7 @@ int main(int argc, char** argv) {
     Collect c(tool.db);
     fe.comp->getRoot().visit(c);
 
+    tool.fsms = extractFsms(fe.comp->getRoot());
     if (!vcdPath.empty()) {
         std::string err;
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
@@ -1695,6 +1999,7 @@ int main(int argc, char** argv) {
         if (q.what == "drivers") ok &= tool.drivers(q.arg);
         else if (q.what == "loads") ok &= tool.loads(q.arg);
         else if (q.what == "blocks") ok &= tool.blocks(q.arg);
+        else if (q.what == "fsm") ok &= tool.fsm(q.arg, at);
         else if (q.what == "trace") ok &= tool.trace(q.arg, depth < 0 ? 2 : depth);
         else if (q.what == "active") ok &= tool.activeTrace(q.arg, at, depth < 0 ? 3 : depth);
         else if (q.what == "scopes")
@@ -1706,6 +2011,14 @@ int main(int argc, char** argv) {
                           << tool.db.src.at(tool.db.src.where(s->location)) << "\n";
     }
 
+    if (!scriptPath.empty()) {
+        if (scriptPath == "-") ok &= tool.script(std::cin, std::cout) == 0;
+        else {
+            std::ifstream is(scriptPath);
+            if (!is) { std::cerr << "mdebug: cannot read " << scriptPath << "\n"; return 2; }
+            ok &= tool.script(is, std::cout) == 0;
+        }
+    }
     if (!jsonPath.empty()) {
         std::ofstream os(jsonPath);
         if (!os) { std::cerr << "mdebug: cannot write " << jsonPath << "\n"; return 2; }
