@@ -50,10 +50,16 @@ they are priced rather than given away. `mvp` has no binary: `msim` keeps its
 `-mvp` option and reports that it cannot find the runtime when the paid layer
 is not installed beside it.
 
+`mvplat` (virtual platforms) is split between the two. The platform engine,
+which covers the RISC-V harts, multi-hart runs, the bundled peripheral models,
+the platform file and the commit log, is free. The gdb server, checkpoints,
+the profile, `mvp` model libraries and RTL co-simulation are a paid
+extension library that the free `mvplat` loads (`docs/VPLAT.md`).
+
 | Edition | Tools |
 |---|---|
-| **Free (Apache-2.0, this repository)** | `msim` (simulator), `mwave` (VCD / FST), `mcov` (coverage), `mregress` (regression runner), `mplan` (verification planning), `mbug` (bug filing), `mlint` + CDC (lint), `mdft` (scan-readiness checks), `mdebug` (source debug and viewer) |
-| **Paid (closed source, separate repository)** | `msynth` (synthesis), `mpnr` (place and route), `msta` (static timing), `mrcx` (parasitic extraction), `mequiv` (equivalence checking), `mformal` (formal property checking), `matpg` (test pattern generation) and `mdft` scan insertion / MBIST, `memu` + `mfpga` (emulation and FPGA prototyping), `mhls` (high-level synthesis), `mspice` + `mchar` (circuit simulation and library characterization), `mpv` (physical verification: DRC and LVS), `mpower` (power signoff), `msdc` (constraint checking), `mlibc` (library checking), `msimprotect` (IEEE 1735 IP protection and key management), `mpss` (portable stimulus), `mvp` (virtual prototypes) |
+| **Free (Apache-2.0, this repository)** | `msim` (simulator), `mwave` (VCD / FST), `mcov` (coverage), `mregress` (regression runner), `mplan` (verification planning), `mbug` (bug filing), `mlint` + CDC (lint), `mdft` (scan-readiness checks), `mdebug` (source debug and viewer), `mvplat` (virtual platform engine) |
+| **Paid (closed source, separate repository)** | `msynth` (synthesis), `mpnr` (place and route), `msta` (static timing), `mrcx` (parasitic extraction), `mequiv` (equivalence checking), `mformal` (formal property checking), `matpg` (test pattern generation) and `mdft` scan insertion / MBIST, `memu` + `mfpga` (emulation and FPGA prototyping), `mhls` (high-level synthesis), `mspice` + `mchar` (circuit simulation and library characterization), `mpv` (physical verification: DRC and LVS), `mpower` (power signoff), `msdc` (constraint checking), `mlibc` (library checking), `msimprotect` (IEEE 1735 IP protection and key management), `mpss` (portable stimulus), `mvp` (virtual prototypes), the `mvplat` extension (gdb, checkpoints, profile, models, RTL co-simulation) |
 
 Two things are worth saying plainly before anything moves:
 

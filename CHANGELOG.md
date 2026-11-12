@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
+  and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
+  with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
+  board is the built-in `virt32` or a JSON platform file with RAM/ROM, a 16550
+  UART, CLINT, PLIC and the test finisher; ELF and HTIF are supported.
+  Several harts run on several threads, and the result does not depend on the
+  thread count. A spike-style commit log, a decoded-instruction cache (about
+  160 MIPS on one hart) and RAM mapped on first touch are included. Its
+  headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
+  is the interface of the licensed extension library: gdb, checkpoints, the
+  profile, model libraries and RTL co-simulation.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
