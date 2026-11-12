@@ -1,0 +1,29 @@
+# Power intent for vcm.sv: VCMs in UPF libraries (5.11, 6.29, 6.30, 6.36, 6.63).
+upf_version 4.0
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+foreach s {VDD VSS} {
+    create_supply_port $s
+    create_supply_net $s
+    connect_supply_net $s -ports $s
+}
+create_supply_set SS_TOP -function {power VDD} -function {ground VSS}
+associate_supply_set SS_TOP -handle PD_TOP.primary
+
+create_upf_library vlib -contents {
+    # Annex I.2.3 and I.2.2
+    create_vcm R2U -hdl_type {sv real} -conversion_direction hdl2upf \
+        -table {{{1.2 *} {UNDETERMINED}} {{1.0 1.2} {FULL_ON *}} {{0.6 1.0} {PARTIAL_ON *}} {{* 0.6} {OFF}}}
+    create_vcm U2R -hdl_type {sv real} -conversion_direction upf2hdl \
+        -table {{{FULL_ON} {*}} {{PARTIAL_ON} {*}} {{OFF} {Zreal}} {{UNDETERMINED} {Xreal}}}
+    create_vcm REAL -vcms {R2U U2R}
+}
+# a second load of the same file does nothing (6.36)
+load_upf_library vcm_lib.upf
+load_upf_library vcm_lib.upf
+use_upf_library vlib
+
+foreach n {VR VE VS} { create_supply_net $n }
+connect_supply_net VR -ports {u_ldo/vout u_ana/vr} -vcm REAL
+connect_supply_net VE -ports {u_ts/t u_ana/vi} -vcm ilib::BUNDLE
+connect_supply_net VS -ports {u_sreg/s u_ana/vs}

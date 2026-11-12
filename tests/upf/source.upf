@@ -1,0 +1,27 @@
+# Power intent for source.sv: create_abstract_power_source (6.16).
+upf_version 4.0
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_CORE -elements {u_core}
+create_supply_port VHI
+create_supply_port VLO
+create_supply_port VSS
+create_supply_net VHI
+create_supply_net VLO
+create_supply_net VSS
+create_supply_net VCORE
+connect_supply_net VHI -ports {VHI}
+connect_supply_net VLO -ports {VLO}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS_HI -function {power VHI} -function {ground VSS}
+create_supply_set SS_LO -function {power VLO} -function {ground VSS}
+create_supply_set SS_CORE -function {power VCORE} -function {ground VSS}
+associate_supply_set SS_HI -handle PD_TOP.primary
+associate_supply_set SS_CORE -handle PD_CORE.primary
+create_abstract_power_source PS \
+    -output_supply_set {out SS_CORE} \
+    -input_supply_set {hi SS_HI} -input_supply_set {lo SS_LO} \
+    -control_port {c_hi hi} -control_port {c_lo lo} \
+    -on_state {RUN hi {c_hi}} -on_state {SLOW lo {c_lo && !c_hi}} \
+    -supply_set SS_HI \
+    -ack_port {a ack} -ack_delay {a 2}
