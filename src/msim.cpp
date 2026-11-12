@@ -1005,6 +1005,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                       }) ? "a concurrent, final or expect assertion"
                     : !clockings().empty() ? "a clocking block"
                     : !cgDefs().empty() ? "a covergroup"
+                    : annexDUsed() ? "an Annex D system task"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -1412,6 +1413,7 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+    annexStartup(argc, argv);   // $reset / $restart run msim again (Annex D)
     std::atexit([] { g_framesDead = true; });   // before the kernel's waiting processes are destroyed
     for (int sg : {SIGSEGV, SIGABRT})
         std::signal(sg, [](int) {   // say where, then stop
@@ -1988,6 +1990,10 @@ int main(int argc, char** argv) {
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
     for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
+    for (auto& t : lowered.trireg) {   // 28.16.2, Annex E
+        if (t.charge != STR_MEDIUM) S.charge[t.sig] = t.charge;
+        if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
+    }
     for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];

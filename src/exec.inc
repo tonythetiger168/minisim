@@ -228,9 +228,14 @@ static void readMem(const Instr& i) {
     if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) { finish = v_to_i64(v); haveFinish = true; } }
     int64_t step = (haveFinish && finish < start) ? -1 : 1;
     if (!haveFinish) finish = highA;
-    std::ifstream in(i.fmt);
-    if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::string text;
+    if (i.pw == 2) {   // $sreadmemb / $sreadmemh (D.14): the data is in the string arguments
+        for (size_t k = 2; k < i.args.size(); k++) { Val sv = eval(i.args[k], rd); sv.str = true; text += v_str(sv) + "\n"; }
+    } else {
+        std::ifstream in(i.fmt);
+        if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
     int64_t addr = start, k = 0;
     const int64_t sub = memSub(a);
     int bits = i.hex ? 4 : 1;
@@ -1845,3 +1850,4 @@ inline void startClockings() {
 #include "cover_rt.inc"
 #include "tchk.inc"
 #include "sdf_annotate.inc"
+#include "annexd.inc"
