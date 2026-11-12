@@ -210,3 +210,241 @@ if(FST)
     message(FATAL_ERROR "memory trace from the FST differs:\n${out}${err}")
   endif()
 endif()
+
+# State machines: the shared extractor's states and transitions with their
+# lines; with a waveform, which transitions ran, the state at a time and the
+# states never entered. The page gets the same data.
+set(SV ${SRC}/tests/cov/fsm.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -vcd ${OUT}/fsm.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "msim fsm.sv: ${rc}\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -fsm RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.state  (ctrl, 2 bits, 4 states)" "states: IDLE=0(reset) RUN=1 WAIT=2 FAIL=3" "RUN -> FAIL  " "fsm.sv:16"
+     "tb.v.st  (one, 2 bits, 3 states)" "tb.w.ph  (ifs, 2 bits, 3 states)")
+if(out MATCHES "taken|cnt")
+  message(FATAL_ERROR "-fsm without a waveform reported run data, or a counter as a state machine:\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -fsm tb.u -at 40 -json ${OUT}/fsm.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("IDLE -> RUN  " "taken 1 time, first @25" "fsm.sv:16  never taken" "state FAIL never entered"
+     "@40: WAIT  (since 35)  after IDLE@0 RUN@25")
+if(NOT rc EQUAL 0 OR out MATCHES "tb.v.st")
+  message(FATAL_ERROR "-fsm tb.u: rc ${rc}, or a machine of another instance was listed:\n${out}")
+endif()
+file(READ ${OUT}/fsm.json page)
+if(NOT page MATCHES "\"fsms\":\\[{\"sig\":[0-9]+,\"states\":\\[\\[0,\"IDLE\",1\\],\\[1,\"RUN\",0\\]")
+  message(FATAL_ERROR "the database has no state machines")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -fsm tb.nothing RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-fsm of a name with no state machine passed")
+endif()
+
+# The script interface: one JSON line per command, errors as answers, and
+# the exit status says a command failed.
+file(WRITE ${OUT}/q.txt "drivers tb.u.state\n# a comment\nvalue tb.u.state 40\nchanges tb.u.state 0 40\nfsm tb.u 40\nactive tb.busy 40 1\nend\n")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -script ${OUT}/q.txt
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("{\"cmd\":\"drivers tb.u.state\",\"ok\":true,\"signal\":\"tb.u.state\",\"drivers\":"
+     "\"line\":10,\"text\":\"state \\u003c= IDLE\"" "\"when\":\"!rst_n\""
+     "\"time\":40,\"value\":\"2'h2\",\"bits\":\"10\",\"since\":35}"
+     "\"changes\":[[0,\"00\"],[25,\"01\"],[35,\"10\"]],\"more\":false}"
+     "\"  @40: WAIT  (since 35)  after IDLE@0 RUN@25\"" "\"tb.busy = 1 @40  (since 25)\"" "\"end\":70,")
+if(NOT rc EQUAL 0 OR NOT "${err}" STREQUAL "")
+  message(FATAL_ERROR "-script: rc ${rc}, stderr: ${err}\n${out}")
+endif()
+file(WRITE ${OUT}/q.txt "value nope\nbogus\nend\n")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/fsm.vcd -script ${OUT}/q.txt
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("{\"cmd\":\"value nope\",\"ok\":false,\"error\":\"no signal 'nope' in the design\"}"
+     "\"ok\":false,\"error\":\"unknown command 'bogus' (help lists them)\"}" "\"end\":70,")
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-script with failing commands exited 0")
+endif()
+# The Python interface on top of it.
+if(PY)
+  file(WRITE ${OUT}/api.py "import sys\nsys.path.insert(0, sys.argv[1])\nfrom mdebug_api import Mdebug, MdebugError\n"
+       "with Mdebug([sys.argv[3], '-top', 'tb'], wave=sys.argv[4], mdebug=sys.argv[2]) as d:\n"
+       "    assert d.value('tb.u.state', 40)['value'] == \"2'h2\"\n"
+       "    assert [x['line'] for x in d.drivers('tb.u.state')] == [10, 11]\n"
+       "    assert d.changes('tb.u.state', 0, 40) == [[0, '00'], [25, '01'], [35, '10']]\n"
+       "    assert d.end() == 70 and any('WAIT' in l for l in d.fsm('tb.u', 40))\n"
+       "    assert d.active('tb.busy', at=40, depth=1)[0].startswith('tb.busy = 1 @40')\n"
+       "    assert len(d.signals('tb.u')) == 8 and any(s['path'] == 'tb.u' for s in d.scopes())\n"
+       "    try:\n        d.value('nope')\n        sys.exit('no error for a missing signal')\n"
+       "    except MdebugError as e:\n        assert 'nope' in str(e)\n"
+       "    assert d.end() == 70\nprint('api ok')\n")
+  execute_process(COMMAND ${PY} ${OUT}/api.py ${SRC}/tools ${MDEBUG} ${SV} ${OUT}/fsm.vcd
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "api ok")
+    message(FATAL_ERROR "mdebug_api.py: ${rc}\n${out}${err}")
+  endif()
+endif()
+
+# Assertions: the list, and with the simulation log and the waveform each
+# failure with what the assertion sampled at the clock ticks before it and
+# what drove each signal.
+set(SV ${SRC}/tests/debug/assert.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -vcd ${OUT}/assert.vcd RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out2)
+file(WRITE ${OUT}/assert.log "${out}${out2}")
+if(NOT "${out}${out2}" MATCHES "tb.u.a_gnt: at time 55")
+  message(FATAL_ERROR "msim assert.sv: no failure of a_gnt at 55 (${rc})\n${out}${out2}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -assert RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.a_gnt  assert property  " "assert.sv:5" "a_gnt: assert property (@(posedge clk) disable iff (rst) req |=> gnt);"
+     "tb.u.a_onehot  assert property  " "tb.u.a_imm  assert  ")
+if(out MATCHES "failed|no failure")
+  message(FATAL_ERROR "-assert without a log reported results:\n${out}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/assert.vcd -log ${OUT}/assert.log -assert tb.u.a_gnt -json ${OUT}/assert.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("failed 1 time: @55" "failure @55, values sampled before each clock tick:"
+     "@25       @35       @45       @55"
+     "tb.u.req         1         0         1         0"
+     "tb.u.gnt         0         1         0         0"
+     "tb.u.gnt = 0 @54  (since 35)" "gnt <= rst ? 1'b0 : req && !hold  [always_ff @posedge clk]")
+if(NOT rc EQUAL 0 OR out MATCHES "a_onehot")
+  message(FATAL_ERROR "-assert tb.u.a_gnt: rc ${rc}, or another assertion was listed:\n${out}")
+endif()
+file(READ ${OUT}/assert.json page)
+if(NOT page MATCHES "\"name\":\"tb.u.a_gnt\",\"kind\":\"assert property\"" OR NOT page MATCHES "\"fails\":\\[55\\]")
+  message(FATAL_ERROR "the database has no assertions or failures")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -vcd ${OUT}/assert.vcd -log ${OUT}/assert.log -assert tb.u.a_imm
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("tb.u.a_imm  assert  " "no failure in the log")
+
+# Coverage: with msim's coverage database, driver lines say how often their
+# line ran, -uncovered lists what never ran or never toggled, and the page's
+# database has the hits per line.
+set(SV ${SRC}/tests/cov/fsm.sv)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -cov ${OUT}/cov.json RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT EXISTS ${OUT}/cov.json)
+  message(FATAL_ERROR "msim -cov: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -cov ${OUT}/cov.json -drivers tb.u.next -uncovered tb.u -json ${OUT}/covdb.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("next = RUN  [always_comb]  when state == IDLE && go  (line ran 3 times)"
+     "next = IDLE  [always_comb]  when state == FAIL  (line never ran)"
+     "assignments on lines that never ran under tb.u:" "signals that never toggled fully:"
+     "tb.u.rst_n  (never fell)" "tb.u.err  (never changed)")
+if(NOT rc EQUAL 0 OR out MATCHES "tb.v.")
+  message(FATAL_ERROR "-uncovered tb.u: rc ${rc}, or another instance was listed:\n${out}${err}")
+endif()
+file(READ ${OUT}/covdb.json page)
+if(NOT page MATCHES "\"cov\":{\"lines\":{\"0\":{\"9\":8" OR NOT page MATCHES "\"19\":0" OR NOT page MATCHES "\"stuck\":{\"[0-9]+\":\"never")
+  message(FATAL_ERROR "the database has no coverage section")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -uncovered RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "needs -cov")
+  message(FATAL_ERROR "-uncovered without -cov: ${rc}\n${out}${err}")
+endif()
+file(WRITE ${OUT}/notcov.json "{}")
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -cov ${OUT}/notcov.json RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 2 OR NOT err MATCHES "is not a coverage database")
+  message(FATAL_ERROR "-cov of a file that is not a database: ${rc}\n${out}${err}")
+endif()
+
+# Low power: the domains of a UPF file, and with the log of a power-aware run
+# their states over time; a trace says that a value is x because its domain
+# is off, and names the isolation on a port.
+set(SV ${SRC}/tests/upf/gating.sv)
+set(UPF ${SRC}/tests/upf/gating.upf)
+execute_process(COMMAND ${MSIM} ${SV} -top tb -upf ${UPF} -power_top u_dut -upf_verbose -vcd ${OUT}/upf.vcd
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out2)
+file(WRITE ${OUT}/upf.log "${out}${out2}")
+if(NOT "${out}${out2}" MATCHES "UPF: 45: power domain PD_CORE simstate CORRUPT")
+  message(FATAL_ERROR "msim -upf -upf_verbose: no power-down of PD_CORE at 45 (${rc})\n${out}${out2}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -power_top u_dut -power
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("PD_TOP  " "elements: tb.u_dut  (1 instance)" "primary supply: SS_AON  ground=VSS  power=VDD"
+     "PD_CORE  " "elements: tb.u_dut.u_core  (1 instance)"
+     "isolation ISO_0: outputs, clamp 0, on u_core/cnt u_core/q, enabled by iso_en(high)"
+     "level shifter LS_IN: inputs, on u_core/d")
+if(NOT rc EQUAL 0 OR out MATCHES "states:")
+  message(FATAL_ERROR "-power without a log: rc ${rc}, or power states were reported:\n${out}${err}")
+endif()
+# Without -power_top the UPF's set_design_top finds the instance.
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -log ${OUT}/upf.log -vcd ${OUT}/upf.vcd
+                        -power PD_CORE -active tb.u_dut.u_core.cnt -at 60 -depth 1
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+want("states: @0 CORRUPT @2 NORMAL @45 CORRUPT @66 NORMAL @90 CORRUPT"
+     "@60: CORRUPT  (since 45)  power switch SW_CORE state off; supply VDD_CORE = OFF"
+     "tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)"
+     "power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF)"
+     "isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)"
+     "x because the domain has no power: no assignment made this value")
+if(NOT rc EQUAL 0 OR out MATCHES "PD_TOP|cnt <= cnt")
+  message(FATAL_ERROR "-power PD_CORE: rc ${rc}, another domain was listed, or an assignment was blamed for a powered-down value:\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -power RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0)
+  message(FATAL_ERROR "-power without -upf passed")
+endif()
+
+# The local server: the page without waves in it, each signal's waves on
+# request, nothing for another host name, and only on 127.0.0.1.
+if(PY)
+  file(WRITE ${OUT}/serve.py "import subprocess, sys, json, re, urllib.request, urllib.error\n"
+       "p = subprocess.Popen([sys.argv[1], sys.argv[2], '-top', 'tb', '-vcd', sys.argv[3], '-serve', '0', '-serve-requests', '5'], stdout=subprocess.PIPE, text=True)\n"
+       "line = p.stdout.readline()\n"
+       "assert 'serving http://127.0.0.1:' in line, line\n"
+       "base = line.split('serving ')[1].split('/ ')[0]\n"
+       "op = urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+       "page = op.open(base + '/').read().decode()\n"
+       "assert '\"live\":true' in page and '\"waves\":' not in page and '\"fsms\":' in page\n"
+       "paths = re.findall(r'\\{\"path\":\"([^\"]+)\",\"width\"', page)\n"
+       "ix = paths.index('tb.u.state')\n"
+       "w = json.loads(op.open(base + '/wave?i=%d' % ix).read())\n"
+       "assert w[:3] == [[0, '00'], [25, '01'], [35, '10']], w\n"
+       "assert json.loads(op.open(base + '/wave?i=99999').read()) is None\n"
+       "for url, hdr, code in ((base + '/nope', {}, 404), (base + '/wave?i=0', {'Host': 'other.example'}, 403)):\n"
+       "    try:\n        op.open(urllib.request.Request(url, headers=hdr))\n        sys.exit('no error for ' + url)\n"
+       "    except urllib.error.HTTPError as e:\n        assert e.code == code, (url, e.code)\n"
+       "assert p.wait(timeout=20) == 0\nprint('serve ok')\n")
+  execute_process(COMMAND ${PY} ${OUT}/serve.py ${MDEBUG} ${SRC}/tests/cov/fsm.sv ${OUT}/fsm.vcd
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 60)
+  if(NOT rc EQUAL 0 OR NOT out MATCHES "serve ok")
+    message(FATAL_ERROR "mdebug -serve: ${rc}\n${out}${err}")
+  endif()
+endif()
+
+# UVM transactions (-tr): tests/debug/tr_db.log is what uvm-core 2020.3.1
+# wrote on msim for tests/debug/uvm_record.sv (the mdebug_uvm_tr test makes
+# a fresh one when UVM is there). Streams, one stream with its fields and
+# parent sequence, the transactions in progress at a time, and the page data.
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "uvm_test_top\\.e\\.ag\\.sqr\\.s  6 transactions  \\(0 to 100000\\)\n"
+   OR NOT out MATCHES "uvm_test_top\\.e\\.ag\\.d\\.drive  5 transactions  \\(10000 to 100000\\)\n"
+   OR NOT out MATCHES "uvm_test_top\\.e\\.ag\\.m\\.observed  5 transactions")
+  message(FATAL_ERROR "-trans: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans ag.d.drive
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "#2 t  @10000 to 20000  a='h60 b='h76 sum='h0  \\(in #0 s on uvm_test_top\\.e\\.ag\\.sqr\\.s\\)\n"
+   OR NOT out MATCHES "#14 t  @90000 to 100000  a='hc1 b='h2")
+  message(FATAL_ERROR "-trans ag.d.drive: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans -at 35000 -json ${OUT}/tr.json
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0 OR NOT out MATCHES "drive at 35000:\n  #5 t  @30000 to 40000"
+   OR NOT out MATCHES "observed at 35000:\n  #6 t  @35000 to 40000  a='h22 b='ha sum='h2c\n")
+  message(FATAL_ERROR "-trans -at 35000: ${rc}\n${out}${err}")
+endif()
+file(READ ${OUT}/tr.json j)
+if(NOT j MATCHES "\"trans\":\\{\"end\":100000,\"streams\":\\[\\{\"name\":\"s\",\"scope\":\"uvm_test_top\\.e\\.ag\\.sqr\"")
+  message(FATAL_ERROR "no transactions in the JSON")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/tr_db.log -trans nosuch
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "no transaction stream 'nosuch'")
+  message(FATAL_ERROR "-trans nosuch: ${rc}\n${out}${err}")
+endif()
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/debug/alu.sv -trans
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "no UVM transaction streams")
+  message(FATAL_ERROR "-tr on a file that is not one passed: ${rc}\n${out}${err}")
+endif()
