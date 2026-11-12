@@ -1,0 +1,8 @@
+ID;Title;Description;Parent;Priority
+CNT-1;Counting;The counter counts.;;
+CNT-1.1;Count up and down;q follows dir, one step per clock;CNT-1;high
+CNT-1.2;Wrap around;q wraps at 7 and at 0;CNT-1;high
+CNT-2;Reset;q is 0 after reset;;high
+CNT-3;Scoreboard agrees;The reference model matches;;medium
+CNT-4;Low power hold;q holds while gated;;low
+CNT-5;Parity output;Not planned yet;;low
