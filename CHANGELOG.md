@@ -877,6 +877,12 @@ Spec references are IEEE 1800-2023 clauses.
   and `mplan report -rules URL` to take the annotations as triage rules.
 
 ### Fixed
+- A function that writes part-selects of its result or of a local in a
+  loop, called from two continuous assignments or always_comb blocks, hung
+  msim at time 0: each caller was sensitive to the function's own variables,
+  so the callers woke each other forever. Callers are now sensitive only to
+  their operands (10.3.2, 9.2.2.2.1). Five open-ip-portfolio IPs that timed
+  out after 600 s now pass in 2 to 101 s (AES_GCM 27.5 s; Icarus 30 s).
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and
