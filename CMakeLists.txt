@@ -62,6 +62,13 @@ endif()
 add_executable(test_gnetlist tests/test_gnetlist.cpp)
 target_include_directories(test_gnetlist PRIVATE src)
 add_test(NAME test_gnetlist COMMAND test_gnetlist)
+# The SAIF reader (src/saif.hpp), state- and path-dependent counts included.
+find_package(Threads REQUIRED)
+add_executable(test_saif tests/test_saif.cpp)
+target_include_directories(test_saif PRIVATE src)
+target_compile_options(test_saif PRIVATE -UNDEBUG)
+target_link_libraries(test_saif PRIVATE Threads::Threads)
+add_test(NAME test_saif COMMAND test_saif ${CMAKE_SOURCE_DIR}/tests/power/gates_sdpd.saif)
 
 add_executable(test_vcd tests/test_vcd.cpp)
 add_test(NAME test_vcd COMMAND test_vcd $<TARGET_FILE:minisim>)
@@ -220,6 +227,21 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vcd_class
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd_class.cmake)
+  # Checkpoints: $save, then msim -restore (like simv -r).
+  add_test(NAME msim_restore
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_restore
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_restore.cmake)
+  # The xrun / irun command line (msim run as xrun, or msim -xrun).
+  add_test(NAME msim_xrun
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xrun
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_xrun.cmake)
+  # Simulation profile (msim -profile): processes, instances, kinds.
+  add_test(NAME msim_profile
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_profile
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_profile.cmake)
   # Multi-core: 256 independent lanes run as parallel partitions. Every
   # thread count must print what the single-threaded event-driven run prints.
   add_test(NAME msim_threads
@@ -245,6 +267,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_smoke
                      -P ${CMAKE_SOURCE_DIR}/tests/mregress.cmake)
+    # -farm slurm on a real one-node Slurm (CI starts it); skips without one.
+    add_test(NAME mregress_slurm
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mregress_slurm
+                     -P ${CMAKE_SOURCE_DIR}/tests/mregress_slurm.cmake)
   endif()
   # mplan: a verification plan scored against a regression (tests/plan).
   if(Python3_FOUND)
@@ -266,6 +293,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_excl
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_excl.cmake)
+    add_test(NAME msim_cov_select
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_select
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cov_select.cmake)
     add_test(NAME msim_cov_inst
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
@@ -322,6 +353,9 @@ if(MINISIM_WITH_SLANG)
       add_test(NAME icarus/${name}
                COMMAND ${CMAKE_COMMAND} -DSIM=${IVERILOG} -DVVP=${VVP} -DSV=${sv}
                        -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
+      # Both runs work in tests/spec: a test that writes a file there
+      # ($fopen, $writememh) must not run under both simulators at once.
+      set_tests_properties(spec/${name} icarus/${name} PROPERTIES RESOURCE_LOCK spec_${name})
     endif()
   endforeach()
 
@@ -366,6 +400,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME mlint
            COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/mlint.cmake)
+  # mlint -cdc-sva writes assertions that msim runs next to the design.
+  add_test(NAME mlint_cdc_sva
+           COMMAND ${CMAKE_COMMAND} -DMLINT=$<TARGET_FILE:mlint> -DMSIM=$<TARGET_FILE:msim>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mlint_cdc_sva
+                   -P ${CMAKE_SOURCE_DIR}/tests/mlint_cdc_sva.cmake)
   # Every mlint rule on a marked source file (tests/lint/rules), the
   # configuration, the waivers, and -threads 1 against -threads 4.
   if(Python3_FOUND)
@@ -377,6 +416,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME upf
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMLINT=$<TARGET_FILE:mlint>
                    -DSRC=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/upf.cmake)
+  # Forward SAIF (IEEE 1801-2024 Annex J): msim -saif -saif_forward.
+  add_test(NAME saif_forward
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/saif_fwd.cmake)
 
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>
@@ -441,6 +484,7 @@ install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mr
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(PROGRAMS tools/mplan.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan)
+install(PROGRAMS tools/mplan_serve.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan_serve)
 # The Python interface to mdebug -script (import mdebug_api).
 install(FILES tools/mdebug_api.py DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/python)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc

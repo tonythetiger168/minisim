@@ -277,10 +277,16 @@ inline const std::vector<RuleInfo>& table() {
         {"CDC003", "cdc", Sev::Warning, true, "combinational logic in front of a synchronizer (a glitch can be captured)", ""},
         {"CDC004", "cdc", Sev::Warning, true, "separately synchronized signals of one domain meet again (reconvergence)", ""},
         {"CDC005", "cdc", Sev::Warning, true, "one signal synchronized more than once into the same domain", ""},
+        {"CDC006", "cdc", Sev::Warning, true, "with -sdc: a flop's clock is not a clock in the SDC file", ""},
+        {"CDC007", "cdc", Sev::Warning, true, "a clock read as data by logic", ""},
+        {"CDC008", "cdc", Sev::Warning, true, "a clock made by combinational logic of a clock and other signals (glitch)", ""},
+        {"CDC009", "cdc", Sev::Warning, true, "a one-cycle pulse from a faster clock into a slower one through a plain synchronizer (SDC periods)", ""},
         {"RDC001", "rdc", Sev::Warning, true, "an asynchronous reset generated in another clock domain", ""},
         {"RDC002", "rdc", Sev::Warning, true, "one asynchronous reset used directly in several clock domains", ""},
         {"RDC003", "rdc", Sev::Warning, true, "a flop feeds a flop with a different asynchronous reset, in one clock domain", ""},
         {"RDC004", "rdc", Sev::Warning, false, "a reset flop feeds a flop with no asynchronous reset", ""},
+        {"RDC005", "rdc", Sev::Warning, true, "a reset synchronizer of one flop", ""},
+        {"RDC006", "rdc", Sev::Warning, true, "an asynchronous reset made by combinational logic of several flops", ""},
     };
     return t;
 }

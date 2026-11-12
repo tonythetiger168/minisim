@@ -53,6 +53,9 @@ int newAssert(int type, int dir, const slang::ast::Statement& st) {
     a.dir = dir;
     a.inst = instPath(scope);
     a.prot = hideLocIf() && hideLocIf()(st.sourceRange.start());   // the coverage right (1735)
+    a.stmt = &st;
+    a.scope = labelSym && labelOf == &st && labelSym->getParentScope() ? labelSym->getParentScope() : scope;
+    std::tie(a.file, a.line) = fileLine(st.sourceRange.start());
     int id = (int)asserts().size();
     if (labelSym && labelOf == &st) a.name = labelSym->getHierarchicalPath();
     else a.name = scopePath(scope) + "." + (dir == AD_COVER ? "cover_" : dir == AD_ASSUME ? "assume_" : "assert_") + std::to_string(id);
@@ -513,6 +516,10 @@ void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge
     using namespace slang::ast;
     if (t.kind == TimingControlKind::SignalEvent) {
         const auto& s = t.as<SignalEventControl>();
+        if (!sampleEv.empty() && isSysCall(s.expr, "$inferred_clock")) {   // in a procedure: its clock (16.14.7)
+            ev.insert(ev.end(), sampleEv.begin(), sampleEv.end());
+            return;
+        }
         const auto* cb = isGlobalClock(s.expr) ? globalClocking() : clockingRef(s.expr);
         if (!cb) cb = inferredClock(s.expr);
         if (cb) {

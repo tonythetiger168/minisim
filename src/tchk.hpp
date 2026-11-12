@@ -55,6 +55,8 @@ struct TimingCheck {
     std::vector<std::pair<int, Edge>> watch;   // the signals the terminals read
 };
 inline std::vector<TimingCheck>& timingChecks() { static std::vector<TimingCheck> v; return v; }
+// VPI cbTchkViolation (38.36.1): called with the check's index after each violation report.
+inline void (*g_tchkHook)(int id) = nullptr;
 // +notimingcheck turns every timing check off.
 inline bool& timingChecksOn() { static bool on = true; return on; }
 // +neg_tchk: negative $setuphold / $recrem limits shift the window with

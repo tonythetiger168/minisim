@@ -99,6 +99,18 @@ inline SrcLoc g_runLoc;   // the statement running now, for run-time error messa
 inline std::string runLocStr();
 inline std::vector<std::string> g_covFiles{""};   // file id -> path; 0 = unknown
 inline bool g_cov = false;
+// VPI cbStmt (38.36.1): with g_hook set, the interpreter calls g_stmtHook
+// on each instruction marked stmtCb.
+struct Instr;
+inline bool g_hook = false;
+inline void (*g_stmtHook)(const Instr&) = nullptr;
+// VPI cbError (38.36.3): called with the format of each run-time error
+// message ($error, $fatal, a failed assertion or $cast) as it is printed.
+inline void (*g_errHook)(const std::string&) = nullptr;
+// VPI cbCreateObj / cbSizeChange (38.36.1): a class object was made (its
+// first signal), a container's size changed (its handle signal).
+inline void (*g_newObjHook)(int obj) = nullptr;
+inline void (*g_sizeHook)(int sig) = nullptr;
 // msim -cm_cond (as VCS): full = every combination of the term values of a
 // condition (up to 8 terms), not only the sensitized vectors; allops = also
 // & and | on one-bit operands.
@@ -154,7 +166,14 @@ struct FsmDef {
 };
 inline std::vector<FsmDef>& fsmDefs() { static std::vector<FsmDef> d; return d; }
 // Relaxed atomic add: a task body can run on two worker threads at once.
-inline void covHit(uint64_t& c) { __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED); }
+// Coverage paused by VPI (40.5): bit 0 statements and branches, bit 1
+// toggles, bit 2 FSM states (vpiCoverageStop / vpiCoverageStart).
+inline int g_covStop = 0;
+inline void covHit(uint64_t& c) {
+    if (!(g_covStop & 1)) __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED);
+}
+// The database a VPI vpiCoverageSave writes (40.5.1): set by msim.
+inline bool (*&covSaveHook())(const std::string&) { static bool (*f)(const std::string&) = nullptr; return f; }
 
 // ---- DPI-C (IEEE 1800-2023 clause 35, annex H) ----
 // How a value is passed to or from C (35.5.6, H.7). A packed type is passed
@@ -302,6 +321,7 @@ struct Instr {
     // WaitEdge with dynWait: wait for a change of any signal `e` reads,
     // resolved when the wait starts (wait (cond) on automatic variables).
     bool dynWait = false;
+    mutable bool stmtCb = false;   // a VPI cbStmt waits for this instruction (38.36.1)
     uint32_t file = 0, line = 0;            // source of the statement (coverage)
     mutable uint64_t hits = 0, taken = 0;   // -cov counters
     // Dpi: the import, one entry per argument (arrays only), and the call's
@@ -422,7 +442,12 @@ inline std::vector<int> g_pdMode, g_pdSig;
 struct Prog {
     int pd = -1;           // UPF power domain, -1 for none (initial blocks are never gated, 9.2.1)
     bool pstate = false;   // UPF: this process models state elements (an edge-triggered block or a latch)
+    // An always procedure whose body starts with an event control: a wait at
+    // code[0] is its sensitivity list. Processes woken mid-body run first on
+    // the event (see Sim::set), as other simulators order them.
+    bool alwaysTop = false;
     std::vector<Instr> code;
+    const void* inst = nullptr;   // msim -cov: the instance it runs in (slang InstanceSymbol), for VPI (40)
     uint32_t covInst = 0;  // g_covInsts: the instance it was lowered in (per-instance coverage)
     // msim -xprop, a clocked block with a clean copy: code[1] tests for an
     // ambiguous clock edge and otherwise jumps here. A clocked function
@@ -443,6 +468,11 @@ struct Prog {
     // case's violation check): the ProcCtl its reports are queued under.
     // Each evaluation is a flush point (16.4.2), as the wait of the process is.
     mutable std::shared_ptr<void> combCtl;
+    // A subroutine's own variables (arguments, result, locals) when they are
+    // static signals. A process that calls it is not sensitive to them
+    // (9.2.2.2.1: not what is declared within a called function; 10.3.2: the
+    // operands of the right-hand side).
+    std::vector<int> locals;
     size_t emit(Instr i) {
         if (!i.line) { i.file = g_emitLoc.file; i.line = g_emitLoc.line; }
         if (code.empty()) covInst = g_covInst;
@@ -511,8 +541,12 @@ inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
     std::vector<int> sigs;
     std::vector<const Prog*> seen;
     collectProgRefs(p, sigs, seen);
+    std::unordered_set<int> own;
+    for (const Prog* q : seen)
+        if (q != &p) own.insert(q->locals.begin(), q->locals.end());
     std::vector<std::pair<int, Edge>> ev;
-    for (int s : sigs) ev.push_back({s, ANY});
+    for (int s : sigs)
+        if (!own.count(s)) ev.push_back({s, ANY});
     return ev;
 }
 // Signals a process (or a subroutine it calls) writes whole: an assignment

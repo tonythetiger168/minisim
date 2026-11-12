@@ -46,6 +46,7 @@ using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
 #include "cpu.hpp"
+#include "profile.hpp"
 #include "sva.hpp"
 #include "sva_engine.hpp"
 #include "clocking.hpp"
@@ -59,7 +60,7 @@ using Handle = coroutine_handle<>;
 struct Sig { string name; int w; Val val; vector<Drv> drv; bool net; bool hide = false; uint8_t kind = NR_WIRE; uint8_t fl = 0; uint8_t p0 = 2; uint64_t at = ~0ULL; };  // p0, at: bit 0 before the last change and its time (msim -xprop edges)  // fl: SF_HELD / SF_LISTEN (force, 10.6)  // hide: array element, kept out of the VCD  // drv: one contribution per driver; net: wire, else reg
 // `fired` is shared by all waiters of one multi-event wait: the first hit sets it,
 // the others become stale and are dropped. Null for a plain single-event wait.
-struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; };
+struct Waiter { Handle h; Edge e; shared_ptr<bool> fired; bool late = false; };
 
 // A process: a coroutine that starts suspended and is owned by the Sim.
 struct Task {
@@ -303,6 +304,7 @@ struct Wheel {
 struct Sim {
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
+    vector<Handle> lateBuf;                          // set(): woken always blocks, queued last
     vector<Handle> all;                              // owned coroutines
     // Assertion action blocks (16.14.3) not yet run: most finish on their
     // first resume and are freed then, so a pass action that runs on every
@@ -565,6 +567,17 @@ struct Sim {
                 combBatch.push_back(r);
             }
             combVals.resize(combBatch.size());
+            if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
+                for (int r : combBatch) {
+                    uint64_t t = prof::Profiler::nowNs();
+                    curComb = r;
+                    if (combs[r].compute) combs[r].commit(combs[r].ctx, combs[r].compute(combs[r].ctx));
+                    else combs[r].fn(combs[r].ctx);
+                    curComb = -1;
+                    prof::P().charge(prof::P().combEnt[r], prof::Profiler::nowNs() - t);
+                }
+                continue;
+            }
             parallelTuned(combTune, combBatch.size(), [&](size_t k) {
                 const Comb& c = combs[combBatch[k]];
                 if (c.compute) combVals[k] = c.compute(c.ctx);
@@ -769,17 +782,26 @@ struct Sim {
         auto dom = [&](size_t k) { return fastSeqId >= 0 && seqs[seqq[k]].fn == seqs[fastSeqId].fn; };
         bool anyDom = false;
         for (size_t k = 0; k < seqq.size() && !anyDom; k++) anyDom = dom(k);
-        parallelTuned(seqTune, seqq.size(), [&](size_t k) {
-            if (anyDom && dom(k)) return;
-            seqBufs[k].clear();
-            seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
-        });
-        if (anyDom)
-            for (size_t k = 0; k < seqq.size(); k++)
-                if (dom(k)) {
-                    seqBufs[k].clear();
-                    seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
-                }
+        if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
+            for (size_t k = 0; k < seqq.size(); k++) {
+                uint64_t t = prof::Profiler::nowNs();
+                seqBufs[k].clear();
+                seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+                prof::P().charge(prof::P().seqEnt[seqq[k]], prof::Profiler::nowNs() - t);
+            }
+        } else {
+            parallelTuned(seqTune, seqq.size(), [&](size_t k) {
+                if (anyDom && dom(k)) return;
+                seqBufs[k].clear();
+                seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+            });
+            if (anyDom)
+                for (size_t k = 0; k < seqq.size(); k++)
+                    if (dom(k)) {
+                        seqBufs[k].clear();
+                        seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+                    }
+        }
         for (size_t k = 0; k < seqq.size(); k++) {
             seqPend[seqq[k]] = 0;
             nbaq.insert(nbaq.end(), seqBufs[k].begin(), seqBufs[k].end());
@@ -1353,14 +1375,16 @@ struct Sim {
     // becomes strong through a tran, and each rtran lowers it one more step.
     // A switch with an X or Z control is resolved both ways: bits that
     // differ become X.
-    struct TranSw { int a, b; bool resist; int state = -1; };   // state: 0 off, 1 on, 2 unknown
+    // A switch with w >= 0 joins only bits [aLo, aLo+w) of a to [bLo, bLo+w)
+    // of b (an inout port on a part of a net).
+    struct TranSw { int a, b; bool resist; int aLo = 0, bLo = 0, w = -1; int state = -1; };   // state: 0 off, 1 on, 2 unknown
     vector<TranSw> trans;
     vector<vector<int>> tranOf;   // net -> its switches
-    void addTran(int a, int b, bool resist) {
+    void addTran(int a, int b, bool resist, int aLo = 0, int bLo = 0, int w = -1) {
         if (tranOf.size() != sigs.size()) tranOf.resize(sigs.size());
         tranOf[(size_t)a].push_back((int)trans.size());
         tranOf[(size_t)b].push_back((int)trans.size());
-        trans.push_back({a, b, resist});
+        trans.push_back({a, b, resist, aLo, bLo, w});
     }
     void tranCtl(int id, int st) {
         if (trans[(size_t)id].state == st) return;
@@ -1376,39 +1400,57 @@ struct Sim {
     // The value net n sees: the drivers of every net it reaches through
     // switches that are on (and, when unkOn, those with an unknown control).
     Val tranValue(int n, bool unkOn, vector<int>& seen) {
-        // Best path to each net: the fewest resistive steps, then any switch at all.
-        map<int, pair<int, bool>> best;   // net -> (resistive steps, crossed a switch)
+        // Best path to each net: the fewest resistive steps, then any switch
+        // at all. Bit b of n is bit b + delta of the net reached, for b in [lo, hi).
+        struct Reach { int k; bool crossed; int delta, lo, hi; };
+        const Sig& g = sigs[(size_t)n];
+        map<int, Reach> best;
         deque<int> q{n};
-        best[n] = {0, false};
+        best[n] = {0, false, 0, 0, g.w};
         while (!q.empty()) {
             int m = q.front(); q.pop_front();
-            auto [k, crossed] = best[m];
+            Reach r = best[m];
             for (int id : tranOf[(size_t)m]) {
                 const TranSw& t = trans[(size_t)id];
                 if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
                 int o = t.a == m ? t.b : t.a;
-                pair<int, bool> nb{k + (t.resist ? 1 : 0), true};
+                Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi};
+                if (t.w >= 0) {   // only the joined bits, moved to o's place
+                    int mLo = t.a == m ? t.aLo : t.bLo, oLo = t.a == m ? t.bLo : t.aLo;
+                    nb.lo = std::max(r.lo, mLo - r.delta);
+                    nb.hi = std::min(r.hi, mLo + t.w - r.delta);
+                    nb.delta = r.delta + oLo - mLo;
+                    if (nb.lo >= nb.hi) continue;
+                }
                 auto it = best.find(o);
-                if (it != best.end() && it->second.first <= nb.first) continue;
+                if (it != best.end() && it->second.k <= nb.k) continue;
                 best[o] = nb;
                 q.push_back(o);
             }
         }
         vector<Drv> all;
-        for (auto& [m, kc] : best) {
+        uint8_t kind = g.kind;
+        for (auto& [m, r] : best) {
             seen.push_back(m);
-            for (Drv d : sigs[(size_t)m].drv) {
-                if (kc.second) {
+            const Sig& sm = sigs[(size_t)m];
+            if (kind == NR_WIRE && sm.kind != NR_WIRE && r.lo == 0 && r.hi == g.w) kind = sm.kind;   // a wire joined to a tri1 is pulled too
+            bool same = r.delta == 0 && r.lo == 0 && r.hi == g.w && sm.w == g.w;
+            for (Drv d : sm.drv) {
+                if (r.crossed) {
                     d.s0 = tranReduce(d.s0, false);
                     d.s1 = tranReduce(d.s1, false);
                 }
-                for (int r = 0; r < kc.first; r++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                for (int k = 0; k < r.k; k++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                if (!same) {   // as n's bits: those outside the joined range are Z
+                    Val v = make(0, 0, g.w);
+                    for (int b = 0; b < g.w; b++) setBit(v, b, b >= r.lo && b < r.hi ? bitAt(d.v, b + r.delta) : 3);
+                    d.v = v;
+                }
                 all.push_back(d);
             }
         }
-        const Sig& g = sigs[(size_t)n];
-        return g.kind != NR_WIRE ? resolveNet(g.kind, all.data(), all.size(), g.w, g.val)
-                                 : resolveDrives(all.data(), all.size(), g.w);
+        return kind != NR_WIRE ? resolveNet(kind, all.data(), all.size(), g.w, g.val)
+                               : resolveDrives(all.data(), all.size(), g.w);
     }
     void tranResolve(int s) {
         vector<int> group, scratch;
@@ -2526,8 +2568,14 @@ struct Sim {
         listenTo(s, e);
         holdFlags(s, h);
         applyHold(s);
+        if (vpiHoldCb) vpiHoldCb(s, force, true, hi, lo);
     }
     void holdOff(int s, bool force, int hi = -1, int lo = 0) {
+        bool had = holds.count(s) > 0;
+        holdOffAll(s, force, hi, lo);
+        if (had && vpiHoldCb) vpiHoldCb(s, force, false, hi, lo);
+    }
+    void holdOffAll(int s, bool force, int hi, int lo) {
         auto it = holds.find(s);
         if (it == holds.end()) return;
         Hold& h = it->second;
@@ -2607,7 +2655,8 @@ struct Sim {
         }
     }
     void covToggle(int s, const Val& o, const Val& n) {
-        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0) covFsm(fsmOf[s], o, n);
+        if ((size_t)s < fsmOf.size() && fsmOf[s] >= 0 && !(g_covStop & 4)) covFsm(fsmOf[s], o, n);
+        if (g_covStop & 2) return;
         if (togRise.size() <= (size_t)s) { togRise.resize(sigs.size()); togFall.resize(sigs.size()); }
         int w = sigs[s].w;
         auto& R = togRise[s];
@@ -2630,9 +2679,14 @@ struct Sim {
     // callbacks of a signal; vpiRegion runs the callbacks of a point in the
     // time slot (VR_*) and says whether any ran. vpiAt counts the
     // cbAfterDelay callbacks due at each time, so that slot is not skipped.
-    enum { VR_START, VR_RW, VR_RO };
+    // vpiHoldCb reports a force / release (force) or procedural assign /
+    // deassign of signal s (bits hi:lo, hi < 0 the whole signal).
+    // vpiNbaPend: cbNBASynch callbacks wait for the NBA region of this slot.
+    enum { VR_START, VR_RW, VR_RO, VR_NBA };
     void (*vpiChange)(int) = nullptr;
     bool (*vpiRegion)(int) = nullptr;
+    void (*vpiHoldCb)(int s, bool force, bool on, int hi, int lo) = nullptr;
+    bool vpiNbaPend = false;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {
         Sig& g = sigs[s];
@@ -2683,18 +2737,28 @@ struct Sim {
         // Wake matching waiters and compact the rest in place (no allocation).
         auto& ws = waiters[s];
         size_t keep = 0;
+        // An always woken at the top of its body (its sensitivity list) runs
+        // after the processes this event resumes in mid-body: an initial
+        // past a wait, a task, a fork branch. 4.7 leaves the order open;
+        // this is the order of other simulators, and testbenches that set a
+        // signal on a clock edge from an initial rely on it.
+        size_t nLate = 0;
         for (size_t j = 0; j < ws.size(); j++) {
             Waiter& w = ws[j];
             if (w.fired && *w.fired) continue;  // stale: sibling event already woke it
             if (w.e == ANY || (w.e == POS && pos) || (w.e == NEG && neg)) {
                 if (w.fired) *w.fired = true;
-                active.push_back(w.h);
+                if (w.late) {
+                    if (nLate == lateBuf.size()) lateBuf.push_back(w.h); else lateBuf[nLate] = w.h;
+                    nLate++;
+                } else active.push_back(w.h);
             } else {
                 if (keep != j) ws[keep] = std::move(w);
                 keep++;
             }
         }
         ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
+        for (size_t j = 0; j < nLate; j++) active.push_back(lateBuf[j]);
         if ((size_t)s < combOf.size())
             for (int r : combOf[s])
                 if (r != curComb) {
@@ -2714,6 +2778,20 @@ struct Sim {
 
     void runObserved();
     void matureFinal();
+    // msim -profile (profile.hpp): a process resumed and timed, and the NBA region.
+    void profResume(Handle h) {
+        int e = prof::P().ofHandle(h.address());
+        uint64_t t = prof::Profiler::nowNs();
+        h.resume();
+        prof::P().charge(e, prof::Profiler::nowNs() - t);
+        if (h.done()) prof::P().byHandle.erase(h.address());   // its frame may be reused
+    }
+    void timedNba() {
+        if (!prof::P().on) [[likely]] { applyNba(); return; }
+        uint64_t t = prof::Profiler::nowNs();
+        applyNba();
+        prof::P().chargeRegion(prof::Profiler::NBA, prof::Profiler::nowNs() - t);
+    }
     // The regions after NBA (4.5), once the active set is empty: observed,
     // the reactive set, postponed, and the end-of-slot $past shift. False
     // when all are empty and time can advance. `rare` is set whenever work is
@@ -2721,7 +2799,14 @@ struct Sim {
     // or programs pays one flag test per pass.
     bool slotTail() {
         if (vpiRegion && vpiRegion(VR_RW)) return true;   // cbReadWriteSynch (38.36.2)
-        if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) { runObserved(); return true; }   // observed (4.4.2.5)
+        if (!observedQ.empty() || !defObs.empty() || !concPending().empty()) {   // observed (4.4.2.5)
+            if (prof::P().on) [[unlikely]] {
+                uint64_t t = prof::Profiler::nowNs();
+                runObserved();
+                prof::P().chargeRegion(prof::Profiler::OBSERVED, prof::Profiler::nowNs() - t);
+            } else runObserved();
+            return true;
+        }   // observed (4.4.2.5)
         if (!reactive.empty() || !reInactive.empty() || !reNbaq.empty()) {
             // Once the reactive set starts, it runs until it is empty, and
             // only then does the active set run again (4.5).
@@ -2729,7 +2814,8 @@ struct Sim {
                 if (!reactive.empty()) {                   // reactive (4.4.2.6)
                     Handle h = reactive.front(); reactive.pop_front();
                     region = R_REACTIVE;
-                    if (!h.done()) h.resume();
+                    if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
+                    else if (!h.done()) h.resume();
                     region = R_ACTIVE;
                     if (!oneShot.empty())
                         if (auto it = oneShot.find(h.address()); it != oneShot.end()) {
@@ -2743,16 +2829,18 @@ struct Sim {
                 } else if (!reNbaq.empty()) {              // re-NBA
                     nbaRun.clear();
                     nbaRun.swap(reNbaq);
-                    applyNba();
+                    timedNba();
                 } else break;
             }
             return true;
         }
         if (!postq.empty() || !defFin.empty()) {           // postponed ($strobe, $monitor, assert final)
             region = R_POSTPONED;
+            uint64_t pt = prof::P().on ? prof::Profiler::nowNs() : 0;
             matureFinal();
             region = R_ACTIVE;
             drainPost();
+            if (pt) prof::P().chargeRegion(prof::Profiler::POSTPONED, prof::Profiler::nowNs() - pt);
             return true;
         }
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
@@ -2918,7 +3006,8 @@ struct Sim {
             for (;;) {                                         // one time slot
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();
-                    if (!h.done()) h.resume();
+                    if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
+                    else if (!h.done()) h.resume();
                 } else if (!seqq.empty()) {                    // clocked processes, one parallel batch
                     runSeqs();
                 } else if (!combq.empty()) {                   // levelized combinational logic
@@ -2926,11 +3015,13 @@ struct Sim {
                 } else if (!inactive.empty()) {                // inactive (#0)
                     for (auto h : inactive) active.push_back(h);
                     inactive.clear();
-                } else if (!nbaq.empty()) {                    // NBA
+                } else if (!nbaq.empty() || vpiNbaPend) {      // NBA
+                    if (vpiNbaPend && vpiRegion(VR_NBA)) continue;   // cbNBASynch first (38.36.2)
+                    if (nbaq.empty()) continue;
                     // Swap, not move: both buffers keep their capacity across slots.
                     nbaRun.clear();
                     nbaRun.swap(nbaq);
-                    applyNba();
+                    timedNba();
                 } else if (rare || !postq.empty()) {           // observed, reactive set, postponed
                     if (!slotTail()) break;                    // then, and only then, time advances
                 } else break;
@@ -3014,15 +3105,16 @@ struct ToReactive {
     void await_resume() const {}
 };
 struct Wait {
-    int sig; Edge e;
+    int sig; Edge e; bool late = false;   // late: an always at its sensitivity list (Sim::set)
     bool await_ready() const { return false; }
-    void await_suspend(Handle h) const { S.waiters[sig].push_back({h, e}); }
+    void await_suspend(Handle h) const { S.waiters[sig].push_back({h, e, nullptr, late}); }
     void await_resume() const {}
 };
 // @(e1 or e2 or ...): resumes once, on whichever event happens first.
 // `ev` points at the instruction's event list, which outlives the wait.
 struct WaitAny {
     const vector<pair<int, Edge>>* ev;
+    bool late = false;
     bool await_ready() const { return false; }
     void await_suspend(Handle h) const {
         auto token = make_shared<bool>(false);
@@ -3033,7 +3125,7 @@ struct WaitAny {
             // them whenever the list doubles, so it stays bounded.
             if (ws.size() >= 16 && (ws.size() & (ws.size() - 1)) == 0)
                 std::erase_if(ws, [](const Waiter& w) { return w.fired && *w.fired; });
-            ws.push_back({h, e, token});
+            ws.push_back({h, e, token, late});
         }
     }
     void await_resume() const {}

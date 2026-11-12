@@ -7,6 +7,41 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Added
+- `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
+  and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
+  with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
+  board is the built-in `virt32` or a JSON platform file with RAM/ROM, a 16550
+  UART, CLINT, PLIC and the test finisher; ELF and HTIF are supported.
+  Several harts run on several threads, and the result does not depend on the
+  thread count. A spike-style commit log, a decoded-instruction cache (about
+  160 MIPS on one hart) and RAM mapped on first touch are included. Its
+  headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
+  is the interface of the licensed extension library: gdb, checkpoints, the
+  profile, model libraries and RTL co-simulation.
+- `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
+  one cycle, crossing from a clock of shorter period into one of longer
+  period through a plain synchronizer, can be missed. Periods come from
+  `create_clock -period`, and for a generated clock from its master with
+  `-divide_by` / `-multiply_by`. A toggle or a held request is not reported.
+- Datapath modules `MW_thermdec`, `MW_stack`, `MW_prod_sum`, `MW_div_pipe`,
+  `MW_sqrt_pipe`, `MW_log2` and `MW_exp2` (fixed point, under one unit in
+  the last place), checked by `tests/dw/more.sv`.
+- VPI constraint details (37.31): `vpiSoft` on expression items, `dist`
+  items as `vpiDistribution` / `vpiDistItem` / `vpiValueRange` objects with
+  `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
+  object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
+  `vpiRefObj` has `vpiName` and `vpiFullName`.
+
+### Added
+- Floating point datapath modules, IEEE 754 in any exponent and fraction
+  width with subnormals and all five rounding modes: `MW_fp_add`,
+  `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,
+  `MW_fp_cmp` (with minimumNumber / maximumNumber), `MW_fp_i2flt`,
+  `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
+  `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
+  them against an exact rational reference (docs/DATAPATH.md).
+
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
   IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
@@ -27,6 +62,14 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
+  `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
+  one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and
+  `vpi_iterate(vpiMemory, ...)` still finds it), `vpiInternalScope` gives
+  the generate scopes, tasks, functions and named blocks instead of the
+  module instances, and objects in a generate block belong to its
+  `vpiGenScope`. Define `VPI_COMPATIBILITY_VERSION_1364v2001` for the old
+  view.
 - `vpi_user.h`: `vpiFuncType` is 44 and `vpiNetDeclAssign` is 43, as annex K
   says (they were swapped). A VPI library built against the old header
   must be rebuilt.
@@ -47,6 +90,101 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- `msim -cm <metrics>` now selects the code coverage metrics written. It takes
+  three notations: VCS `line+branch+cond+tgl+fsm`, Xcelium `b:e:t:f` or
+  `all`, and Questa `bcesftx`. `msim -cm_hier <file>` selects the part of
+  the design by instance, module or file. It reads VCS `+tree`/`-tree`
+  lines and Xcelium covfile `select_coverage` / `deselect_coverage`
+  commands. Before this, `-cm` wrote every metric. Covergroups and
+  assertions are always written.
+- `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
+  clock made by combinational logic of a clock and other signals, which can
+  glitch).
+- `mlint -sdc`: `set_input_delay` / `set_output_delay -clock` give ports a
+  clock domain (virtual clocks included), so an input read without a
+  synchronizer, or an output launched on another clock, is a crossing.
+  `set_case_analysis 0/1` makes a signal static.
+- `msim -upf` and `mlint -upf` check the implementation commands of IEEE
+  1801-2024 instead of ignoring them: `map_power_switch`, `map_repeater_cell`,
+  `map_retention_cell`, `map_retention_clamp_cell`, `name_format`,
+  `set_correlated`, `set_variation`, `use_interface_cell` (6.37 to 6.41, 6.43,
+  6.57, 6.62) and the `define_*_cell` library commands (clause 7). Each error
+  their clauses list is reported with file, line and clause; the simulation is
+  unchanged.
+- UPF (IEEE 1801-2024): `set_repeater` and the simulation of repeaters
+  (6.52, 9.10); `create_logic_net`, `create_logic_port` and
+  `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
+  transition detection (6.7, 9.4); `create_power_state_group` (6.22);
+  `-applies_to_boundary` on isolation and level-shifter strategies.
+- UPF (IEEE 1801-2024): `create_composite_domain` (6.17), `set_equivalent`
+  (6.47), `connect_supply_set` (6.15), `set_simstate_behavior` (6.56),
+  `set_design_attributes` (6.44), `set_port_attributes` (6.51),
+  `set_retention_elements` (6.54), `set_partial_on_translation` (6.50) and
+  `add_supply_state` with `{net_state voltage}` (6.8) are applied instead of
+  read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
+- UPF (IEEE 1801-2024): `sim_corruption_control` (6.59),
+  `sim_assertion_control` (6.58) and `load_simstate_behavior` (6.34).
+- UPF (IEEE 1801-2024): power models: `define_power_model` (6.31),
+  `begin_power_model` / `end_power_model` (6.11, 6.32), `apply_power_model`
+  (6.9) with `-supply_map`, `-port_map` and `-parameters`, and
+  `add_parameter` (6.3).
+- UPF (IEEE 1801-2024): `bind_checker` (6.12) instantiates checker modules
+  in the design through SV `bind` directives; `sim_replay_control` (6.60)
+  runs initial blocks again when their domain powers up; `save_upf` (6.42)
+  writes the power intent of a scope.
+- UPF (IEEE 1801-2024): `(* UPF_... *)` attributes in the HDL (5.6) are read
+  by `msim -upf` and `mlint -upf`, below UPF commands in precedence (5.7);
+  the Table 8 model-only and instance-only rules are errors.
+- UPF (IEEE 1801-2024): `create_abstract_power_source` (6.16) switches a
+  supply set between input supply sets, with ack ports.
+- UPF (IEEE 1801-2024): value conversion methods (`create_vcm`, 6.30) with
+  `connect_supply_net -vcm`: tables for one-bit, real, integer and enum HDL
+  ports, VCM lists, and ports of type `upfSupplyTypeT` without conversion
+  (4.10); UPF libraries (`create_upf_library`, `use_upf_library`,
+  `load_upf_library`; 5.11, 6.29, 6.36, 6.63).
+- UPF (IEEE 1801-2024): function and model VCMs (6.30.8, 6.30.9) are
+  simulated: the function is called, or the model instantiated, on the port
+  through a module bound into the simulation top.
+- UPF (IEEE 1801-2024): supply ports connected by pg_type:
+  `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
+  `connect_supply_set -connect` (6.15), and the automatic connection of a
+  domain's primary supply set (4.5.4.6.2).
+- Forward SAIF (IEEE 1801-2024 Annex J): `msim -saif_forward <file>`. A
+  library forward file (J.4) adds state-dependent, path-dependent and SDPD
+  toggle counts and state-dependent leakage times for each instance of its
+  cells (J.3.6 to J.3.10); an RTL forward file (J.5) writes only its mapped
+  ports and nets, typed ports as virtual instances (J.3.11). The SAIF reader
+  takes `(INSTANCE "design" path ..)` and `VIRTUAL_INSTANCE`.
+- `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
+  the crossings (filter, the path of each through its synchronizer) and the
+  reset synchronizers.
+- `mlint -cdc-abstract FILE` and `-cdc-model FILE`: a block's CDC model (the
+  clock of each port, and which inputs it synchronizes) is written from its
+  RTL and used in the SoC run in place of the RTL, so a block can be a black
+  box or skipped for speed with the same findings at its ports.
+- `mlint -cdc-sva FILE`: writes a module of assertions for the synchronized
+  crossings (a one-bit signal holds for two reading edges, a Gray or
+  multi-bit bus changes one bit at a time, enable-qualified data is stable
+  when its control arrives), to simulate with the design.
+- `mlint` CDC/RDC: a vector written bit by bit, or a struct written field by
+  field, is tracked as separate signals (`top.r[1]`, `top.ctl.req`), so two
+  synchronizers kept in one vector, or a struct with fields in different
+  domains, are no longer mixed up.
+- `mlint` reset tree checks: `RDC005` (a reset synchronizer of one flop) and
+  `RDC006` (an asynchronous reset made by combinational logic of several
+  flops). `-cdc-report` lists the reset synchronizers, their length and how
+  many flops each resets.
+- `mlint` `CDC004` follows synchronized signals through flops: signals
+  synchronized separately that meet again up to `-cdc-depth N` flops later
+  (default 2) are reported, once per set of signals.
+- `mlint -sdc file.sdc`: the CDC and RDC checks take the clocks and how they
+  are related from the timing constraints (`src/cdc_sdc.hpp`, the SDC
+  commands that set a domain, on the shared Tcl interpreter): generated
+  clocks are synchronous to their master, `set_clock_groups -asynchronous`
+  and a false path between two clocks make a pair a crossing, exclusive
+  groups are not checked, any other pair is synchronous. New rule `CDC006`:
+  a flop's clock is not a clock in the SDC file. `-cdc-report` lists the SDC
+  clocks of every domain (`docs/CDC.md`).
 - `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
   the object a module's class handle variable points to is a signal
   `tb.p.addr` that follows the handle (x while it is null), with handle
@@ -150,6 +288,13 @@ Spec references are IEEE 1800-2023 clauses.
   library's cells; the `mpnr` test places, routes and DRC-checks one.
 - `mplan`: `cond` and `fsm` plan metrics (condition vectors of files, states
   and transitions of FSMs), in the totals, the history and `mplan init`.
+- `mregress -farm`: runs go to a compute farm instead of the local machine:
+  `lsf` (bsub -K), `slurm` (srun), `sge` (qsub -sync y), `ssh:HOST[*N],...`
+  or `cmd:TEMPLATE` for any other launcher. `-farm-opts`, `-farm-cpus`
+  (cores per job and msim -threads), `-farm-retries` (a job that never ran
+  is submitted again), `-farm-wait`, `-farm-dry`. The time limit runs on the
+  farm host, so queue time does not count; results come back through the
+  shared run directory.
 - `mdebug -blocks INST`, and a block diagram in the viewer: the instances
   inside a scope, their port connections and which instance feeds which.
 - `mdebug`: tasks and functions in a module, call output arguments, `force`,
@@ -441,6 +586,17 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
+  `forever` loops are merged; once a break or the condition of an unbounded
+  loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or
+  `repeat` loop whose body met an unknown condition in the clean copy
+  continued with a stale loop counter.
+- `-xprop`: a configuration file (`-xprop=<file>` or `-xprop-config <file>`,
+  VCS style: `tree`, `instance`, `module`, `merge`) turns X-propagation on or
+  off per instance, subtree or module. Branches that call tasks or functions
+  are merged (their writes too); `break` and `continue` in `for` / `foreach`
+  loops are merged; an array write whose index has an unknown bit merges
+  into every element the index may name.
 - `-xprop`: the clean copy uses the standard `case`, and clocked blocks skip
   the ambiguous-edge test when nothing went from or to x. Ibex with
   `-xprop` now costs about 12% more than without (was 30%).
@@ -473,6 +629,90 @@ Spec references are IEEE 1800-2023 clauses.
   the caller's mode. New routines `vpi_get_value_array` and
   `vpi_put_value_array` (38.16, 38.35). A whole array can be an argument of
   a user system task. See `docs/VPI.md`.
+- VPI object model of SystemVerilog (clause 37): packages, interfaces with
+  modports and programs as instances (`vpi_iterate(vpiInstance, NULL)`);
+  generate scopes, tasks, functions and named blocks as internal scopes;
+  variables and nets report their SystemVerilog type (`vpiBitVar`,
+  `vpiIntVar`, `vpiEnumVar`, `vpiStructVar`, `vpiStringVar`, ...) and have a
+  typespec with enum constants, struct members and typedef names; arrays of
+  any number of dimensions with ranges, `vpi_handle_by_multi_index` and
+  names like `top.m[1][2][3]`; `vpiHighConn`; `pkg::name` in
+  `vpi_handle_by_name`. An application built for IEEE 1364
+  (`vpi_compatibility.h`) keeps that standard's view. See `docs/VPI.md`.
+- VPI assertion API (clause 39): assertions are objects found by
+  `vpi_iterate(vpiAssertion, ...)`; `vpi_register_assertion_cb` reports each
+  attempt's start, success, vacuous success, failure and disabled
+  evaluation, and assertion control; the system callbacks
+  (`cbAssertionSysInitialized`, `cbAssertionSysOff`, ...) and every
+  assertion operation of `vpi_control` work. See `docs/VPI.md`.
+- VPI `cbCreateObj` and `cbSizeChange` (38.36.1); the save, restart and
+  reset callback reasons register (msim has no save, so they never run).
+  `tests/spec/38.36-vpi-sv-callbacks.sv`.
+- VPI constraints (37.31): `vpi_iterate(vpiConstraint, class)`, the items of
+  each block (expressions, implication, if / if-else, foreach, disable soft,
+  solve before), and pure virtual prototypes in `vpiMethods`.
+  `tests/spec/37-vpi-constraints.sv`.
+- VPI module path properties: `vpiPathType`, `vpiPolarity`,
+  `vpiDataPolarity`, `vpiCondition` and `vpiModDataPathIn` (37, 38.10).
+- VPI delays of continuous assignments (38.10): `vpi_get_delays` /
+  `vpi_put_delays` on a `vpiContAssign` with a delay.
+  `tests/spec/38.10-vpi-assign-delay.sv`.
+- VPI primitives (37, 38.10): `vpi_iterate(vpiPrimitive / vpiGate /
+  vpiSwitch / vpiUdp, module)`, `vpiPrimType`, `vpiPrimTerm` terminals with
+  direction and connection, and gate delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-primitives.sv`.
+- VPI module paths (38.10): `vpi_iterate(vpiModPath, module)`, their input
+  and output terms, and their delays through `vpi_get_delays` /
+  `vpi_put_delays`. `tests/spec/38.10-vpi-modpath.sv`.
+- VPI timing checks: `vpi_iterate(vpiTchk, module)`, their terms, notifier
+  and limits (`vpi_get_delays` / `vpi_put_delays`), and `cbTchkViolation`
+  (38.10, 38.36.1). `tests/spec/38.36-vpi-tchk.sv`.
+- VPI assertion stepping (39.5.2): `vpiAssertionEnableStep` /
+  `vpiAssertionDisableStep` with `cbAssertionStepSuccess` /
+  `cbAssertionStepFailure` for each clock step of each attempt.
+  `tests/spec/39.5-vpi-assert-step.sv`.
+- VPI `vpi_control(vpiCoverageMerge, type, name)` (40.5.1): adds the
+  statement, toggle, FSM or assertion counts of a saved msim coverage
+  database to the current run. `tests/spec/40-vpi-coverage-merge.sv`.
+- VPI `vpi_handle_multi(vpiInterModPath, out, in)` (38.21): the path
+  between two instance ports on one net, its ports, and its interconnect
+  delay through `vpi_get_delays` / `vpi_put_delays`.
+  `tests/spec/38.21-vpi-handle-multi.sv`.
+- VPI `cbError` and `cbPLIError` (38.36.3): called for run-time error
+  messages of the simulation and for errors of VPI calls, with
+  `vpi_chk_error` giving the error. `tests/spec/38.36-vpi-cberror.sv`.
+- VPI class definitions (37.29): `vpiClassDefn`, `vpiExtends`,
+  `vpiMethods`, `vpiDerivedClasses` and static `vpiVariables`; a class
+  object now reports the class it was made of, and its properties include
+  that class's own. `tests/spec/37-vpi-classes.sv`.
+- VPI drivers and loads (37.16, 37.17): `vpiDriver`, `vpiLoad`,
+  `vpiLocalDriver`, `vpiLocalLoad` and `vpiPortInst` on nets and variables
+  give continuous assignments and instance ports, following whole-signal
+  port connections through the hierarchy. `tests/spec/37-vpi-drivers.sv`.
+- VPI structs, containers and classes (37.17, 37.18, 37.29): unpacked
+  struct and union variables with `vpiMember` (also of packed ones),
+  dynamic arrays, queues and associative arrays with their elements, class
+  variables, `vpiClassObj` and its properties.
+- VPI `cbStmt` (38.36.1): a callback each time a statement runs.
+- VPI processes, statements and expressions (37.32 to 37.51):
+  `vpi_iterate(vpiProcess / vpiContAssign, module)`, the statement tree
+  (blocks, assignments, if, case and case items, loops, delay and event
+  controls, task calls, wait, disable, force / release, ...) and
+  expressions (`vpiOperation`, `vpiConstant`, function calls, selects) with
+  `vpiOpType`, `vpiConstType`, `vpiDecompile`, `vpiLineNo`.
+- VPI scheduling (38.35, 38.36): `vpiReturnEvent` gives a `vpiSchedEvent`
+  handle that `vpiCancelEvent` cancels (`vpiScheduled`); inertial,
+  transport and pure transport writes remove pending writes as the standard
+  says; `cbForce`, `cbRelease`, `cbAssign`, `cbDeassign`, `cbNBASynch` and
+  `cbAtEndOfSimTime`; `vpi_get_delays` / `vpi_put_delays` on nets with a
+  declared delay (38.10, 38.30).
+- VPI coverage API (clause 40): `vpi_get` of `vpiStatementCoverage`,
+  `vpiToggleCoverage`, `vpiFsmStateCoverage` and `vpiAssertCoverage` on an
+  instance, `vpiCovered` / `vpiCoveredCount` / `vpiCoveredMax` and the
+  assertion counts on assertions, FSMs, FSM states, nets and bits,
+  `vpi_iterate(vpiFsm)` and `vpiFsmStates`, and `vpi_control` with
+  `vpiCoverageStart`, `Stop`, `Reset`, `Check` and `Save` (`msim -cov`).
+  `vpi_handle_by_name` finds an assertion by its label.
 - VPI: `vpi_handle_by_name` of a part select (`top.u.r[3:0]`, a
   `vpiPartSelect`, 38.27) reads, writes, forces and releases just those
   bits, so UVM's `uvm_hdl_*` backdoor works on part-select paths.
@@ -724,8 +964,36 @@ Spec references are IEEE 1800-2023 clauses.
   the redundant tests, `-keep FILE` for the short list with the same
   coverage, and with a plan the tests behind each feature's coverage.
   `mplan report -rank` adds it to `plan.html` and `plan.json`.
+- `mplan serve` and `mplan push`: a multi-user server and web dashboard.
+  CI pushes each report; the server keeps the history per project and shows
+  every plan (score, status, tests, requirements, trend) and one page per
+  plan where people set the owner, status, bug id and note of each failure
+  bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
+  and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/compat.hpp` and `docs/COMPAT.md`: one shared layer that lets every tool
+  accept Synopsys, Cadence or Siemens command lines (`--compat=cadence`, or the
+  name the tool was started as). It renames or drops options from a per-tool
+  rule table and prints messages in the chosen vendor's layout. The engine
+  stays the same; nothing is implemented twice. Unit test `test_compat`.
+- `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
+  / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
+  state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
+- A function that writes part-selects of its result or of a local in a
+  loop, called from two continuous assignments or always_comb blocks, hung
+  msim at time 0: each caller was sensitive to the function's own variables,
+  so the callers woke each other forever. Callers are now sensitive only to
+  their operands (10.3.2, 9.2.2.2.1). Five open-ip-portfolio IPs that timed
+  out after 600 s now pass in 2 to 101 s (AES_GCM 27.5 s; Icarus 30 s).
+- `c ? q.pop_front() : d` (and `pop_back`) runs the pop only in the chosen
+  arm, after the condition (11.4.11). It used to pop first, so a condition
+  on `q.size()` popping the last element gave `d` and lost the element.
+  Found by the SPI VIP's slave model.
+- `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
+  caller's variable in `randomize() with`, or a class property), no longer
+  makes randomize() fail: the solver narrows x to the container's elements
+  (11.4.13, 18.5.4). Found by the CCIX VIP's data sequence.
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and

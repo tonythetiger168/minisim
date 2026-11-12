@@ -100,7 +100,9 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `+define+N[=V]`, `-D N[=V]` | Preprocessor define |
 | `+incdir+<dir>`, `-I <dir>` | Include directory |
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
-| `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov`. `-cm line+cond+fsm+tgl` (as VCS) does the same |
+| `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov` |
+| `-cm <metrics>` | The same, with only these code coverage metrics: `line+branch+cond+tgl+fsm` (as VCS), `b:e:t:f` or `all` (as Xcelium `-coverage`), `bcesftx` (as Questa `+cover`). Covergroups and assertions are always written |
+| `-cm_hier <file>` | The part of the design whose code coverage is written: `+tree`/`-tree <inst> [depth]`, `+module`/`-module`, `+file`/`-file` lines (as VCS `-cm_hier`), or `select_coverage` / `deselect_coverage -block -expr -toggle -fsm -instance <inst>[...] -module <m>` (as an Xcelium covfile). The last line that matches decides |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
 | `-vcd-class [N]` | Also write class objects: each property of the object a module's class handle variable points to, as `tb.p.addr` (x while the handle is null), following handle properties N levels (default 1). See `docs/DEBUG.md` |
 | `-vcd-arrays [N]` | Also write the elements of unpacked arrays (memories) with at most N elements (default 1024) to the VCD or FST, as `mem[3]`. Off by default: memories are left out, as `$dumpvars` does. `mdebug` uses them to trace through a memory |
@@ -115,7 +117,11 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
-| `-xprop[=tmerge\|xmerge]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
+| `-xprop[=tmerge\|xmerge\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
+| `-restore <checkpoint> [+plusargs]` | Go back to a `$save` checkpoint: run the saved command line again quietly up to it, check the state, and carry on; see [`docs/CHECKPOINT.md`](docs/CHECKPOINT.md) |
+| `-xrun ...` (or msim run as `xrun` / `irun`) | The rest of the command line is an xrun / irun one: `-f`, `-incdir`, `-define`, `-l`, `-input`, `-access`, ... translated to msim options; see [`docs/XRUN.md`](docs/XRUN.md) |
+| `-elab` | Stop after elaboration, before the run |
+| `-profile [<file>]` | Simulation profile: time and activations per process, instance, source file and kind, plus scheduler regions (default `simprofile.txt`); see [`docs/PROFILE.md`](docs/PROFILE.md) |
 | `-upf <file>` | Power-aware simulation with this UPF (IEEE 1801) power intent; see [`docs/LOWPOWER.md`](docs/LOWPOWER.md) |
 | `-power_top <inst>`, `-upf_verbose` | The instance the UPF describes; print supply, power state and simstate changes |
 | `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
@@ -152,6 +158,7 @@ failures grouped by their first error line:
 ```sh
 mregress tests.list -sim msim -j 8 -seeds 3     # or -sim vcs / xrun / questa / iverilog
 mregress tests.list -rerun                      # repeat only the failures
+mregress tests.list -farm lsf '-farm-opts=-q regress'   # on a farm: lsf, slurm, sge, ssh:hosts, or cmd:TEMPLATE
 mregress -spec tests/spec -sim iverilog         # the spec suite on another simulator
 ```
 
@@ -358,6 +365,7 @@ mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
 mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
 mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
 mplan rank   -results regress.d -keep keep.list    # what each test adds; the redundant tests
+mplan serve  -root /srv/mplan -users users.txt     # dashboard for many plans; CI uploads with mplan push
 mplan report uart.vplan -results regress.d -reqs reqs.reqif -trace trace.csv   # requirement traceability
 ```
 
@@ -548,7 +556,7 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
 | `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`, `STY004`..`STY009`, `NAME014`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
 | `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |
-| `cdc`, `rdc` | `CDC001`..`CDC005`, `RDC001`..`RDC004` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
+| `cdc`, `rdc` | `CDC001`..`CDC008`, `RDC001`..`RDC006` | crossings with no synchronizer, multi-bit buses, logic in front of a synchronizer, reconvergence, reset crossings ([docs/CDC.md](docs/CDC.md)) |
 
 ```sh
 mlint rtl/*.sv -config mlint.cfg -waivers waivers.cfg -json lint.json
@@ -566,7 +574,12 @@ the configuration and the waiver format are in [docs/LINT.md](docs/LINT.md).
 Clock and reset domains are found from the RTL: the clock of every
 edge-triggered block, followed through ports, buffers and clock gates, so one
 clock passed down through several modules stays one domain. `-cdc-report`
-lists every domain and crossing, `-clock-group a,b` declares related clocks
+lists every domain and crossing, `-cdc-html FILE` writes a page to browse
+them, `-cdc-abstract`/`-cdc-model` check a
+block once and use its port model in the SoC, `-cdc-sva FILE` writes assertions for the
+synchronized crossings, `-sdc file.sdc` takes the clocks and their
+relations (generated clocks, `set_clock_groups`, false paths between clocks)
+from the timing constraints, `-clock-group a,b` declares related clocks
 and `-static sig` waives a quasi-static signal. Findings print as
 `file:line:col: severity: [RULE] text`, sorted by file and line.
 

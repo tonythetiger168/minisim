@@ -187,15 +187,19 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         const Expression& ce = cp->getCoverageExpr();
         // What lowering emits for an expression (a container's slot through a
         // handle: Assign tmp = Addr(h)) runs before it at each sample.
-        auto takePre = [&](size_t from, std::vector<std::pair<int, E>>& out) {
-            for (size_t k = from; k < prog.code.size(); k++) {
-                const Instr& i = prog.code[k];
-                if (i.k != IK::Assign || i.hi >= 0 || i.bidx || i.sig < 0) unsupported("a coverpoint expression of this kind (19.5)");
-                out.push_back({i.sig, i.e});
-            }
-            prog.code.resize(from);
+        // Anything else (a function or method call) is lowered into a program
+        // of its own, run to its end before the expression is read.
+        Prog outer;
+        auto beginPre = [&]() { outer = std::move(prog); prog = Prog{}; return (size_t)0; };
+        auto takePre = [&](size_t, std::vector<std::pair<int, E>>& out, std::shared_ptr<Prog>& code) {
+            bool simple = true;
+            for (const Instr& i : prog.code)
+                if (i.k != IK::Assign || i.hi >= 0 || i.bidx || i.sig < 0) simple = false;
+            if (simple) for (const Instr& i : prog.code) out.push_back({i.sig, i.e});
+            else code = std::make_shared<Prog>(std::move(prog));
+            prog = std::move(outer);
         };
-        size_t at0 = prog.code.size();
+        size_t at0 = beginPre();
         if (ty.isFloating()) {   // a real coverpoint (19.5)
             c.isReal = true;
             c.w = 64;
@@ -207,11 +211,11 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             c.sgn = ty.isSigned();
             c.expr = resize(expr(ce), c.w, ce.type->isSigned(), c.sgn);
         }
-        takePre(at0, c.pre);
+        takePre(at0, c.pre, c.preProg);
         if (const Expression* iff = cp->getIffExpr()) {
-            size_t at1 = prog.code.size();
+            size_t at1 = beginPre();
             c.iff = expr(*iff);
-            takePre(at1, c.preIff);
+            takePre(at1, c.preIff, c.preIffProg);
         }
         const Expression* pe = &ce;   // the coverpoint expression under its conversion to the coverpoint type
         while (pe->kind == ExpressionKind::Conversion) pe = &pe->as<ConversionExpression>().operand();

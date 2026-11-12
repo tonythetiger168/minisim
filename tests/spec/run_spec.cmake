@@ -57,7 +57,13 @@ if(VVP)
   if(vpi_src)
     set(vvp_args -M${vdir})   # the compile named the module (-m), so vvp loads it once
   endif()
-  execute_process(COMMAND ${VVP} -n ${vvp_args} ${out} OUTPUT_VARIABLE got RESULT_VARIABLE rc TIMEOUT 20
+  set(plus "")   # +plusargs from "//! args:" go to the run, as for msim
+  foreach(a IN LISTS extra)
+    if(a MATCHES "^\\+")
+      list(APPEND plus ${a})
+    endif()
+  endforeach()
+  execute_process(COMMAND ${VVP} -n ${vvp_args} ${out} ${plus} OUTPUT_VARIABLE got RESULT_VARIABLE rc TIMEOUT 20
                   WORKING_DIRECTORY ${dir})
   string(REGEX REPLACE "[^\n]*\\$finish called[^\n]*\n" "" got "${got}")
   string(REGEX REPLACE "VCD info:[^\n]*\n" "" got "${got}")
