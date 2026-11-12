@@ -23,8 +23,8 @@ endforeach()
 # (6.34, 6.58, 6.59); power models, applied by name and to every instance of
 # a model, with a parameter, and a legacy one (6.3, 6.9, 6.11, 6.31, 6.32);
 # checkers bound into the design by the power intent (6.12); initial blocks
-# replayed at power-up (6.60).
-foreach(t logic transitions attributes simctl pmodel bindchk replay)
+# replayed at power-up (6.60); attributes written in the HDL (5.6, 5.7).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -200,6 +200,21 @@ execute_process(COMMAND ${MSIM} ${D}/logic.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/s
 file(READ ${CMAKE_CURRENT_BINARY_DIR}/saved_scope.upf saved)
 if(NOT rc EQUAL 0 OR NOT saved MATCHES "\ncreate_logic_net zz\n" OR saved MATCHES "create_power_domain")
   message(FATAL_ERROR "save_upf -scope u_core: ${rc} ${err}\n${saved}")
+endif()
+
+# Table 8 (5.6): attributes only for models or only for instances; a bad
+# value of an HDL attribute.
+upf_error_in(hdlattr e_t8a "set_port_attributes -ports {u_c/y} -is_isolated" "UPF_is_isolated can only be given for model ports, with -model (5.6, Table 8)")
+upf_error_in(hdlattr e_t8b "set_port_attributes -model core -ports {y} -driver_supply SS" "UPF_driver_supply can only be given for instance ports (5.6, Table 8)")
+upf_error_in(hdlattr e_t8c "set_design_attributes -elements {u_m} -is_hard_macro TRUE" "UPF_is_hard_macro can only be given for models, with -models (5.6, Table 8)")
+upf_error_in(hdlattr e_t8d "set_design_attributes -models {macro} -attribute {UPF_driver_supply SS}" "UPF_driver_supply can only be given for instances (5.6, Table 8)")
+file(READ ${D}/hdlattr.sv hdl)
+string(REPLACE "(* UPF_clamp_value = \"1\" *) output logic [3:0] y" "(* UPF_is_analog = \"maybe\" *) output logic [3:0] y" hdl "${hdl}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/hdlattr_bad.sv "${hdl}")
+execute_process(COMMAND ${MSIM} ${CMAKE_CURRENT_BINARY_DIR}/hdlattr_bad.sv -upf ${D}/hdlattr.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(rc EQUAL 0 OR NOT err MATCHES "hdlattr_bad.sv:12: attribute UPF_is_analog cannot be \"maybe\" [(]5.6[)]")
+  message(FATAL_ERROR "a bad HDL attribute was not reported: ${rc}\n${out}${err}")
 endif()
 
 # -power_top names the instance the UPF describes; it wins over set_design_top.

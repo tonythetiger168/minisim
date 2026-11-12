@@ -16,6 +16,7 @@
 //   L004  one variable or net is assigned by more than one process.
 //   CDC001..CDC005, RDC001..RDC004  clock- and reset-domain crossings (cdc.hpp).
 //   UPF001..UPF007  with -upf: power intent checks (upf.hpp check()).
+#include "upf_hdl.hpp"
 #include <unistd.h>
 
 #include <chrono>
@@ -126,6 +127,7 @@ void upfWalk(const Scope& sc, const std::string& path, upf::DesignView& dv, cons
 void checkUpf(Compilation& comp, const std::string& upfPath, std::string powerTop, bool powerTopSet, Report& rep) {
     upf::Model m;
     m.load(upfPath, "");
+    m.addHdlAttrs(upfHdlAttrs(comp));   // (* UPF_... *) in the HDL (5.6)
     upf::DesignView dv;
     auto tops = comp.getRoot().topInstances;
     for (auto* t : tops) upfWalk(t->body, "", dv, *comp.getSourceManager());

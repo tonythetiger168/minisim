@@ -708,6 +708,21 @@ struct PortAttrRule {
     int dirs = 7;   // bit 0 inputs, 1 outputs, 2 inouts
     std::map<std::string, std::string> attrs;
 };
+// An attribute given in the HDL (5.6): on a module (port empty) or on one
+// of its ports. It counts as set_design_attributes -models or
+// set_port_attributes -model -ports given before any UPF command.
+struct HdlAttr { std::string model, port, name, value, where; };
+// Table 8: attributes that can only be given for models, or only for instances.
+inline bool modelOnlyAttr(const std::string& a) {
+    static const std::set<std::string> s = {"UPF_pg_type", "UPF_related_power_port", "UPF_related_ground_port", "UPF_related_bias_ports",
+                                            "UPF_feedthrough", "UPF_is_hard_macro", "UPF_is_isolated", "UPF_switch_cell_type",
+                                            "UPF_async_clamp_value", "UPF_unconnected", "UPF_is_soft_macro", "UPF_is_refinable_macro",
+                                            "UPF_is_power_aware_model"};
+    return s.count(a) != 0;
+}
+inline bool instanceOnlyAttr(const std::string& a) {
+    return a == "UPF_literal_supply" || a == "UPF_driver_supply" || a == "UPF_receiver_supply";
+}
 struct Pst {
     std::string name, where;
     std::vector<std::string> supplies;
@@ -967,6 +982,45 @@ struct Model {
             if (rank && rank >= best) { best = rank; val = a->second; }
         }
         return val;
+    }
+
+    // Attributes from the HDL (5.6). They come before every UPF command, so
+    // a command of the same precedence wins (5.7).
+    void addHdlAttrs(const std::vector<HdlAttr>& v) {
+        static const std::map<std::string, std::set<std::string>> legal = {
+            {"UPF_is_soft_macro", {"TRUE", "FALSE"}}, {"UPF_is_hard_macro", {"TRUE", "FALSE"}},
+            {"UPF_is_refinable_macro", {"TRUE", "FALSE"}}, {"UPF_is_power_aware_model", {"TRUE", "FALSE"}},
+            {"UPF_is_isolated", {"TRUE", "FALSE"}}, {"UPF_is_analog", {"TRUE", "FALSE"}}, {"UPF_unconnected", {"TRUE", "FALSE"}},
+            {"UPF_retention", {"required", "optional"}}, {"UPF_async_clamp_value", {"0", "1"}},
+            {"UPF_switch_cell_type", {"fine_grain", "coarse_grain"}},
+            {"UPF_simstate_behavior", {"ENABLE", "SIMSTATE_ONLY", "PORT_CORR_ONLY", "DISABLE"}}};
+        std::vector<DesignAttrRule> ds;
+        std::vector<PortAttrRule> ps;
+        for (auto& a : v) {
+            if (a.name.rfind("UPF_", 0) != 0) continue;
+            auto lg = legal.find(a.name);
+            if (lg != legal.end() && !lg->second.count(a.value))
+                throw Error(a.where + ": attribute " + a.name + " cannot be \"" + a.value + "\" (5.6)");
+            if (instanceOnlyAttr(a.name))
+                throw Error(a.where + ": " + a.name + " can only be given for instance ports, not in the HDL (5.6, Table 8)");
+            if (a.port.empty()) {
+                DesignAttrRule r;
+                r.where = a.where;
+                r.models = {a.model};
+                r.attrs[a.name] = a.value;
+                ds.push_back(r);
+            } else {
+                PortAttrRule r;
+                r.where = a.where;
+                r.model = a.model;
+                r.hasPorts = true;
+                r.ports = {a.port};
+                r.attrs[a.name] = a.value;
+                ps.push_back(r);
+            }
+        }
+        designAttrs.insert(designAttrs.begin(), ds.begin(), ds.end());
+        portAttrs.insert(portAttrs.begin(), ps.begin(), ps.end());
     }
 
     // ---- reading ----
@@ -2034,6 +2088,11 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 r.attrs["UPF_switch_cell_type"] = t;
             }
             if (r.attrs.empty()) throw Error(c.where() + ": set_design_attributes gives no attribute (6.44)");
+            for (auto& [an, av] : r.attrs) {   // Table 8 (5.6)
+                if (o.has("-models") && instanceOnlyAttr(an)) throw Error(c.where() + ": " + an + " can only be given for instances (5.6, Table 8)");
+                if (!o.has("-models") && o.has("-elements") && modelOnlyAttr(an))
+                    throw Error(c.where() + ": " + an + " can only be given for models, with -models (5.6, Table 8)");
+            }
             static const std::map<std::string, std::set<std::string>> legal = {
                 {"UPF_is_soft_macro", {"TRUE", "FALSE"}}, {"UPF_is_hard_macro", {"TRUE", "FALSE"}},
                 {"UPF_is_refinable_macro", {"TRUE", "FALSE"}}, {"UPF_is_power_aware_model", {"TRUE", "FALSE"}},
@@ -2098,6 +2157,10 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (o.has("-is_analog")) r.attrs["UPF_is_analog"] = "TRUE";
             if (o.has("-is_isolated")) r.attrs["UPF_is_isolated"] = "TRUE";
             if (r.attrs.empty()) throw Error(c.where() + ": set_port_attributes gives no attribute (6.51)");
+            for (auto& [an, av] : r.attrs) {   // Table 8 (5.6)
+                if (!r.model.empty() && instanceOnlyAttr(an)) throw Error(c.where() + ": " + an + " can only be given for instance ports (5.6, Table 8)");
+                if (r.model.empty() && modelOnlyAttr(an)) throw Error(c.where() + ": " + an + " can only be given for model ports, with -model (5.6, Table 8)");
+            }
             auto acv = r.attrs.find("UPF_async_clamp_value");
             if (acv != r.attrs.end() && acv->second != "0" && acv->second != "1")
                 throw Error(c.where() + ": -async_clamp_value " + acv->second + " (0 or 1)");

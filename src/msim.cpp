@@ -159,6 +159,7 @@
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
 #include "upf_rt.inc"
+#include "upf_hdl.hpp"
 #include "dpi.inc"
 #include "vpi.inc"
 #include "interactive.inc"
@@ -2225,6 +2226,7 @@ int main(int argc, char** argv) {
                 else if (!found.empty()) top = found;
             }
             rt.m.top = top;
+            rt.m.addHdlAttrs(upfHdlAttrs(*comp));   // (* UPF_... *) in the HDL (5.6)
             if (!rt.m.bindCheckers.empty()) {
                 static std::string bindText;
                 // the simulation top: a checker module nothing instantiates yet is a top too
