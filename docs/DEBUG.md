@@ -173,6 +173,90 @@ and a value that is not a state. In the page, selecting a state register
 draws its state diagram: the state at the cursor is marked, transitions that
 ran are bright, and an arrow opens its source line.
 
+## Assertions
+
+    msim design.sv -top tb -vcd run.vcd > run.log
+    mdebug design.sv -top tb -assert                              # the assertions
+    mdebug design.sv -top tb -vcd run.vcd -log run.log -assert    # and why each one failed
+
+`-assert` lists the assert, assume and cover directives of the design, or
+those under an instance, or one by name. With `-log` (msim's output, which
+has a line `Error: "file", line: name: at time T` per failure) it says which
+failed and when. With a waveform as well it explains one failure of each, the
+first, or with `-at T` the last at or before T:
+
+    tb.u.a_gnt  assert property  arb.sv:5
+      a_gnt: assert property (@(posedge clk) disable iff (rst) req |=> gnt);
+      failed 1 time: @55
+      failure @55, values sampled before each clock tick:
+                       @25       @35       @45       @55
+        tb.u.rst         0         0         0         0
+        tb.u.req         1         0         1         0
+        tb.u.gnt         0         1         0         0
+      what drove them:
+        tb.u.gnt = 0 @54  (since 35)
+          <- arb.sv:4: gnt <= rst ? 1'b0 : req && !hold  [always_ff @posedge clk]
+
+The table has the signals the assertion reads at its last four clock ticks,
+sampled before the edge as a concurrent assertion samples them; an immediate
+assertion shows the values at the failure. Below it is the active-driver
+trace of each signal. The log's time and the waveform's must be in the same
+unit. `-json` and the page's database carry the assertions and their failure
+times (`asserts`).
+
+## Coverage
+
+    msim design.sv -top tb -cov cov.json
+    mdebug design.sv -top tb -cov cov.json -drivers tb.u.next
+    mdebug design.sv -top tb -cov cov.json -uncovered tb.u
+    mdebug design.sv -top tb -cov cov.json -vcd run.vcd -html debug.html
+
+`-cov` reads msim's coverage database (one run, or several merged with
+`mcov merge`). Every driver line then says how often its source line ran:
+
+    fsm.sv:15: next = RUN  [always_comb]  when state == IDLE && go  (line ran 3 times)
+    fsm.sv:19: next = IDLE  [always_comb]  when state == FAIL  (line never ran)
+
+so a trace shows at a glance which of a signal's drivers the tests never
+reached. The count is the line's: a line with a condition and an assignment
+counts when the condition was evaluated. `-uncovered [INST]` lists the
+assignments on lines that never ran and the signals with bits that never rose
+or never fell, in the design or under one instance. In the page, the line
+numbers of lines that ran have a green edge and those that never ran a red
+one, with the count as a tooltip, and a selected signal shows its toggle
+gaps. Reports and merging stay in `mcov`.
+
+## Low power (UPF)
+
+    msim tb.sv dut.sv -top tb -upf dut.upf -upf_verbose -vcd run.vcd > run.log
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -power
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -log run.log -vcd run.vcd -power PD_CORE -at 60
+    mdebug tb.sv dut.sv -top tb -upf dut.upf -log run.log -vcd run.vcd -active tb.u_dut.u_core.cnt -at 60
+
+`-upf` reads the power intent with msim's own reader, so both see the same
+domains (`-power_top INST` as for msim; without it the UPF's
+`set_design_top`). `-power [DOMAIN]` lists each power domain: the instances
+in it, its primary supply set, and its isolation, level-shifter and
+retention strategies with their lines in the UPF file. With `-log`, the
+output of a run with `-upf_verbose`, it adds the domain's power states over
+time, the state at `-at T`, and the supply or switch change that caused it:
+
+    PD_CORE  dut.upf:7
+      elements: tb.u_dut.u_core  (1 instance)
+      primary supply: SS_CORE  ground=VSS  power=VDD_CORE
+      isolation ISO_0: outputs, clamp 0, on u_core/cnt u_core/q, enabled by iso_en(high)  dut.upf:30
+      states: @0 CORRUPT @2 NORMAL @45 CORRUPT @66 NORMAL @90 CORRUPT
+      @60: CORRUPT  (since 45)  power switch SW_CORE state off; supply VDD_CORE = OFF
+
+The active trace uses the same data. A value that is x because its domain
+has no power is reported as that, with the cause, and no assignment is
+blamed for it; a port with an isolation strategy says so, with the clamp
+value and the enable:
+
+    tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)
+      power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF); isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)
+      x because the domain has no power: no assignment made this value
+
 ## Scripts and other programs
 
     mdebug design.sv -top tb -vcd run.vcd -script queries.txt
@@ -188,7 +272,7 @@ skipped. The exit status is 1 when a command failed.
 | `drivers SIG`, `loads SIG` | `drivers` / `loads`: `file`, `line`, `text`, `kind`, `when`, `target` (and `control` for a load) |
 | `value SIG [T]` | `value` (`8'h43`), `bits`, `since`, at T or at the end |
 | `changes SIG [T0 [T1]]` | `changes`: `[time, bits]` pairs, at most 10000, then `more` is true |
-| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]` | `text`: the lines the option of the same name prints |
+| `active SIG [T [DEPTH]]`, `trace SIG [DEPTH]`, `blocks INST`, `fsm [NAME] [T]`, `assert [NAME] [T]`, `uncovered [INST]`, `power [DOMAIN] [T]` | `text`: the lines the option of the same name prints |
 | `scopes`, `signals [SCOPE]` | the instances; the signals (directly inside SCOPE) |
 | `end` | `end` time and `timescale` of the waveform |
 | `help`, `quit` | the command list; stop |
