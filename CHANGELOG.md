@@ -620,6 +620,13 @@ Spec references are IEEE 1800-2023 clauses.
   first, which keeps the pivots of a long chain of gain stages usable.
 
 ### Fixed
+- msim memory on big VIP benches: a 2-state unpacked array with more than
+  64 elements gets its 0 defaults (6.8) from a loop instead of one
+  instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and
+  an assertion action block (16.14.3) is freed when it finishes instead of
+  at the end of the run (a pass action on every clock grew without bound).
+  A UFS VIP test went from 7.5 GB to 2.3 GB; SD and eMMC tests were killed
+  for memory before.
 - msim: four faults found by re-measuring the spec table with uvm-core.
   `void'($cast(d, s))` no longer reports an error when the cast fails; only
   the task form does (8.16). `'{default: v}` on an associative array sets

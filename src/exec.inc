@@ -800,7 +800,7 @@ static void runAction(const Prog* p, uint64_t n, const vector<E>* slots = nullpt
         if (slots && caps)
             for (size_t j = 0; j < slots->size(); j++) ctl->init.push_back({(*slots)[j].get(), (*caps)[j]});
         Task t = startProc(p, ctl);
-        S.all.push_back(t.h);
+        S.oneShot.insert(t.h.address());   // freed after its run (Sim::oneShot)
         S.reactive.push_back(t.h);
     }
     S.rare = true;

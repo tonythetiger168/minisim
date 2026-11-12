@@ -8473,11 +8473,35 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             const auto& s = *ar->second;
             if (!s.twoState) return;
             if (!init0) { init0 = std::make_unique<Lowerer>(sigmap); prep(*init0); }
-            for (int k = 0; k < s.count; k++) {
-                Instr i; i.k = IK::Assign; i.sig = s.base + k;
-                i.e = konst(make(0, 0, s.elemW, 0, s.sgn));
-                init0->prog.emit(i);
+            if (s.count <= 64) {
+                for (int k = 0; k < s.count; k++) {
+                    Instr i; i.k = IK::Assign; i.sig = s.base + k;
+                    i.e = konst(make(0, 0, s.elemW, 0, s.sgn));
+                    init0->prog.emit(i);
+                }
+                return;
             }
+            // A big array (bit [7:0] mem [0:1<<20]): a loop over a flat view,
+            // not one instruction per element, which took gigabytes.
+            auto flat = std::make_shared<ArrShape>();
+            flat->base = s.base; flat->count = s.count; flat->elemW = s.elemW;
+            flat->sgn = s.sgn; flat->twoState = true;
+            flat->dims = {{0, (int64_t)s.count - 1}};
+            Prog& p = init0->prog;
+            int c = init0->fresh(32);
+            Instr i0; i0.k = IK::Assign; i0.sig = c; i0.e = konst(make(0, 0, 32, 0, true));
+            p.emit(i0);
+            size_t top = p.here();
+            Instr t; t.k = IK::JmpIfNot; t.e = bin(Op::Lt, ref(c, true), konst(make((uint64_t)s.count, 0, 32, 0, true)));
+            size_t test = p.emit(t);
+            Instr a; a.k = IK::Assign; a.sig = s.base; a.arr = flat; a.aidx = {ref(c, true)};
+            a.e = konst(make(0, 0, s.elemW, 0, s.sgn));
+            p.emit(a);
+            Instr inc; inc.k = IK::Assign; inc.sig = c; inc.e = bin(Op::Add, ref(c, true), konst(make(1, 0, 32, 0, true)));
+            p.emit(inc);
+            Instr j; j.k = IK::Jmp; j.target = top;
+            p.emit(j);
+            p.code[test].target = p.here();
             return;
         }
         const auto& t = v.getType();
