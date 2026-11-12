@@ -2355,8 +2355,26 @@ int main(int argc, char** argv) {
     if ((!sdfRequests().empty() || sdfAtRunTime()) && !gateRecs().empty()) staticComb = staticSeq = false;
     // Paths, SDF and gate delays (30-32) act on drivers; tran and net kinds
     // resolve them: those designs keep every driver.
+    // $dumpports (21.7.4.3) tells which side of a port drives it: every
+    // continuous driver keeps its slot, and its instance is recorded.
+    bool dumpPorts = false;
+    {
+        auto scan = [&](const Prog& p) {
+            for (const Instr& i : p.code) if (i.k == IK::Dump && i.dcmd == DC_PORTS) dumpPorts = true;
+        };
+        for (auto& lp : lowered.procs) scan(lp.prog);
+        for (auto& sp : lowered.subs) if (sp) scan(*sp);
+        if (dumpPorts)
+            for (auto& lp : lowered.procs)
+                for (const Instr& i : lp.prog.code) {
+                    if (i.k != IK::Assign || i.drv < 0 || i.sig < 0 || (size_t)i.sig >= S.sigs.size()) continue;
+                    auto& v = S.drvScope[i.sig];
+                    if (v.size() <= (size_t)i.drv) v.resize((size_t)i.drv + 1);
+                    v[(size_t)i.drv] = lp.scope;
+                }
+    }
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
-        gateRecs().empty())
+        gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
