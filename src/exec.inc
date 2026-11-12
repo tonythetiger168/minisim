@@ -44,6 +44,26 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
 // $writememh / $writememb (21.5): one word per line, every digit written
 // (x and z as x and z), no @ addresses. The default range is the whole
 // memory, lowest address first; start and finish pick a range and order.
+// A multidimensional memory in a $readmem / $writemem file (21.4.3): an
+// address picks a word of the highest dimension, and its words of the
+// lower dimensions follow in row-major order, each dimension from its low
+// address up. k numbers those words; memSub is how many there are.
+static int64_t memSub(const ArrShape& a) {
+    int64_t n = 1;
+    for (size_t d = 1; d < a.dims.size(); d++) n *= std::abs(a.dims[d].first - a.dims[d].second) + 1;
+    return n;
+}
+static std::vector<int64_t> memIdx(const ArrShape& a, int64_t addr, int64_t k) {
+    std::vector<int64_t> idx(a.dims.size());
+    idx[0] = addr;
+    for (size_t d = a.dims.size(); d-- > 1;) {
+        auto [l, r] = a.dims[d];
+        int64_t n = std::abs(l - r) + 1;
+        idx[d] = std::min(l, r) + k % n;
+        k /= n;
+    }
+    return idx;
+}
 static void writeMem(const Instr& i) {
     const ArrShape& a = *i.arr;
     auto [l, r] = a.dims[0];
@@ -54,8 +74,10 @@ static void writeMem(const Instr& i) {
     std::ofstream out(i.fmt);
     if (!out) { std::cerr << "$writemem: cannot open " << i.fmt << "\n"; return; }
     int64_t step = finish < start ? -1 : 1;
+    const int64_t sub = memSub(a);
     for (int64_t ad = start;; ad += step) {
-        int64_t off = a.offset({ad});
+      for (int64_t k = 0; k < sub; k++) {
+        int64_t off = a.offset(memIdx(a, ad, k));
         if (off >= 0) {
             Val v = S.get(R(a.base) + (int)off);
             v.sgn = false;
@@ -74,6 +96,7 @@ static void writeMem(const Instr& i) {
             }
             out << s << "\n";
         }
+      }
         if (ad == finish) break;
     }
 }
@@ -205,10 +228,16 @@ static void readMem(const Instr& i) {
     if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) { finish = v_to_i64(v); haveFinish = true; } }
     int64_t step = (haveFinish && finish < start) ? -1 : 1;
     if (!haveFinish) finish = highA;
-    std::ifstream in(i.fmt);
-    if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    int64_t addr = start;
+    std::string text;
+    if (i.pw == 2) {   // $sreadmemb / $sreadmemh (D.14): the data is in the string arguments
+        for (size_t k = 2; k < i.args.size(); k++) { Val sv = eval(i.args[k], rd); sv.str = true; text += v_str(sv) + "\n"; }
+    } else {
+        std::ifstream in(i.fmt);
+        if (!in) { std::cerr << "$readmem: cannot open " << i.fmt << "\n"; return; }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    int64_t addr = start, k = 0;
+    const int64_t sub = memSub(a);
     int bits = i.hex ? 4 : 1;
     int64_t words = 0;
     bool sawAddr = false;
@@ -232,6 +261,7 @@ static void readMem(const Instr& i) {
         p = e;
         if (c == '@') {
             addr = (int64_t)std::stoull(tok, nullptr, 16);
+            k = 0;
             sawAddr = true;
             if (!inRange(addr)) { std::cerr << "$readmem: address " << tok << " out of range in " << i.fmt << "\n"; return; }
             continue;
@@ -251,14 +281,14 @@ static void readMem(const Instr& i) {
                 acc = v_or(v_shl(acc, sh), dig);
             }
             if (!inRange(addr)) break;
-            int64_t off = a.offset({addr});
+            int64_t off = a.offset(memIdx(a, addr, k));
             if (off < 0) break;
             if (a.twoState) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
             S.set(R(a.base) + (int)off, acc);
-            addr += step;
+            if (++k == sub) { k = 0; addr += step; }
             words++;
             continue;
         }
@@ -274,17 +304,17 @@ static void readMem(const Instr& i) {
             else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
         }
         if (!inRange(addr)) break;
-        int64_t off = a.offset({addr});
+        int64_t off = a.offset(memIdx(a, addr, k));
         if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
         S.set(R(a.base) + (int)off, make(v, x, a.elemW, z));
-        addr += step;
+        if (++k == sub) { k = 0; addr += step; }
         words++;
     }
     // A file with no @address whose word count differs from the range warns
     // (21.4): the range given by start and finish addresses, or, with no
     // finish address, a file with more words than the memory has room for.
-    int64_t range = (step > 0 ? finish - start : start - finish) + 1;
+    int64_t range = ((step > 0 ? finish - start : start - finish) + 1) * sub;
     if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
 }
@@ -554,6 +584,22 @@ struct ProcCtl {
         for (auto& k : kids) if (!k->ended) return false;
         return true;
     }
+    // Where it is, for disable (9.6.2): the running coroutine's call stack,
+    // code and frame (its locals), the code it started from, and where its
+    // parent forked it. A disable that moves a waiting process starts a new
+    // coroutine at the new place (restart) and bumps gen: the old one stops
+    // when it next runs.
+    vector<RetFrame>* rets = nullptr;
+    const Prog** pp = nullptr;
+    size_t* ppc = nullptr;
+    FrameP* pfr = nullptr;
+    const Prog* entry = nullptr;
+    FrameP fr0;
+    uint64_t gen = 0;
+    struct Restart { vector<RetFrame> rets; const Prog* p; size_t pc; FrameP fr; };
+    std::unique_ptr<Restart> restart;
+    size_t forkDepth = 0, forkPc = 0;
+    const Prog* forkProg = nullptr;
 };
 inline unordered_map<int, vector<weak_ptr<ProcCtl>>>& rootProcs() {
     static unordered_map<int, vector<weak_ptr<ProcCtl>>> m;
@@ -651,11 +697,83 @@ static void procResume(ProcCtl* c) {
 }
 static int doRandomize(int obj, const RandCall* rc);   // rand.inc
 static void randModeAll(int obj, bool blocks, bool on);
+inline vector<weak_ptr<ProcCtl>>& liveProcs() { static vector<weak_ptr<ProcCtl>> v; return v; }
 inline Task startProc(const Prog* p, shared_ptr<ProcCtl> c, FrameP fr = nullptr) {
+    c->entry = p;
+    c->fr0 = fr;
     Task t = exec(p, c, std::move(fr));
     c->h = t.h;
     for (int r : p->roots) rootProcs()[r].push_back(c);
+    if (anySpans()) liveProcs().push_back(c);
     return t;
+}
+// disable of block or task id (9.6.2) for every process inside it: it
+// resumes after the block, or after the call of the task; what it forked
+// in there ends. Returns whether self was moved (its own locals are set).
+inline bool disableSpans(int id, const shared_ptr<ProcCtl>& self) {
+    auto& L = liveProcs();
+    std::erase_if(L, [](auto& w) { auto c = w.lock(); return !c || c->ended; });
+    auto list = L;
+    bool moved = false;
+    for (auto& w : list) {
+        auto c = w.lock();
+        if (!c || c->ended || c->killed || !c->rets) continue;
+        auto& R = *c->rets;
+        size_t n = R.size();
+        // The outermost frame inside the span: frame k runs R[k].prog at
+        // R[k].pc (the return address of its call) for k < n, else the
+        // current code and pc.
+        size_t hit = SIZE_MAX;
+        const Prog::Span* sp = nullptr;
+        for (size_t k = 0; k <= n && hit == SIZE_MAX; k++) {
+            const Prog* P = k < n ? R[k].prog : *c->pp;
+            size_t pc = k < n ? R[k].pc : *c->ppc;
+            for (auto& x : P->spans) {
+                if (x.id != id) continue;
+                bool in = x.e == SIZE_MAX ? k > 0
+                        : k < n ? x.s < pc && pc <= x.e
+                        : (x.s <= pc && pc < x.e) || (pc == x.e && pc > x.s && P->code[pc - 1].k == IK::Fork);
+                if (in) { hit = k; sp = &x; break; }
+            }
+        }
+        if (hit == SIZE_MAX) continue;
+        bool task = sp->e == SIZE_MAX;
+        const Prog* hp = hit < n ? R[hit].prog : *c->pp;
+        // What it forked in there ends with it.
+        for (auto& kid : c->kids) {
+            if (kid->ended) continue;
+            bool inside = task ? kid->forkDepth >= hit
+                        : kid->forkDepth > hit || (kid->forkDepth == hit && kid->forkProg == hp && sp->s <= kid->forkPc && kid->forkPc < sp->e);
+            if (inside) procKill(kid);
+        }
+        std::erase_if(c->kids, [](auto& k) { return k->ended; });
+        auto r = std::make_unique<ProcCtl::Restart>();
+        if (task) {   // back in the caller, after the call
+            r->rets.assign(R.begin(), R.begin() + (long)(hit - 1));
+            r->p = R[hit - 1].prog; r->pc = R[hit - 1].pc; r->fr = R[hit - 1].fr;
+        } else {      // after the block, in the frame that runs it
+            r->rets.assign(R.begin(), R.begin() + (long)hit);
+            r->p = hp; r->pc = sp->e; r->fr = hit < n ? R[hit].fr : *c->pfr;
+        }
+        if (c == self) {
+            *c->rets = std::move(r->rets);
+            *c->pp = r->p; *c->ppc = r->pc; *c->pfr = std::move(r->fr);
+            moved = true;
+            continue;
+        }
+        // A waiting process: its wait is dropped, and it goes on from there now.
+        c->gen++;
+        c->rets = nullptr;   // until the new coroutine runs
+        S.dead.insert(c->h.address());
+        c->restart = std::move(r);
+        c->waitingFork = false;
+        c->parked = false;
+        Task t = exec(c->entry, c, c->fr0);
+        c->h = t.h;
+        S.all.push_back(t.h);
+        S.active.push_back(t.h);
+    }
+    return moved;
 }
 // A top-level process (initial, always, final).
 // A new top-level process's generator (18.14.2), seeded in start order.
@@ -804,7 +922,7 @@ static void runAction(const Prog* p, uint64_t n, const vector<E>* slots = nullpt
         if (slots && caps)
             for (size_t j = 0; j < slots->size(); j++) ctl->init.push_back({(*slots)[j].get(), (*caps)[j]});
         Task t = startProc(p, ctl);
-        S.all.push_back(t.h);
+        S.oneShot.insert(t.h.address());   // freed after its run (Sim::oneShot)
         S.reactive.push_back(t.h);
     }
     S.rare = true;
@@ -1076,6 +1194,15 @@ static void queueConc(const Instr& i, const shared_ptr<ProcCtl>& ctl) {
     c.pending.push_back({ctl, ctl->epoch, caps});
     S.rare = true;
 }
+// The assume set of a checker ticked (17.7.2): new random values for its
+// active free variables, tried again while an assumption would fail now.
+static void freeSolveNow(ConcAssert& c) {
+    if (c.solveVars.empty()) return;
+    for (int t = 0; t < 4096; t++) {   // random tries: no search, so a narrow assume set can still miss (allowed)
+        for (int v : c.solveVars) S.set(v, S.freeValue(v));
+        if (!c.solveOk || truth(eval(c.solveOk, rd)) == 1) return;
+    }
+}
 // A multiclock assertion (16.13): one process per clock marks it ticked;
 // the first in a time step runs the assertion in the observed region, once,
 // with every clock that ticked in that step.
@@ -1087,6 +1214,7 @@ inline Task concClockProc(int k, int ci) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (iff && truth(eval(iff, rd)) != 1) continue;
+        if (ci == 0) freeSolveNow(c);
         c.ticked |= 1u << ci;
         if (c.due) continue;
         c.due = true;
@@ -1104,6 +1232,7 @@ inline Task concProc(int k) {
         if (ev->size() > 1) co_await WaitAny{ev};
         else co_await Wait{(*ev)[0].first, (*ev)[0].second};
         if (c.clkIff && truth(eval(c.clkIff, rd)) != 1) continue;   // @(posedge clk iff en)
+        freeSolveNow(c);
         co_await ToObserved{};
         concTick(c);
     }
@@ -1212,7 +1341,16 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         pc = f.pc;
         if (f.fr != fr) { lastRet = std::move(fr); fr = std::move(f.fr); }
     };
-    for (auto& [slot, v] : ctl->init) slot->k = v;
+    const uint64_t gen0 = ctl->gen;
+    if (ctl->restart) {   // moved here by a disable (9.6.2)
+        rets = std::move(ctl->restart->rets);
+        p = ctl->restart->p;
+        pc = ctl->restart->pc;
+        fr = std::move(ctl->restart->fr);
+        ctl->restart.reset();
+    } else
+        for (auto& [slot, v] : ctl->init) slot->k = v;
+    ctl->rets = &rets; ctl->pp = &p; ctl->ppc = &pc; ctl->pfr = &fr;
     // A program thread runs in the reactive region set (24.3.1): it starts
     // there, and goes back there after every wait.
 #define TO_REACTIVE if (__builtin_expect(ctl->reactive, 0) && S.region != R_REACTIVE) co_await ToReactive{}
@@ -1222,6 +1360,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
         g_ret = lastRet.get();
         g_threadRng = ctl->rngp;
         if (ctl->killed) goto done;
+        if (ctl->gen != gen0) [[unlikely]] co_return;   // a disable moved it to a new coroutine
         // A process of a powered-off domain is inactive (1801 9.5.3): it
         // sleeps until the domain powers up, then starts over from its top,
         // so combinational logic re-evaluates and edge-triggered logic waits
@@ -1323,6 +1462,15 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++; break;
             }
             case IK::Dump: {
+                if (i.dcmd >= DC_PORTS) {   // extended VCD: [size,] file name
+                    size_t k = 0;
+                    int64_t size = 0;
+                    std::string file;
+                    if (i.dcmd == DC_PLIMIT) { Val sz = eval(i.args[k++], rd); size = sz.x ? 0 : v_to_i64(sz); }
+                    if (k < i.args.size()) { Val f = eval(i.args[k], rd); f.str = true; file = v_str(f); }
+                    S.dumpPorts(i.dcmd, file, size, i.dsel);
+                    pc++; break;
+                }
                 Val a = i.args.empty() ? Val{} : eval(i.args[0], rd);
                 std::string str;
                 int64_t num = -1;
@@ -1546,6 +1694,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                         uint64_t a = urandomNext(*ctl->rngp), b = urandomNext(*ctl->rngp);
                         c->rng = seedState(a << 32 | b);
                     }
+                    c->forkDepth = rets.size(); c->forkProg = p; c->forkPc = pc;
                     ctl->kids.push_back(c);
                     FrameP bf = bn < i.blays.size() && i.blays[bn] ? newFrame(i.blays[bn], ff, ff ? ff->self : 0) : ff;
                     Task t = startProc(b, c, std::move(bf));
@@ -1563,6 +1712,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 for (auto& w : list)
                     if (auto c = w.lock()) procKill(c);
                 std::erase_if(v, [](auto& w) { auto c = w.lock(); return !c || c->ended; });
+                if (anySpans() && !ctl->killed && disableSpans(i.sig, ctl)) break;   // this process was inside it
                 pc++;
                 break;   // the loop top stops this process if it was one of them
             }
@@ -1843,3 +1993,4 @@ inline void startClockings() {
 #include "cover_rt.inc"
 #include "tchk.inc"
 #include "sdf_annotate.inc"
+#include "annexd.inc"

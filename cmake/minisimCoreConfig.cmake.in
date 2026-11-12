@@ -13,7 +13,7 @@ if(MINISIM_CORE_WITH_FST)
   find_dependency(ZLIB)
 endif()
 if(MINISIM_CORE_WITH_OPENSSL)
-  find_dependency(OpenSSL COMPONENTS Crypto)
+  find_dependency(OpenSSL COMPONENTS Crypto SSL)
 endif()
 
 # slang is not installed by minisim: a consumer either has it installed, or
