@@ -86,8 +86,15 @@ Names are hierarchical paths, with or without the top (`top.u.clk` or
 ### From an SDC file
 
 `-sdc file.sdc` (repeatable) reads the clocks and how they are related from
-the timing constraints, with the SDC reader `msdc` and `msta` use, so the
-crossing checks and timing agree on what a domain is:
+the timing constraints, so the crossing checks and timing agree on what a
+domain is. The file runs as Tcl (variables, loops, procs, `source`) on the
+shared Tcl interpreter (`src/tcl.hpp`); `src/cdc_sdc.hpp` keeps the commands
+in the table below and the object queries (`get_ports`, `get_pins`,
+`get_cells`, `get_nets` with `-hierarchical`, `get_clocks`, `all_clocks`,
+`all_inputs`, `all_outputs`). Other SDC commands (delays, loads, multicycle
+paths, design rules) are read and ignored, since they do not change a
+domain; a command that is not SDC, and a name that matches nothing, are
+reported:
 
 ```
 mlint rtl/*.sv -top soc_top -sdc soc_top.sdc -cdc-report
@@ -110,7 +117,7 @@ are not generated from one another as asynchronous, and says so.
 divider with no `create_generated_clock`, most often). It is checked as a
 domain of its own, asynchronous to every other.
 
-Object names follow `msdc`: `/` between instance levels and no top name
+Object names are the ones timing tools use: `/` between instance levels and no top name
 (`u_a/u_b/clk`), a register `q` in `u_a` is the cell `u_a/q_reg` with pins
 `CK`, `D` and `Q`, generate blocks are `name.` and `name[i].`. With `-sdc`,
 `-cdc-report` prints the SDC clocks of every domain. `-clock-group` and

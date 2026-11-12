@@ -48,7 +48,8 @@ Spec references are IEEE 1800-2023 clauses.
   synchronized separately that meet again up to `-cdc-depth N` flops later
   (default 2) are reported, once per set of signals.
 - `mlint -sdc file.sdc`: the CDC and RDC checks take the clocks and how they
-  are related from the timing constraints (shared SDC reader): generated
+  are related from the timing constraints (`src/cdc_sdc.hpp`, the SDC
+  commands that set a domain, on the shared Tcl interpreter): generated
   clocks are synchronous to their master, `set_clock_groups -asynchronous`
   and a false path between two clocks make a pair a crossing, exclusive
   groups are not checked, any other pair is synchronous. New rule `CDC006`:
