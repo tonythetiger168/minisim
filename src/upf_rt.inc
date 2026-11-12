@@ -35,12 +35,15 @@ struct DomRt {
     int mode = SS_CORRUPT;
     bool applied = false;
     bool alwaysOn = false;
+    bool region = false;   // elements explicitly powered by a supply set (6.15), not a domain
     std::vector<int> owned;
     std::string state;     // current power state of the domain (add_power_state -domain)
     std::string forced;
 };
+struct GroupRt { std::string name, state = "UNDEFINED", forced; };
 struct Cell {               // an isolation or level-shifter cell on a port connection
-    int kind = 0;           // 0 isolation, 1 level shifter
+    int kind = 0;           // 0 isolation, 1 level shifter, 2 repeater or a port corrupted with its supply
+    std::string clamp;      // isolation: the clamp value
     const Isolation* iso = nullptr;
     std::vector<std::string> supplies;   // all must be NORMAL
     std::vector<int> senseLow;
@@ -71,6 +74,9 @@ struct Rt {
     std::vector<DomRt> doms;
     std::map<std::string, int> domIdx;
     std::vector<Cell> cells;
+    std::vector<GroupRt> groups;
+    std::map<std::string, int> groupIdx;
+    std::map<std::string, std::string> lastState;   // object -> its last power state that is not UNDEFINED (9.4)
     std::vector<RetRt> rets;
     std::vector<std::pair<int, Edge>> watch;
     std::map<int, int> override;   // signal -> 0 X held, 1 retained value held
@@ -135,6 +141,8 @@ struct Rt {
         r.k = EVal::Supply;
         auto it = val.find(root(net));
         if (it != val.end()) r.sv = it->second;
+        // set_partial_on_translation (6.50): before any expression or PST sees it
+        if (r.sv.st == S_PARTIAL_ON && !m.partialOn.empty()) r.sv.st = m.partialOn == "OFF" ? S_OFF : S_FULL_ON;
         return r;
     }
     // Names in power state expressions: a function of the set itself, a
@@ -152,9 +160,9 @@ struct Rt {
                 if (isSupply(n)) { out = supplyOf(n); return true; }
                 std::string f = m.fnNet(n);
                 if (!f.empty()) { out = supplyOf(f); return true; }
-                if (m.domains.count(n) || m.sets.count(m.setOf(n))) {
+                if (m.domains.count(n) || m.groups.count(n) || m.sets.count(m.setOf(n))) {
                     out.k = EVal::Obj;
-                    out.sym = m.domains.count(n) ? n : m.setOf(n);
+                    out.sym = m.domains.count(n) || m.groups.count(n) ? n : m.setOf(n);
                     return true;
                 }
                 int s = sigOf(n);
@@ -165,6 +173,8 @@ struct Rt {
         c.inState = [this](const std::string& obj, const std::string& st) {
             auto d = domIdx.find(obj);
             if (d != domIdx.end()) return doms[(size_t)d->second].state == st;
+            auto gi = groupIdx.find(obj);
+            if (gi != groupIdx.end()) return groups[(size_t)gi->second].state == st;
             auto it = sets.find(obj);
             return it != sets.end() && it->second.state == st;
         };
@@ -185,11 +195,112 @@ struct Rt {
         S.holdOff(s, true);
     }
 
+    // ------------------------------------------- models, regions, behavior
+    // The module of an instance (simulator path); "" for a generate block.
+    std::string modelOf(const std::string& path) const {
+        std::string full = S.vcdTop.empty() ? path : path.empty() ? S.vcdTop : S.vcdTop + "." + path;
+        auto it = instCells().find(full);
+        return it == instCells().end() ? std::string() : it->second;
+    }
+    // The supply set an instance is explicitly connected to (6.15), or
+    // null: the closest element above it wins, and the later command.
+    const SupplyConn* explicitConn(const std::string& path) const {
+        const SupplyConn* best = nullptr;
+        size_t len = 0;
+        for (auto& sc : m.supplyConns) {
+            bool out = false;
+            for (auto& x : sc.exclude) if (DomainMap::within(path, m.design(x))) out = true;
+            if (out) continue;
+            for (auto& e : sc.elements) {
+                std::string d = m.design(e);
+                bool in = sc.transitive ? DomainMap::within(path, d) : path == d;
+                if (in && (!best || d.size() >= len)) { best = &sc; len = d.size(); }
+            }
+        }
+        return best;
+    }
+    std::map<std::string, int> regionIdx;
+    int regionOf(const std::string& set) {
+        auto it = regionIdx.find(set);
+        if (it != regionIdx.end()) return it->second;
+        DomRt d;
+        d.name = "supply set " + set;
+        d.set = m.setOf(set);
+        d.region = true;
+        auto st = m.sets.find(d.set);
+        d.alwaysOn = st == m.sets.end() || st->second.fn.empty();
+        d.mode = d.alwaysOn ? SS_NORMAL : SS_CORRUPT;
+        int idx = (int)doms.size();
+        regionIdx[set] = idx;
+        doms.push_back(d);
+        g_pdMode.push_back(d.mode);
+        g_pdSig.push_back(S.sig("$upf.ss_region." + set, 1));
+        return idx;
+    }
+    // The supply set that powers an instance: an explicit connection, else
+    // its domain's primary supply; "" outside every domain.
+    std::string supplySetOf(const std::string& path) const {
+        if (const SupplyConn* sc = explicitConn(path)) return m.setOf(sc->set);
+        std::string dn = dm.of(path);
+        return dn.empty() ? std::string() : m.primaryOf(dn);
+    }
+    // The simstate behavior of an instance (6.56): ENABLE, SIMSTATE_ONLY,
+    // PORT_CORR_ONLY or DISABLE, and the instance the rule was given for
+    // (the macro whose ports are corrupted).
+    std::pair<std::string, std::string> behaviorOf(const std::string& path) const {
+        std::string mode, at;
+        int best = -1;
+        auto take = [&](int rank, const std::string& md, const std::string& inst) {
+            if (rank >= best) { best = rank; mode = md; at = inst; }
+        };
+        // every instance from the top down to path
+        std::vector<std::string> chain{""};
+        for (size_t i = 0; i <= path.size(); i++)
+            if (i == path.size() || path[i] == '.') { if (i) chain.push_back(path.substr(0, i)); }
+        for (auto& a : chain) {
+            std::string mod = modelOf(a);
+            if (mod.empty() && !a.empty()) continue;
+            // attributes: the lowest precedence
+            std::string av = m.designAttr(a, mod, "UPF_simstate_behavior");
+            if (!av.empty()) take(1, av, a);
+            else if (m.designAttr(a, mod, "UPF_is_power_aware_model") == "TRUE") take(0, "DISABLE", a);
+        }
+        for (auto& sb : m.simBehaviors) {
+            if (!sb.models.empty() || !sb.lib.empty()) {
+                for (auto& a : chain) {
+                    std::string mod = modelOf(a);
+                    if (mod.empty()) continue;
+                    if (!sb.models.empty() && !Model::modelIn(sb.models, mod)) continue;
+                    bool in = sb.elements.empty();
+                    auto rel = [&](const std::string& e) {
+                        std::string d = e;
+                        for (char& ch : d) if (ch == '/') ch = '.';
+                        return a.empty() ? d : a + "." + d;
+                    };
+                    for (auto& e : sb.elements) if (DomainMap::within(path, rel(e))) in = true;
+                    for (auto& e : sb.exclude) if (DomainMap::within(path, rel(e))) in = false;
+                    if (in) take(sb.elements.empty() ? 2 : 3, sb.mode, a);
+                }
+            } else {
+                bool in = false;
+                std::string at2;
+                for (auto& e : sb.elements) if (DomainMap::within(path, m.design(e))) { in = true; at2 = m.design(e); }
+                for (auto& e : sb.exclude) if (DomainMap::within(path, m.design(e))) in = false;
+                if (in) take(3, sb.mode, at2);
+            }
+        }
+        if (mode == "PORT_CORR_ONLY" && m.designAttr(at, modelOf(at), "UPF_is_hard_macro") != "TRUE")
+            throw Error("set_simstate_behavior PORT_CORR_ONLY for " + (at.empty() ? std::string("the top") : at) +
+                        ", which is not a hard macro (UPF_is_hard_macro, 6.56)");
+        return {mode.empty() ? std::string("ENABLE") : mode, at};
+    }
+
     // ----------------------------------------------------------- bind
     void bind(LowerResult& lw) {
         on = true;
         g_upf = true;
         dm.build(m);
+        expandPgConnects();
         g.build(m);
         for (size_t i = 0; i < S.sigs.size(); i++) sigByName.emplace(S.sigs[i].name, (int)i);
         for (auto& w : m.warnings) std::cerr << "msim: UPF: " << w << "\n";
@@ -240,18 +351,57 @@ struct Rt {
                 if (!found) std::cerr << "msim: UPF: " << m.domains.at(e).where << ": power domain " << e
                                       << ": no instance '" << p << "' in the design\n";
             }
+        for (auto& gn : m.groupOrder) {
+            groupIdx[gn] = (int)groups.size();
+            groups.push_back({gn, "UNDEFINED", ""});
+        }
+        // every state a transition names is a power state of its object (6.7)
+        for (auto& [obj, ts] : m.transitions) {
+            std::set<std::string> names;
+            const std::vector<PowerState>* st = ts.kind == 'g' ? &m.groups.at(obj).states
+                                              : ts.kind == 'd' ? &m.domains.at(obj).states : &m.sets.at(obj).states;
+            for (auto& ps : *st) names.insert(ps.name);
+            if (ts.kind == 's') { names.insert("ON"); names.insert("OFF"); }
+            for (auto& t : ts.tr) {
+                auto chk = [&](const std::string& sn) {
+                    if (!names.count(sn)) throw Error(t.where + ": transition " + t.name + ": " + sn + " is not a power state of " + obj + " (6.7)");
+                };
+                for (auto& a : t.from) chk(a);
+                for (auto& b : t.to) chk(b);
+                for (auto& [a, b] : t.paired) { chk(a); chk(b); }
+            }
+        }
+        for (auto& e : intentErrors(m, dm, [this](const std::string& p) { return modelOf(p); }))
+            throw Error(e.where + ": " + e.text);
+        for (auto& sb : m.simBehaviors)
+            if (sb.loaded)
+                for (auto& mm : sb.models)
+                    if (instancesOf(mm.substr(mm.find('.') + 1)).empty())
+                        throw Error(sb.where + ": load_simstate_behavior: model " + mm + " is not in the design (6.34)");
+        bindLogic(lw);
+        bindTypes(lw);
         // processes: domain, state or not; what each domain drives
         std::vector<std::set<int>> owned(doms.size());
         stateSigs.assign(doms.size(), {});
         for (auto& lp : lw.procs) {
-            if (!lp.port.empty()) continue;   // a port connection is a wire, not logic of either side
+            if (!lp.port.empty() || lp.kind == "upf_wire") continue;   // a port connection is a wire, not logic of either side
             // slang names procedure kinds "Initial", "AlwaysFF", ...; lowering adds "assign", "init", "sampled"
             const std::string& k = lp.kind;
             if (k == "Initial" || k == "Final" || k == "init" || k == "sampled") continue;
             std::string dn = dm.of(lp.scope);
-            if (dn.empty()) continue;
-            int pd = domIdx.at(dn);
-            lp.prog.pd = pd;
+            // set_simstate_behavior (6.56): DISABLE and PORT_CORR_ONLY leave the logic alone
+            auto [beh, behAt] = behaviorOf(lp.scope);
+            if (beh == "DISABLE" || beh == "PORT_CORR_ONLY") continue;
+            int pd;
+            if (const SupplyConn* sc = explicitConn(lp.scope)) pd = regionOf(sc->set);   // connect_supply_set (6.15)
+            else if (!dn.empty()) pd = domIdx.at(dn);
+            else continue;
+            if (owned.size() < doms.size()) { owned.resize(doms.size()); stateSigs.resize(doms.size()); }
+            // sim_corruption_control -type process (6.59): the process is not corrupted
+            bool keepProc = false;
+            for (auto& cc : m.corrCtls)
+                if (cc.type == "process" && selected(cc.sel, lp.scope, true)) keepProc = true;
+            if (keepProc) continue;
             bool st = k == "AlwaysFF" || k == "AlwaysLatch";
             if (k == "Always")
                 for (auto& in : lp.prog.code)
@@ -259,34 +409,57 @@ struct Rt {
                         if (in.events.size() > 1) { for (auto& [s, e] : in.events) if (e != ANY) st = true; }
                         else if (in.edge != ANY) st = true;
                     }
-            lp.prog.pstate = st;
+            std::set<int> wr;
             std::vector<const Prog*> seen;
             std::function<void(const Prog&)> writes = [&](const Prog& p) {
                 for (const Prog* q : seen) if (q == &p) return;
                 seen.push_back(&p);
                 for (auto& in : p.code) {
                     if ((in.k == IK::Assign || in.k == IK::Nba) && in.sig >= 0 && !isRel(in.sig)) {
-                        if (in.arr) for (int k = 0; k < in.arr->count; k++) owned[(size_t)pd].insert(in.arr->base + k);
-                        else owned[(size_t)pd].insert(in.sig);
+                        if (in.arr) for (int k = 0; k < in.arr->count; k++) wr.insert(in.arr->base + k);
+                        else wr.insert(in.sig);
                     }
                     if (in.k == IK::Call && in.callee) writes(*in.callee);
                     for (const Prog* b : in.branches) writes(*b);
                 }
             };
             writes(lp.prog);
+            // sim_corruption_control (6.59): what the process drives that is
+            // not to be corrupted; a process that drives nothing else runs on
+            size_t kept = 0;
+            for (int s : wr)
+                if (noCorruption(s, st)) { noCorr.insert(s); kept++; }
+            if (!wr.empty() && kept == wr.size()) continue;
+            lp.prog.pd = pd;
+            lp.prog.pstate = st;
+            for (int s : wr) owned[(size_t)pd].insert(s);
             if (st) {
                 std::set<int> w;
                 for (auto& in : lp.prog.code)
                     if ((in.k == IK::Nba || in.k == IK::Assign) && in.sig >= 0 && !isRel(in.sig) && !in.arr) w.insert(in.sig);
                 for (int s : w) stateSigs[(size_t)pd].insert(s);
+                // a domain's retention strategies also reach the elements on another supply
+                if (doms[(size_t)pd].region && !dn.empty())
+                    for (int s : w) stateSigs[(size_t)domIdx.at(dn)].insert(s);
             }
         }
         for (size_t d = 0; d < doms.size(); d++) {
             for (int s : owned[d])
-                if (S.sigs[(size_t)s].name.find('$') == std::string::npos) doms[d].owned.push_back(s);
+                if (S.sigs[(size_t)s].name.find('$') == std::string::npos && !noCorr.count(s)) doms[d].owned.push_back(s);
         }
         bindCells(lw);
         bindRetention();
+        // a retained register is corrupted after all (6.59)
+        for (auto& r : rets)
+            for (auto& e : r.els)
+                if (noCorr.count(e.sig)) {
+                    std::cerr << "msim: UPF: sim_corruption_control: " << S.sigs[(size_t)e.sig].name << " is retained by "
+                              << r.r->name << "; its corruption is not turned off (6.59)\n";
+                    noCorr.erase(e.sig);
+                    if (r.dom >= 0) doms[(size_t)r.dom].owned.push_back(e.sig);
+                }
+        bindAsserts();
+        bindReplays(lw);
         // logic signals the runtime reacts to
         std::set<int> w;
         auto addIds = [&](const ExP& e, const std::string& scope) {
@@ -309,6 +482,8 @@ struct Rt {
             for (auto& ps : s.states) addIds(ps.logicExpr, scopeOfName(n));
         for (auto& dn : m.domainOrder)
             for (auto& ps : m.domains.at(dn).states) addIds(ps.logicExpr, m.domains.at(dn).scope);
+        for (auto& gn : m.groupOrder)
+            for (auto& ps : m.groups.at(gn).states) addIds(ps.logicExpr, m.groups.at(gn).scope);
         for (auto& r : rets) {
             if (r.saveSig >= 0) w.insert(r.saveSig);
             if (r.restoreSig >= 0) w.insert(r.restoreSig);
@@ -317,13 +492,259 @@ struct Rt {
             addIds(r.r->restorePeriodCond, scopeOfName(r.r->domain));
             addIds(r.r->powerdownCond, scopeOfName(r.r->domain));
         }
+        for (auto& ac : m.assertCtls) addIds(ac.ctlExpr, ac.sel.scope);
         bindHdlPorts(lw);
-        for (auto& h : hdlPorts) if (h.vct->hdl2upf) w.insert(h.sig);
+        for (auto& h : hdlPorts) {
+            if (h.hdl2upf) w.insert(h.sig);
+            if (h.copyFrom >= 0) w.insert(h.copyFrom);
+        }
         for (int s : w) watch.push_back({s, ANY});
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
     }
     std::vector<std::set<int>> stateSigs;
+
+    // ------------------------------------- simulation controls (6.58, 6.59)
+    std::set<int> noCorr;   // signals sim_corruption_control keeps from corruption
+    std::set<int> realSigs, intSigs;   // variables of type real / shortreal, and of a predefined integer type
+    void bindTypes(LowerResult& lw) {
+        if (m.corrCtls.empty()) return;
+        for (auto& [sym, sid] : lw.sigOf) {
+            if (!sym || !slang::ast::ValueSymbol::isKind(sym->kind)) continue;
+            const auto& t = sym->as<slang::ast::ValueSymbol>().getType().getCanonicalType();
+            if (t.isFloating()) realSigs.insert(sid);
+            else if (t.kind == slang::ast::SymbolKind::PredefinedIntegerType) intSigs.insert(sid);
+        }
+    }
+    // Instances of a model (5.8), as design paths.
+    std::vector<std::string> instancesOf(const std::string& model) const {
+        std::vector<std::string> r;
+        std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+        for (auto& [full, mod] : instCells()) {
+            if (mod != model) continue;
+            if (!pre.empty() && full.compare(0, pre.size(), pre) != 0) continue;
+            r.push_back(full.substr(pre.size()));
+        }
+        return r;
+    }
+    // Whether a control selects a design element: an instance (inst) or a
+    // signal or assertion in one.
+    bool selected(const ElemSel& sel, const std::string& path, bool inst) const {
+        std::string container = inst ? path : parentOf(path);
+        if (!sel.domain.empty() && dm.of(container) != sel.domain) return false;
+        auto hit = [&](const std::string& e) {
+            if (path == e) return true;
+            return sel.transitive ? DomainMap::within(path, e) : container == e;
+        };
+        std::vector<std::string> bases;
+        if (sel.model.empty()) bases.push_back("");
+        else bases = instancesOf(sel.model);
+        for (auto& b : bases) {
+            auto name = [&](const std::string& e) {
+                if (sel.model.empty()) return m.design(e);
+                std::string d = e;
+                for (char& ch : d) if (ch == '/') ch = '.';
+                return b.empty() ? d : b + "." + d;
+            };
+            bool in = false;
+            if (!sel.elements.empty()) {
+                for (auto& e : sel.elements) if (hit(name(e))) in = true;
+            } else if (!sel.model.empty()) in = hit(b);
+            else if (!sel.domain.empty()) in = true;
+            else in = hit(m.design(sel.scope));
+            if (!in) continue;
+            bool out = false;
+            for (auto& e : sel.exclude) if (hit(name(e))) out = true;
+            if (!out) return true;
+        }
+        return false;
+    }
+    // Whether sim_corruption_control keeps signal s (written by a state
+    // process when st) from corruption.
+    bool noCorruption(int s, bool st) const {
+        if (m.corrCtls.empty()) return false;
+        const auto& sg = S.sigs[(size_t)s];
+        bool isPort = false;
+        if (!S.vcdTop.empty()) isPort = portRecs().count(S.vcdTop + "." + sg.name) != 0;
+        for (auto& cc : m.corrCtls) {
+            const std::string& t = cc.type;
+            bool kind = t == "real" ? realSigs.count(s) != 0
+                      : t == "integer" ? intSigs.count(s) != 0
+                      : t == "seq" ? st : t == "comb" ? !st : t == "port" ? isPort : false;
+            if (kind && selected(cc.sel, sg.name, false)) return true;
+        }
+        return false;
+    }
+    // sim_assertion_control: each assertion it selects, and what controls it.
+    struct AsrtCtlRt {
+        const AssertCtl* r;
+        int id;
+        int dom = -1;          // the controlling domain; -1: the expression
+        bool active = false, dead = false;
+    };
+    std::vector<AsrtCtlRt> asrtCtls;
+    std::string designOf(const std::string& simPath) const {
+        std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+        if (!pre.empty() && simPath.compare(0, pre.size(), pre) == 0) return simPath.substr(pre.size());
+        return simPath;
+    }
+    void bindAsserts() {
+        auto& as = asserts();
+        for (auto& ac : m.assertCtls)
+            for (size_t i = 0; i < as.size(); i++) {
+                const AssertInfo& a = as[i];
+                if (a.hidden) continue;
+                std::string inst = designOf(a.inst), name = designOf(a.name);
+                if (!selected(ac.sel, name, false) && !selected(ac.sel, inst, true)) continue;
+                AsrtCtlRt x;
+                x.r = &ac;
+                x.id = (int)i;
+                if (!ac.ctlExpr) {
+                    if (!ac.ctlDomain.empty()) x.dom = domIdx.at(ac.ctlDomain);
+                    else if (const SupplyConn* sc = explicitConn(inst)) x.dom = regionOf(sc->set);
+                    else {
+                        std::string dn = dm.of(inst);
+                        if (dn.empty()) continue;   // in no domain: never off
+                        x.dom = domIdx.at(dn);
+                    }
+                }
+                note("sim_assertion_control -type " + ac.type + " on " + name);
+                asrtCtls.push_back(x);
+            }
+    }
+    // sim_replay_control (6.60): the initial blocks to run again, by the
+    // domain whose power-up replays them.
+    std::vector<std::pair<const Prog*, int>> replays;
+    void bindReplays(LowerResult& lw) {
+        std::map<std::string, const ReplayCtl*> byModel;   // instances a -model command covers
+        for (auto& rc : m.replayCtls)
+            if (!rc.sel.model.empty())
+                for (auto& i : instancesOf(rc.sel.model)) byModel.emplace(i, &rc);
+        for (auto& rc : m.replayCtls)
+            if (rc.sel.model.empty())
+                for (auto& e : rc.sel.elements) {
+                    auto it = byModel.find(m.design(e));
+                    if (it != byModel.end())
+                        throw Error(rc.where + ": sim_replay_control: " + m.design(e) + " is already covered by sim_replay_control -model " +
+                                    it->second->sel.model + " (" + it->second->where + ", 6.60)");
+                }
+        for (auto& lp : lw.procs) {
+            if (lp.kind != "Initial") continue;
+            for (auto& rc : m.replayCtls) {
+                if (!selected(rc.sel, lp.scope, true)) continue;
+                int d = -1;
+                if (!rc.ctlDomain.empty()) d = domIdx.at(rc.ctlDomain);
+                else if (const SupplyConn* sc = explicitConn(lp.scope)) d = regionOf(sc->set);
+                else if (std::string dn = dm.of(lp.scope); !dn.empty()) d = domIdx.at(dn);
+                if (d < 0) continue;
+                replays.push_back({&lp.prog, d});
+                note("sim_replay_control: an initial block of " + lp.scope + " replays when " + doms[(size_t)d].name + " powers up");
+                break;
+            }
+        }
+    }
+    void applyAsserts() {
+        for (auto& x : asrtCtls) {
+            if (x.dead) continue;
+            bool act = x.dom >= 0 ? g_pdMode[(size_t)x.dom] != SS_NORMAL
+                                  : truthOf(evalEx(x.r->ctlExpr, ctx(x.r->sel.scope, nullptr), "sim_assertion_control -control_expr")) == 1;
+            if (act == x.active) continue;
+            x.active = act;
+            AssertInfo& a = asserts()[(size_t)x.id];
+            const std::string& t = x.r->type;
+            if (act) {
+                a.on = false;
+                if (t != "suspend") a.killGen++;   // reset and kill end the attempts in progress
+                if (t == "kill") x.dead = true;
+            } else a.on = true;
+            note("assertion " + designOf(a.name) + (act ? (t == "kill" ? " killed" : t == "reset" ? " reset and suspended" : " suspended")
+                                                        : " enabled again"));
+        }
+    }
+
+    // Logic ports and nets made by UPF and their connections (6.13, 6.19,
+    // 6.20): each connection is one more continuous assignment, from the
+    // source side to the sink side. A connection to a port of a descendant
+    // instance is a port connection like those of the HDL, so the interface
+    // cell strategies see it (4.5.5).
+    void bindLogic(LowerResult& lw) {
+        auto make1 = [&](const std::string& upfName) {
+            std::string dn = m.design(upfName);
+            auto it = sigByName.find(dn);
+            if (it != sigByName.end()) return it->second;
+            int s = S.sig(dn, 1);
+            sigByName.emplace(dn, s);
+            return s;
+        };
+        for (auto& n : m.logicNets) make1(n);
+        for (auto& [n, d] : m.logicPorts) make1(n);
+        std::string top = S.vcdTop;
+        for (auto& lc : m.logicConns) {
+            int net = sigOf(lc.net);
+            if (net < 0)
+                throw Error(lc.where + ": connect_logic_net: no logic net '" + m.design(lc.net) + "' in the design or made by create_logic_net (6.13 a)");
+            std::string dn = m.design(lc.port);
+            int port = sigOf(lc.port);
+            if (port < 0)
+                throw Error(lc.where + ": connect_logic_net: no port '" + dn + "' in the design or made by create_logic_port");
+            int dir = -1;
+            auto lp = m.logicPorts.find(lc.port);
+            if (lp != m.logicPorts.end()) dir = lp->second == "in" ? 0 : lp->second == "out" ? 1 : 2;
+            else {
+                auto pr = portRecs().find(top.empty() ? dn : top + "." + dn);
+                if (pr == portRecs().end())
+                    throw Error(lc.where + ": connect_logic_net: '" + dn + "' is not a port (6.13)");
+                dir = pr->second.dir;
+            }
+            if (S.sigs[(size_t)port].w != 1 || S.sigs[(size_t)net].w != 1)
+                throw Error(lc.where + ": connect_logic_net: " + dn + " and " + m.design(lc.net) + " must both be one bit of logic (6.13)");
+            if (dir == 2) throw Error(lc.where + ": connect_logic_net: inout port " + dn + " is not supported");
+            // the port is on the interface of the net's scope (LowConn) or
+            // on an instance below it (HighConn)
+            size_t sl = lc.port.rfind('/');
+            std::string owner = sl == std::string::npos ? "" : lc.port.substr(0, sl);
+            bool low = owner == lc.scope;
+            // LowConn of an input and HighConn of an output are sources (6.20)
+            bool portDrives = low ? dir == 0 : dir == 1;
+            if (!low) {
+                // what the HDL already connects to the HighConn
+                for (auto& old : lw.procs) {
+                    if (old.port != dn) continue;
+                    bool same = false, constant = true;
+                    for (auto& in : old.prog.code) {
+                        if (in.k == IK::WaitEdge) {
+                            constant = false;
+                            if (in.events.size() <= 1 ? in.sig == net : false) same = true;
+                        }
+                        if (in.k == IK::Assign && in.sig == net) same = true;
+                    }
+                    if (same) continue;
+                    if (dir == 0 && constant) {
+                        if (!lc.reconnect)
+                            throw Error(lc.where + ": connect_logic_net: input port " + dn + " is driven by a constant; use -reconnect (6.13 c)");
+                        old.prog.code.clear();
+                        old.port.clear();
+                        old.kind = "upf_wire";
+                        continue;
+                    }
+                    throw Error(lc.where + ": connect_logic_net: port " + dn + " is already connected to another net (6.13 b)");
+                }
+            }
+            int src = portDrives ? port : net, dst = portDrives ? net : port;
+            LoweredProc np;
+            Instr a; a.k = IK::Assign; a.sig = dst; a.e = ref(src);
+            np.prog.emit(a);
+            np.prog.emit(waitInstr({{src, ANY}}));
+            Instr j; j.k = IK::Jmp; j.target = 0;
+            np.prog.emit(j);
+            np.loops = true;
+            np.kind = low ? "upf_wire" : "assign";
+            np.scope = m.design(lc.scope);
+            if (!low) { np.port = dn; np.portDir = dir; }
+            lw.procs.push_back(std::move(np));
+            note("logic net " + m.design(lc.net) + (portDrives ? " <- " : " -> ") + dn);
+        }
+    }
 
     // ------------------------------------------- HDL ports on supply nets
     // connect_supply_net to a port of the design that is not a UPF supply
@@ -332,26 +753,230 @@ struct Rt {
     // net's state into the port's value (upf2hdl, the net drives the port).
     // Without -vct an output port drives the net through SV_LOGIC2UPF and
     // an input port is driven through UPF2SV_LOGIC (Annex B).
+    // With -vcm (6.14, 6.30) a VCM converts other HDL types too: real,
+    // integer, enum and multi-bit ports by table, the VCM picked out of a
+    // list by the port's type and direction (4.10.2). A port of the package
+    // type upfSupplyTypeT (supply_net_type) connects without conversion
+    // (4.10.1).
     struct HdlPort {
         int sig = -1;
         std::string net, port;
         const Vct* vct = nullptr;
-        int last = -1;   // upf2hdl: the value held on the port
+        const Vcm* vcm = nullptr;    // a table VCM of type r, i or e
+        bool supply = false;         // a upfSupplyTypeT port
+        bool hdl2upf = true;
+        char cat = 'b';
+        bool sgn = false;
+        int w = 1;
+        std::map<int64_t, std::string> labelOf;   // enum value -> name
+        std::map<std::string, int64_t> valueOf;   // enum name -> value
+        int last = -1;               // upf2hdl through a Vct: the value held on the port
+        Val lastVal;
+        bool held = false;
+        double lastV = 0;            // hdl2upf: the voltage last driven (rows without a voltage keep it)
+        bool hasV = false;
+        bool warned = false;
+        int copyFrom = -1, target = -1;   // a function or model VCM (upf2hdl): its result, held on the port
+        Val lastCopy;
+        bool copied = false;
     };
     std::vector<HdlPort> hdlPorts;
+    // Supply ports found by their pg_type (UPF_pg_type, 6.51): the
+    // connections of connect_supply_net -pg_type (6.14), of
+    // connect_supply_set -connect (6.15), and the automatic ones of each
+    // domain's primary supply set (4.5.4.6.2), in that order of precedence;
+    // a port already connected keeps its connection.
+    void expandPgConnects() {
+        std::set<std::string> taken;
+        for (auto& [net, ps] : m.connects) taken.insert(ps.begin(), ps.end());
+        std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+        std::string topPre = m.top.empty() ? "" : m.top + ".";
+        struct Inst { std::string design, upf, model; };
+        std::vector<Inst> insts;
+        for (auto& [full, mod] : instCells()) {
+            if (!pre.empty() && full.compare(0, pre.size(), pre) != 0) continue;
+            std::string d = full.substr(pre.size());
+            if (!topPre.empty() && d.compare(0, topPre.size(), topPre) != 0) continue;
+            std::string u = d.substr(topPre.size());
+            for (char& c : u) if (c == '.') c = '/';
+            insts.push_back({d, u, mod});
+        }
+        auto under = [](const std::string& u, const std::string& scope) {
+            return scope.empty() || u == scope || (u.size() > scope.size() && u.compare(0, scope.size(), scope) == 0 && u[scope.size()] == '/');
+        };
+        // the ports of an instance with a pg_type in `types`
+        auto pgPorts = [&](const Inst& in, const std::vector<std::string>& types, std::vector<std::pair<std::string, std::string>>& out) {
+            std::string full = pre + in.design + ".";
+            for (auto it = portRecs().lower_bound(full); it != portRecs().end() && it->first.compare(0, full.size(), full) == 0; ++it) {
+                std::string port = it->first.substr(full.size());
+                if (port.find('.') != std::string::npos) continue;
+                std::string pg = m.portAttr(in.design, in.model, port, it->second.dir, "UPF_pg_type");
+                if (!pg.empty() && std::find(types.begin(), types.end(), pg) != types.end()) out.push_back({in.upf + "/" + port, pg});
+            }
+        };
+        auto add = [&](const std::string& net, const std::string& port, const Vcm* vcm, const std::string& where, const std::string& how) {
+            if (!taken.insert(port).second) return;
+            m.connects[net].push_back(port);
+            if (vcm) m.connectVcm[{net, port}] = vcm;
+            m.connectWhere[{net, port}] = where;
+            note("supply " + net + " connected to " + m.design(port) + " (" + how + ")");
+        };
+        for (auto& pc : m.pgConnects) {   // 6.14
+            std::string base = pc.domain.empty() ? pc.scope : m.domains.at(pc.domain).scope;
+            int hits = 0;
+            for (auto& in : insts) {
+                if (!under(in.upf, base) || in.upf == base) continue;
+                if (!pc.domain.empty() && dm.of(in.design) != pc.domain) continue;
+                if (!pc.cells.empty() && std::find(pc.cells.begin(), pc.cells.end(), in.model) == pc.cells.end()) continue;
+                if (!pc.elements.empty() && std::find(pc.elements.begin(), pc.elements.end(), in.upf) == pc.elements.end()) continue;
+                std::vector<std::pair<std::string, std::string>> ps;
+                pgPorts(in, pc.pgTypes, ps);
+                for (auto& [port, pg] : ps) { add(pc.net, port, pc.vcm, pc.where, "-pg_type " + pg); hits++; }
+            }
+            for (auto& c : pc.cells)
+                if (std::none_of(insts.begin(), insts.end(), [&](const Inst& in) { return in.model == c; }))
+                    throw Error(pc.where + ": connect_supply_net -cells: no instance of " + c + " in the design (6.14)");
+            for (auto& e : pc.elements)
+                if (std::none_of(insts.begin(), insts.end(), [&](const Inst& in) { return in.upf == e; }))
+                    throw Error(pc.where + ": connect_supply_net -elements: no instance " + m.design(e) + " in the design (6.14)");
+            if (!hits) std::cerr << "msim: UPF: " << pc.where << ": connect_supply_net " << pc.net << " -pg_type: no port with that pg_type\n";
+        }
+        // the supply net of a supply set function
+        auto fnNet = [&](const std::string& set, const std::string& fn) -> std::string {
+            auto it = m.sets.find(m.setOf(set));
+            if (it == m.sets.end()) return "";
+            auto f = it->second.fn.find(fn);
+            return f == it->second.fn.end() ? "" : f->second;
+        };
+        for (auto& sc : m.supplyConns) {   // 6.15 -connect
+            if (sc.connect.empty()) continue;
+            for (auto& in : insts) {
+                bool hit = false;
+                for (auto& e : sc.elements)
+                    if (in.upf == e || (sc.transitive && under(in.upf, e))) hit = true;
+                for (auto& e : sc.exclude)
+                    if (in.upf == e || under(in.upf, e)) hit = false;
+                if (!hit) continue;
+                for (auto& [fn, pg] : sc.connect) {
+                    std::string net = fnNet(sc.set, fn);
+                    if (net.empty()) throw Error(sc.where + ": connect_supply_set " + sc.set + " -connect: the set has no " + fn + " function (6.15)");
+                    std::vector<std::pair<std::string, std::string>> ps;
+                    pgPorts(in, {pg}, ps);
+                    for (auto& pp : ps) add(net, pp.first, nullptr, sc.where, "connect_supply_set " + sc.set + "." + fn);
+                }
+            }
+        }
+        // 4.5.4.6.2: each function of a domain's primary supply set to the
+        // ports of its default pg_type, on instances in the domain's extent
+        static const std::vector<std::pair<std::string, std::string>> dflt = {
+            {"power", "primary_power"}, {"ground", "primary_ground"}, {"pwell", "pwell"},
+            {"nwell", "nwell"}, {"deeppwell", "deeppwell"}, {"deepnwell", "deepnwell"}};
+        for (auto& in : insts) {
+            std::string dn = dm.of(in.design);
+            if (dn.empty()) continue;
+            auto d = m.domains.find(dn);
+            if (d == m.domains.end()) continue;
+            auto h = d->second.handles.find("primary");
+            if (h == d->second.handles.end()) continue;
+            for (auto& [fn, pg] : dflt) {
+                std::string net = fnNet(h->second, fn);
+                if (net.empty()) continue;
+                std::vector<std::pair<std::string, std::string>> ps;
+                pgPorts(in, {pg}, ps);
+                for (auto& pp : ps) add(net, pp.first, nullptr, d->second.where, "primary supply of " + dn);
+            }
+        }
+    }
+    // Function and model VCMs (6.30.8, 6.30.9) placed in the design before
+    // it is elaborated again: the instance that runs the conversion.
+    struct VcmBind {
+        const Vcm* vcm = nullptr;
+        bool hdl2upf = true;
+        std::string inst;   // under the simulation top
+    };
+    std::map<std::pair<std::string, std::string>, VcmBind> vcmBinds;
+    // What an HDL port is, for choosing a VCM: its category, type name, enum values.
+    struct PortType {
+        char cat = 'x';              // b one bit, r real, i integer or vector, e enum, s upfSupplyTypeT
+        std::string name, keyword;   // the type's own name (an alias or enum), the predefined keyword
+        bool sgn = false;
+        std::map<int64_t, std::string> labels;
+    };
+    static std::string stateName(int st) {
+        return st == S_OFF ? "OFF" : st == S_FULL_ON ? "FULL_ON" : st == S_PARTIAL_ON ? "PARTIAL_ON" : "UNDETERMINED";
+    }
+    static PortType portTypeOf(const slang::ast::Symbol* sym) {
+        using namespace slang::ast;
+        PortType pt;
+        if (!sym || !ValueSymbol::isKind(sym->kind)) return pt;
+        const Type& t = sym->as<ValueSymbol>().getType();
+        const Type& ct = t.getCanonicalType();
+        if (t.isAlias()) pt.name = std::string(t.name);
+        if (ct.kind == SymbolKind::PackedStructType) {
+            std::set<std::string> f;
+            for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>()) f.insert(std::string(fs.name));
+            if (f == std::set<std::string>{"state", "voltage"}) pt.cat = 's';
+            return pt;
+        }
+        if (ct.isFloating()) { pt.cat = 'r'; pt.keyword = ct.toString(); return pt; }
+        if (ct.isEnum()) {
+            pt.cat = 'e';
+            if (pt.name.empty()) pt.name = std::string(ct.name);
+            for (auto& ev : ct.as<EnumType>().values()) {
+                auto cv = ev.getValue();
+                if (cv.isInteger()) {
+                    auto iv = cv.integer().as<int64_t>();
+                    if (iv) pt.labels[*iv] = std::string(ev.name);
+                }
+            }
+            return pt;
+        }
+        if (ct.isIntegral()) {
+            pt.sgn = ct.isSigned();
+            if (ct.kind == SymbolKind::PredefinedIntegerType) { pt.cat = 'i'; pt.keyword = ct.toString(); }
+            else pt.cat = ct.getBitWidth() == 1 ? 'b' : 'i';
+        }
+        return pt;
+    }
+    // Whether a table VCM converts this port's type (6.14).
+    static bool vcmFits(const Vcm& v, const PortType& pt) {
+        if (v.lang != "sv") return false;
+        if (v.cat != pt.cat) return false;
+        static const std::set<std::string> builtin = {"bit", "logic", "reg", "real", "shortreal", "realtime", "int", "integer",
+                                                      "shortint", "longint", "byte"};
+        std::string ty = v.hdlType;
+        for (char& c : ty) c = (char)std::tolower((unsigned char)c);
+        if (!builtin.count(ty)) {   // a user type: by its name, with or without the package
+            std::string last = v.hdlType.substr(v.hdlType.rfind(':') == std::string::npos ? 0 : v.hdlType.rfind(':') + 1);
+            return last == pt.name;
+        }
+        if (pt.cat == 'i' && !pt.keyword.empty()) return ty == pt.keyword;
+        if (pt.cat == 'i') return ty == "integer" || ty == "int" || ty == "longint";   // a vector
+        return true;
+    }
     void bindHdlPorts(LowerResult& lw) {
         std::map<std::string, int> dirOf;   // instance port (simulator name) -> 0 input, 1 output, 2 inout
         for (auto& lp : lw.procs)
             if (!lp.port.empty()) dirOf[lp.port] = lp.portDir;
+        std::map<int, const slang::ast::Symbol*> symOf;
+        auto typeOf = [&](int s) {
+            if (symOf.empty())
+                for (auto& [sym, sid] : lw.sigOf)
+                    if (sym && slang::ast::ValueSymbol::isKind(sym->kind)) symOf.emplace(sid, sym);
+            auto it = symOf.find(s);
+            return portTypeOf(it == symOf.end() ? nullptr : it->second);
+        };
         for (auto& [net, ps] : m.connects)
             for (auto& p : ps) {
                 if (isSupply(p)) continue;
                 auto key = std::make_pair(net, p);
                 std::string where = m.connectWhere.count(key) ? m.connectWhere.at(key) : "";
                 auto named = m.connectVct.find(key);
+                auto nvcm = m.connectVcm.find(key);
+                bool explicitConv = named != m.connectVct.end() || nvcm != m.connectVcm.end();
                 int s = sigOf(p);
                 if (s < 0) {
-                    if (named != m.connectVct.end())
+                    if (explicitConv)
                         throw Error(where + ": connect_supply_net " + net + ": no port '" + m.design(p) + "' in the design");
                     continue;
                 }
@@ -359,8 +984,75 @@ struct Rt {
                 h.sig = s;
                 h.net = net;
                 h.port = p;
+                h.w = S.sigs[(size_t)s].w;
                 auto d = dirOf.find(S.sigs[(size_t)s].name);
                 int dir = d == dirOf.end() ? -1 : d->second;
+                PortType pt = typeOf(s);
+                auto fail = [&](const std::string& msg) { throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) + msg); };
+                if (pt.cat == 's') {   // upfSupplyTypeT: no conversion; -vct and -vcm do not apply (6.14)
+                    if (dir != 0 && dir != 1) fail(" is a upfSupplyTypeT port that is neither an input nor an output");
+                    h.supply = true;
+                    h.hdl2upf = dir == 1;
+                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " (upfSupplyTypeT)");
+                    hdlPorts.push_back(h);
+                    continue;
+                }
+                if (auto vb = vcmBinds.find(key); vb != vcmBinds.end()) {   // a function or model VCM
+                    auto sigNamed = [&](const std::string& n) {
+                        auto it = sigByName.find(n);
+                        if (it == sigByName.end()) fail(": VCM " + vb->second.vcm->name + ": no signal " + n);
+                        return it->second;
+                    };
+                    h.supply = true;
+                    h.hdl2upf = vb->second.hdl2upf;
+                    if (h.hdl2upf) h.sig = sigNamed(vb->second.inst + ".upf_vcm_out");
+                    else {
+                        h.sig = sigNamed(vb->second.inst + ".upf_vcm_in");
+                        h.copyFrom = sigNamed(vb->second.inst + ".upf_vcm_val");
+                        h.target = s;
+                    }
+                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " through " +
+                         vb->second.vcm->name + " (" + vb->second.inst + ")");
+                    hdlPorts.push_back(h);
+                    continue;
+                }
+                if (nvcm != m.connectVcm.end()) {
+                    std::vector<const Vcm*> all, fit;
+                    nvcm->second->flatten(all);
+                    for (auto* v : all) {
+                        if (v->kind == Vcm::Function || v->kind == Vcm::Model) continue;   // none fit this port (vcmSource)
+                        bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
+                        if (!dirOk) continue;
+                        bool typeOk = v->cat == 'b' ? (pt.cat == 'b' && (v->lang == "sv" || v->bits.lang == "sv")) : vcmFits(*v, pt);
+                        if (typeOk) fit.push_back(v);
+                    }
+                    std::string tn = pt.cat == 'b' ? "a one-bit port" : pt.cat == 'r' ? "a real port" : pt.cat == 'e' ? "an enum port (" + pt.name + ")"
+                                   : pt.cat == 'i' ? "an integer port" : "a port of a type no VCM converts";
+                    std::string dn = dir == 0 ? "input" : dir == 1 ? "output" : "inout";
+                    if (fit.empty())
+                        fail(" is " + tn + " (" + dn + "), and VCM " + nvcm->second->name + " has no " +
+                             (dir == 0 ? "upf2hdl " : dir == 1 ? "hdl2upf " : "") + "conversion for it (6.14, 4.10.2)");
+                    if (fit.size() > 1)
+                        fail(" is " + tn + " (" + dn + "), and VCMs " + fit[0]->name + " and " + fit[1]->name + " both fit it" +
+                             (dir == 2 ? "; a list for an inout port holds one direction per type (4.10.2)" : " (6.14)"));
+                    const Vcm* v = fit[0];
+                    if (!v->field.empty()) fail(": VCM " + v->name + " converts field " + v->field + " of a struct; msim does not convert struct fields yet");
+                    h.hdl2upf = v->hdl2upf;
+                    if (v->cat == 'b') h.vct = &v->bits;
+                    else {
+                        h.vcm = v;
+                        h.cat = pt.cat;
+                        h.sgn = pt.sgn;
+                        for (auto& [val, nm] : pt.labels) { h.labelOf[val] = nm; h.valueOf[nm] = val; }
+                        if (pt.cat == 'e')
+                            for (auto& r : v->rows)
+                                if (r.h == Vcm::Row::Label && !h.valueOf.count(r.label))
+                                    fail(": VCM " + v->name + " names " + r.label + ", which is not a value of " + pt.name + " (6.30.6)");
+                    }
+                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " through " + v->name);
+                    hdlPorts.push_back(h);
+                    continue;
+                }
                 if (named != m.connectVct.end()) {
                     h.vct = m.vct(named->second);
                     if ((dir == 0 && h.vct->hdl2upf) || (dir == 1 && !h.vct->hdl2upf))
@@ -368,11 +1060,14 @@ struct Rt {
                                     (dir == 0 ? "input" : "output") + " port, but " + h.vct->name + " converts " +
                                     (h.vct->hdl2upf ? "an HDL value to a supply state" : "a supply state to an HDL value"));
                 } else if (dir == 0 || dir == 1) {
+                    if (pt.cat != 'b' && pt.cat != 'x')
+                        fail(" is not a one-bit port; connect it with -vcm and a VCM for its type (6.14, 9.1)");
                     h.vct = m.vct(dir == 1 ? "SV_LOGIC2UPF" : "UPF2SV_LOGIC");
                 } else {
                     throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) +
                                 " is not an input or output port of an instance; name a value conversion table with -vct");
                 }
+                h.hdl2upf = h.vct->hdl2upf;
                 if (S.sigs[(size_t)s].w != 1)
                     throw Error(where + ": connect_supply_net " + net + ": " + m.design(p) + " is " +
                                 std::to_string(S.sigs[(size_t)s].w) + " bits wide; a value conversion table converts one bit");
@@ -382,7 +1077,7 @@ struct Rt {
             }
         std::map<std::string, std::string> drivers;
         for (auto& h : hdlPorts) {
-            if (!h.vct->hdl2upf) continue;
+            if (!h.hdl2upf) continue;
             std::string r = root(h.net);
             if (swOf.count(r))
                 throw Error("supply net " + h.net + " is driven by the HDL port " + m.design(h.port) + " and by the power switch " +
@@ -391,23 +1086,247 @@ struct Rt {
                 throw Error("supply net " + h.net + " is driven by two HDL ports (" + m.design(drivers[r]) + ", " + m.design(h.port) + ")");
         }
     }
+    // A function or model VCM's result, held on its port (upf2hdl).
+    void copyVcmResults() {
+        for (auto& h : hdlPorts) {
+            if (h.copyFrom < 0) continue;
+            Val v = S.get(h.copyFrom);
+            if (h.copied && v == h.lastCopy) continue;
+            h.copied = true;
+            h.lastCopy = v;
+            S.holdOn(h.target, konst(v), true);
+        }
+    }
+    static bool supplyType(const slang::ast::Type& t) {
+        using namespace slang::ast;
+        const Type& ct = t.getCanonicalType();
+        if (ct.kind != SymbolKind::PackedStructType) return false;
+        std::set<std::string> f;
+        for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>()) f.insert(std::string(fs.name));
+        return f == std::set<std::string>{"state", "voltage"};
+    }
+    // SystemVerilog for the function and model VCMs of connect_supply_net
+    // -vcm (6.30.8, 6.30.9): one module per connection, bound into the
+    // simulation top, that calls the function or instantiates the model on
+    // the port (a hierarchical reference) and a upfSupplyTypeT variable the
+    // runtime reads or writes. Table VCMs need none. simTop is the
+    // simulation's top instance; comp is the design elaborated without them.
+    std::string vcmSource(slang::ast::Compilation& comp, const std::string& simTop) {
+        using namespace slang::ast;
+        std::string out;
+        int k = 0;
+        for (auto& [key, vcm] : m.connectVcm) {
+            std::vector<const Vcm*> all;
+            vcm->flatten(all);
+            if (std::none_of(all.begin(), all.end(), [](const Vcm* v) { return v->kind == Vcm::Function || v->kind == Vcm::Model; }))
+                continue;
+            const std::string& p = key.second;
+            std::string where = m.connectWhere.count(key) ? m.connectWhere.at(key) : "";
+            std::string full = simTop + "." + m.design(p);
+            auto fail = [&](const std::string& msg) -> void { throw Error(where + ": connect_supply_net " + key.first + ": " + msg); };
+            // walk the instance tree: the instance, then the port's own variable or net
+            size_t dot = full.rfind('.');
+            const Symbol* instSym = nullptr;
+            {
+                std::vector<std::string> parts;
+                for (size_t a = 0, b2; a <= dot; a = b2 + 1) {
+                    b2 = full.find('.', a);
+                    if (b2 == std::string::npos || b2 > dot) b2 = dot;
+                    parts.push_back(full.substr(a, b2 - a));
+                    if (b2 == dot) break;
+                }
+                for (auto* t : comp.getRoot().topInstances)
+                    if (!parts.empty() && t->name == parts[0]) instSym = t;
+                for (size_t i = 1; instSym && i < parts.size(); i++) {
+                    const Symbol* c2 = instSym->as<InstanceSymbol>().body.find(parts[i]);
+                    instSym = c2 && c2->kind == SymbolKind::Instance ? c2 : nullptr;
+                }
+            }
+            const Symbol* sym = instSym ? instSym->as<InstanceSymbol>().body.find(full.substr(dot + 1)) : nullptr;
+            if (!sym || !instSym || instSym->kind != SymbolKind::Instance) fail("no port '" + m.design(p) + "' in the design");
+            const Symbol* ps = instSym->as<InstanceSymbol>().body.findPort(full.substr(dot + 1));
+            if (!ps || ps->kind != SymbolKind::Port) fail(m.design(p) + " is not a port");
+            ArgumentDirection pd = ps->as<PortSymbol>().direction;
+            int dir = pd == ArgumentDirection::In ? 0 : pd == ArgumentDirection::Out ? 1 : 2;
+            if (!ValueSymbol::isKind(sym->kind)) fail(m.design(p) + " is not a variable or net");
+            const Type& pt = sym->as<ValueSymbol>().getType();
+            PortType ptc = portTypeOf(sym);
+            if (ptc.cat == 's') continue;   // no conversion (6.14)
+            struct Fit { const Vcm* v; bool h2u; std::string inPort, outPort; };
+            std::vector<Fit> fits;
+            for (const Vcm* v : all) {
+                bool h2u = false;
+                std::string inP, outP;
+                if (v->kind == Vcm::Table) {
+                    bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
+                    bool typeOk = v->cat == 'b' ? ptc.cat == 'b' : vcmFits(*v, ptc);
+                    if (dirOk && typeOk) fits.push_back({v, v->hdl2upf, "", ""});
+                    continue;
+                }
+                if (v->kind == Vcm::Function) {   // 6.30.8
+                    std::string pkg = v->function.substr(0, v->function.find("::")), fn = v->function.substr(v->function.find("::") + 2);
+                    const PackageSymbol* pk = comp.getPackage(pkg);
+                    if (!pk) fail("VCM " + v->name + ": no package " + pkg + " for -function " + v->function + " (6.30.8)");
+                    const Symbol* f = pk->find(fn);
+                    if (!f || f->kind != SymbolKind::Subroutine) fail("VCM " + v->name + ": no function " + v->function + " (6.30.8)");
+                    auto& sub = f->as<SubroutineSymbol>();
+                    auto args = sub.getArguments();
+                    if (args.size() != 1 || args[0]->direction != ArgumentDirection::In)
+                        fail("VCM " + v->name + ": " + v->function + " needs exactly one input argument (6.30.8)");
+                    bool argS = supplyType(args[0]->getType()), retS = supplyType(sub.getReturnType());
+                    if (argS == retS)
+                        fail("VCM " + v->name + ": exactly one of the argument and the return type of " + v->function +
+                             " is upfSupplyTypeT (6.30.8)");
+                    h2u = retS;
+                    const Type& hdlT = h2u ? args[0]->getType() : sub.getReturnType();
+                    if (!hdlT.isMatching(pt) && !hdlT.isEquivalent(pt)) continue;
+                } else {   // 6.30.9
+                    std::string mod = v->model.substr(v->model.rfind('.') == std::string::npos ? 0 : v->model.rfind('.') + 1);
+                    auto def = comp.tryGetDefinition(mod, comp.getRoot());
+                    if (!def.definition || def.definition->kind != SymbolKind::Definition)
+                        fail("VCM " + v->name + ": no module " + v->model + " for -model (6.30.9)");
+                    auto& inst = InstanceSymbol::createDefault(comp, def.definition->as<DefinitionSymbol>());
+                    std::vector<const PortSymbol*> ins, outs;
+                    for (const Symbol* q : inst.body.getPortList()) {
+                        if (q->kind != SymbolKind::Port) fail("VCM " + v->name + ": " + v->model + " has a port that is not a plain port (6.30.9)");
+                        auto& qp = q->as<PortSymbol>();
+                        if (qp.direction == ArgumentDirection::In) ins.push_back(&qp);
+                        else if (qp.direction == ArgumentDirection::Out) outs.push_back(&qp);
+                        else fail("VCM " + v->name + ": " + v->model + " has an inout port; bidirectional model VCMs are not supported (6.30.9)");
+                    }
+                    if (ins.size() != 1 || outs.size() != 1)
+                        fail("VCM " + v->name + ": " + v->model + " needs one input and one output port (6.30.9)");
+                    bool inS = supplyType(ins[0]->getType()), outS = supplyType(outs[0]->getType());
+                    if (inS == outS)
+                        fail("VCM " + v->name + ": exactly one port of " + v->model + " is upfSupplyTypeT (6.30.9)");
+                    h2u = outS;
+                    const Type& hdlT = h2u ? ins[0]->getType() : outs[0]->getType();
+                    if (!hdlT.isMatching(pt) && !hdlT.isEquivalent(pt)) continue;
+                    inP = std::string(ins[0]->name);
+                    outP = std::string(outs[0]->name);
+                }
+                bool dirOk = dir == 2 || (dir == 0 && !h2u) || (dir == 1 && h2u);
+                if (dirOk) fits.push_back({v, h2u, inP, outP});
+            }
+            if (fits.size() > 1)
+                fail(m.design(p) + ": VCMs " + fits[0].v->name + " and " + fits[1].v->name + " both fit it (6.14)");
+            if (fits.empty() || fits[0].v->kind == Vcm::Table) continue;   // bindHdlPorts reports it, or converts by table
+            const Fit& f = fits[0];
+            std::string modName = "upf_vcm_mod_" + std::to_string(k), inst = "upf_vcm_" + std::to_string(k);
+            k++;
+            std::string body;
+            if (f.v->kind == Vcm::Function) {
+                if (f.h2u) body = "  UPF::upfSupplyTypeT upf_vcm_out;\n  assign upf_vcm_out = " + f.v->function + "(" + full + ");\n";
+                else
+                    body = "  UPF::upfSupplyTypeT upf_vcm_in = '0;\n  var type(" + f.v->function + "(upf_vcm_in)) upf_vcm_val;\n" +
+                           "  assign upf_vcm_val = " + f.v->function + "(upf_vcm_in);\n";
+            } else {
+                std::string mod = f.v->model.substr(f.v->model.rfind('.') == std::string::npos ? 0 : f.v->model.rfind('.') + 1);
+                std::string params;
+                for (size_t i = 0; i < f.v->params.size(); i++) {
+                    static const std::regex num(R"(^[-+]?([0-9][0-9_]*(\.[0-9_]+)?([eE][-+]?[0-9]+)?)?('[sS]?[bBoOdDhH]?[0-9a-fA-FxXzZ_?]+)?$)");
+                    std::string val = f.v->params[i].second;
+                    if (val.empty() || !std::regex_match(val, num)) val = "\"" + val + "\"";
+                    params += std::string(i ? ", ." : ".") + f.v->params[i].first + "(" + val + ")";
+                }
+                std::string inst2 = mod + (params.empty() ? "" : " #(" + params + ")") + " u_model(";
+                if (f.h2u) body = "  UPF::upfSupplyTypeT upf_vcm_out;\n  " + inst2 + "." + f.inPort + "(" + full + "), ." + f.outPort + "(upf_vcm_out));\n";
+                else
+                    body = "  UPF::upfSupplyTypeT upf_vcm_in = '0;\n  " + pt.toString() + " upf_vcm_val;\n  " + inst2 + "." + f.inPort +
+                           "(upf_vcm_in), ." + f.outPort + "(upf_vcm_val));\n";
+            }
+            out += "// connect_supply_net " + key.first + " -ports " + p + " -vcm " + f.v->name + " (IEEE 1801-2024 6.30)\nmodule " + modName +
+                   ";\n" + body + "endmodule\nbind " + simTop + " " + modName + " " + inst + "();\n";
+            vcmBinds[key] = {f.v, f.h2u, inst};
+        }
+        return out;
+    }
     // The HDL ports that drive supply nets: their value is the root supply.
     void readHdlPorts() {
         for (auto& h : hdlPorts) {
-            if (!h.vct->hdl2upf) continue;
+            if (!h.hdl2upf) continue;
             Val v = S.get(h.sig);
-            char c = (v.z & 1) ? 'Z' : (v.x & 1) ? 'X' : (v.v & 1) ? '1' : '0';
             SupplyVal sv;
-            sv.st = h.vct->toUpf(c);
+            if (h.supply) {   // {state, voltage in microvolts}, state in the upper word
+                if (v.x) sv.st = S_UNDETERMINED;
+                else {
+                    uint64_t st = (v.v >> 32) & 0xffffffffu;
+                    sv.st = st <= 3 ? (int)st : S_UNDETERMINED;
+                    sv.v = (double)(int32_t)(uint32_t)(v.v & 0xffffffffu) / 1e6;
+                    sv.hasV = true;
+                }
+            } else if (h.vcm) {
+                uint64_t mask = h.w >= 64 ? ~0ull : ((1ull << h.w) - 1);
+                bool unknown = (v.x & mask) != 0;
+                double x = 0;
+                std::string label;
+                if (h.cat == 'r') {
+                    x = Vcm::bitsReal(v.v);
+                    if (v.v == Vcm::XrealBits || v.v == Vcm::ZrealBits) unknown = true;
+                } else {
+                    uint64_t u = v.v & mask;
+                    int64_t iv = (int64_t)u;
+                    if (h.sgn && h.w < 64 && (u >> (h.w - 1)) & 1) iv = (int64_t)(u | ~mask);
+                    x = (double)iv;
+                    if (h.cat == 'e') {
+                        auto it = h.labelOf.find(iv);
+                        if (it != h.labelOf.end()) label = it->second;
+                        else unknown = true;
+                    }
+                }
+                int st;
+                bool setV;
+                double nv = 0;
+                h.vcm->toUpf(x, label, unknown, v.v, st, setV, nv);
+                sv.st = st;
+                if (setV) { h.lastV = nv; h.hasV = true; }
+                sv.v = h.lastV;
+                sv.hasV = h.hasV;
+            } else {
+                char c = (v.z & 1) ? 'Z' : (v.x & 1) ? 'X' : (v.v & 1) ? '1' : '0';
+                sv.st = h.vct->toUpf(c);
+            }
             drv[root(h.net)] = sv;
         }
     }
     // The HDL ports that supply nets drive: held at the converted value.
     void driveHdlPorts() {
         for (auto& h : hdlPorts) {
-            if (h.vct->hdl2upf) continue;
+            if (h.hdl2upf) continue;
             auto it = val.find(root(h.net));
-            char c = h.vct->toHdl(it == val.end() ? S_OFF : it->second.st);
+            SupplyVal sv = it == val.end() ? SupplyVal{} : it->second;
+            if (h.supply || h.vcm) {
+                Val out;
+                if (h.supply) {
+                    int64_t uv = (int64_t)std::llround(sv.v * 1e6);
+                    out = make(((uint64_t)sv.st << 32) | (uint32_t)uv, 0, 64, 0);
+                } else {
+                    const Vcm::Row* r = h.vcm->toHdl(sv.st, sv.v);
+                    if (!r) {   // 6.30.4 f
+                        if (!h.warned)
+                            error("supply net " + h.net + " is " + stateName(sv.st) + (sv.hasV ? " " + std::to_string(sv.v) : "") +
+                                  ", which VCM " + h.vcm->name + " has no row for (6.30.4)");
+                        h.warned = true;
+                        continue;
+                    }
+                    h.warned = false;
+                    uint64_t mask = h.w >= 64 ? ~0ull : ((1ull << h.w) - 1);
+                    switch (r->h) {
+                        case Vcm::Row::Pass: out = mkreal(sv.v); break;
+                        case Vcm::Row::XReal: out = mkreal(Vcm::bitsReal(Vcm::XrealBits)); break;
+                        case Vcm::Row::ZReal: out = mkreal(Vcm::bitsReal(Vcm::ZrealBits)); break;
+                        case Vcm::Row::Label: out = make((uint64_t)h.valueOf.at(r->label) & mask, 0, h.w, 0); break;
+                        default:
+                            out = h.cat == 'r' ? mkreal(r->num) : make((uint64_t)(int64_t)r->num & mask, 0, h.w, 0);
+                    }
+                }
+                if (h.held && out == h.lastVal) continue;
+                h.held = true;
+                h.lastVal = out;
+                S.holdOn(h.sig, konst(out), true);
+                continue;
+            }
+            char c = h.vct->toHdl(sv.st);
             if (c == h.last) continue;
             h.last = c;
             bool one = c == '1' || c == 'H', zero = c == '0' || c == 'L', z = c == 'Z';
@@ -420,6 +1339,11 @@ struct Rt {
     void bindCells(LowerResult& lw) {
         std::vector<PortSite> sites;
         std::vector<size_t> procOf;
+        std::set<std::string> hasLogic;   // instances with a process in or below them
+        for (auto& lp : lw.procs) {
+            if (!lp.port.empty() || lp.kind == "upf_wire") continue;
+            for (std::string sc = lp.scope; !sc.empty(); sc = parentOf(sc)) hasLogic.insert(sc);
+        }
         for (size_t i = 0; i < lw.procs.size(); i++) {
             auto& lp = lw.procs[i];
             if (lp.port.empty()) continue;
@@ -435,16 +1359,50 @@ struct Rt {
             const PortSite& p = sites[k];
             if (p.dir == 2) continue;
             std::string child = dm.of(p.inst), parent = dm.of(parentOf(p.inst));
-            if (child == parent) continue;
+            std::string model = modelOf(p.inst);
+            auto attr = [&](const char* name) { return m.portAttr(p.inst, model, p.port, p.dir, name); };
+            bool cross = child != parent && attr("UPF_is_analog") != "TRUE";   // analog ports take no strategy
             Crossing c{&p, p.dir == 1 ? child : parent, p.dir == 1 ? parent : child};
             std::vector<int> made;
+            // The driver of the port is not in the design (6.51): a primary
+            // input of the power top, or an output of an instance with no
+            // logic in it. The port is corrupted with UPF_driver_supply.
+            // PORT_CORR_ONLY (6.56): the outputs of a hard macro follow its supply.
+            {
+                std::string ds = attr("UPF_driver_supply");
+                bool empty = !hasLogic.count(p.inst);
+                std::string portSupply;
+                if (!ds.empty()) {
+                    if ((p.dir == 0 && p.inst == m.top) || (p.dir == 1 && empty)) portSupply = m.setOf(ds);
+                    else if (p.dir == 1) {
+                        std::string actual = supplySetOf(p.inst);
+                        if (!actual.empty() && m.eqOf(actual) != m.eqOf(ds))
+                            throw Error("set_port_attributes -driver_supply " + ds + " on " + p.inst + "." + p.port +
+                                        ": the logic that drives it is on " + actual + " (6.51)");
+                    }
+                }
+                auto [beh, at] = behaviorOf(p.inst);
+                if (portSupply.empty() && p.dir == 1 && beh == "PORT_CORR_ONLY" && at == p.inst) portSupply = supplySetOf(p.inst);
+                if (!portSupply.empty() && sets.count(portSupply)) {
+                    Cell cell;
+                    cell.kind = 2;
+                    cell.port = p.inst + "." + p.port;
+                    cell.supplies.push_back(portSupply);
+                    made.push_back((int)cells.size());
+                    cells.push_back(cell);
+                    note("port " + cell.port + " is corrupted with supply set " + portSupply);
+                }
+            }
             for (auto& is : m.isos) {
-                if (!isoApplies(m, is, c)) continue;
+                if (!cross || !isoApplies(m, is, c)) continue;
                 if (is.noIso) break;
                 Cell cell;
                 cell.kind = 0;
                 cell.iso = &is;
                 cell.port = p.inst + "." + p.port;
+                // the port's own clamp requirement, when the strategy gives none (6.51)
+                cell.clamp = is.clamp;
+                if (std::string pc = attr("UPF_clamp_value"); !is.clampSet && (pc == "0" || pc == "1" || pc == "Z" || pc == "latch")) cell.clamp = pc;
                 if (!is.supply.empty()) cell.supplies.push_back(m.setOf(is.supply));
                 for (size_t q = 0; q < is.signals.size(); q++) cell.senseLow.push_back(q < is.senseLow.size() ? is.senseLow[q] : 0);
                 if (is.signals.empty()) throw Error(is.where + ": isolation " + is.name + " has no -isolation_signal");
@@ -454,7 +1412,7 @@ struct Rt {
                 break;   // one strategy per port (5.7 precedence: the first that applies)
             }
             for (auto& l : m.lss) {
-                if (!lsApplies(m, l, c) || l.noShift) continue;
+                if (!cross || !lsApplies(m, l, c) || l.noShift) continue;
                 Cell cell;
                 cell.kind = 1;
                 cell.port = p.inst + "." + p.port;
@@ -464,6 +1422,19 @@ struct Rt {
                 if (!out.empty()) cell.supplies.push_back(out);
                 made.push_back((int)cells.size());
                 cells.push_back(cell);
+                break;
+            }
+            for (auto& rp : m.reps) {   // 9.10: the repeater's output follows its supply's simstate
+                if (!cross || !repApplies(m, rp, c)) continue;
+                Cell cell;
+                cell.kind = 2;
+                cell.port = p.inst + "." + p.port;
+                std::string sn = m.domains.count(rp.supply) ? m.primaryOf(rp.supply) : m.setOf(rp.supply);
+                if (!sets.count(sn)) throw Error(rp.where + ": repeater " + rp.name + ": no supply set '" + rp.supply + "'");
+                cell.supplies.push_back(sn);
+                made.push_back((int)cells.size());
+                cells.push_back(cell);
+                note("repeater " + rp.name + " on " + cell.port);
                 break;
             }
             if (made.empty()) continue;
@@ -745,6 +1716,7 @@ struct Rt {
                 else if (st == "OFF") sim = offDef && offDef->simstate != SS_NONE ? offDef->simstate : SS_CORRUPT;
                 else sim = r.known ? r.sim : SS_CORRUPT;
             }
+            if (st != r.state || !r.known) transition(n, "supply set", st, s.complete);
             if (st != r.state || sim != r.sim || !r.known) {
                 if (r.known || st != "OFF") note("supply set " + n + " power state " + st + " (" + simstateName(sim) + ")");
                 bool simChanged = sim != r.sim || !r.known;
@@ -758,6 +1730,7 @@ struct Rt {
 
     void evalDomainStates() {
         for (auto& d : doms) {
+            if (d.region) continue;
             const Domain& dd = m.domains.at(d.name);
             if (dd.states.empty()) continue;
             auto cx = ctx(dd.scope, nullptr);
@@ -771,6 +1744,7 @@ struct Rt {
             if (st == d.state) continue;
             d.state = st;
             note("power domain " + d.name + " power state " + st);
+            transition(d.name, "power domain", st, dd.complete);
             pendingChecks.push_back([this, &d, st, act, &dd]() {
                 if (d.state != st) return;
                 if (st == "ERROR") error("power domain " + d.name + " is in more than one power state");
@@ -782,6 +1756,62 @@ struct Rt {
     }
     std::vector<std::function<void()>> pendingChecks;
 
+    // Power state groups (6.22): the legal combinations of the power states
+    // of other objects.
+    void evalGroups() {
+        for (auto& g : groups) {
+            const StateGroup& gg = m.groups.at(g.name);
+            auto cx = ctx(gg.scope, nullptr);
+            std::vector<const PowerState*> act;
+            for (auto& ps : gg.states) {
+                bool a = ps.logicExpr ? truthOf(evalEx(ps.logicExpr, cx, ps.where)) == 1 : g.forced == ps.name;
+                if (a && ps.supplyExpr) a = truthOf(evalEx(ps.supplyExpr, cx, ps.where)) == 1;
+                if (a) act.push_back(&ps);
+            }
+            std::string st = act.size() == 1 ? act[0]->name : act.empty() ? "UNDEFINED" : "ERROR";
+            if (st == g.state) continue;
+            g.state = st;
+            note("power state group " + g.name + " power state " + st);
+            transition(g.name, "power state group", st, gg.complete);
+            pendingChecks.push_back([this, &g, st, act, &gg]() {
+                if (g.state != st) return;
+                if (st == "ERROR") error("power state group " + g.name + " is in more than one power state");
+                else if (act.size() == 1 && act[0]->illegal) error("power state group " + g.name + " is in illegal power state " + st);
+                else if (st == "UNDEFINED" && gg.complete)
+                    error("power state group " + g.name + " matches none of its power states (-complete)");
+            });
+        }
+    }
+
+    // Power state transition detection (9.4): the object went to state `to`.
+    // The transition is from the last state that was not UNDEFINED, which
+    // is an allowed intermediate state while the object's power states are
+    // not complete. An -illegal transition is an error (6.7), and so is a
+    // transition that is not named when the transitions are -complete.
+    void transition(const std::string& obj, const char* what, const std::string& to, bool statesComplete) {
+        if (to == "ERROR" || to.empty()) return;
+        if (to == "UNDEFINED") {
+            if (statesComplete) lastState[obj] = to;
+            return;
+        }
+        auto prev = lastState.find(obj);
+        std::string from = prev == lastState.end() ? "" : prev->second;
+        lastState[obj] = to;
+        if (from.empty() || from == to || from == "UNDEFINED") return;
+        auto it = m.transitions.find(obj);
+        if (it == m.transitions.end()) return;
+        const Transition* legal = nullptr;
+        const Transition* illegal = nullptr;
+        for (auto& t : it->second.tr)
+            if (t.matches(from, to)) (t.illegal ? illegal : legal) = &t;
+        if (illegal)
+            error(std::string(what) + " " + obj + ": illegal state transition " + illegal->name + " (" + from + " -> " + to + ")");
+        else if (legal)
+            note(std::string(what) + " " + obj + ": state transition " + legal->name + " (" + from + " -> " + to + ")");
+        else if (it->second.complete)
+            error(std::string(what) + " " + obj + ": state transition " + from + " -> " + to + " is not defined (-complete)");
+    }
+
     // Apply each domain's simstate (9.6).
     void applyDomains() {
         for (size_t i = 0; i < doms.size(); i++) {
@@ -792,7 +1822,13 @@ struct Rt {
             d.mode = nm;
             g_pdMode[i] = nm;
             d.applied = true;
-            if (old != -1 || nm != SS_NORMAL) note("power domain " + d.name + " simstate " + simstateName(nm));
+            if (old != -1 || nm != SS_NORMAL) note((d.region ? "elements on " : "power domain ") + d.name + " simstate " + simstateName(nm));
+            if (nm == SS_NORMAL && old != -1 && old != SS_NORMAL && S.now > 0)
+                for (auto& [prog, rd] : replays)
+                    if (rd == (int)i) {
+                        note("sim_replay_control: replaying an initial block on the power-up of " + d.name);
+                        S.spawn(process(prog));
+                    }
             if (nm == SS_CORRUPT && old != SS_CORRUPT) {
                 // Retention: the retained value is kept by the retention
                 // supply; the register itself loses power (9.7.4).
@@ -926,7 +1962,7 @@ struct Rt {
         if (it == m.portStates.end()) return v.st == S_OFF ? "OFF" : stateName(v.st);
         for (auto& d : it->second) {
             if (d.off && v.st == S_OFF) return d.name;
-            if (!d.off && v.st != S_OFF && v.hasV && v.v >= d.vmin - 1e-6 && v.v <= d.vmax + 1e-6) return d.name;
+            if (!d.off && v.st != S_OFF && (!d.partial || v.st == S_PARTIAL_ON) && v.hasV && v.v >= d.vmin - 1e-6 && v.v <= d.vmax + 1e-6) return d.name;
         }
         if (v.st == S_OFF) return "OFF";
         return std::string(stateName(v.st)) + (v.hasV ? " " + fmtV(v.v) + "V" : "");
@@ -959,11 +1995,13 @@ struct Rt {
 
     bool checkArmed = false;
     void evaluate() {
+        copyVcmResults();
         readHdlPorts();
         evalSupplies();
         driveHdlPorts();
         evalSets();
         evalDomainStates();
+        evalGroups();
         applyDomains();
         evalRetention();
         if (!checkArmed && chkSig >= 0) {   // legality is checked once the time step settles
@@ -988,6 +2026,7 @@ struct Rt {
             co_await Delay{0};
             r.checkArmed = false;
             r.checkPst();
+            r.applyAsserts();   // once the time step settles: supplies the testbench turns on at time 0 are on
             auto pc = std::move(r.pendingChecks);
             r.pendingChecks.clear();
             for (auto& f : pc) f();
@@ -1121,8 +2160,8 @@ struct Rt {
         const Val& d = a[0];
         bool ok = true;
         for (auto& sn : c.supplies) ok &= supplyNormal(sn);
-        if (c.kind == 1) return ok ? d : allx(d.w);
-        bool latch = c.iso->clamp == "latch";
+        if (c.kind != 0) return ok ? d : allx(d.w);   // level shifter (9.9), repeater (9.10)
+        bool latch = c.clamp == "latch";
         if (!ok) {
             if (latch) { c.latch = allx(d.w); c.latched = true; }
             return allx(d.w);
@@ -1141,7 +2180,7 @@ struct Rt {
             if (latch) { c.latch = d; c.latched = true; }
             return d;
         }
-        const std::string& cv = c.iso->clamp;
+        const std::string& cv = c.clamp;
         if (cv == "0") return make(0, 0, d.w, 0);
         if (cv == "1") return d.w <= 64 ? make(d.w >= 64 ? ~0ull : ((1ull << d.w) - 1), 0, d.w, 0) : v_not(make(0, 0, d.w, 0));
         if (cv == "Z" || cv == "z") return allz(d.w);

@@ -14,6 +14,10 @@
 // create_upf2hdl_vct add more. This file holds the tables and the
 // conversion only; upf.hpp reads the commands and upf_rt.inc applies them.
 #include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 #include <map>
 #include <string>
 #include <utility>
@@ -66,6 +70,81 @@ struct Vct {
         for (auto& [from, to] : table)
             if (stateNum(from) == state) return hdlChar(to, lang);
         return 'X';
+    }
+};
+
+// A value conversion method (6.30): a table for one HDL type and one
+// direction, an HDL function or module that converts, or a list of VCMs to
+// choose from per port (-vcms). Single-bit tables convert through a Vct.
+struct Vcm {
+    enum Kind { Table, Function, Model, Bundle } kind = Table;
+    std::string name, where;          // name: "lib::name"
+    bool hdl2upf = true;
+    std::string lang = "sv", hdlType, field;
+    // The HDL side of a table: b single bit, r real, i integer, e enum
+    char cat = 'b';
+    Vct bits;                         // cat b
+    struct Row {
+        // HDL side. hdl2upf: what matches; upf2hdl: what is driven.
+        enum H { Any, Range, Exact, XReal, ZReal, Label, Pass } h = Exact;
+        double lo = -INFINITY, hi = INFINITY, num = 0;   // Range [lo, hi); Exact num
+        std::string label;
+        // UPF side: the state, and its voltage: none, a value, '*' (the HDL
+        // value), or (upf2hdl) a range [vlo, vhi)
+        int st = 3;
+        enum V { None, Value, Star, VRange } vk = None;
+        double v = 0, vlo = -INFINITY, vhi = INFINITY;
+    };
+    std::vector<Row> rows;
+    std::string function, model;
+    std::vector<std::pair<std::string, std::string>> params;
+    std::vector<const Vcm*> members;  // Bundle
+
+    // Xreal and Zreal of package UPF (Annex D: $bitstoreal of these).
+    static constexpr uint64_t XrealBits = 0xFFFFFFFE00000000ull, ZrealBits = 0xFFFFFFFF00000000ull;
+    static double bitsReal(uint64_t b) {
+        double d;
+        std::memcpy(&d, &b, sizeof d);
+        return d;
+    }
+    // Every Table VCM, flattened out of nested lists.
+    void flatten(std::vector<const Vcm*>& out) const {
+        if (kind != Bundle) { out.push_back(this); return; }
+        for (auto* m : members) m->flatten(out);
+    }
+    // hdl2upf: the HDL value (x: unknown, isX/isZ: Xreal/Zreal or x/z bits)
+    // to a supply state, and the voltage to set (setV); UNDETERMINED and no
+    // voltage when no row matches (6.30.3 i).
+    void toUpf(double x, const std::string& label, bool unknown, uint64_t raw, int& st, bool& setV, double& v) const {
+        st = 3;
+        setV = false;
+        for (const Row& r : rows) {
+            bool hit = false;
+            switch (r.h) {
+                case Row::Any: hit = true; break;
+                case Row::Range: hit = !unknown && x >= r.lo && x < r.hi; break;
+                case Row::Exact: hit = !unknown && x == r.num; break;
+                case Row::XReal: hit = raw == XrealBits; break;
+                case Row::ZReal: hit = raw == ZrealBits; break;
+                case Row::Label: hit = !unknown && label == r.label; break;
+                default: break;
+            }
+            if (!hit) continue;
+            st = r.st;
+            if (r.vk == Row::Value) { setV = true; v = r.v; }
+            else if (r.vk == Row::Star && !unknown) { setV = true; v = x; }
+            return;
+        }
+    }
+    // upf2hdl: the row for a supply state and voltage (volts), or null.
+    const Row* toHdl(int st, double volts) const {
+        for (const Row& r : rows) {
+            if (r.st != st) continue;
+            if (r.vk == Row::Value && std::fabs(r.v - volts) > 1e-9) continue;
+            if (r.vk == Row::VRange && !(volts >= r.vlo && volts < r.vhi)) continue;
+            return &r;
+        }
+        return nullptr;
     }
 };
 

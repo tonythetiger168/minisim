@@ -82,6 +82,13 @@ Spec references are IEEE 1800-2023 clauses.
   its own supply ports and nets (`-transitive`, `-regexp`, `-exact`,
   `-ignore_case`, `-leaf_only`, `-non_leaf`). msim and mlint share the
   design walk and the power top lookup (`src/upf_design.hpp`).
+- `msim -cm <metrics>` now selects the code coverage metrics written. It takes
+  three notations: VCS `line+branch+cond+tgl+fsm`, Xcelium `b:e:t:f` or
+  `all`, and Questa `bcesftx`. `msim -cm_hier <file>` selects the part of
+  the design by instance, module or file. It reads VCS `+tree`/`-tree`
+  lines and Xcelium covfile `select_coverage` / `deselect_coverage`
+  commands. Before this, `-cm` wrote every metric. Covergroups and
+  assertions are always written.
 - `mlint` clock checks: `CDC007` (a clock read as data) and `CDC008` (a
   clock made by combinational logic of a clock and other signals, which can
   glitch).
@@ -89,6 +96,44 @@ Spec references are IEEE 1800-2023 clauses.
   clock domain (virtual clocks included), so an input read without a
   synchronizer, or an output launched on another clock, is a crossing.
   `set_case_analysis 0/1` makes a signal static.
+- UPF (IEEE 1801-2024): `set_repeater` and the simulation of repeaters
+  (6.52, 9.10); `create_logic_net`, `create_logic_port` and
+  `connect_logic_net` (6.13, 6.19, 6.20); `add_state_transition` with
+  transition detection (6.7, 9.4); `create_power_state_group` (6.22);
+  `-applies_to_boundary` on isolation and level-shifter strategies.
+- UPF (IEEE 1801-2024): `create_composite_domain` (6.17), `set_equivalent`
+  (6.47), `connect_supply_set` (6.15), `set_simstate_behavior` (6.56),
+  `set_design_attributes` (6.44), `set_port_attributes` (6.51),
+  `set_retention_elements` (6.54), `set_partial_on_translation` (6.50) and
+  `add_supply_state` with `{net_state voltage}` (6.8) are applied instead of
+  read and ignored; `mlint -upf` rule `UPF007`. See `docs/LOWPOWER.md`.
+- UPF (IEEE 1801-2024): `sim_corruption_control` (6.59),
+  `sim_assertion_control` (6.58) and `load_simstate_behavior` (6.34).
+- UPF (IEEE 1801-2024): power models: `define_power_model` (6.31),
+  `begin_power_model` / `end_power_model` (6.11, 6.32), `apply_power_model`
+  (6.9) with `-supply_map`, `-port_map` and `-parameters`, and
+  `add_parameter` (6.3).
+- UPF (IEEE 1801-2024): `bind_checker` (6.12) instantiates checker modules
+  in the design through SV `bind` directives; `sim_replay_control` (6.60)
+  runs initial blocks again when their domain powers up; `save_upf` (6.42)
+  writes the power intent of a scope.
+- UPF (IEEE 1801-2024): `(* UPF_... *)` attributes in the HDL (5.6) are read
+  by `msim -upf` and `mlint -upf`, below UPF commands in precedence (5.7);
+  the Table 8 model-only and instance-only rules are errors.
+- UPF (IEEE 1801-2024): `create_abstract_power_source` (6.16) switches a
+  supply set between input supply sets, with ack ports.
+- UPF (IEEE 1801-2024): value conversion methods (`create_vcm`, 6.30) with
+  `connect_supply_net -vcm`: tables for one-bit, real, integer and enum HDL
+  ports, VCM lists, and ports of type `upfSupplyTypeT` without conversion
+  (4.10); UPF libraries (`create_upf_library`, `use_upf_library`,
+  `load_upf_library`; 5.11, 6.29, 6.36, 6.63).
+- UPF (IEEE 1801-2024): function and model VCMs (6.30.8, 6.30.9) are
+  simulated: the function is called, or the model instantiated, on the port
+  through a module bound into the simulation top.
+- UPF (IEEE 1801-2024): supply ports connected by pg_type:
+  `connect_supply_net -pg_type` with `-cells`, `-domain`, `-elements` (6.14),
+  `connect_supply_set -connect` (6.15), and the automatic connection of a
+  domain's primary supply set (4.5.4.6.2).
 - `mlint -cdc-html FILE`: a self-contained page to browse the clock domains,
   the crossings (filter, the path of each through its synchronizer) and the
   reset synchronizers.
@@ -893,8 +938,15 @@ Spec references are IEEE 1800-2023 clauses.
   plan where people set the owner, status, bug id and note of each failure
   bucket. Tokens with read / write / admin roles, an audit log, a JSON API,
   and `mplan report -rules URL` to take the annotations as triage rules.
+- `src/saif.hpp` reads state- and path-dependent SAIF: the `COND` / `IOPATH`
+  / `RISE` / `FALL` toggle counts of a port go to `Db::paths`, the `LEAKAGE`
+  state times of an instance to `Db::states`. Unit test `test_saif`.
 
 ### Fixed
+- `x inside {q}` in a constraint, where `q` is a queue or dynamic array (a
+  caller's variable in `randomize() with`, or a class property), no longer
+  makes randomize() fail: the solver narrows x to the container's elements
+  (11.4.13, 18.5.4). Found by the CCIX VIP's data sequence.
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and

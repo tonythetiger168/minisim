@@ -43,6 +43,7 @@ inline void walkDesign(const slang::ast::Scope& sc, const std::string& path, Des
             std::string p = in(std::string(ch.name));
             dv.instances.insert(p);
             dv.model[p] = std::string(ch.getDefinition().name);
+            dv.models[p] = dv.model[p];
             auto& own = dv.portsOf[p];
             for (const Symbol* ps : ch.body.getPortList())
                 if (ps && ps->kind == SymbolKind::Port)
