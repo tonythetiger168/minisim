@@ -2926,6 +2926,29 @@ struct Lowerer {
         condDefs().push_back(std::move(d));
         return condDefs().back().base;
     }
+    // A procedural checker instance (17.3): the process reaching it queues
+    // the checker's static assertions, concurrent ones as procedural
+    // concurrent assertions (16.14.6) and deferred ones as procedural
+    // deferred assertions (16.4), with the procedure's clock and automatic
+    // values. Those of checkers it instantiates statically go the same way.
+    // Everything else in the checker runs on its own (ProcCollector).
+    void procCheckerAsserts(const slang::ast::Scope& body) {
+        using namespace slang::ast;
+        const Scope* savedScope = scope;
+        scope = &body;
+        for (const Symbol& m : body.members()) {
+            if (m.kind == SymbolKind::ProceduralBlock && m.as<ProceduralBlockSymbol>().isFromAssertion)
+                stmt(m.as<ProceduralBlockSymbol>().getBody());
+            else if (m.kind == SymbolKind::CheckerInstance)
+                procCheckerAsserts(m.as<CheckerInstanceSymbol>().body);
+            else if (m.kind == SymbolKind::GenerateBlock && !m.as<GenerateBlockSymbol>().isUninstantiated)
+                procCheckerAsserts(m.as<GenerateBlockSymbol>());
+            else if (m.kind == SymbolKind::GenerateBlockArray)
+                for (const auto* e : m.as<GenerateBlockArraySymbol>().entries)
+                    if (!e->isUninstantiated) procCheckerAsserts(*e);
+        }
+        scope = savedScope;
+    }
     E lazyExpr(const slang::ast::Expression& e, ExprCtx ctx) {
         using namespace slang::ast;
         if (e.kind == ExpressionKind::ConditionalOp) {
@@ -7829,6 +7852,10 @@ struct Lowerer {
                 break;
             }
             case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
+            case StatementKind::ProceduralChecker:   // 17.3: its static assertions, queued here
+                for (const Symbol* inst : s.as<ProceduralCheckerStatement>().instances)
+                    if (inst->kind == SymbolKind::CheckerInstance) procCheckerAsserts(inst->as<CheckerInstanceSymbol>().body);
+                break;
             case StatementKind::ImmediateAssertion:
                 xpGuard([&] { immAssert(s.as<ImmediateAssertionStatement>()); });
                 break;
@@ -9384,6 +9411,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     int checkerDepth = 0;
     std::unordered_set<const slang::ast::Symbol*> freeAssigned;
     bool checkerAssumes = false;
+    int procCheckerDepth = 0;   // inside a checker instantiated in procedural code (17.3)
     // A free checker variable (17.7): random from the start, unless it has
     // an initializer; an active one gets a new random value every time step.
     void freeVar(const slang::ast::VariableSymbol& v) {
@@ -9398,7 +9426,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     void handle(const slang::ast::CheckerInstanceSymbol& ci) {
         using namespace slang::ast;
-        if (ci.body.isProcedural) Lowerer::unsupported("a checker instance in procedural code (17.3)");
+        // In procedural code (17.3) its static assertions are lowered where the
+        // process reaches the instance (Lowerer::procCheckerAsserts); the rest
+        // runs as for a static instance.
+        bool procedural = ci.body.isProcedural;
+        if (procedural) procCheckerDepth++;
+        struct Leave { int& d; bool on; ~Leave() { if (on) d--; } } leave{procCheckerDepth, procedural};
         // Which variables the checker assigns, and whether it has assume
         // statements (17.7.2): an active free variable is one it never assigns.
         struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
@@ -9551,7 +9584,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
-        if (p.isFromAssertion) { assertionItem(p); return; }
+        if (p.isFromAssertion) {
+            if (procCheckerDepth == 0) assertionItem(p);   // else queued by the procedure (17.3)
+            return;
+        }
         // A final block (9.2.3) runs once when simulation ends. Lowering it as
         // a process would run it at time 0 and, looping, forever.
         Lowerer lw(sigmap);

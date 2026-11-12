@@ -504,6 +504,10 @@ void clockOf(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge
     using namespace slang::ast;
     if (t.kind == TimingControlKind::SignalEvent) {
         const auto& s = t.as<SignalEventControl>();
+        if (!sampleEv.empty() && isSysCall(s.expr, "$inferred_clock")) {   // in a procedure: its clock (16.14.7)
+            ev.insert(ev.end(), sampleEv.begin(), sampleEv.end());
+            return;
+        }
         const auto* cb = isGlobalClock(s.expr) ? globalClocking() : clockingRef(s.expr);
         if (!cb) cb = inferredClock(s.expr);
         if (cb) {
