@@ -13,6 +13,10 @@
 // summed here into the same numbers, one signal per thread. scan() also hands
 // each toggle to the caller, which is how mpower bins energy over time.
 //
+// State- and path-dependent SAIF is read too: the COND / IOPATH toggle counts
+// of a port go to Db::paths and the LEAKAGE state times of an instance to
+// Db::states, as written (conditions as text). write() does not emit them.
+//
 // A signal is kept per bit. Its name is the simulator's hierarchical name
 // with '.' between scopes and "[i]" for a bit of a vector: tb.dut.q[3]. A
 // waveform does not always record a vector's range (msim writes "q", width
@@ -57,7 +61,24 @@ struct Sig {
     int index(int j) const { return (msb < 0 ? width - 1 : msb) + step * j; }
 };
 
+// State- and path-dependent activity (SDPD), as the file gives it. A port's
+// toggles split by the condition they happened under (COND), the edge (RISE,
+// FALL) and the input that caused them (IOPATH); an instance's time in each
+// state (LEAKAGE). Conditions are kept as text, over the cell's pin names.
+struct PathCount {
+    std::string cond;      // "" for COND_DEFAULT, or when there is no COND
+    std::string related;   // "" for IOPATH_DEFAULT, or when there is no IOPATH
+    int edge = 0;          // 0 either, 1 RISE, 2 FALL
+    double tc = 0;
+};
+struct StateTime {
+    std::string cond;      // "" for COND_DEFAULT
+    double t1 = 0;         // ticks the condition held
+};
+
 struct Db {
+    std::unordered_map<std::string, std::vector<PathCount>> paths;    // "tb.dut.u1.Y"
+    std::unordered_map<std::string, std::vector<StateTime>> states;   // "tb.dut.u1"
     double tick = 1e-9;      // seconds per time unit
     double duration = 0;     // ticks
     uint64_t start = 0;      // the time of the first value (waveforms)
@@ -285,6 +306,97 @@ struct SaifParser {
             out.push_back(t);
         }
     }
+    // The inside of a list whose head word `head` was just read (COND, IOPATH or
+    // LEAKAGE), to its ')'. The forms nest and chain freely:
+    //   (COND B (RISE) (IOPATH A (TC 3) (IG 0)) COND B (FALL) (IOPATH A (TC 2)) COND_DEFAULT (TC 1))
+    //   (IOPATH A (TC 3) IOPATH_DEFAULT (TC 1))
+    //   (LEAKAGE (COND (A*B) (T1 20) (T0 80)) COND_DEFAULT (T1 80) (T0 20))
+    // so this walks the tokens, keeps the condition, edge and path in force, and
+    // records a count at every (TC n) and a time at every (T1 n).
+    struct SdCtx {
+        std::string cond, related;
+        int edge = 0;
+    };
+    static bool sdKeyword(const std::string& t) {
+        return t == "RISE" || t == "FALL" || t == "RISE_FALL" || t == "IOPATH" || t == "IOPATH_DEFAULT" || t == "TC" ||
+               t == "IG" || t == "T0" || t == "T1" || t == "TX" || t == "TZ" || t == "TB" || t == "COND" || t == "COND_DEFAULT";
+    }
+    // A condition: a word or a parenthesized expression, and what is glued to it.
+    static std::string sdExpr(SaifLex& lx) {
+        std::string out, t;
+        for (;;) {
+            size_t p0 = lx.p;
+            int l0 = lx.line;
+            int k = lx.next(t);
+            if (k == 'w' && !sdKeyword(t)) {
+                out += t;
+                continue;
+            }
+            if (k == '(') {
+                size_t p1 = lx.p;
+                int l1 = lx.line;
+                std::string h;
+                int k2 = lx.next(h);
+                lx.p = p1;
+                lx.line = l1;
+                if (!(k2 == 'w' && sdKeyword(h))) {
+                    // a parenthesized part of the expression
+                    out += "(";
+                    int depth = 1;
+                    while (depth > 0) {
+                        k = lx.next(t);
+                        if (k == 0) lx.fail("unexpected end of file in a condition");
+                        if (k == '(') depth++, out += "(";
+                        else if (k == ')') depth--, out += ")";
+                        else out += t;
+                    }
+                    continue;
+                }
+            }
+            lx.p = p0;
+            lx.line = l0;
+            return out;
+        }
+    }
+    void sdpd(SaifLex& lx, const std::string& head, SdCtx cx, std::vector<PathCount>* paths, std::vector<StateTime>* states) {
+        std::string t;
+        auto word = [&](const std::string& w) {
+            if (w == "COND") cx.cond = sdExpr(lx), cx.edge = 0, cx.related.clear();
+            else if (w == "COND_DEFAULT") cx.cond.clear(), cx.edge = 0, cx.related.clear();
+            else if (w == "RISE") cx.edge = 1;
+            else if (w == "FALL") cx.edge = 2;
+            else if (w == "RISE_FALL") cx.edge = 0;
+            else if (w == "IOPATH") {
+                if (lx.next(t) != 'w') lx.fail("expected a port after IOPATH");
+                cx.related = t;
+            } else if (w == "IOPATH_DEFAULT") cx.related.clear();
+        };
+        word(head);
+        for (;;) {
+            int k = lx.next(t);
+            if (k == 0) lx.fail("unexpected end of file");
+            if (k == ')') return;
+            if (k == 'w') {
+                word(t);
+                continue;
+            }
+            if (lx.next(t) != 'w') lx.fail("expected a keyword");
+            std::string key = t;
+            if (key == "TC" || key == "T1") {
+                auto v = words(lx);
+                double x = v.empty() ? 0 : std::atof(v[0].c_str());
+                if (key == "TC" && paths) paths->push_back({cx.cond, cx.related, cx.edge, x});
+                if (key == "T1" && states) states->push_back({cx.cond, x});
+            } else if (key == "RISE" || key == "FALL" || key == "RISE_FALL") {
+                word(key);
+                words(lx);
+            } else if (key == "COND" || key == "COND_DEFAULT" || key == "IOPATH" || key == "IOPATH_DEFAULT") {
+                sdpd(lx, key, cx, paths, states);
+            } else {
+                skip(lx);
+            }
+        }
+    }
     void nets(SaifLex& lx, Db& db, const std::string& scope, char divider) {
         std::string t;
         for (;;) {
@@ -303,6 +415,10 @@ struct SaifParser {
                 if (k != '(') lx.fail("expected (T0 ..) in net " + name);
                 lx.next(t);
                 std::string key = t;
+                if (key == "COND" || key == "COND_DEFAULT" || key == "IOPATH" || key == "IOPATH_DEFAULT") {
+                    sdpd(lx, key, {}, &db.paths[scope.empty() ? name : scope + "." + name], nullptr);
+                    continue;
+                }
                 auto v = words(lx);
                 double x = v.empty() ? 0 : std::atof(v[0].c_str());
                 if (key == "T0") b.t0 = x;
@@ -330,6 +446,7 @@ struct SaifParser {
             lx.next(t);
             if (t == "INSTANCE" || t == "VIRTUAL_INSTANCE") instance(lx, db, here, divider);
             else if (t == "NET" || t == "PORT") nets(lx, db, here, divider);
+            else if (t == "LEAKAGE") sdpd(lx, "", {}, nullptr, &db.states[here]);
             else skip(lx);
         }
     }
