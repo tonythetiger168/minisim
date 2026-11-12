@@ -1,0 +1,25 @@
+{
+  "name": "mregress",
+  "title": "mregress regression runner",
+  "summary": "Runs test lists with seeds in parallel on msim, VCS, Xcelium, Questa or Icarus, groups failures, writes results.json, JUnit and HTML, reruns failures.",
+  "docs": [
+    "README.md#Regressions",
+    "README.md#Coverage: ",
+    "README.md#Bug reports",
+    "README.md#Spec coverage and tests",
+    "ci/README.md",
+    "CHANGELOG.md"
+  ],
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "msim",
+    "mwave",
+    "mcov",
+    "mplan",
+    "mbug",
+    "mlint",
+    "mdft",
+    "mdebug"
+  ]
+}

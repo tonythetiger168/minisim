@@ -1,0 +1,63 @@
+{
+  "name": "msim",
+  "title": "msim SystemVerilog simulator",
+  "summary": "Compiles, elaborates and simulates Verilog / SystemVerilog (IEEE 1800-2023) in one step with an irun / vcs -R style command line: interpreter by default, -compile to native C++, multi-core, VCD and FST waveforms, UVM, DPI-C, VPI, X-propagation and UPF low-power simulation.",
+  "docs": [
+    "README.md#Features",
+    "README.md#Install",
+    "README.md#Build and run",
+    "README.md#Simulating your own design",
+    "README.md#C code: DPI-C",
+    "README.md#Compiled mode",
+    "README.md#Static combinational schedule",
+    "README.md#Multi-core",
+    "README.md#Cycle domain",
+    "README.md#2-state fast path",
+    "README.md#Low-power simulation",
+    "README.md#Known limits",
+    "README.md#Spec coverage and tests",
+    "README.md#License",
+    "docs/COVERAGE.md",
+    "docs/UVM.md",
+    "docs/VPI.md",
+    "docs/XPROP.md",
+    "docs/LOWPOWER.md",
+    "docs/RELEASING.md",
+    "CHANGELOG.md"
+  ],
+  "run": {
+    "binary": "msim",
+    "source_ext": ".sv",
+    "fixed": [
+      "-threads",
+      "2"
+    ],
+    "flags": [
+      "-sv",
+      "-xprop",
+      "-no-static-comb",
+      "-no-2state",
+      "-uvmnodpi"
+    ],
+    "valued": [
+      "-top",
+      "-maxtime"
+    ],
+    "plusargs": true,
+    "cpu_seconds": 10,
+    "wall_seconds": 20,
+    "memory_mb": 2048
+  },
+  "edition": "free",
+  "access": "public",
+  "related": [
+    "mwave",
+    "mcov",
+    "mregress",
+    "mplan",
+    "mbug",
+    "mlint",
+    "mdft",
+    "mdebug"
+  ]
+}

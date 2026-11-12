@@ -810,6 +810,8 @@ and reports the fault coverage of the chosen algorithm. See
 ```sh
 mdft -insert_scan design.v -lib cells.lib -o design_scan.v -chains 8 -scandef chains.json -tb flush_tb.v
 mdft -mbist -name ram256x32 -words 256 -width 32 -backgrounds all -o ram_bist.v -tb ram_bist_tb.v
+```
+
 `mdft` also does IEEE 1149.1 boundary scan and IEEE 1687 IJTAG
 ([docs/JTAG.md](docs/JTAG.md)); every flow can write SVF and a self-checking
 testbench that `msim` runs:
@@ -939,6 +941,21 @@ A model is ordinary C against [`include/mvp.h`](include/mvp.h):
 to interrupt, `mvp_bus_read` / `mvp_bus_write` to be a master. A TLM-2.0
 target goes behind the same bridge with `mvp_tlm.h`. A memory and a 16550-style
 UART are bundled in `mvp/models/`. See [docs/VPROTO.md](docs/VPROTO.md).
+
+### Support agents: `msupport`
+
+Each product has an AI support agent that answers users' questions from that
+product's documentation, can run a short example on the product's own tool in
+a sandbox, and files a ticket when the documentation does not answer. One
+JSON file per product in `support/products/`; the model is Claude through the
+Anthropic SDK. Built and tested, not online yet. See
+[docs/SUPPORT.md](docs/SUPPORT.md).
+
+```sh
+python3 tools/msupport.py -list
+python3 tools/msupport.py -product msim "How do I write an FST waveform?"
+python3 tools/msupport.py -serve 8080            # a local web page and JSON API
+```
 
 ## Known limits
 
