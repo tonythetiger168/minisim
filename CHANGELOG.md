@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
+  one cycle, crossing from a clock of shorter period into one of longer
+  period through a plain synchronizer, can be missed. Periods come from
+  `create_clock -period`, and for a generated clock from its master with
+  `-divide_by` / `-multiply_by`. A toggle or a held request is not reported.
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
   width with subnormals and all five rounding modes: `MW_fp_add`,
   `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`,

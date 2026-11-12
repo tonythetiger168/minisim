@@ -261,6 +261,7 @@ it. One-hot registers tested bit by bit are followed too.
 | `CDC006` | warning | on | With `-sdc`: a flop's clock is not a clock in the SDC file |
 | `CDC007` | warning | on | A clock read as data by logic |
 | `CDC008` | warning | on | A clock made by combinational logic of a clock and other signals (glitch) |
+| `CDC009` | warning | on | A one-cycle pulse from a faster clock into a slower one through a plain synchronizer (SDC periods) |
 
 ### Reset-domain crossings (`rdc`)
 
