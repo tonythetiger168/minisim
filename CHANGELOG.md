@@ -706,6 +706,12 @@ Spec references are IEEE 1800-2023 clauses.
   HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
   writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
   `mplan init -reqs` drafts a plan from the list.
+- `mplan rank`: per-test coverage and test ranking from the per-run
+  coverage databases of `mregress -cov`. A greedy order by new coverage
+  points (`-by rate`: per second of run time), each test's unique points,
+  the redundant tests, `-keep FILE` for the short list with the same
+  coverage, and with a plan the tests behind each feature's coverage.
+  `mplan report -rank` adds it to `plan.html` and `plan.json`.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than
