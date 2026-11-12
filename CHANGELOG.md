@@ -38,6 +38,10 @@ Spec references are IEEE 1800-2023 clauses.
   stay under it, and so does the git history. `docs/LICENSING.md` holds the
   open-core policy, the proposed free / paid split per tool, and the rule
   that no GPL or other copyleft code enters the tree.
+- Protected IP: the `-license <feature>` option is removed. It let the IP
+  user grant a licensed right to themselves; only the license proxy named by
+  the envelope decides now. `-license_fail stop|deny` chooses what happens
+  when no proxy can be reached.
 
 ### Added
 - VIP library: `vip/` holds UVM verification IP that runs on `msim -uvm`:
@@ -71,6 +75,11 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI: `vpi_get_vlog_info` gives a `-f` file's arguments as the nested
   array 38.36 describes, so `msim -uvm -f files.f` no longer crashes in
   UVM's command line reader.
+- `msim -vcd-class [N]`: class objects in the VCD or FST. Each property of
+  the object a module's class handle variable points to is a signal
+  `tb.p.addr` that follows the handle (x while it is null), with handle
+  properties followed N levels. `mdebug` reads them back: script `value` and
+  `changes`, `-signals`, and the page adds them when the handle is picked.
 - `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
   uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
   parent sequence, those in progress at `-at T`, and stream rows in the
@@ -709,6 +718,31 @@ Spec references are IEEE 1800-2023 clauses.
   against 5.8 s. Build option `MINISIM_WITH_BSIM4`.
 - `mspice`: unknowns fixed by a voltage source to ground are eliminated
   first, which keeps the pivots of a long chain of gain stages usable.
+- Protected IP: the IEEE 1735-2023 clause 8 license system. `msim`, `mlint`
+  and `mdft` ask the IP author's license proxy over TLS for the value of a
+  `license(...)` or `license_string(...)` call in a right (`src/licproxy.hpp`).
+  See "Licenses" in `docs/PROTECT.md`.
+- Protected IP, IEEE 1735-2023 5.2, 9.3, 9.4, 9.9 and Annex A checked rule
+  by rule (in `test_protect`): strings without `\` or control
+  characters, lower-case keywords (`` `pragma protect BEGIN `` is an error
+  instead of leaving the source in the clear), key names and rights that
+  differ only in case, end-of-file characters inside an envelope, strict
+  BASE64_TEXT, what tool and common blocks may hold, and viewport lists with
+  `.` or `:` scoped names. Clear modules instantiated in or bound into
+  protected IP are hidden from waveforms, coverage and lint output.
+- `mplan`: requirement traceability. `req ID ...` in a feature and a
+  requirement list (`reqs FILE` in the plan or `-reqs FILE`), read from CSV
+  or ReqIF (`.reqif` / `.reqifz`, with the hierarchy). Every requirement is
+  verified, partial, failing, not started or uncovered; the report, the
+  HTML page, `plan.json`, the history and `mplan trend` show it, `-trace`
+  writes the matrix as CSV, `-fail-on-uncovered` gates on it, and
+  `mplan init -reqs` drafts a plan from the list.
+- `mplan rank`: per-test coverage and test ranking from the per-run
+  coverage databases of `mregress -cov`. A greedy order by new coverage
+  points (`-by rate`: per second of run time), each test's unique points,
+  the redundant tests, `-keep FILE` for the short list with the same
+  coverage, and with a plan the tests behind each feature's coverage.
+  `mplan report -rank` adds it to `plan.html` and `plan.json`.
 
 ### Fixed
 - msim memory on big VIP benches: a 2-state unpacked array with more than
