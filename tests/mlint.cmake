@@ -121,6 +121,96 @@ if(NOT out MATCHES "\\[RDC004\\] 'rdc.s', reset by 'rdc.soft_n', feeds 'rdc.q4',
   message(FATAL_ERROR "rdc.sv -enable RDC004:\n${out}")
 endif()
 
+# -sdc: the file says which clocks are related. Clocks alone: primary clocks
+# are asynchronous, a generated clock goes with its master, and a clock the
+# file does not define is CDC006.
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_none.sdc;-cdc-report")
+foreach(want
+    "cdc_sdc.div2  1 flop  SDC clock DIV"
+    "cdc_sdc.mclk  1 flop  SDC clock C, T"
+    "cdc_sdc.uclk  1 flop  no SDC clock"
+    "[CDC001] 'cdc_sdc.a0' (clocked by cdc_sdc.aclk) is read by logic clocked by cdc_sdc.bclk"
+    "[CDC001] 'cdc_sdc.d0' (clocked by cdc_sdc.div2) is read by logic clocked by cdc_sdc.bclk"
+    "[CDC001] 'cdc_sdc.b0' (clocked by cdc_sdc.bclk) is read by logic clocked by cdc_sdc.cclk"
+    "[CDC001] 'cdc_sdc.c0' (clocked by cdc_sdc.cclk) is read by logic clocked by cdc_sdc.mclk"
+    "[CDC006] clock 'cdc_sdc.uclk' of 1 flop is not a clock in the SDC file"
+    "5 findings (CDC001 4, CDC006 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_none.sdc missing: ${want}\n${out}")
+  endif()
+endforeach()
+# set_clock_groups: A against B only; exclusive clocks are no crossing.
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_groups.sdc")
+if(NOT out MATCHES "'cdc_sdc.a0' \\(clocked by cdc_sdc.aclk\\) is read by logic clocked by cdc_sdc.bclk"
+   OR NOT out MATCHES "'cdc_sdc.d0' \\(clocked by cdc_sdc.div2\\) is read by logic clocked by cdc_sdc.bclk"
+   OR NOT out MATCHES "2 findings \\(CDC001 2\\)")
+  message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_groups.sdc:\n${out}")
+endif()
+# The same constraints written with variables, loops, bare names, wildcards,
+# -hierarchical and commands that change no domain give the same result.
+set(groups_out "${out}")
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_syntax.sdc")
+if(NOT out STREQUAL groups_out)
+  message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_syntax.sdc differs from cdc_sdc_groups.sdc:\n${out}")
+endif()
+# A false path between two clocks makes that pair asynchronous.
+run(cdc_sdc.sv "-top;cdc_sdc;-only;cdc,RDC001,RDC002,RDC003;-sdc;${SRC}/tests/lint/cdc_sdc_false.sdc")
+if(NOT out MATCHES "'cdc_sdc.b0' \\(clocked by cdc_sdc.bclk\\) is read by logic clocked by cdc_sdc.cclk"
+   OR NOT out MATCHES "1 finding \\(CDC001 1\\)")
+  message(FATAL_ERROR "cdc_sdc.sv -sdc cdc_sdc_false.sdc:\n${out}")
+endif()
+
+# CDC004 through flops: where the signals meet, once, to the depth asked for.
+run(cdc_seq.sv "-top;cdc_seq;-only;cdc")
+foreach(want
+    "[CDC004] 'cdc_seq.a1', 'cdc_seq.a2' (clocked by cdc_seq.aclk) are synchronized separately and meet again at 'cdc_seq.o1', 1 flop after the synchronizers (and at 1 more flop)"
+    "[CDC004] 'cdc_seq.a1', 'cdc_seq.a3' (clocked by cdc_seq.aclk) are synchronized separately and meet again at 'cdc_seq.o3', 2 flops after the synchronizers:"
+    "2 findings (CDC004 2)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_seq.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+run(cdc_seq.sv "-top;cdc_seq;-only;cdc;-cdc-depth;3")
+if(NOT out MATCHES "meet again at 'cdc_seq.o4', 3 flops after the synchronizers" OR NOT out MATCHES "3 findings")
+  message(FATAL_ERROR "cdc_seq.sv -cdc-depth 3:\n${out}")
+endif()
+run(cdc_seq.sv "-top;cdc_seq;-only;cdc;-cdc-depth;0")
+if(NOT out MATCHES "0 findings")
+  message(FATAL_ERROR "cdc_seq.sv -cdc-depth 0:\n${out}")
+endif()
+
+# The reset tree: one-flop reset synchronizers and logic on a reset; a
+# two-flop synchronizer behind a scan mux is clean and in the report.
+run(rdc_tree.sv "-top;rdc_tree;-only;cdc,rdc;-cdc-report")
+foreach(want
+    "reset synchronizers: 4"
+    "rdc_tree.rst_n (rdc_tree.clk)  2 flops, resets 1 flop, from rdc_tree.por_n"
+    "rdc_tree.e2 (rdc_tree.clk)  2 flops, resets 1 flop"
+    "[RDC005] reset synchronizer 'rdc_tree.one_n' (clocked by rdc_tree.clk) is one flop"
+    "[RDC005] reset synchronizer 'rdc_tree.ext_q' (clocked by rdc_tree.clk) is one flop"
+    "[RDC006] asynchronous reset 'rdc_tree.both_n' of 1 flop is combinational logic of 2 flops ('rdc_tree.sw', 'rdc_tree.wd')"
+    "3 findings (RDC005 2, RDC006 1)")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "rdc_tree.sv missing: ${want}\n${out}")
+  endif()
+endforeach()
+
+# Crossing waivers: by source and reading clock, by file, and a reset.
+run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-waivers;${SRC}/tests/lint/cdc_waivers.cfg;-show-waived")
+foreach(want
+    "waived: [CDC001] 'cdc_bad.a1' (clocked by cdc_bad.aclk)"
+    "waived: [CDC005] 'cdc_bad.a3'"
+    "waived: [RDC002] asynchronous reset 'cdc_bad.rst_n'"
+    "4 findings (CDC002 1, CDC003 2, CDC004 1), 3 waived")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "cdc_bad.sv with waivers missing: ${want}\n${out}")
+  endif()
+endforeach()
+
 # The findings do not depend on the thread count.
 run(cdc_bad.sv "-top;cdc_bad;-only;cdc,RDC001,RDC002,RDC003;-cdc-report;-threads;1")
 set(one "${out}")
