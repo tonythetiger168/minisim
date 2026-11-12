@@ -659,6 +659,11 @@ Spec references are IEEE 1800-2023 clauses.
   first, which keeps the pivots of a long chain of gain stages usable.
 
 ### Fixed
+- `randomize()` no longer fails when a variable solved first is tied to one
+  whose values have holes (`s == d` with `d inside {512, 1024, 4096}` and
+  `solve s before d`, or `data.size() == len` with `len` in a set, since
+  array sizes are solved first). The value search now narrows the other
+  variables at each step (18.5, 18.4).
 - msim: four faults found by re-measuring the spec table with uvm-core.
   `void'($cast(d, s))` no longer reports an error when the cast fails; only
   the task form does (8.16). `'{default: v}` on an associative array sets
