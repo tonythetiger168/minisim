@@ -39,7 +39,8 @@ struct Cb;
 // One VPI object. `kind` says which fields are used.
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
-                Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent } kind;
+                Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -59,6 +60,7 @@ struct Obj {
     size_t pos = 0;
     mutable int8_t prot = -1;             // vpiIsProtected, once worked out (-1: not yet)
     bool sched = false;                   // SchedEvent: still scheduled (vpiScheduled)
+    const void* node = nullptr;           // Stmt: slang Statement; Expr, ExprStmt: Expression; CaseItem: the item group
     Cb* cb = nullptr;                     // Callback
 };
 struct Cb {
@@ -82,6 +84,7 @@ struct State {
     std::vector<Systf> systfs;
     std::vector<std::unique_ptr<Obj>> objs;
     std::unordered_map<const Symbol*, Obj*> symObj;
+    std::map<std::pair<const void*, int>, Obj*> codeObjs;   // statement and expression objects (vpi_code.inc)
     std::unordered_map<const VpiSite*, Obj*> callObj;
     std::map<std::pair<const Obj*, int>, Obj*> subObj;   // memory words and bits
     std::unordered_map<int, Obj*> sysObj;
@@ -443,6 +446,17 @@ inline bool isProt(const Obj* o) {
         case Obj::Call:
         case Obj::Arg: p = o->site && o->site->prot; break;
         case Obj::Assertion: p = asserts()[(size_t)o->idx].prot; break;
+        case Obj::Process:
+        case Obj::ContAssign:
+        case Obj::Stmt:
+        case Obj::Expr:
+        case Obj::ExprStmt:
+        case Obj::CaseItem: {   // code inside protected IP
+            const Obj* w = o;
+            while (w && w->kind != Obj::Process && w->kind != Obj::ContAssign) w = w->parent;
+            p = w && w->sym && protectedInstance(instOf(w->sym->getParentScope()));
+            break;
+        }
         case Obj::Fsm:
         case Obj::FsmState: {   // the state register's declaration
             auto it = st().sigSym.find(fsmDefs()[(size_t)o->idx].sig);
@@ -1924,6 +1938,7 @@ inline const char* typeName(int type) {
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
 }
+#include "vpi_code.inc"
 }   // namespace vpi
 extern "C" {
 
@@ -1938,6 +1953,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (!o) { vpi::error(vpiError, "vpi_handle: null reference handle"); return nullptr; }
     if (vpi::denied(o, "vpi_handle")) return nullptr;
     using slang::ast::SymbolKind;
+    if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (o->kind == Obj::Fsm || o->kind == Obj::FsmState) {   // 40.5.2
         if (type == vpiFsmStateExpression || type == vpiExpr) {
             auto it = s.sigSym.find(fsmDefs()[(size_t)o->idx].sig);
@@ -2083,6 +2099,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     // A protected call still gives its arguments (38.36); nothing else of a
     // protected object can be iterated.
     if (!(type == vpiArgument && o->kind == Obj::Call) && vpi::denied(o, "vpi_iterate")) return nullptr;
+    if (vpi::isCode(o)) return vpi::codeIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
     if (type == vpiArgument) {
         if (o->kind != Obj::Call) return nullptr;
         for (size_t k = 0; k < o->site->args.size(); k++) add(vpi::argObj(o->site, (int)k));
@@ -2181,6 +2198,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     }
     const slang::ast::Scope* sc = vpi::scopeOf(o);
     if (!sc) return nullptr;
+    if (vpi::scopeCode(type, *sc, items)) return vpi::iter(std::move(items));   // vpiProcess, vpiContAssign
     if (type == vpiPort) {
         if (o->kind != Obj::Module) return nullptr;
         for (const slang::ast::Symbol* p : o->sym->as<slang::ast::InstanceSymbol>().body.getPortList())
@@ -2463,6 +2481,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (prop != vpiType && !(prop == vpiSize && expr) && vpi::denied(o, "vpi_get"))
         return vpiUndefined;
     auto isVar = [&] { return o->kind == Obj::Signal || o->kind == Obj::Word; };
+    if (vpi::isCode(o)) return (PLI_INT32)vpi::codeGet(prop, o);
     if (o->kind == Obj::SchedEvent) return prop == vpiType ? vpiSchedEvent : prop == vpiScheduled ? o->sched : vpiUndefined;
     if (int64_t c = vpi::covGet(prop, o); c >= 0) return (PLI_INT32)std::min<int64_t>(c, INT32_MAX);   // 40.5.2
     if (o->kind == Obj::Fsm || o->kind == Obj::FsmState) {
@@ -2638,6 +2657,12 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
     using slang::ast::SymbolKind;
     if (!o) return nullptr;
     if (prop != vpiType && vpi::denied(o, "vpi_get_str")) return nullptr;
+    if (vpi::isCode(o) && prop != vpiType) {
+        std::string r;
+        bool have = false;
+        vpi::codeGetStr(prop, o, r, have);
+        return have ? vpi::retStr(r) : nullptr;
+    }
     if ((o->kind == Obj::Fsm || o->kind == Obj::FsmState) && prop != vpiType) {   // 40.5.2
         const FsmDef& d = fsmDefs()[(size_t)o->idx];
         std::string name = o->kind == Obj::Fsm ? d.name : d.states[o->pos].second;
@@ -2727,6 +2752,7 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
             return nullptr;
         case vpiType: {
             const char* nm = vpi::typeName(vpi::effType(o));
+            if (!nm) nm = vpi::codeTypeName(o->type);
             return nm ? vpi::retStr(nm) : nullptr;
         }
         default:
@@ -2752,6 +2778,18 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
             vpi::error(vpiError, "vpi_get_value: parameter value of this type");
             return;
         }
+        vpi::getValueOf(o, val, v);
+        return;
+    }
+    if (vpi::isCode(o)) {   // a constant expression (37.35)
+        Val val;
+        if (o->kind != Obj::Expr || !vpi::codeValue(o, val)) {
+            vpi::error(vpiError, "vpi_get_value: only a constant expression has a value here");
+            return;
+        }
+        o->w = val.w;
+        o->real = val.real;
+        o->str = val.str;
         vpi::getValueOf(o, val, v);
         return;
     }

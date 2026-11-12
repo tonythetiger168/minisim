@@ -165,6 +165,35 @@ coverage database (the `-cov` JSON) to `name` now. Not supported:
 or stopping statement, toggle or FSM coverage for an instance below the
 top (it is for the whole design).
 
+**Processes, statements and expressions (37.32 to 37.51).**
+`vpi_iterate(vpiProcess, module)` gives the `initial`, `always` (with
+`vpiAlwaysType`: `vpiAlways`, `vpiAlwaysComb`, `vpiAlwaysFF`,
+`vpiAlwaysLatch`) and `final` blocks, `vpi_iterate(vpiContAssign, module)`
+the continuous assignments (`vpiLhs`, `vpiRhs`, `vpiDelay`). From a process,
+`vpiStmt` gives its statement. Statements: `vpiBegin` / `vpiNamedBegin` /
+`vpiFork` / `vpiNamedFork` (`vpiStmt` iteration, `vpiJoinType`),
+`vpiAssignment` (`vpiBlocking`, `vpiLhs`, `vpiRhs`), `vpiIf` / `vpiIfElse`
+(`vpiCondition`, `vpiStmt`, `vpiElseStmt`), `vpiCase` (`vpiCaseType`,
+`vpiQualifier`, `vpiCaseItem` iteration; an item has `vpiExpr` iteration
+and `vpiStmt`), `vpiFor` (`vpiForInitStmt`, `vpiCondition`,
+`vpiForIncStmt`, `vpiStmt`), `vpiWhile`, `vpiDoWhile`, `vpiRepeat`,
+`vpiForever`, `vpiForeachStmt`, `vpiDelayControl` (`vpiDelay`),
+`vpiEventControl` (`vpiCondition` the event expression), `vpiRepeatControl`,
+`vpiTaskCall` / `vpiSysTaskCall` / `vpiMethodTaskCall` (`vpiName`,
+`vpiArgument` iteration), `vpiWait`, `vpiWaitFork`, `vpiOrderedWait`,
+`vpiDisable`, `vpiDisableFork`, `vpiEventStmt`, `vpiReturn`, `vpiBreak`,
+`vpiContinue`, `vpiForce` / `vpiRelease` / `vpiAssignStmt` /
+`vpiDeassign`, `vpiNullStmt`; an assertion statement is the assertion
+object of clause 39. Expressions: a net, variable, word, bit or parameter
+is the object itself; otherwise `vpiOperation` (`vpiOpType`, `vpiOperand`
+iteration), `vpiConstant` (`vpiConstType`, value), `vpiFuncCall` /
+`vpiSysFuncCall` / `vpiMethodFuncCall` (`vpiName`, `vpiFuncType`,
+`vpiArgument`), `vpiBitSelect` (`vpiParent`, `vpiIndex`), `vpiPartSelect` /
+`vpiIndexedPartSelect` with a variable index. Every one has `vpiLineNo`,
+`vpiFile`, `vpiParent`, `vpiModule`, `vpiScope`; an expression has
+`vpiSize` and `vpiDecompile` (its source text). `vpi_get_value` reads an
+expression only when it is constant.
+
 **Scheduling and more callbacks (38.10, 38.30, 38.35, 38.36).** A delayed
 `vpi_put_value` with `vpiReturnEvent` returns a `vpiSchedEvent` handle;
 `vpi_get(vpiScheduled, ev)` is 1 until the write lands, and
@@ -199,7 +228,7 @@ objects in decryption envelopes: see "VPI and DPI" in `docs/PROTECT.md`.
 ## Not yet
 
 Class objects, unpacked structs, dynamic arrays, queues and associative
-arrays, statements, processes and expressions, drivers and loads,
+arrays, the value of a non-constant expression, drivers and loads,
 instance arrays as objects, delays of anything but a net (primitives,
 continuous assignments, module paths, timing checks), `vpi_handle_multi`,
 `cbStmt`, `cbTchkViolation`, `cbError` / `cbPLIError`, interactive mode
@@ -209,7 +238,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

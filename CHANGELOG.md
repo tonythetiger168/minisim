@@ -32,6 +32,12 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI processes, statements and expressions (37.32 to 37.51):
+  `vpi_iterate(vpiProcess / vpiContAssign, module)`, the statement tree
+  (blocks, assignments, if, case and case items, loops, delay and event
+  controls, task calls, wait, disable, force / release, ...) and
+  expressions (`vpiOperation`, `vpiConstant`, function calls, selects) with
+  `vpiOpType`, `vpiConstType`, `vpiDecompile`, `vpiLineNo`.
 - VPI scheduling (38.35, 38.36): `vpiReturnEvent` gives a `vpiSchedEvent`
   handle that `vpiCancelEvent` cancels (`vpiScheduled`); inertial,
   transport and pure transport writes remove pending writes as the standard
