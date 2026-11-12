@@ -254,6 +254,16 @@ statement as `obj`; msim finds the statement's code by its source line, so
 two statements on one line (`#2 n = n + 1;` is a delay control and an
 assignment) share the callback.
 
+**Inter-module paths (38.21).** `vpi_handle_multi(vpiInterModPath, out,
+in)` takes an output (or inout) port of one instance and an input (or
+inout) port of another that are connected to the same net, in either order,
+and gives the same path object each time. `vpi_iterate(vpiPort, path)` gives
+the two ports. `vpi_get_delays` / `vpi_put_delays` read and write its delay
+(1, 2, 3, 6 or 12 values, with `pulsere_flag` pulse limits and
+`append_flag`), which is the interconnect delay of the load port from every
+source on the net, the same as an SDF `PORT` or `INTERCONNECT` delay
+(32.4.4). The load port has to be a net.
+
 **Error callbacks (38.36.3).** `cbPLIError` runs each time a VPI routine
 reports an error (level `vpiError` or above); `cbError` runs after each
 run-time error message of the simulation (`$error`, `$fatal`, a failed
@@ -283,7 +293,8 @@ declarations of a class definition, constraints (37.30), containers of structs,
 classes or containers, the value of a non-constant expression, drivers and
 loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, delays of anything but a net (primitives,
-continuous assignments, module paths, timing checks), `vpi_handle_multi`,
+continuous assignments, module paths, timing checks), the per-source
+delay of an inter-module path on a net with several sources,
 `cbTchkViolation`, interactive mode
 callbacks, and save / restart / reset. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
@@ -291,7 +302,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

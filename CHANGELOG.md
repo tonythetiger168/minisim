@@ -32,6 +32,10 @@ Spec references are IEEE 1800-2023 clauses.
   that no GPL or other copyleft code enters the tree.
 
 ### Added
+- VPI `vpi_handle_multi(vpiInterModPath, out, in)` (38.21): the path
+  between two instance ports on one net, its ports, and its interconnect
+  delay through `vpi_get_delays` / `vpi_put_delays`.
+  `tests/spec/38.21-vpi-handle-multi.sv`.
 - VPI `cbError` and `cbPLIError` (38.36.3): called for run-time error
   messages of the simulation and for errors of VPI calls, with
   `vpi_chk_error` giving the error. `tests/spec/38.36-vpi-cberror.sv`.
