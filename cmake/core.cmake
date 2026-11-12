@@ -52,6 +52,7 @@ set(MINISIM_CORE_HEADERS
     upf_rt.inc
     vpi.inc
     vpi_code.inc
+    vpi_covmerge.inc
     vpi_data.inc
     wave_reader.hpp)
 
