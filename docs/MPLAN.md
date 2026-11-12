@@ -204,6 +204,55 @@ run time instead, which gives the cheapest way to the same coverage.
 in `plan.html` and `plan.json`. The per-run databases are read in parallel
 (`-threads`). The result does not depend on the worker count.
 
+## Server and dashboard
+
+`mplan serve` is one place for many plans and many people.
+
+```
+mplan serve -root /srv/mplan -port 8080 -bind 0.0.0.0 -users users.txt
+mplan push  http://host:8080 plan.d -token $MPLAN_TOKEN     # from CI, after mplan report
+```
+
+The server keeps a directory per project under `-root`: `history.jsonl`
+(every snapshot pushed), the last `plan.json` and `plan.html`,
+`annotations.json` (what people set on the failure buckets) and
+`audit.jsonl` (who pushed or changed what, and when). They are plain files:
+back them up or put them in git. Pushing the same label again replaces that
+snapshot. The project name is the plan's name unless `-project` says
+otherwise.
+
+| Page | Shows |
+|---|---|
+| `/` | every plan: score, change since the previous snapshot, status, features met, tests passing, requirements verified, failure buckets, a sparkline of the score |
+| `/p/NAME/` | one plan: the trend chart, the snapshots, and each failure bucket with a form for its status (open / known / waived), owner, bug id and note |
+| `/p/NAME/plan.html` | the full report of the last push |
+
+| API | |
+|---|---|
+| `GET /api/projects` | the summaries the index shows |
+| `GET /api/p/NAME` | one summary with the annotations |
+| `GET /api/p/NAME/history` | every snapshot |
+| `GET /api/p/NAME/rules` | the annotations, as `mplan report -rules URL` reads them |
+| `POST /api/p/NAME/push` | `{"plan": <plan.json>, "html": <plan.html>}` (what `mplan push` sends) |
+| `POST /api/p/NAME/annotate` | `{"signature", "status", "owner", "bug", "note"}` |
+
+`mplan report -rules http://host:8080/api/p/NAME/rules` takes the
+dashboard's annotations as its triage rules (the token comes from
+`MPLAN_TOKEN`), so a bucket somebody marked known with an owner and a bug
+id shows that way in the next report and does not trip `-fail-on-new`.
+
+**Users.** `-users FILE` holds one `name:token[:role]` a line, the role
+`read`, `write` (default) or `admin`. A request carries the token as
+`Authorization: Bearer TOKEN`; a browser signs in at `/login`. Without
+`-users` everybody may read and nobody may write; `-open` lets anyone who
+reaches the port write (trusted networks only); `-private` asks for a token
+to read as well. Writes must be `application/json`, so a page on another
+site cannot post on a signed-in user's behalf, and an uploaded report is
+served sandboxed. The server listens on 127.0.0.1 unless `-bind` says
+otherwise and speaks plain HTTP: put a TLS proxy in front of it outside a
+trusted network. It serves requests on threads and writes each project one
+change at a time.
+
 ## Triage
 
 Every failing run goes into a bucket by its failure signature: mregress's,
