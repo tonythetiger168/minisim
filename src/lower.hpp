@@ -3715,6 +3715,28 @@ struct Lowerer {
             Instr i = dynCmd(t, D_COPY); i.dsrc = relSig(kRelRet, it->second->retSig); prog.emit(i);
             return t;
         }
+        if (e.kind == ExpressionKind::Call && isDynType(*e.type) && e.as<CallExpression>().isSystemCall()) {
+            // qq.pop_front() / pop_back() of a queue of queues (7.10.2.6): the
+            // element is copied out, then removed
+            const auto& call = e.as<CallExpression>();
+            auto n = call.getSubroutineName();
+            if ((n != "pop_front" && n != "pop_back") || call.arguments().empty()) return -1;
+            int outer = dynSig(*call.arguments()[0]);
+            if (outer < 0 || !dynShape(outer).elem) return -1;
+            int t = dynTemp(dynShapeOf(*e.type));
+            { Instr c = dynCmd(t, D_DELETE); prog.emit(c); }   // empty when the queue is
+            Instr j; j.k = IK::JmpIfNot;
+            j.e = bin(Op::Ne, dynSize(outer), konst(mk(0, 32)));
+            size_t at = prog.emit(j);
+            E key = n == "pop_front" ? konst(mk(0, 64)) : bin(Op::Sub, resize(dynSize(outer), 64, false, false), konst(mk(1, 64)));
+            auto r = node(Op::DynElemRef, {key});
+            r->sig = outer;
+            int el = elemRef(outer, r);
+            Instr c = dynCmd(t, D_COPY); c.dsrc = el; prog.emit(c);
+            prog.code[at].target = prog.here();
+            prog.emit(dynCmd(outer, n == "pop_front" ? D_POP_FRONT : D_POP_BACK));   // warns when it is empty
+            return t;
+        }
         if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // m[i] of a container of containers
             const auto& sel = e.as<ElementSelectExpression>();
             // f[i][j] of a fixed-size array of containers: its element's id
