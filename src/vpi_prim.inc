@@ -111,43 +111,53 @@ inline bool primGetStr(int prop, const Obj* o, std::string& r) {
     if (prop == vpiFile && srcMgr()) { r = std::string(srcMgr()->getFileName(g.location)); return true; }
     return false;
 }
-// Delays of a primitive (38.10): rise, fall and turn-off, as 1, 2 or 3
-// values (or 6 / 12 transitions).
+// Delays of a primitive or a delayed continuous assignment (38.10): rise,
+// fall and turn-off, as 1, 2 or 3 values (or 6 / 12 transitions). Both
+// keep them in a gateRecs() entry.
+inline int gateRecOf(const Obj* o) {
+    if (o->kind == Obj::Prim) return o->idx;
+    auto it = assignGates().find(o->sym);
+    return it == assignGates().end() ? -1 : it->second;
+}
 inline bool primDelayCount(const Obj* o, p_vpi_delay d, const char* who) {
     if (!d || !d->da) { error(vpiError, std::string(who) + ": no delay structure"); return false; }
     int n = d->no_of_delays;
     if (n != 1 && n != 2 && n != 3 && n != 6 && n != 12) {
-        error(vpiError, std::string(who) + ": a primitive has 1, 2, 3, 6 or 12 delays");
+        error(vpiError, std::string(who) + ": a primitive or assignment has 1, 2, 3, 6 or 12 delays");
         return false;
     }
-    if (o->idx < 0) { error(vpiError, std::string(who) + ": msim keeps no delays for this primitive"); return false; }
+    if (gateRecOf(o) < 0) {
+        error(vpiError, std::string(who) + (o->kind == Obj::Prim ? ": msim keeps no delays for this primitive"
+                                                                 : ": the continuous assignment has no delay"));
+        return false;
+    }
     return true;
 }
 inline void primGetDelays(const Obj* o, p_vpi_delay d) {
-    const GateRec& g = gateRecs()[(size_t)o->idx];
+    const GateRec& g = gateRecs()[(size_t)gateRecOf(o)];
     const Obj* m = scopeOfSym(*o->sym);
     // The order of 1 to 3 values is rise, fall, turn-off; the 12 transitions
     // hold them as 0->1, 1->0, 0->z.
     static const int pick3[3] = {T01, T10, T0Z};
+    int per = d->mtm_flag ? 3 : 1;
     for (int k = 0; k < d->no_of_delays; k++)
-        for (int q = 0; q < (d->mtm_flag ? 3 : 1); q++) {
-            p_vpi_time t = &d->da[k * (d->mtm_flag ? 3 : 1) + q];
+        for (int q = 0; q < per; q++) {
+            p_vpi_time t = &d->da[k * per + q];
             t->type = d->time_type;
             fillTime(t, m, g.d[d->no_of_delays <= 3 ? pick3[k] : k]);
         }
 }
 inline void primPutDelays(const Obj* o, p_vpi_delay d) {
-    GateRec& g = gateRecs()[(size_t)o->idx];
+    GateRec& g = gateRecs()[(size_t)gateRecOf(o)];
     const Obj* m = scopeOfSym(*o->sym);
+    int per = d->mtm_flag ? 3 : 1;
     std::vector<uint64_t> v;
     for (int k = 0; k < d->no_of_delays; k++) {
-        s_vpi_time t = d->da[k * (d->mtm_flag ? 3 : 1) + (d->mtm_flag ? 1 : 0)];   // typical
+        s_vpi_time t = d->da[k * per + (d->mtm_flag ? 1 : 0)];   // typical
         t.type = d->time_type;
         v.push_back((uint64_t)std::max<int64_t>(0, sigTicks(&t, m)));
     }
-    if (d->no_of_delays == 2) {   // two delays: turn-off is the smaller (28.16)
-        v.push_back(std::min(v[0], v[1]));
-    }
+    if (d->no_of_delays == 2) v.push_back(std::min(v[0], v[1]));   // two delays: turn-off is the smaller (28.16)
     auto D = expand12(v);
     for (int k = 0; k < 12; k++) g.d[k] = d->append_flag ? g.d[k] + D[(size_t)k] : D[(size_t)k];
     g.annotated = true;

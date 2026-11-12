@@ -309,7 +309,9 @@ gate, switch and UDP instances of a module; `vpiGate`, `vpiSwitch` and
 terminals) and `vpiExpr` (the connection). `vpi_get_delays` /
 `vpi_put_delays` read and write a gate's rise, fall and turn-off delays (1,
 2, 3, 6 or 12 values, `append_flag`); the new delay takes effect for the
-next change.
+next change. The same two routines read and change the delay of a
+continuous assignment (`vpiContAssign`) that has one; one without a delay
+is an error.
 
 **Error callbacks (38.36.3).** `cbPLIError` runs each time a VPI routine
 reports an error (level `vpiError` or above); `cbError` runs after each
@@ -339,7 +341,7 @@ Pure virtual method prototypes in `vpiMethods`, the non-static property
 declarations of a class definition, constraints (37.30), containers of structs,
 classes or containers, the value of a non-constant expression, drivers and
 loads of a bit or part of a signal and of primitive terminals,
-instance arrays as objects, delays of continuous assignments, the per-source
+instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
 callbacks, and save / restart / reset. A call to something not
@@ -348,7 +350,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

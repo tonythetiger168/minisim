@@ -107,6 +107,9 @@ struct GateRec {
     bool annotated = false;
 };
 inline std::vector<GateRec>& gateRecs() { static std::vector<GateRec> v; return v; }
+// A continuous assignment with a delay: its gateRecs() entry, so VPI can
+// read and change the delay (38.10). Keyed by its ContinuousAssignSymbol.
+inline std::map<const void*, int>& assignGates() { static std::map<const void*, int> m; return m; }
 
 // Port connections, for INTERCONNECT between one source and one load of a
 // net with several sources (32.4.4): an output or inout formal drives its
