@@ -86,4 +86,4 @@ endmodule
 //> we=x: mem1=101001xx q2=x0x00xx0 q3=11 q4=xxxxx11x
 //> ad=1x: q2=00000000 q3=0001001x q4=xxxx1111
 //>   write 55
-//> ad=xx: mem=xx aX xx xx q3=000100xx
+//> ad=xx: mem=xx xX xx xx q3=000100xx

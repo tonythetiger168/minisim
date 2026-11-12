@@ -673,6 +673,12 @@ inline bool codeGetStr(int prop, const Obj* o, std::string& r, bool& have) {
             have = true;
             return true;
         }
+        if (o->kind == Obj::Expr && o->type == vpiRefObj) {   // a reference by name (a class property, a loop variable)
+            const Symbol& sym = static_cast<const Expression*>(o->node)->as<ValueExpressionBase>().symbol;
+            r = prop == vpiName ? std::string(sym.name) : sym.getHierarchicalPath();
+            have = true;
+            return true;
+        }
         if (o->kind == Obj::Stmt) {
             const Statement& s = *static_cast<const Statement*>(o->node);
             if (s.kind == StatementKind::ExpressionStatement) {
