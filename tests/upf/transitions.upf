@@ -1,0 +1,47 @@
+# Power intent for transitions.sv.
+upf_version 4.0
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+create_power_domain PD0 -elements {u0}
+create_power_domain PD1 -elements {u1}
+create_supply_port VDD
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSS
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VSS -ports {VSS}
+create_supply_set SS -function {power VDD} -function {ground VSS}
+associate_supply_set SS -handle PD_TOP.primary
+associate_supply_set SS -handle PD0.primary
+associate_supply_set SS -handle PD1.primary
+
+add_power_state PD0 -domain \
+    -state {OFF   -logic_expr {mode0 == 2'd0}} \
+    -state {SLEEP -logic_expr {mode0 == 2'd1}} \
+    -state {RUN   -logic_expr {mode0 == 2'd2}}
+add_power_state PD1 -domain \
+    -state {OFF   -logic_expr {mode1 == 2'd0}} \
+    -state {SLEEP -logic_expr {mode1 == 2'd1}} \
+    -state {RUN   -logic_expr {mode1 == 2'd2}}
+
+add_state_transition PD0 -domain \
+    -transition {turn_on  -from OFF -to RUN} \
+    -transition {suspend  -from RUN -to SLEEP} \
+    -transition {resume   -from SLEEP -to RUN} \
+    -transition {turn_off -from {RUN SLEEP} -to OFF}
+add_state_transition PD0 -domain -update \
+    -transition {no_wake_to_sleep -paired {{OFF SLEEP}} -illegal}
+
+add_state_transition PD1 -domain -complete \
+    -transition {power -paired {{OFF RUN} {RUN OFF} {SLEEP OFF}}}
+
+create_power_state_group CLUSTER
+add_power_state CLUSTER -group -complete \
+    -state {NONE -logic_expr {PD0 == OFF && PD1 == OFF} -illegal} \
+    -state {ONE  -logic_expr {(PD0 != OFF && PD1 == OFF) || (PD0 == OFF && PD1 != OFF)}} \
+    -state {BOTH -logic_expr {PD0 != OFF && PD1 != OFF}}
+add_state_transition CLUSTER -group \
+    -transition {more -from ONE -to BOTH} \
+    -transition {less -from BOTH -to ONE}
+# the supply set's predefined states can be named too
+add_state_transition SS -supply -transition {up -from OFF -to ON}
