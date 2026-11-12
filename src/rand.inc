@@ -389,10 +389,40 @@ inline i128 below(i128 n) {
 }
 
 // Find a value of v in [lo, hi] (DFS over halves, random order by size).
+inline bool propagate();
+// With few variables, each step of the search also narrows the others
+// (forward checking): bounds alone miss holes, so s == d with d inside
+// {512, 1024, 4096} would let s take 3000 and the next variable fail.
 inline bool search(Var& v, i128 lo, i128 hi) {
     if (--g_ctx->budget < 0) return false;
     v.lo = lo; v.hi = hi;
     if (!varOk(v)) return false;
+    if (g_ctx->vars.size() > 1 && g_ctx->vars.size() <= 32) {
+        std::pair<i128, i128> snap[32];
+        size_t n = g_ctx->vars.size();
+        for (size_t k = 0; k < n; k++) snap[k] = {g_ctx->vars[k].lo, g_ctx->vars[k].hi};
+        if (!propagate()) {
+            for (size_t k = 0; k < n; k++) { g_ctx->vars[k].lo = snap[k].first; g_ctx->vars[k].hi = snap[k].second; }
+            return false;
+        }
+        if (v.lo != lo || v.hi != hi) {   // propagation narrowed v itself
+            i128 nlo = v.lo, nhi = v.hi;
+            bool ok = search(v, nlo, nhi);
+            if (!ok) for (size_t k = 0; k < n; k++) { g_ctx->vars[k].lo = snap[k].first; g_ctx->vars[k].hi = snap[k].second; }
+            return ok;
+        }
+        if (lo != hi) {
+            i128 mid = lo + (hi - lo) / 2;
+            i128 n1 = mid - lo + 1, n2 = hi - mid;
+            bool firstLow = below(n1 + n2) < n1;
+            for (int t = 0; t < 2; t++) {
+                bool low = (t == 0) == firstLow;
+                if (low ? search(v, lo, mid) : search(v, mid + 1, hi)) return true;
+                for (size_t k = 0; k < n; k++) { g_ctx->vars[k].lo = snap[k].first; g_ctx->vars[k].hi = snap[k].second; }
+            }
+            return false;
+        }
+    }
     if (lo == hi) { v.set = true; v.val = lo; return true; }
     // Small ranges: try the values in random order.
     if (hi - lo < 8) {
