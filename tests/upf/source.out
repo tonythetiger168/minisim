@@ -1,0 +1,5 @@
+1 off: q=x ack=x
+2 hi: q=c ack=x
+4 hi, acknowledged: q=c ack=1
+7 lo: q=c ack=1
+10 off again: q=x ack=0

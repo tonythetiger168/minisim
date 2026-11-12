@@ -15,7 +15,8 @@
 //   L003  a non-blocking assignment in an always_comb.
 //   L004  one variable or net is assigned by more than one process.
 //   CDC001..CDC005, RDC001..RDC004  clock- and reset-domain crossings (cdc.hpp).
-//   UPF001..UPF006  with -upf: power intent checks (upf.hpp check()).
+//   UPF001..UPF007  with -upf: power intent checks (upf.hpp check()).
+#include "upf_hdl.hpp"
 #include <unistd.h>
 
 #include <chrono>
@@ -90,6 +91,7 @@ void upfWalk(const Scope& sc, const std::string& path, upf::DesignView& dv, cons
             const auto& ch = m.as<InstanceSymbol>();
             std::string p = in(std::string(ch.name));
             dv.instances.insert(p);
+            dv.models[p] = std::string(ch.getDefinition().name);
             for (const PortConnection* c : ch.getPortConnections()) {
                 if (!c || c->port.kind != SymbolKind::Port) continue;
                 const auto& ps = c->port.as<PortSymbol>();
@@ -125,6 +127,7 @@ void upfWalk(const Scope& sc, const std::string& path, upf::DesignView& dv, cons
 void checkUpf(Compilation& comp, const std::string& upfPath, std::string powerTop, bool powerTopSet, Report& rep) {
     upf::Model m;
     m.load(upfPath, "");
+    m.addHdlAttrs(upfHdlAttrs(comp));   // (* UPF_... *) in the HDL (5.6)
     upf::DesignView dv;
     auto tops = comp.getRoot().topInstances;
     for (auto* t : tops) upfWalk(t->body, "", dv, *comp.getSourceManager());
@@ -151,6 +154,11 @@ void checkUpf(Compilation& comp, const std::string& upfPath, std::string powerTo
         top = found == "." ? "" : found.empty() ? top : found;
     }
     m.top = top;
+    m.resolveApplies([&](const std::string& mod) {   // apply_power_model without -elements (6.9)
+        std::vector<std::string> r;
+        for (auto& [p, md] : dv.models) if (md == mod) r.push_back(p);
+        return r;
+    });
     for (auto& w : m.warnings) std::cerr << "mlint: UPF: " << w << "\n";
     for (auto& f : upf::check(m, dv)) {
         if (!rep.rules.enabled(f.rule)) continue;

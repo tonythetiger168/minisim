@@ -1,0 +1,5 @@
+1 all off: m1 VDD=0 ok=x bk=x | m2 VDD=0 ok=x bk=x
+2 VDD on: m1 VDD=1 ok=1 bk=0 | m2 VDD=0 ok=x bk=x
+3 VDDB on: m1 VDD=1 ok=1 bk=0 | m2 VDD=1 ok=1 bk=0
+4 VBAT on: m1 VDD=1 ok=1 bk=1 | m2 VDD=1 ok=1 bk=1
+5 VDD off: m1 VDD=0 ok=x bk=x | m2 VDD=1 ok=1 bk=1

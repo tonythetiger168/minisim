@@ -259,6 +259,8 @@ it. One-hot registers tested bit by bit are followed too.
 | `CDC004` | warning | on | Separately synchronized signals of one domain meet again (reconvergence) |
 | `CDC005` | warning | on | One signal synchronized more than once into the same domain |
 | `CDC006` | warning | on | With `-sdc`: a flop's clock is not a clock in the SDC file |
+| `CDC007` | warning | on | A clock read as data by logic |
+| `CDC008` | warning | on | A clock made by combinational logic of a clock and other signals (glitch) |
 
 ### Reset-domain crossings (`rdc`)
 
@@ -274,7 +276,7 @@ it. One-hot registers tested bit by bit are followed too.
 How domains and synchronizers are recognized, and the options `-cdc-report`,
 `-clock-group` and `-static`, are in [CDC.md](CDC.md).
 
-The UPF rules (`UPF001`..`UPF006`, with `-upf`) are in `docs/LOWPOWER.md`.
+The UPF rules (`UPF001`..`UPF007`, with `-upf`) are in `docs/LOWPOWER.md`.
 Design-for-test rules (gated clocks, logic-driven resets, divided clocks,
 both clock edges) are `mdft`'s.
 

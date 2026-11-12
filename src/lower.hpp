@@ -430,6 +430,9 @@ inline std::function<bool(const slang::ast::Symbol&)>& hideSigIf() {
     return f;
 }
 inline std::vector<int>& hiddenSigs() { static std::vector<int> v; return v; }
+// The automatic variables declared by for statements (12.7.1) in a static
+// process: local to their loop, so msim may unroll the loop (unrollSeqLoops).
+inline std::vector<int>& loopVarSigs() { static std::vector<int> v; return v; }
 // Per-instance coverage: the g_covInsts id of an instance, named by its path
 // below the top ("" = a top).
 inline uint32_t covInstIdOf(const slang::ast::InstanceSymbol& inst) {
@@ -898,6 +901,12 @@ struct Lowerer {
         }
         if (x.kind == ExpressionKind::IntegerLiteral && !x.as<IntegerLiteral>().getValue().hasUnknown()) {
             i.delay = ticksOf((double)*x.as<IntegerLiteral>().getValue().as<uint64_t>());
+            return;
+        }
+        if (d.type->isFloating()) {   // #(hb) with a real variable: scaled to ticks, rounded (10.3.3, 11.11)
+            // rounded to the module's precision first, as a constant delay is
+            E inPrec = rtoi(bin(Op::FMul, realOf(d), realK((double)pow10u(tsUnit - tsPrec))), 64, false, false);
+            i.de = bin(Op::Mul, inPrec, konst(mk(pow10u(tsPrec - simPrecExp()), 64)));
             return;
         }
         if (!d.type->isIntegral()) unsupported("non-integral delay expression");
@@ -3110,6 +3119,29 @@ struct Lowerer {
         condDefs().push_back(std::move(d));
         return condDefs().back().base;
     }
+    // A procedural checker instance (17.3): the process reaching it queues
+    // the checker's static assertions, concurrent ones as procedural
+    // concurrent assertions (16.14.6) and deferred ones as procedural
+    // deferred assertions (16.4), with the procedure's clock and automatic
+    // values. Those of checkers it instantiates statically go the same way.
+    // Everything else in the checker runs on its own (ProcCollector).
+    void procCheckerAsserts(const slang::ast::Scope& body) {
+        using namespace slang::ast;
+        const Scope* savedScope = scope;
+        scope = &body;
+        for (const Symbol& m : body.members()) {
+            if (m.kind == SymbolKind::ProceduralBlock && m.as<ProceduralBlockSymbol>().isFromAssertion)
+                stmt(m.as<ProceduralBlockSymbol>().getBody());
+            else if (m.kind == SymbolKind::CheckerInstance)
+                procCheckerAsserts(m.as<CheckerInstanceSymbol>().body);
+            else if (m.kind == SymbolKind::GenerateBlock && !m.as<GenerateBlockSymbol>().isUninstantiated)
+                procCheckerAsserts(m.as<GenerateBlockSymbol>());
+            else if (m.kind == SymbolKind::GenerateBlockArray)
+                for (const auto* e : m.as<GenerateBlockArraySymbol>().entries)
+                    if (!e->isUninstantiated) procCheckerAsserts(*e);
+        }
+        scope = savedScope;
+    }
     // The condition of c ? a : b, or of x matches p &&& g ? a : b (12.6.2):
     // each part in turn, pattern variables bound as they are matched.
     E condOf(const slang::ast::ConditionalExpression& c) {
@@ -3816,6 +3848,28 @@ struct Lowerer {
             emitUserCall(call, false);
             int t = dynTemp(dynShapeOf(*e.type));
             Instr i = dynCmd(t, D_COPY); i.dsrc = relSig(kRelRet, it->second->retSig); prog.emit(i);
+            return t;
+        }
+        if (e.kind == ExpressionKind::Call && isDynType(*e.type) && e.as<CallExpression>().isSystemCall()) {
+            // qq.pop_front() / pop_back() of a queue of queues (7.10.2.6): the
+            // element is copied out, then removed
+            const auto& call = e.as<CallExpression>();
+            auto n = call.getSubroutineName();
+            if ((n != "pop_front" && n != "pop_back") || call.arguments().empty()) return -1;
+            int outer = dynSig(*call.arguments()[0]);
+            if (outer < 0 || !dynShape(outer).elem) return -1;
+            int t = dynTemp(dynShapeOf(*e.type));
+            { Instr c = dynCmd(t, D_DELETE); prog.emit(c); }   // empty when the queue is
+            Instr j; j.k = IK::JmpIfNot;
+            j.e = bin(Op::Ne, dynSize(outer), konst(mk(0, 32)));
+            size_t at = prog.emit(j);
+            E key = n == "pop_front" ? konst(mk(0, 64)) : bin(Op::Sub, resize(dynSize(outer), 64, false, false), konst(mk(1, 64)));
+            auto r = node(Op::DynElemRef, {key});
+            r->sig = outer;
+            int el = elemRef(outer, r);
+            Instr c = dynCmd(t, D_COPY); c.dsrc = el; prog.emit(c);
+            prog.code[at].target = prog.here();
+            prog.emit(dynCmd(outer, n == "pop_front" ? D_POP_FRONT : D_POP_BACK));   // warns when it is empty
             return t;
         }
         if (e.kind == ExpressionKind::ElementSelect && isDynType(*e.type)) {   // m[i] of a container of containers
@@ -5434,7 +5488,8 @@ struct Lowerer {
         if (dst.isFloating()) return rl ? v : txt ? v : un(Op::IToR, v);
         if (txt) { v = node(Op::StrToInt, {v}); v->hi = w; return v; }
         if (rl) return rtoi(v, w, dst.isSigned(), false);
-        return resize(v, w, true, dst.isSigned());
+        // %d reads a signed number; %h, %o, %b digits are zero-extended (21.3.4.3)
+        return resize(v, w, c == 'd', dst.isSigned());
     }
     // $fscanf / $sscanf (21.3.4): one node reads everything; then each output
     // that a conversion reached is written. Returns the count.
@@ -6395,6 +6450,7 @@ struct Lowerer {
             out.push_back(name);
             return;
         }
+        if (isTaggedUnion(t)) { pfmtTagged(t, v, fmt, out); return; }
         if (t.kind == SymbolKind::PackedStructType || t.kind == SymbolKind::PackedUnionType) {
             fmt += "'{";
             bool first = true;
@@ -6421,10 +6477,42 @@ struct Lowerer {
         }
         unsupported("%p of this type");
     }
+    // A tagged union prints tag:value of the member its tag names (21.2.1.6),
+    // as '{M:v}; a void member prints as '{M}.
+    void pfmtTagged(const slang::ast::Type& t, E v, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        bool up = t.isUnpackedUnion();
+        int w = up ? uWidth(t) : (int)t.getBitWidth();
+        int tb = tagBitsOf(t);
+        E r = konst(mkstr("'{?}"));
+        std::vector<const FieldSymbol*> fs;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) fs.push_back(&f);
+        for (size_t k = fs.size(); k-- > 0;) {
+            const FieldSymbol& f = *fs[k];
+            const Type& mt = f.getType();
+            std::string sub = "'{" + escPct(std::string(f.name));
+            std::vector<E> subArgs;
+            if (!mt.isVoid()) {
+                int fw = up ? uWidth(mt) : (int)mt.getBitWidth();
+                sub += ":";
+                E part = slice(v, fw - 1, 0);
+                if (up) pfmtBits(mt, part, sub, subArgs);
+                else pfmtSingular(mt, mt.isSigned() ? resize(part, fw, false, true) : part, sub, subArgs);
+            }
+            sub += "}";
+            auto sf = node(Op::SFormat, std::move(subArgs));
+            sf->fmt = sub;
+            E cond = tb > 0 ? bin(Op::CaseEq, slice(v, w - 1, w - tb), konst(mk((uint64_t)k, tb))) : konst(mk(1, 1));
+            r = mux(cond, sf, r);
+        }
+        fmt += "%s";
+        out.push_back(r);
+    }
     // An unpacked struct prints with member names; a union, its first member (21.2.1.6).
     void pfmtStruct(const slang::ast::Type& t0, E v, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
         const Type& t = t0.getCanonicalType();
+        if (isTaggedUnion(t)) { pfmtTagged(t, v, fmt, out); return; }
         fmt += "'{";
         bool first = true;
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
@@ -8787,9 +8875,13 @@ struct Lowerer {
                 // first call, then left alone. The flag starts as X, so the
                 // first call fails the "already done" test and takes the init.
                 bool once = current && vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
-                if (!once) {
+                auto initVar = [&] {   // a fixed-size array takes its value element by element
+                    if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
                     prog.emit(i);
+                };
+                if (!once) {
+                    initVar();
                     break;
                 }
                 int flag = freshStatic(1);
@@ -8799,8 +8891,7 @@ struct Lowerer {
                 prog.code[jf].target = prog.here();
                 Instr set; set.k = IK::Assign; set.sig = flag; set.e = konst(mk(1, 1));
                 prog.emit(set);
-                Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
-                prog.emit(i);
+                initVar();
                 prog.code[js].target = prog.here();
                 break;
             }
@@ -8841,6 +8932,9 @@ struct Lowerer {
             }
             case StatementKind::ForLoop: {
                 const auto& f = s.as<ForLoopStatement>();
+                for (const VariableSymbol* v : f.loopVars)
+                    if (v->lifetime == VariableLifetime::Automatic && !localMap().count(v))
+                        if (int sg = sigFind(v); sg >= 0) loopVarSigs().push_back(sg);
                 for (const VariableSymbol* v : f.loopVars)
                     if (const Expression* init = v->getInitializer()) {
                         Instr i; i.k = IK::Assign; i.sig = sigAt(v); i.e = expr(*init);
@@ -9209,6 +9303,10 @@ struct Lowerer {
                 break;
             }
             case StatementKind::WaitFork: { Instr i; i.k = IK::WaitFork; prog.emit(i); break; }
+            case StatementKind::ProceduralChecker:   // 17.3: its static assertions, queued here
+                for (const Symbol* inst : s.as<ProceduralCheckerStatement>().instances)
+                    if (inst->kind == SymbolKind::CheckerInstance) procCheckerAsserts(inst->as<CheckerInstanceSymbol>().body);
+                break;
             case StatementKind::ImmediateAssertion:
                 xpGuard([&] { immAssert(s.as<ImmediateAssertionStatement>()); });
                 break;
@@ -9421,11 +9519,16 @@ inline const slang::ast::Symbol* inoutCollapses(const slang::ast::PortSymbol& ps
     if (ps.internalSymbol->kind != SymbolKind::Net || actual.kind != SymbolKind::Net) return nullptr;
     const auto& in = ps.internalSymbol->as<NetSymbol>();
     const auto& out = actual.as<NetSymbol>();
-    auto plain = [](const NetSymbol& n) {
-        return (n.netType.netKind == NetType::Wire || n.netType.netKind == NetType::Tri) && n.getType().isIntegral() &&
-               !n.getDelay();
+    auto wireish = [](const NetSymbol& n) { return n.netType.netKind == NetType::Wire || n.netType.netKind == NetType::Tri; };
+    auto simple = [](const NetSymbol& n) {
+        auto k = n.netType.netKind;
+        return n.getType().isIntegral() && !n.getDelay() && k != NetType::UserDefined && k != NetType::Interconnect &&
+               k != NetType::TriReg && k != NetType::Unknown;
     };
-    if (!plain(in) || !plain(out) || in.getType().getBitWidth() != out.getType().getBitWidth()) return nullptr;
+    if (!simple(in) || !simple(out) || in.getType().getBitWidth() != out.getType().getBitWidth()) return nullptr;
+    // One net, of the kind that wins (23.3.3.7): a wire or tri side takes the
+    // other side's kind (an inout tri port on a tri1 bus is a tri1 net).
+    if (!wireish(in) && !wireish(out) && in.netType.netKind != out.netType.netKind) return nullptr;
     return &in;
 }
 
@@ -9614,6 +9717,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
         visitDefault(p);
         prefix = std::move(saved);
     }
+    std::vector<std::pair<const slang::ast::Symbol*, uint8_t>> aliasedKinds;
     void finishAliases() {
         for (const auto* s : aliased) {
             const slang::ast::Symbol* root = aliasOf().at(s);
@@ -9624,6 +9728,8 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (auto it = dynArrMap().find(root); it != dynArrMap().end()) { dynArrMap()[s] = it->second; any = true; }
             if (!any) Lowerer::unsupported("alias of a net that has no signal");
         }
+        for (auto [s, k] : aliasedKinds)
+            if (auto it = sigmap.find(s); it != sigmap.end()) netKinds().push_back({it->second, k});
     }
     void aliasModports() {
         for (const auto* m : modportPorts) {
@@ -9640,7 +9746,6 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     }
     void handle(const slang::ast::NetSymbol& n) {
         reg(n, true);
-        if (auto a = aliasOf().find(&n); a != aliasOf().end() && a->second != &n) return;
         using NK = slang::ast::NetType::NetKind;
         uint8_t k = NR_WIRE;
         switch (n.netType.netKind) {
@@ -9655,6 +9760,13 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             default: break;
         }
         if (k == NR_WIRE) return;
+        // A net collapsed into another (an inout port, alias): its type is the
+        // simulated net's when the other side is a wire (23.3.3.7), once the
+        // alias has its signal.
+        if (auto a = aliasOf().find(&n); a != aliasOf().end() && a->second != &n) {
+            if (!n.getType().isUnpackedArray()) aliasedKinds.push_back({&n, k});
+            return;
+        }
         if (n.getType().isUnpackedArray()) {   // wor w [0:1]: each element resolves on its own (6.6.3)
             auto a = arrMap().find(&n);
             if (a == arrMap().end() || a->second->dynElem) Lowerer::unsupported("this array of wand/wor/tri0/tri1/trireg/supply nets");
@@ -10974,6 +11086,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     int checkerDepth = 0;
     std::unordered_set<const slang::ast::Symbol*> freeAssigned;
     bool checkerAssumes = false;
+    int procCheckerDepth = 0;   // inside a checker instantiated in procedural code (17.3)
     // A free checker variable (17.7): random from the start, unless it has
     // an initializer; an active one gets a new random value every time step.
     void freeVar(const slang::ast::VariableSymbol& v) {
@@ -10988,7 +11101,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     void handle(const slang::ast::CheckerInstanceSymbol& ci) {
         using namespace slang::ast;
-        if (ci.body.isProcedural) Lowerer::unsupported("a checker instance in procedural code (17.3)");
+        // In procedural code (17.3) its static assertions are lowered where the
+        // process reaches the instance (Lowerer::procCheckerAsserts); the rest
+        // runs as for a static instance.
+        bool procedural = ci.body.isProcedural;
+        if (procedural) procCheckerDepth++;
+        struct Leave { int& d; bool on; ~Leave() { if (on) d--; } } leave{procCheckerDepth, procedural};
         // Which variables the checker assigns, and whether it has assume
         // statements (17.7.2): an active free variable is one it never assigns.
         struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
@@ -11157,7 +11275,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     void handle(const slang::ast::ProceduralBlockSymbol& p) {
         using slang::ast::ProceduralBlockKind;
-        if (p.isFromAssertion) { assertionItem(p); return; }
+        if (p.isFromAssertion) {
+            if (procCheckerDepth == 0) assertionItem(p);   // else queued by the procedure (17.3)
+            return;
+        }
         // A final block (9.2.3) runs once when simulation ends. Lowering it as
         // a process would run it at time 0 and, looping, forever.
         Lowerer lw(sigmap);
@@ -11627,6 +11748,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     dynMap().clear();
     dynStore().clear();
     hiddenSigs().clear();
+    loopVarSigs().clear();
     dynPending().clear();
     dynPendingAt().clear();
     blockIds() = BlockIds{};
