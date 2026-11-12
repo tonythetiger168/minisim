@@ -494,6 +494,42 @@ inline bool pickVar(Var& v) {
         v.lo = flo; v.hi = fhi;
         return false;
     }
+    if (v.randc) {
+        // Wider than 16 bits: the values given in this cycle are kept
+        // (sorted) and not given again. A cycle ends when no unused value
+        // is found, or after 65536 values, which bounds the memory.
+        auto& used = randcLeft()[{v.owner, v.addr}];
+        auto isUsed = [&](i128 x) { return std::binary_search(used.begin(), used.end(), x); };
+        auto take = [&](i128 x) {
+            used.insert(std::lower_bound(used.begin(), used.end(), x), x);
+            v.lo = v.hi = x; v.set = true; v.val = x;
+            return true;
+        };
+        if (used.size() >= 65536) used.clear();
+        for (int pass = 0; pass < 2; pass++) {
+            if (fhi - flo < 4096) {
+                std::vector<i128> cand;
+                for (i128 x = flo; x <= fhi; x++) if (!isUsed(x)) cand.push_back(x);
+                for (size_t k = cand.size(); k > 1; k--) std::swap(cand[k - 1], cand[(size_t)below((i128)k)]);
+                for (i128 x : cand) {
+                    v.lo = v.hi = x;
+                    if (varOk(v)) return take(x);
+                }
+            } else {
+                for (int t = 0; t < 64; t++) {
+                    v.lo = flo; v.hi = fhi; v.set = false;
+                    v.randc = false;
+                    bool got = pickVar(v);
+                    v.randc = true;
+                    if (!got) { v.lo = flo; v.hi = fhi; return false; }
+                    if (!isUsed(v.val)) return take(v.val);
+                }
+            }
+            used.clear();   // start a new cycle
+        }
+        v.lo = flo; v.hi = fhi; v.set = false;
+        return false;
+    }
     if (v.dist) {
         // Pick a range by weight (18.5.3), then a value in it.
         struct Opt { i128 lo, hi; double w; };
@@ -1196,6 +1232,15 @@ static int doRandomize(int obj, const RandCall* rc) {
             return false;
         };
         ok = attempt();
+        long nFirst = std::count(rank.begin(), rank.end(), -1);
+        if (!ok && pass == 1 && nFirst > 0 && (size_t)nFirst < order.size()) {
+            // A size picked first may leave the other variables no solution
+            // when they decide it together (op == 2 -> q.size() > 1; op != 2
+            // -> q.size() == 0): then the sizes go last, picked within what
+            // the others leave.
+            std::rotate(order.begin(), order.begin() + nFirst, order.end());
+            ok = attempt();
+        }
         if (!ok && !softs.empty()) {
             // Keep soft constraints from the highest priority down, each only if
             // it still leaves a solution (18.5.13.1).
@@ -1230,11 +1275,29 @@ static int doRandomize(int obj, const RandCall* rc) {
         return ok;
     };
 
+    // rand variables wider than 64 bits take random bits. A constraint
+    // that reads one sees those bits as state, so the fill is retried
+    // while the rest has no solution.
+    std::vector<std::pair<int, Val>> wideOld;
+    for (auto& sv : scalars)
+        if (sv.w > 64) wideOld.push_back({sv.addr, S.get(sv.addr)});
+    auto fillWide = [&]() {
+        for (auto& [addr, old] : wideOld) {
+            Val nv = make(0, 0, old.w, 0, old.sgn);
+            for (int i = 0; i < limbCount(old.w); i++) setLimb(nv, i, rnd64(), 0, 0);
+            S.set(addr, finish(nv));
+        }
+    };
     bool ok;
     if (conts.empty()) {
         std::vector<int> none;
-        ok = solvePass(0, none);
+        for (int fill = 0; fill < (wideOld.empty() ? 1 : 64); fill++) {
+            fillWide();
+            ok = solvePass(0, none);
+            if (ok) break;
+        }
     } else {
+        fillWide();
         // Sizes are solved before elements (18.5.8.1), so a size may leave
         // the elements no solution: then the sizes are picked again.
         const std::vector<RCont> conts0 = conts;
@@ -1321,6 +1384,8 @@ static int doRandomize(int obj, const RandCall* rc) {
                 dynBump(c.cid);
             }
     }
+    if (!ok)
+        for (auto& [addr, old] : wideOld) S.set(addr, old);
     if (!ok) cerr << "warning: randomize() failed: the constraints cannot all be met (time " << S.now << ")\n";
     g_fr = callerFr;
     g_rng = savedRng;
