@@ -96,6 +96,7 @@ struct State {
     std::unordered_map<int64_t, Obj*> constObj;
     std::unordered_map<int, Obj*> assertObj;
     std::unordered_map<int, std::vector<Cb*>> assertCbs;   // assertion -> its callbacks (39.4.2)
+    std::map<std::pair<int, const void*>, int> stepStates;   // (assertion, engine term) -> state number (39.5.2)
     std::vector<Cb*> assertSys;                            // callbacks on the assertion system (39.4.1)
     bool assertEnded = false;                              // vpiAssertionSysEnd
     // Coverage (40): per assertion its attempts, successes, failures, vacuous
@@ -1264,6 +1265,8 @@ inline void onAssert(int id, int ev, uint64_t start) {
         case AE_VACUOUS: reason = cbAssertionVacuousSuccess; break;
         case AE_FAILURE: reason = cbAssertionFailure; break;
         case AE_DISABLED: reason = cbAssertionDisabledEvaluation; break;
+        case AE_STEP_OK: reason = cbAssertionStepSuccess; break;
+        case AE_STEP_FAIL: reason = cbAssertionStepFailure; break;
         case AE_RESET: reason = cbAssertionReset; break;
         case AE_KILLED: return;   // an attempt that $assertkill ended: no outcome (39.4.2)
         default: reason = ev >= AE_CTL ? ctlReason(ev - AE_CTL, false) : 0;
@@ -1278,7 +1281,23 @@ inline void onAssert(int id, int ev, uint64_t start) {
         s_vpi_attempt_info info{};
         info.attemptStartTime = s_vpi_time{vpiSimTime, (PLI_UINT32)(start >> 32), (PLI_UINT32)start, (double)start};
         info.detail.failExpr = nullptr;
-        bool attempt = ev <= AE_DISABLED;
+        s_vpi_assertion_step_info step{};
+        if (ev == AE_STEP_OK || ev == AE_STEP_FAIL) {   // 39.5.2: the states are the engine's, numbered per assertion as first seen
+            auto num = [&](const void* n) {
+                auto [it2, fresh] = s.stepStates.try_emplace({id, n}, 0);
+                if (fresh) {
+                    int k = 0;
+                    for (auto& [key, v] : s.stepStates)
+                        if (key.first == id && key.second != n) k++;
+                    it2->second = k;
+                }
+                return it2->second;
+            };
+            step.stateFrom = num(assertStep().from);
+            step.stateTo = num(assertStep().to);
+            info.detail.step = &step;
+        }
+        bool attempt = ev <= AE_DISABLED || ev == AE_STEP_OK || ev == AE_STEP_FAIL;
         c->assertFn(reason, &t, H(a), attempt ? &info : nullptr, c->d.user_data);
     }
 }
@@ -1314,9 +1333,23 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         case vpiAssertionSysEnableNonvacuousAction: ctl = AC_NONVACON; sys = true; break;
         case vpiAssertionSysDisableVacuousAction: ctl = AC_VACOFF; sys = true; break;
         case vpiAssertionEnableStep:
-        case vpiAssertionDisableStep:
+        case vpiAssertionDisableStep: {   // 39.5.2: report each clock step of the assertion's attempts
+            Obj* o = O(va_arg(ap, vpiHandle));
+            if (!o || o->kind != Obj::Assertion) {
+                error(vpiError, "vpi_control: assertion stepping needs an assertion handle");
+                return 0;
+            }
+            if (denied(o, "vpi_control")) return 0;
+            AssertInfo& a = asserts()[(size_t)o->idx];
+            if (a.type != AT_CONCURRENT) {   // a concurrent assertion: immediate ones have no steps
+                error(vpiError, "vpi_control: only a concurrent assertion has clock steps");
+                return 0;
+            }
+            a.step = op == vpiAssertionEnableStep;
+            return 1;
+        }
         case vpiAssertionClockSteps:
-            error(vpiError, "vpi_control: assertion stepping (39.5.2) is not supported");
+            error(vpiError, "vpi_control: vpiAssertionClockSteps is not supported");
             return 0;
         default: return -1;   // not an assertion operation
     }
@@ -3554,10 +3587,6 @@ vpiHandle vpi_register_assertion_cb(vpiHandle assertion, PLI_INT32 reason, vpi_a
     if (!fn) { vpi::error(vpiError, "vpi_register_assertion_cb: no callback routine"); return nullptr; }
     if (!vpi::assertReason(reason)) {
         vpi::error(vpiError, "vpi_register_assertion_cb: reason " + std::to_string(reason) + " is not an assertion callback reason");
-        return nullptr;
-    }
-    if (reason == cbAssertionStepSuccess || reason == cbAssertionStepFailure) {
-        vpi::error(vpiError, "vpi_register_assertion_cb: assertion stepping (39.5.2) is not supported");
         return nullptr;
     }
     if (asserts()[(size_t)a->idx].prot) { vpi::error(vpiError, "vpi_register_assertion_cb: the assertion is protected"); return nullptr; }

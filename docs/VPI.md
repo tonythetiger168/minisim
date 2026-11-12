@@ -135,9 +135,17 @@ pass, fail and vacuous action ones; `vpi_remove_cb` removes it.
 simulation) and the action ones. `vpi_control` (39.5) takes every assertion
 operation of annex M, on one assertion (`vpi_control(vpiAssertionDisable,
 h)`) or the system (`vpi_control(vpiAssertionSysOff)`). The system tasks of
-20.11 (`$assertoff`, `$assertcontrol`, ...) call the same callbacks. Not
-supported: stepping (`vpiAssertionEnableStep`, `cbAssertionStepSuccess`,
-39.5.2), and `failExpr` of a failure is NULL.
+20.11 (`$assertoff`, `$assertcontrol`, ...) call the same callbacks.
+Stepping (39.5.2): `vpi_control(vpiAssertionEnableStep, h)` on a
+concurrent assertion makes every clock step of each of its attempts call
+`cbAssertionStepSuccess` (the attempt goes on or matches) or
+`cbAssertionStepFailure` (it fails), with the attempt's start time and
+`detail.step` giving `stateFrom` and `stateTo`: the engine's states for the
+attempt, numbered per assertion in the order they are first seen (two
+attempts in the same state have the same number). `vpiAssertionDisableStep`
+turns it off. Not supported: `vpiAssertionClockSteps`, the matched
+expressions of a step (`matched_expression_count` is 0), and `failExpr` of
+a failure is NULL.
 
 **Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
 instance)` gives the covered items of that instance: `vpiStatementCoverage`
@@ -306,7 +314,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `39-vpi-assertions.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
