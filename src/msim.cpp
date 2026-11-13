@@ -1254,6 +1254,39 @@ static void splitCombBlocks(LowerResult& lowered) {
     }
 }
 
+// Under -upf, a process stays a coroutine on the interpreter when power can
+// gate it (it is in a power domain) or it runs UPF code (an isolation or
+// level-shifter cell on a port connection, the UPF package): the rest of the
+// design is planned, and runs on several threads, as without -upf.
+// A process that writes a signal the UPF runtime watches (a supply or power
+// state control, a logic expression's operand) stays a coroutine too, so the
+// power states see its value in the same order as without planning.
+static bool upfPinned(const Prog& q) {
+    if (!g_upf) return false;
+    if (q.pd >= 0) return true;
+    static const std::set<int> watched = [] {
+        std::set<int> w;
+        for (auto& [sg, e] : upfrt::rt().watch) w.insert(sg);
+        return w;
+    }();
+    for (auto& i : q.code)
+        if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig >= 0 && watched.count(i.sig)) return true;
+    std::function<bool(const E&)> has = [&](const E& e) -> bool {
+        if (!e) return false;
+        if (e->op == Op::SysFn && e->hi == SF_UPF) return true;
+        if (has(e->at)) return true;
+        for (auto& k : e->kids) if (has(k)) return true;
+        return false;
+    };
+    for (auto& i : q.code) {
+        if (has(i.e) || has(i.bidx) || has(i.de) || has(i.fd) || has(i.self)) return true;
+        for (auto& a : i.args) if (has(a)) return true;
+        for (auto& a : i.aidx) if (has(a)) return true;
+        if (i.k == IK::Call || i.k == IK::Fork) return true;   // the callee may run UPF code
+    }
+    return false;
+}
+
 static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     size_t n = lowered.procs.size();
     Plan p;
@@ -1269,7 +1302,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
         std::vector<size_t> procOf;
         for (size_t i = 0; i < n; i++) {
             CombShape c;
-            if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
+            if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && !upfPinned(lowered.procs[i].prog) && combShape(lowered.procs[i].prog, c)) { shapes.push_back(c); procOf.push_back(i); }
         }
         std::vector<int> lv;
         // MSIM_WHYCYCLE=1: the blocks that feed each other (they keep the
@@ -1296,7 +1329,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     }
     if (staticSeq)
         for (size_t i = 0; i < n; i++)
-            if (p.rank[i] < 0 && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
+            if (p.rank[i] < 0 && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && !upfPinned(lowered.procs[i].prog) && seqShape(lowered.procs[i].prog, p.ev[i])) p.seq[i] = 1;
     // MSIM_WHYCORO=1: the processes left as coroutines, with the kinds of
     // instruction that are neither an assign nor a jump.
     if (std::getenv("MSIM_WHYCORO"))
@@ -1413,7 +1446,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         if (pl.rank[i] >= 0)
             for (auto& in : lowered.procs[i].prog.code) combAssert |= in.k == IK::Assert;
     parts.on = staticPart && !combAssert && !pl.cyclic;
-    cycle = cycle && !pl.cyclic;   // the domain evaluates every comb statement once, in rank order
+    // The domain evaluates every comb statement once, in rank order. Not with
+    // -upf: every write goes through Sim::set, which keeps the UPF holds.
+    cycle = cycle && !pl.cyclic && !upf;
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     std::vector<std::pair<const Prog*, size_t>> covSlots;
@@ -2942,9 +2977,13 @@ int main(int argc, char** argv) {
             std::cerr << "msim: UPF: " << ex.what() << "\n";
             return 1;
         }
-        // Power gating needs every process on the interpreter, one thread.
-        staticComb = staticSeq = staticPart = false;
-        threads = 1;
+        // Power gating keeps the processes it can gate, and those that run
+        // UPF code, on the interpreter (upfPinned); the rest is planned and
+        // runs on several threads. MSIM_UPF_SERIAL=1 runs it all serially.
+        if (std::getenv("MSIM_UPF_SERIAL")) {
+            staticComb = staticSeq = staticPart = false;
+            threads = 1;
+        }
         // -compile: simv runs the same runtime from a snapshot of it (upf_rt.inc).
         if (std::string gap = rt.simvGap(); compiled && !gap.empty()) {
             std::cerr << "msim: -compile: " << gap << " in the power intent is not compiled yet; using the interpreter\n";

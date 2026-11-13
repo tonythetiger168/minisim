@@ -18,6 +18,11 @@ Spec references are IEEE 1800-2023 clauses.
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
   check no longer counts the reset value as a change.
+- `msim -upf` plans the logic power cannot gate (testbench, always-on
+  logic) as without `-upf`: static schedules, partitions and `-threads`.
+  Processes in power domains, UPF cells and writers of UPF controls stay on
+  the interpreter. A testbench-heavy power-aware run is about 1.7 times
+  faster; `MSIM_UPF_SERIAL=1` restores the old serial mode.
 - The Tcl interpreter of the tool line (`src/tcl.hpp`, used by UPF, SDC and
   the tool shells) has `upvar`, `uplevel`, `namespace eval` with `variable`
   and namespace procs, `namespace current / exists / qualifiers / tail /
