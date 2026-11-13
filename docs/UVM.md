@@ -55,6 +55,9 @@ test runs with `msim -uvmhome`, so with UVM's C code, unless it says
 | `dpi.sv` | UVM's C code: `uvm_re_match`, `uvm_cmdline_processor`, `+uvm_set_config_int`, `uvm_hdl_*` read / deposit / force / release on variables, nets and part selects, `uvm_hdl_force_time`, a register read and written through its backdoor |
 | `hello_nodpi.sv` | `hello.sv` with the library built without its C code |
 | `features.sv` | field macros (print, clone, compare, sprint, pack), a factory type override, a TLM FIFO between put and get ports, a report catcher, `print_topology`, `randomize() with`, `+UVM_TESTNAME` |
+| `base_extras.sv` | `uvm_time`, `uvm_heartbeat` (a missed beat is reported), `uvm_sequence_library` (RANDC and RAND selection, add and remove), the report macros with counts, `uvm_callback_iter`, `print_config`, package scope functions, `uvm_run_test_callback`, `uvm_root` find / find_all |
+| `reg_extras.sv` | `uvm_reg_file` with its HDL path, register randomization, `uvm_reg_indirect_data`, `uvm_reg_fifo`, `uvm_vreg` / `uvm_vreg_field` (static, allocated and implemented), `uvm_mem_mam` and regions, the `uvm_reg_block` lookups |
+| `reg_sequences.sv` | `uvm_reg_access_seq`, the shared access sequences, `uvm_mem_access_seq`, `uvm_reg_mem_hdl_paths_seq`, `uvm_reg_mem_built_in_seq`: each runs clean on a good DUT and reports an error on a broken one |
 
 ## Not yet
 

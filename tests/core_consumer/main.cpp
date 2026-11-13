@@ -20,6 +20,8 @@
 #include "gnetlist.hpp"
 #include "liberty.hpp"
 #include "upf.hpp"
+// The vendor command-line layer every tool registers its option tables with.
+#include "compat.hpp"
 
 int main() {
     // The pool: the same one every tool uses for its per-core work.
@@ -35,5 +37,8 @@ int main() {
 
     std::printf("core_consumer: minisim %s, pool sum %d, %zu findings, %zu instructions\n",
                 MINISIM_VERSION, sum.load(), report.out.size(), prog.code.size());
-    return (sum == 10 && prog.code.size() == 1) ? 0 : 1;
+    std::vector<std::string> args{"--compat=cadence", "-64bit"};
+    compat::Vendor v = compat::detect("tool", args, {});
+    compat::Result r = compat::translate(v, args, {});
+    return (sum == 10 && prog.code.size() == 1 && v == compat::Vendor::Cadence && r.args.empty()) ? 0 : 1;
 }

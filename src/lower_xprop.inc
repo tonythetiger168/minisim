@@ -145,6 +145,9 @@ struct Xp {
     std::unordered_set<int> temps;              // this process's temporaries
     std::unordered_set<int> bad;                // targets that cannot be merged (real, string, ...)
     std::unordered_set<size_t> okNba, okArr, oolJmp;
+    // Called subroutines with nonblocking assignments, and their copies for
+    // this process (see xpVariant).
+    std::unordered_map<const Prog*, const Prog*> variants;
     // The clean copy (see xpProc): `sites` holds, per region in the order
     // the regions are lowered, where the merging copy takes over when
     // condition k is unknown (empty: the region is not merged).
@@ -220,16 +223,17 @@ static bool xpMessageTask(std::string_view n) {
            n.starts_with("$fstrobe") || n.starts_with("$fmonitor") || n == "$fatal" || n == "$error" ||
            n == "$warning" || n == "$info" || n == "$finish" || n == "$stop";
 }
-// Whether a task or function, and every one it calls, only assigns with =
-// (no <=, no delay or event control, no fork): then a call of it can run
-// speculatively, and its writes are merged with the region's (xpScan).
+// Whether a task or function, and every one it calls, has no delay, event
+// control or fork: then a call of it can run speculatively, its blocking
+// writes are merged with the region's (xpScan), and its nonblocking ones
+// write x in an unknown region (xpVariant).
 static bool xpPureSub(const slang::ast::SubroutineSymbol& sub, int depth = 0) {
     using namespace slang::ast;
     struct V : ASTVisitor<V, VisitFlags::Statements | VisitFlags::Expressions> {
         bool ok = true;
         int depth = 0;
         void handle(const AssignmentExpression& a) {
-            if (a.isNonBlocking() || a.timingControl) ok = false;
+            if (a.timingControl) ok = false;   // a plain <= runs as in xpVariant
             visitDefault(a);
         }
         void handle(const TimedStatement&) { ok = false; }
@@ -252,7 +256,7 @@ static bool xpPureSub(const slang::ast::SubroutineSymbol& sub, int depth = 0) {
     return v.ok;
 }
 // An expression statement: a message task is guarded; a call of a user task
-// or function that only assigns with = is lowered as it is, and its writes
+// or function with no timing control is lowered as it is, and its writes
 // are merged (xpScan); any other call makes the regions around it unmergeable.
 void xpExprStmt(const slang::ast::Expression& ex) {
     using namespace slang::ast;
@@ -338,6 +342,35 @@ void xpTargets(const slang::ast::Expression& l0, bool delayed, XpCounts& out, Xp
     if (!s) { pre.unknown = true; return; }
     out[s] = std::min(2, out[s] + 1);
     if (!simple || delayed) pre.direct.insert(s);
+}
+// The variables the tasks and functions that s calls assign with <=. They
+// have no shadow (xpVariant writes them directly), so the block's own <=
+// to one of them has none either: its merged value would be scheduled
+// after the task's x.
+void xpCalleeTargets(const slang::ast::Statement& s, XpCounts& out, XpPre& pre) {
+    using namespace slang::ast;
+    struct V : ASTVisitor<V, VisitFlags::Statements | VisitFlags::Expressions> {
+        Lowerer& lw;
+        XpCounts& out;
+        XpPre& pre;
+        std::unordered_set<const SubroutineSymbol*> seen;
+        int depth = 0;   // inside a called body
+        V(Lowerer& l, XpCounts& o, XpPre& p) : lw(l), out(o), pre(p) {}
+        void handle(const AssignmentExpression& a) {
+            if (a.isNonBlocking() && depth > 0) {
+                XpCounts c;
+                lw.xpTargets(a.left(), true, c, pre);   // delayed: always direct
+                for (auto& [sym, n] : c) out[sym] = std::min(2, out[sym] + n);
+            }
+            visitDefault(a);
+        }
+        void handle(const CallExpression& c) {
+            if (const auto* sub = std::get_if<const SubroutineSymbol*>(&c.subroutine))
+                if (seen.insert(*sub).second) { depth++; (*sub)->getBody().visit(*this); depth--; }
+            visitDefault(c);
+        }
+    } v(*this, out, pre);
+    s.visit(v);
 }
 // How many times one pass over s can assign each variable with <=
 // (0, 1, or 2 for more).
@@ -631,9 +664,10 @@ void xpLoopPoison(size_t a, size_t b, const std::vector<size_t>& jps) {
     for (size_t j : jps) prog.code[j].target = prog.here();
     std::map<int, XpBits> tg;
     std::string why;
+    std::vector<int> nbas;   // what called tasks assign with <=
     for (size_t pc = a; pc < b; pc++) {
         const Instr& i = prog.code[pc];
-        if (i.k == IK::Call) { xpCallee(i.callee, tg, why, 0); continue; }
+        if (i.k == IK::Call) { xpCallee(i.callee, tg, why, 0, &nbas); continue; }
         if (i.k != IK::Assign || i.sig < 0 || i.arr || i.dyn >= 0 || i.drv >= 0 || isRel(i.sig) ||
             xp.bad.count(i.sig) || !xpSigW(i.sig))
             continue;
@@ -645,6 +679,9 @@ void xpLoopPoison(size_t a, size_t b, const std::vector<size_t>& jps) {
         if (u.hi >= 0) { i.hi = u.hi; i.lo = u.lo; }
         prog.emit(i);
     }
+    std::sort(nbas.begin(), nbas.end());
+    nbas.erase(std::unique(nbas.begin(), nbas.end()), nbas.end());
+    for (int s : nbas) { Instr i; i.k = IK::Nba; i.sig = s; i.e = xpX(xpSigW(s)); xp.okNba.insert(prog.emit(i)); }
 }
 // Lowers the body; returns the jump that leaves the loop when brk is 1 (to be patched to the loop's end).
 size_t xpLoopBody(const slang::ast::Statement& body) {
@@ -684,7 +721,55 @@ struct XpBits { bool all = false; std::vector<std::pair<int, int>> r; };
 // The same for the body of a called function or task: its static
 // variables become units of the region; its automatic ones live in its own
 // frame and need nothing.
-bool xpCallee(const Prog* p, std::map<int, XpBits>& tg, std::string& why, int depth) {
+// A nonblocking assignment in a called subroutine that xpVariant can run.
+bool xpCalleeNbaOk(const Instr& i) {
+    return i.sig >= 0 && !isRel(i.sig) && !i.arr && i.dyn < 0 && i.drv < 0 && i.aidx.empty() &&
+           !xp.bad.count(i.sig) && xpSigW(i.sig) > 0;
+}
+static bool xpCalleeHasNba(const Prog* p, int depth = 0) {
+    if (!p || depth > 16) return false;
+    for (const Instr& i : p->code)
+        if (i.k == IK::Nba || (i.k == IK::Call && i.callee != p && xpCalleeHasNba(i.callee, depth + 1))) return true;
+    return false;
+}
+// What a call in an unknown region runs. A called task's nonblocking
+// assignment cannot be shadowed like the caller's own (the task is shared
+// by every caller), so the call runs a copy made for this process in which
+// each one writes x while this process's region is unknown (xp.xm), the
+// rule for a target with no shadow (xpDirect). The copy keeps every
+// instruction where it was: a nonblocking assignment becomes a jump to code
+// added after the end, which jumps back.
+const Prog* xpVariant(const Prog* p, int depth = 0) {
+    if (!p || !store || depth > 16 || !xpCalleeHasNba(p)) return p;
+    if (auto it = xp.variants.find(p); it != xp.variants.end()) return it->second;
+    store->push_back(std::make_unique<Prog>(*p));
+    Prog& v = *store->back();
+    xp.variants[p] = &v;
+    v.combCtl.reset();
+    size_t n = v.code.size();
+    { Instr r; r.k = IK::Ret; v.code.push_back(r); }
+    for (size_t pc = 0; pc < n; pc++) {
+        Instr& c = v.code[pc];
+        if (c.k == IK::Call && c.callee != p) { c.callee = xpVariant(c.callee, depth + 1); continue; }
+        if (c.k != IK::Nba || !xpCalleeNbaOk(c)) continue;
+        Instr orig = c;
+        int w = orig.bidx && orig.pw <= 0 ? 1 : orig.pw > 0 ? orig.pw : orig.hi >= 0 ? orig.hi - orig.lo + 1 : xpSigW(orig.sig);
+        Instr to; to.k = IK::Jmp; to.target = v.code.size(); to.file = orig.file; to.line = orig.line;
+        v.code[pc] = to;
+        Instr jf; jf.k = IK::JmpIfNot; jf.e = ref(xp.xm); jf.file = orig.file; jf.line = orig.line;
+        size_t at = v.code.size();
+        v.code.push_back(jf);
+        Instr x = orig; x.e = xpX(w);
+        v.code.push_back(x);
+        Instr back; back.k = IK::Jmp; back.target = pc + 1;
+        v.code.push_back(back);
+        v.code[at].target = v.code.size();
+        v.code.push_back(orig);
+        v.code.push_back(back);
+    }
+    return &v;
+}
+bool xpCallee(const Prog* p, std::map<int, XpBits>& tg, std::string& why, int depth, std::vector<int>* nbas = nullptr) {
     if (!p) return true;
     if (depth > 16) { why = "a recursive call"; return false; }
     for (const Instr& i : p->code)
@@ -699,9 +784,16 @@ bool xpCallee(const Prog* p, std::map<int, XpBits>& tg, std::string& why, int de
                 break;
             case IK::Jmp: case IK::JmpIfNot: case IK::Ret:
                 break;
+            case IK::Nba:   // runs as in xpVariant
+                if (!xpCalleeNbaOk(i)) {
+                    why = "a called task with a nonblocking assignment to an array element, an automatic variable or a net"; return false;
+                }
+                if (!store) { why = "a called task with a nonblocking assignment"; return false; }
+                if (nbas) nbas->push_back(i.sig);
+                break;
             case IK::Call:
                 if (i.callee == p) { why = "a recursive call"; return false; }
-                if (!xpCallee(i.callee, tg, why, depth + 1)) return false;
+                if (!xpCallee(i.callee, tg, why, depth + 1, nbas)) return false;
                 break;
             default:
                 why = "a called function or task with a statement that cannot run speculatively"; return false;
@@ -741,6 +833,7 @@ bool xpScan(size_t a, size_t b, std::map<int, XpBits>& tg, std::string& why) {
                 break;
             case IK::Call:   // a function or task: what it writes is merged too
                 if (!xpCallee(i.callee, tg, why, 0)) return false;
+                prog.code[pc].callee = xpVariant(i.callee);
                 break;
             case IK::WaitEdge: case IK::WaitDelay: case IK::CycleWait: case IK::WaitFork:
                 why = "a delay or event control"; return false;
@@ -1209,6 +1302,7 @@ void xpProc(const slang::ast::Statement& body) {
     XpCounts counts;
     XpPre pre;
     xpCount(*b, counts, pre);
+    xpCalleeTargets(*b, counts, pre);
     bool anyEager = false;
     for (auto& [sym, n] : counts) {
         int cls = pre.unknown || pre.direct.count(sym) ? XC_DIRECT

@@ -3037,6 +3037,10 @@ struct Lowerer {
                 if (!c.isSystemCall() || n == "pop_front" || n == "pop_back") found = true;
                 else visitDefault(c);
             }
+            void handle(const AssignmentExpression&) { found = true; }   // c ? i = 1 : 0
+            void handle(const UnaryExpression& u) {   // c ? i++ : i
+                if (OpInfo::isLValue(u.op)) found = true; else visitDefault(u);
+            }
             void handle(const NewClassExpression&) { found = true; }
             void handle(const CopyClassExpression&) { found = true; }
         } v;
@@ -4831,6 +4835,22 @@ struct Lowerer {
                 // (11.8.3): extend with the operand's signedness. An outer width
                 // still wins, so a truncating assign stays narrow.
                 const auto& c = e.as<ConversionExpression>();
+                // To a 2-state type (bit, int, byte) from a 4-state one: x and
+                // z bits become 0 (6.11.2, 10.7). The conversion is lowered as
+                // usual, then its x and z bits are cleared.
+                if (to2State != &e && c.type->isIntegral() && !c.type->isFourState() &&
+                    c.operand().type->isIntegral() && c.operand().type->isFourState()) {
+                    const Expression* saved = to2State;
+                    to2State = &e;
+                    E v = expr(e, ctx);
+                    to2State = saved;
+                    if (v->op == Op::Const) {
+                        Val k = v->k;
+                        for (int i = 0; i < limbCount(k.w); i++) setLimb(k, i, limbV(k, i) & ~limbX(k, i), 0, 0);
+                        return konst(k);
+                    }
+                    return sysFnNode(SF_TO_2STATE, {std::move(v)});
+                }
                 if (peel(c.operand()).kind == ExpressionKind::Streaming && c.type->isIntegral()) {
                     // a stream into a wider integral type is left-aligned,
                     // padded with zeros on the right (11.4.14)
@@ -5304,6 +5324,9 @@ struct Lowerer {
                     return sized(r, storeW(*e.type), e.type->isSigned(), ctx);
                 }
                 if (isHandleType(*m.value().type)) {   // h.x (8.4): read through the handle when evaluated
+                    // h.P, a parameter or enum value of the class (8.25): its constant
+                    if (m.member.kind == SymbolKind::Parameter || m.member.kind == SymbolKind::EnumValue)
+                        return constSym(m.member, e, ctx);
                     const PropSlot* ps = memberSlot(m);
                     E r;
                     if (!ps) {
@@ -5492,11 +5515,23 @@ struct Lowerer {
                 break;
             }
             default: {  // SignalEvent or EventList: @(posedge a or negedge b ...)
+                // @(ev iff c) (9.4.2.3): the event counts only when c is true
+                // as it happens, so wait again otherwise.
+                const Expression* iff = nullptr;
+                if (t.kind == TimingControlKind::SignalEvent) iff = t.as<SignalEventControl>().iffCondition;
+                else if (t.kind == TimingControlKind::EventList)
+                    for (auto* sub : t.as<EventListControl>().events)
+                        if (sub->kind == TimingControlKind::SignalEvent && sub->as<SignalEventControl>().iffCondition)
+                            unsupported("iff in an event list");
                 Instr i; i.k = IK::WaitEdge;
                 collectEvents(t, i.events);
                 i.sig = i.events[0].first;
                 i.edge = i.events[0].second;
-                prog.emit(i);
+                size_t top = prog.emit(i);
+                if (iff) {
+                    Instr j; j.k = IK::JmpIfNot; j.e = expr(*iff); j.target = top;
+                    prog.emit(j);
+                }
             }
         }
     }
@@ -6833,6 +6868,7 @@ struct Lowerer {
     // ---------- constrained randomization (18) ----------
     std::unordered_map<const slang::ast::Symbol*, Val> constVals;     // foreach indices of a constraint, unrolled
     std::unordered_map<const slang::ast::Symbol*, int> symOverride;   // with {...}: the caller's properties, copied
+    const slang::ast::Expression* to2State = nullptr;   // the conversion being lowered without its x/z clearing
     // with {...}: an element of the caller's array or container, by an index
     // the caller knows (addrs[i]), read into a signal before the call.
     std::unordered_map<const slang::ast::Expression*, int> exprOverride;
@@ -8005,6 +8041,25 @@ struct Lowerer {
         }
         for (size_t k : toEnd) prog.code[k].target = prog.here();
     }
+    // An expression that reads signals and computes, with no side effect and
+    // nothing that depends on how often it runs: a case selector that may be
+    // evaluated once instead of once per label.
+    static bool pureSel(const E& e) {
+        if (!e) return true;
+        switch (e->op) {
+            case Op::Const: case Op::Ref: case Op::Not: case Op::And: case Op::Or: case Op::Xor:
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Eq: case Op::Ne: case Op::CaseEq:
+            case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Shl: case Op::Shr: case Op::Asr:
+            case Op::Resize: case Op::LogNot: case Op::LogAnd: case Op::LogOr: case Op::RedAnd: case Op::RedOr:
+            case Op::RedXor: case Op::Slice: case Op::Index: case Op::Concat: case Op::Mux: case Op::ArrRead:
+                break;
+            default: return false;
+        }
+        if (!pureSel(e->at)) return false;
+        for (const auto& k : e->kids) if (!pureSel(k)) return false;
+        return true;
+    }
+    inline static int caseIds = 0;   // the last Instr::caseId given out
     static int caseMayOverlap(const slang::ast::CaseStatement& c) {
         using namespace slang::ast;
         using slang::logic_t;
@@ -8966,6 +9021,12 @@ struct Lowerer {
                     for (int k = 0; k < a->count; k++) { Instr i; i.k = IK::Assign; i.sig = a->base + k; i.e = konst(iv); prog.emit(i); }
                     break;
                 }
+                // An array with an initializer in a function that keeps static
+                // signals: assigned at each entry, as an automatic one is.
+                if (init && vd.symbol.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType &&
+                    !(current && vd.symbol.lifetime == VariableLifetime::Static) && arrFind(&vd.symbol) &&
+                    assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false))
+                    break;
                 if (localMap().count(&vd.symbol)) {   // an automatic variable starts over at each entry (6.21)
                     if (vd.symbol.getType().isEvent()) break;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol);
@@ -9327,11 +9388,16 @@ struct Lowerer {
                          : c.condition == CaseStatementCondition::WildcardJustZ ? Op::CaseZEq
                                                                                 : Op::CaseXEq;
                 std::vector<E> conds;
+                // A selector without side effects is lowered once and shared by
+                // every compare, so the interpreter can find the item through a
+                // table (Instr::caseId) instead of comparing label by label.
+                E sel1 = c.condition == CaseStatementCondition::Normal ? expr(c.expr) : nullptr;
+                if (sel1 && !pureSel(sel1)) sel1 = nullptr;
                 for (const auto& item : c.items) {
                     E cond;   // OR of (selector === item_expr) over this item's labels
                     for (const Expression* x : item.expressions) {
                         E m = c.condition == CaseStatementCondition::Inside ? insideItem(c.expr, *x)
-                                                                             : bin(cmp, expr(c.expr), expr(*x));
+                                                                             : bin(cmp, sel1 ? sel1 : expr(c.expr), expr(*x));
                         cond = cond ? bin(Op::LogOr, cond, m) : m;
                     }
                     conds.push_back(cond);
@@ -9342,6 +9408,14 @@ struct Lowerer {
                 bool uniq = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Unique0;
                 bool needAll = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority;
                 int ov = uniq ? caseMayOverlap(c) : 0;
+                if (ov == 2 && sel1) {   // labels slang did not fold, such as enum names: compare the lowered constants
+                    E sel;
+                    std::vector<uint64_t> keys;
+                    bool known = true;
+                    for (const E& cd : conds) known = known && caseLabels(cd, sel, keys);
+                    std::sort(keys.begin(), keys.end());
+                    if (known && std::adjacent_find(keys.begin(), keys.end()) == keys.end()) ov = 0;
+                }
                 bool mayOverlap = ov > 0;
                 E selUnknown;   // casez / casex labels that never overlap can still
                                 // both match a selector with z (or x) bits
@@ -9352,8 +9426,11 @@ struct Lowerer {
                     uniqueCaseLinear(s, c, conds, selUnknown);
                     break;
                 }
+                bool table = sel1 && !mayOverlap && c.items.size() >= 4 && !g_cov;
+                if (table) caseIds++;
                 for (size_t k = 0; k < c.items.size(); k++) {
                     Instr j; j.k = IK::JmpIfNot; j.e = conds[k];
+                    if (table) { j.caseId = caseIds; j.caseItem = (int)k + 1; }
                     size_t jf = prog.emit(j);
                     if (mayOverlap && k + 1 < c.items.size()) {
                         E more;
@@ -9888,10 +9965,20 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
     }
+    int subrDepth = 0;
     void handle(const slang::ast::SubroutineSymbol& sub) {
         bool m = isClassMethod(sub);
         inMethod += m;
+        // Every signal made in here belongs to the subroutine (see subrLocalSigs).
+        MkSig saved = mkSig;
+        if (subrDepth++ == 0)
+            mkSig = [saved](const std::string& n, int w, bool net) {
+                int id = saved(n, w, net);
+                subrLocalSigs().insert(id);
+                return id;
+            };
         visitDefault(sub);
+        if (--subrDepth == 0) mkSig = saved;
         inMethod -= m;
     }
     // extern task t in an interface (25.7): the module task that exports it
@@ -11114,6 +11201,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (it == sigmap.end())
             throw std::runtime_error("lower: port '" + std::string(ps.name) + "' is not a signal");
         int w = (int)ps.getType().getBitWidth();
+        if (w <= 0 && (ps.getType().isUnpackedStruct() || ps.getType().isUnpackedUnion()))
+            w = storeW(ps.getType());   // an unpacked struct port: one vector, as for a variable (7.2)
         if (w <= 0) Lowerer::unsupported("port width");
         return Formal{it->second, w, ps.getType().isSigned()};
     }
@@ -12006,6 +12095,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     classRt().clear();
     layoutStore() = &out.layouts;
     netKinds().clear();
+    subrLocalSigs().clear();
     usesForce() = false;
     srcMgr() = comp.getSourceManager();
     dynMap().clear();
@@ -12369,6 +12459,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             if (sub->cls->builtin) lw.builtinMethod(*sub->cls, *sub);
             else lw.ctorBody(*sub->cls, sub->sym ? &sub->sym->getBody() : nullptr);
             *sub->prog = std::move(lw.prog);
+            sub->prog->sub = sub->sym;
             continue;
         }
         g_covInst = 0;
@@ -12388,6 +12479,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);
+        sub->prog->sub = sub->sym;   // VPI frames (38.36.1)
         if (!sub->lay) {   // its static variables: callers are not sensitive to them
             struct Walk {
                 const std::unordered_map<const slang::ast::Symbol*, int>& sm;
@@ -12514,7 +12606,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
-                            if (rv.w > 64 && (rv.dyn || rv.randc)) Lowerer::unsupported(rv.randc ? "randc variable wider than 64 bits" : "rand container of elements wider than 64 bits");
+                            if (rv.w > 64 && rv.randc) Lowerer::unsupported("randc variable wider than 64 bits");
                         } else Lowerer::unsupported("rand property of this type");
                         if (et->isEnum() && rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // each element: one of the named values
                             RandItem loop;
