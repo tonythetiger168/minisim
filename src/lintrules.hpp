@@ -230,6 +230,8 @@ struct Shape {
     std::vector<const SignalEventControl*> edges, levels;
     bool implicit = false;  // @*
     bool oldStyle = false;  // a plain always
+    bool trailing = false;  // always begin ... @(list); end   (or ... wait (0); end: a constant driver)
+    const Statement* tail = nullptr;  // that last @(list) or wait (0)
 };
 
 inline Shape shapeOf(const ProceduralBlockSymbol& p) {
@@ -248,6 +250,44 @@ inline Shape shapeOf(const ProceduralBlockSymbol& p) {
             for (auto* e : evs) (e->edge != EdgeKind::None ? s.edges : s.levels).push_back(e);
         }
     }
+    // always begin <body> @(a or b); end: the same process as always @(a or b) <body>,
+    // except that it also runs once at time 0. VHDL processes arrive in this
+    // form (src/vhdl/sv.hpp). Only when nothing else in the body waits.
+    if (p.procedureKind == ProceduralBlockKind::Always && !s.outerTimed && body.kind == StatementKind::Block &&
+        body.as<BlockStatement>().body.kind == StatementKind::List) {
+        auto list = body.as<BlockStatement>().body.as<StatementList>().list;
+        bool waits = false;
+        for (size_t i = 0; i + 1 < list.size(); i++)
+            list[i]->visit(makeVisitor([&](auto&, const TimedStatement&) { waits = true; },
+                                       [&](auto&, const WaitStatement&) { waits = true; },
+                                       [&](auto&, const WaitForkStatement&) { waits = true; },
+                                       [&](auto&, const WaitOrderStatement&) { waits = true; }));
+        if (!waits && list.size() >= 2 && list.back()->kind == StatementKind::Wait) {
+            const auto& w = list.back()->as<WaitStatement>();
+            const Expression& c = w.cond;
+            if (w.stmt.kind == StatementKind::Empty && c.kind == ExpressionKind::IntegerLiteral &&
+                c.as<IntegerLiteral>().getValue() == 0) {
+                s.trailing = true;
+                s.tail = list.back();
+            }
+        }
+        if (list.size() >= 2 && list.back()->kind == StatementKind::Timed) {
+            const auto& t = list.back()->as<TimedStatement>();
+            TimingControlKind k = t.timing.kind;
+            if (!waits && t.stmt.kind == StatementKind::Empty &&
+                (k == TimingControlKind::SignalEvent || k == TimingControlKind::EventList)) {
+                std::vector<const SignalEventControl*> evs;
+                clocksOf(t.timing, evs);
+                bool level = !evs.empty();
+                for (auto* e : evs) level &= e->edge == EdgeKind::None;
+                if (level) {
+                    s.levels = evs;
+                    s.trailing = true;
+                    s.tail = list.back();
+                }
+            }
+        }
+    }
     switch (p.procedureKind) {
         case ProceduralBlockKind::Initial: s.cls = Cls::Init; break;
         case ProceduralBlockKind::Final: s.cls = Cls::Final; break;
@@ -256,7 +296,7 @@ inline Shape shapeOf(const ProceduralBlockSymbol& p) {
         case ProceduralBlockKind::AlwaysFF: s.cls = Cls::Seq; break;
         default:
             s.oldStyle = true;
-            s.cls = !s.edges.empty() ? Cls::Seq : (s.implicit || !s.levels.empty()) ? Cls::Comb : Cls::Other;
+            s.cls = !s.edges.empty() ? Cls::Seq : (s.implicit || !s.levels.empty() || s.trailing) ? Cls::Comb : Cls::Other;
             break;
     }
     return s;
@@ -303,7 +343,9 @@ inline const Symbol* resetCond(const Expression& e0, bool& low) {
     }
     if (e.kind == ExpressionKind::BinaryOp) {
         const auto& b = e.as<BinaryExpression>();
-        if (b.op != BinaryOperator::Equality && b.op != BinaryOperator::Inequality) return nullptr;
+        // rst === 1'b1 too: VHDL's rst = '1' arrives that way (src/vhdl/sv.hpp).
+        bool eq = b.op == BinaryOperator::Equality || b.op == BinaryOperator::CaseEquality;
+        if (!eq && b.op != BinaryOperator::Inequality && b.op != BinaryOperator::CaseInequality) return nullptr;
         const Expression* n = &strip(b.left());
         const Expression* k = &strip(b.right());
         if (!signalOf(*n)) std::swap(n, k);
@@ -311,7 +353,7 @@ inline const Symbol* resetCond(const Expression& e0, bool& low) {
         SVInt v = k->as<IntegerLiteral>().getValue();
         if (v.hasUnknown()) return nullptr;
         bool zero = exactlyEqual(v, SVInt(v.getBitWidth(), 0, v.isSigned()));
-        low = (b.op == BinaryOperator::Equality) == zero;
+        low = eq == zero;
         return signalOf(*n);
     }
     return nullptr;
@@ -476,6 +518,19 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
           iface(b.getDefinition().definitionKind == DefinitionKind::Interface) {}
 
     bool on(std::string_view rule) const { return rep.rules.enabled(rule); }
+    // A process translated from VHDL (src/vhdl/sv.hpp): its closing wait is
+    // the sensitivity list, not code.
+    bool vhdlProc() const {
+        if (!proc || !rep.sm) return false;
+        std::string_view f = rep.sm->getFileName(rep.sm->getFullyOriginalLoc(proc->location));
+        auto ends = [&](std::string_view e) {
+            if (f.size() <= e.size()) return false;
+            for (size_t i = 0; i < e.size(); i++)
+                if (std::tolower((unsigned char)f[f.size() - e.size() + i]) != e[i]) return false;
+            return true;
+        };
+        return ends(".vhd") || ends(".vhdl") || ends(".vho") || ends(".vht");
+    }
     bool design() const { return !tb && inAssert == 0; }
     bool inAlways() const { return proc && (shape.cls == Cls::Seq || shape.cls == Cls::Comb || shape.cls == Cls::Latch || shape.cls == Cls::Other); }
     // Code that synthesis turns into gates.
@@ -952,7 +1007,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                 rep.add("SYN008", loc, "a timing control inside a loop: synthesis cannot unroll it");
             else if (delay)
                 rep.add("SYN002", loc, "a delay in an always block is ignored by synthesis");
-            else if (&t != shape.outerTimed)
+            else if (&t != shape.outerTimed && !(&t == shape.tail && vhdlProc()))
                 rep.add("SYN012", loc, "an event control inside the body of an always block (an implicit state machine) is not synthesizable by most tools");
         }
         visitDefault(t);
@@ -986,7 +1041,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         visitDefault(b);
     }
     void handle(const WaitStatement& s) {
-        if (inAlways()) notSynth(s, "wait", "SYN005");
+        if (inAlways() && !(&s == shape.tail && vhdlProc())) notSynth(s, "wait", "SYN005");
         visitDefault(s);
     }
     void handle(const WaitForkStatement& s) {

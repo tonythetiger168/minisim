@@ -3,7 +3,7 @@
 
     check_rules.py <mlint> <tests/lint dir>
 
-Each tests/lint/rules/*.sv says how to run mlint on it ("//! args: ...") and
+Each tests/lint/rules/*.sv (and *.vhd, with -- for //) says how to run mlint on it ("//! args: ...") and
 marks every line that must get a finding ("//~ RULE [RULE ...]", or
 "//~v RULE" on the line above it). The run
 must report exactly the marked (line, rule) pairs: a missing one is a rule
@@ -42,16 +42,16 @@ tested = set()
 # The TIDY rules are a build option (MINISIM_WITH_SLANG_TIDY).
 have_tidy = "TIDY001" in run(["-list"])[1]
 for name in sorted(os.listdir(rules_dir)):
-    if not name.endswith(".sv"):
+    if not name.endswith((".sv", ".vhd")):
         continue
     if name == "tidy.sv" and not have_tidy:
         continue
     path = os.path.join(rules_dir, name)
     text = open(path).read()
-    args = [x.replace("$DIR", here) for x in re.search(r"^//! args: (.*)$", text, re.M).group(1).split()]
+    args = [x.replace("$DIR", here) for x in re.search(r"^(?://|--)! args: (.*)$", text, re.M).group(1).split()]
     want = []
     for n, line in enumerate(text.splitlines(), 1):
-        m = re.search(r"//~(v?) (.*)$", line)
+        m = re.search(r"(?://|--)~(v?) (.*)$", line)
         if m:  # "//~v RULE" marks the line below, for rules about the end of a line
             want += [(n + (m.group(1) == "v"), r) for r in m.group(2).split()]
     rc, out, err = run([path] + args + ["-threads", "1"])
