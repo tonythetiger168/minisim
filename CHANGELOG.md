@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: the V extension 1.0 on RV32 and RV64 (VLEN 128 to 1024 with
+  `-vlen` or the platform's `"vlen"`, ELEN 64): every load and store form,
+  integer, fixed point, mask, reduction, permutation and SEW 32/64 floating
+  point, `vstart` on traps, `mstatus.VS`; `v` in `misa` and the device tree.
+  Tested with riscv-tests' vector benchmarks (845 programs now), clang's
+  vectorized loops against its scalar ones, single-instruction checks, and
+  under Linux. EXT_ABI 8: the extension library needs a rebuild.
 - mvplat: Zbkb, Zbkx, Zabha, Zacas, Zfh (half precision), the CBO.*
   instructions (Zicboz in the device tree) and Svnapot. riscv-tests: 837
   programs (uzbkb, uzbkx, uzabha, uzacas, uzabha_zacas, uzfh, mzicbo and

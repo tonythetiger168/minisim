@@ -303,7 +303,7 @@ inline uint16_t d2h(uint64_t u, unsigned rm, uint32_t& fl) {
     if (nx) {
         bool t;
         bool tiny = !(E == -15 && (shiftRound(m, 42, rm, neg, t) >> 11));  // tininess after rounding
-        fl |= NX | (tiny ? UF : 0);
+        fl |= NX | (tiny ? (uint32_t)UF : 0u);
     }
     return s | (uint16_t)q;
 }

@@ -114,11 +114,20 @@ enum : uint32_t {
     MSTATUS_TVM = 1u << 20,
     MSTATUS_TSR = 1u << 22,
     MSTATUS_FS = 3u << 13,
+    MSTATUS_VS = 3u << 9,
     // The view of mstatus that sstatus is.
-    SSTATUS_MASK = (1u << 1) | (1u << 5) | (1u << 8) | (1u << 13) | (1u << 14) | (1u << 18) | (1u << 19),
+    SSTATUS_MASK = (1u << 1) | (1u << 5) | (1u << 8) | (1u << 9) | (1u << 10) | (1u << 13) | (1u << 14) | (1u << 18) | (1u << 19),
 };
 enum : uint32_t { MIP_MSIP = 1u << 3, MIP_MTIP = 1u << 7, MIP_MEIP = 1u << 11,
                   MIP_SSIP = 1u << 1, MIP_STIP = 1u << 5, MIP_SEIP = 1u << 9 };
+
+// vtype as a hart holds it (vill is a flag of its own): SEW in bits, log2
+// LMUL from -3 to 3, and the tail and mask agnostic bits.
+struct VType {
+    unsigned sew = 8;
+    int lmul = 0;
+    bool ta = false, ma = false;
+};
 
 struct Hart {
     unsigned id = 0;
@@ -128,6 +137,15 @@ struct Hart {
     // upper 32 bits all ones) and fcsr (frm << 5 | fflags).
     uint64_t f[32] = {};
     uint32_t fcsr = 0;
+    // V: VLEN bits per register (up to VLEN_MAX), one array so that a
+    // register group is contiguous; vl, vstart, vtype, vxrm, vxsat.
+    static constexpr unsigned VLEN_MAX = 1024;
+    unsigned vlen = 128;
+    alignas(16) uint8_t vr[32 * VLEN_MAX / 8] = {};
+    uint64_t vl = 0, vstart = 0, vtypeRaw = 0;
+    VType vt;
+    bool vill = true;
+    uint8_t vxrm = 0, vxsat = 0;
     uint64_t pc = 0;
     uint64_t cycle = 0, instret = 0;
     int64_t cycleAdj = 0, instretAdj = 0;  // what software wrote to mcycle / minstret
