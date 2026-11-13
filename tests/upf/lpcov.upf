@@ -1,0 +1,30 @@
+# Power intent for retlatch.sv with power states, transitions and isolation:
+# the low-power coverage report of msim -upf_cov.
+create_supply_port VDD
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSS
+connect_supply_net VDD -ports VDD
+connect_supply_net VSS -ports VSS
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+
+create_power_domain PD_A -elements {u_a}
+create_supply_net VA
+create_power_switch SW_A -output_supply_port {o VA} -input_supply_port {i VDD} -control_port {c on} -on_state {on i {c}}
+set_domain_supply_net PD_A -primary_power_net VA -primary_ground_net VSS
+
+set_retention RET_F -domain PD_A -applies_to flop -retention_supply SS_AON \
+    -save_signal {sf high} -restore_signal {sf low}
+set_retention RET_L -domain PD_A -applies_to latch -retention_supply SS_AON \
+    -save_signal {sl high} -restore_signal {sl low}
+set_isolation ISO_F -domain PD_A -applies_to outputs -elements {u_a/f} -isolation_supply SS_AON \
+    -clamp_value 0 -isolation_signal sl -isolation_sense high
+add_power_state PD_A -domain \
+    -state {RUN  -logic_expr {on == 1'b1}} \
+    -state {OFF  -logic_expr {on == 1'b0}} \
+    -state {SCAN -logic_expr {sf == 1'b1 && sl == 1'b1}}
+add_state_transition PD_A -domain \
+    -transition {wake  -from OFF -to RUN} \
+    -transition {sleep -from RUN -to OFF} \
+    -transition {scan  -from RUN -to SCAN}
+add_state_transition SS_AON -supply -transition {up -from OFF -to ON}

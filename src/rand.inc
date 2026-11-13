@@ -1158,7 +1158,12 @@ static int doRandomize(int obj, const RandCall* rc) {
         g_fr = callFr;
         for (const E& a : rc->args) {
             int addr = a->at ? (int)eval(a->at, rd).v + a->sig : R(a->sig);
-            scalars.push_back({addr, S.sigs[addr].w, a->sgn, false, obj});
+            bool cyc = false;   // a randc property stays cyclic when named (18.11)
+            if (obj > 0 && !S.sigs[obj].val.x && S.sigs[obj].val.v < classRt().size())
+                if (const auto& sp = classRt()[(size_t)S.sigs[obj].val.v].rand)
+                    for (const RandVar& rv : sp->vars)
+                        if (!rv.dyn && !rv.obj && addr >= obj + rv.off && addr < obj + rv.off + rv.count) cyc = rv.randc;
+            scalars.push_back({addr, S.sigs[addr].w, a->sgn, cyc, obj});
         }
         for (const auto& ca : rc->contArgs) {   // randomize(q): its size and elements
             RCont c;

@@ -1,0 +1,6 @@
+43 running: keep=4 lose=4
+53 held: keep=4 lose=5
+63 off: keep=4 lose=x
+73 model supply off: keep=x lose=x
+76 power up, reset: keep=0 lose=1
+96 running again: keep=2 lose=3
