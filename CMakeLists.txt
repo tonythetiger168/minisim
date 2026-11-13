@@ -350,6 +350,11 @@ if(MINISIM_WITH_SLANG)
                      -DCHK=$<TARGET_FILE:test_fst> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vendor_dump
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_vendor_dump.cmake)
+    # -vcd-sva, $fsdbDumpSVA and -vcd-power (statview.inc).
+    add_test(NAME msim_wave_state
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DCHK=$<TARGET_FILE:test_fst>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_wave_state
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_wave_state.cmake)
   endif()
   # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
   add_test(NAME msim_dpi

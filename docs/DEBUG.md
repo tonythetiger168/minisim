@@ -220,6 +220,18 @@ trace of each signal. The log's time and the waveform's must be in the same
 unit. `-json` and the page's database carry the assertions and their failure
 times (`asserts`).
 
+### Assertions in the waveform
+
+    msim design.sv -top tb -fst run.fst -vcd-sva
+
+writes two counters for each assertion, assume and cover: `tb.u.a_gnt.passes`
+and `tb.u.a_gnt.fails` (32 bits), how many attempts have passed (a cover:
+matched) and failed so far. Each failure is a step in `.fails` at the time it
+is reported, so the wave shows where to look and `-active` / `-assert` say
+why. `$fsdbDumpSVA` in the testbench (or `"+sva"` in `$fsdbDumpvars`) turns
+it on as well. Assertions in protected code are left out. The counters are
+written at the end of each time slot; `-compile` runs the interpreter.
+
 ## Coverage
 
     msim design.sv -top tb -cov cov.json
@@ -272,6 +284,23 @@ value and the enable:
     tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)
       power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF); isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)
       x because the domain has no power: no assignment made this value
+
+### Power in the waveform
+
+    msim tb.sv dut.sv -top tb -upf dut.upf -fst run.fst -vcd-power
+
+adds, under a scope `upf` in the top (`tb.upf`), each power domain's simstate (9.6) and each supply
+net's state and voltage:
+
+| Signal | Value |
+|---|---|
+| `tb.upf.PD_CORE.simstate` | 0 NORMAL, 1 CORRUPT_STATE_ON_CHANGE, 2 CORRUPT_STATE_ON_ACTIVITY, 3 CORRUPT_ON_CHANGE, 4 CORRUPT_ON_ACTIVITY, 5 CORRUPT |
+| `tb.upf.VDD_CORE.state` | 0 OFF, 1 FULL_ON, 2 PARTIAL_ON, 3 UNDETERMINED |
+| `tb.upf.VDD_CORE.mV` | the voltage in millivolts (0 while OFF) |
+
+so a switch-off is visible next to the signals it corrupts. `"+power"` in
+`$fsdbDumpvars` turns it on as well. A supply net is listed by the net that
+drives its subnet (a switch output, a supply port).
 
 ## Large designs: the served viewer
 
@@ -411,12 +440,13 @@ written instead, and msim says so once:
 | Tasks | What msim does |
 |---|---|
 | `$fsdbDumpfile`, `$vcdplusfile`, `$shm_open`, `$fsdbAutoSwitchDumpfile`, `$recordfile` | name the file (`.fst`); without one, `novas.fst`, `vcdplus.fst` or `waves.fst` |
-| `$fsdbDumpvars`, `$fsdbDumpvarsES`, `$fsdbDumpSingle`, `$vcdpluson`, `$shm_probe`, `$recordvars` | as `$dumpvars`: a depth, instances or signals (by name or as strings, `"tb.dut"`); `+fsdbfile+NAME` names the file, `+all` and `+mda` add memories, other `+` options are accepted |
+| `$fsdbDumpvars`, `$fsdbDumpvarsES`, `$fsdbDumpSingle`, `$vcdpluson`, `$shm_probe`, `$recordvars` | as `$dumpvars`: a depth, instances or signals (by name or as strings, `"tb.dut"`); `+fsdbfile+NAME` names the file, `+all` and `+mda` add memories, `+sva` and `+power` add assertions and power states (`-vcd-sva`, `-vcd-power` above), other `+` options are accepted |
 | `$fsdbDumpMDA`, `$fsdbDumpMem`, `$vcdplusmemon` | memories too, as `-vcd-arrays` |
 | `$fsdbDumpon` / `off`, `$vcdpluson` / `off`, `$recordon` / `off` | as `$dumpon` / `$dumpoff` |
 | `$fsdbDumpflush`, `$vcdplusflush` | as `$dumpflush` |
 | `$fsdbDumpFinish`, `$vcdplusclose`, `$shm_close`, `$recordclose` | flush and stop |
-| `$fsdbDumpSVA`, `$fsdbSuppress`, `$fsdbLog`, `$vcdplusautoflushon`, ... | accepted, nothing to do |
+| `$fsdbDumpSVA` | assertions in the waveform, as `-vcd-sva` |
+| `$fsdbSuppress`, `$fsdbLog`, `$vcdplusautoflushon`, ... | accepted, nothing to do |
 
 `msim -i` and `-do` take Verdi's UCLI commands the same way:
 `fsdbDumpfile`, `fsdbDumpvars [DEPTH] [SCOPES] [+all]`, `fsdbDumpon`,

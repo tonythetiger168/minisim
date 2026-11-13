@@ -13,6 +13,11 @@ Spec references are IEEE 1800-2023 clauses.
   guest's writes reach the file; platform files take `"type": "virtio-blk"`.
   Linux mounts an ext4 disk and boots with its root file system on it.
   Extension ABI 7.
+- `msim -vcd-sva` and `-vcd-power`: assertions and power in the waveform.
+  Each assertion and cover gets `.passes` and `.fails` counters; with `-upf`
+  each power domain gets `upf.PD.simstate` and each supply net
+  `upf.NET.state` and `upf.NET.mV`. `$fsdbDumpSVA` and `"+power"` in
+  `$fsdbDumpvars` turn them on too. `docs/DEBUG.md`.
 - VPI inter-module paths on a net with several sources each have their own
   delay (`vpi_put_delays` / `vpi_get_delays`, 38.21), and `msim -i` / `-do`
   runs `cbEnterInteractive`, `cbExitInteractive` and
