@@ -131,6 +131,7 @@ it). It is the address map most RISC-V bare-metal software already targets.
 | `clint` | `msip` at `4*h`, `mtimecmp` at `0x4000 + 8*h`, `mtime` at `0xbff8` | `mtime` follows the asking hart's cycle count |
 | `plic` | priorities, pending, per-hart enables, threshold, claim/complete | one M-mode context per hart; level-triggered sources |
 | `finisher` | `0x5555` passes, `0x3333 \| code << 16` fails with `code` | the SiFive test device |
+| `virtio-blk` | virtio over MMIO, version 2 (VIRTIO 1.2, 4.2), one queue | a disk: `file` is a raw image, `irq` its PLIC source; writes stay in the run unless `"write": true`, `"readonly": true` refuses them. See "Disks" |
 | `mvp` | the library's own map (`mvp_add_device`) | see below |
 | `rtl` | whatever the RTL decodes | see below |
 
@@ -233,7 +234,8 @@ mvplat -platform board.json -bios fw_dynamic.elf -kernel Image \
 The device tree is made from the platform: a `cpu` node per hart (with
 `riscv,isa`, `mmu-type` and its interrupt controller), a `memory` node per
 RAM, and the CLINT (`riscv,clint0`), PLIC (`riscv,plic0`), each 16550 UART
-(`ns16550a`; the first is `stdout-path`) and the finisher (`sifive,test1` with
+(`ns16550a`; the first is `stdout-path`), each virtio device (`virtio,mmio`)
+and the finisher (`sifive,test1` with
 `syscon-poweroff` and `syscon-reboot`), with the compatible strings that
 OpenSBI, Linux, U-Boot and Zephyr already have drivers for. It sits at the top
 of the first RAM on a 2 MiB boundary. `-dump-dtb FILE` writes it out
@@ -284,6 +286,30 @@ would have. `-restore` checks that the platform file describes the same
 board. A platform with an `mvp` library or an `rtl` window cannot be saved:
 their state lives outside the platform, and the save says so.
 
+### Disks
+
+`-disk FILE` puts a raw disk image on a `virtio-blk` device (Linux's
+`/dev/vda`; repeat it for `vdb`, `vdc`, ...), in the virtio-mmio slots of
+QEMU's virt board: `0x10001000` up, `0x1000` apart, PLIC sources 1 up. The
+device tree gets a `virtio,mmio` node for each. The guest's writes stay in
+the run (the image is mapped copy-on-write) unless `-disk-write` lets them
+reach the file, or the platform file says `"write": true`. A request is
+served when the driver notifies the queue, before the notifying store
+retires: an instant disk, so a run stays deterministic.
+
+```
+mkfs.ext4 -d rootdir root.img 64M
+mvplat -platform linux.json -bios fw_dynamic.elf -kernel Image -disk root.img \
+       -append "console=ttyS0 root=/dev/vda rw"
+```
+
+Checked: Ubuntu 24.04's kernel mounts an ext4 image on `/dev/vda`, reads and
+writes it (`debugfs` sees the written file with `-disk-write`), and boots
+with its root file system on the disk and no initramfs.
+`tests/vplat/virtio.c` is a bare-metal driver that tests the device itself:
+reads, a two-sector read, a write read back, flush, `GET_ID`, a read past the
+end (`IOERR`), an unknown request (`UNSUPP`) and the interrupt.
+
 ## Options
 
 | Option | |
@@ -299,6 +325,7 @@ their state lives outside the platform, and the save says so.
 | `-trace FILE` | commit log |
 | `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
 | `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |
+| `-disk FILE`, `-disk-write` | a raw disk image on virtio-blk; let writes reach the file (see "Disks") |
 | `-profile FILE` | profile (`-`: stdout) *(extension)* |
 | `-gdb PORT`, `-gdb-portfile FILE` | gdb server *(extension)* |
 | `-save FILE`, `-restore FILE` | checkpoints *(extension)* |
@@ -342,8 +369,9 @@ simulation time.
   to integers; other RMM results round as ties-to-even (differs only for a
   value exactly half way). Bare-metal software, RTOSes (FreeRTOS, Zephyr),
   OpenSBI, Linux with an rv64gc user space and the architecture tests run.
-- No virtio devices: Linux has its console and an initramfs, but no disk or
-  network yet.
+- Of virtio, only the block device: no virtio network, console, entropy or
+  9p yet, and no indirect descriptors or `EVENT_IDX`. Disk images are raw
+  (no qcow2).
 - No hardware triggers, no Smepmp (`mseccfg`).
 - One instruction per cycle: no pipeline or cache timing model.
 - No Spike or QEMU back end yet (Spike is BSD-licensed and could be linked;

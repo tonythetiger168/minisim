@@ -27,6 +27,7 @@
 #include "vp/fdt.hpp"
 #include "vp/json.hpp"
 #include "vp/machine.hpp"
+#include "vp/virtio.hpp"
 
 namespace fs = std::filesystem;
 using namespace vp;
@@ -70,6 +71,9 @@ void usage() {
         "  -initrd FILE       initial RAM disk\n"
         "  -append TEXT       kernel command line\n"
         "  -dtb FILE          device tree blob to pass instead of the one made from the platform\n"
+        "  -disk FILE         a raw disk image on a virtio-blk device (/dev/vda); writes stay in\n"
+        "                     the run unless -disk-write (repeat for vdb, vdc, ...)\n"
+        "  -disk-write        let writes reach the image files\n"
         "  -dump-dtb FILE     write the platform's device tree blob and exit\n"
         "  -map               print the memory map\n"
         "  -q                 no summary line on stderr\n"
@@ -82,6 +86,8 @@ void usage() {
 struct Options {
     std::string platform, elf, trace, input;
     std::string bios, kernel, initrd, append, dtb, dumpDtb;
+    std::vector<std::string> disks;
+    bool diskWrite = false;
     bool haveAppend = false;
     int harts = -1;
     unsigned threads = par::defaultThreads();
@@ -190,14 +196,39 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             f->name = name;
             f->base = base();
             dev = std::move(f);
+        } else if (type == "virtio-blk") {
+            auto v = std::make_unique<VirtioBlk>();
+            v->name = name;
+            v->base = base();
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (!d.get("file")) throw std::runtime_error(d.where() + "'" + name + "' has no \"file\" (a raw disk image)");
+            bool w = d.get("write") && d.get("write")->b;
+            bool ro = d.get("readonly") && d.get("readonly")->b;
+            v->open(rel(d.get("file")->str()), w || o.diskWrite, ro);
+            dev = std::move(v);
         } else {
             Ext* x = loadExt(g_argc, g_argv, ("device type '" + type + "'").c_str());
             if (x && x->device(m, d, type, name, dir)) continue;
             throw std::runtime_error(d.where() + "unknown device type '" + type +
-                                     "' (ram, rom, uart16550, clint, plic, finisher" +
+                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk" +
                                      (x ? "" : "; mvp and rtl need the mvplat extension library") + ")");
         }
         m.bus.add(std::move(dev));
+    }
+    // -disk: virtio-blk devices where QEMU's virt board has its virtio-mmio
+    // slots (0x10001000 up, 0x1000 apart, PLIC sources 1 up), after any the
+    // platform already has.
+    unsigned slot = 0;
+    for (const std::string& img : o.disks) {
+        uint64_t b;
+        do b = 0x10001000ull + 0x1000ull * slot++; while (m.bus.find(b) && slot < 64);
+        auto v = std::make_unique<VirtioBlk>();
+        v->name = "virtio" + std::to_string(slot - 1);
+        v->base = b;
+        v->irq = slot;
+        if (m.plic && v->irq > m.plic->nsrc) throw std::runtime_error("-disk: no PLIC source left for " + img);
+        v->open(img, o.diskWrite, false);
+        m.bus.add(std::move(v));
     }
 }
 
@@ -381,6 +412,8 @@ int main(int argc, char** argv) {
         else if (s == "-append") { o.append = next("a command line"); o.haveAppend = true; }
         else if (s == "-dtb") o.dtb = next("a device tree blob");
         else if (s == "-dump-dtb") o.dumpDtb = next("a file");
+        else if (s == "-disk") o.disks.push_back(next("a disk image"));
+        else if (s == "-disk-write") o.diskWrite = true;
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
         else if (!s.empty() && s[0] == '-') {

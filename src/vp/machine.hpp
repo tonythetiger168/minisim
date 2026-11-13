@@ -124,6 +124,12 @@ public:
         d->nwrite++;
         return true;
     }
+    uint8_t* memSpan(uint64_t a, uint64_t n, bool write) override {
+        Device* d = bus.find(a);
+        if (!d || !d->memory() || (write && !d->writable()) || a + n > d->base + d->size || a + n < a) return nullptr;
+        if (write && tohost && a < tohost + 8 && a + n > tohost) return nullptr;
+        return d->memory() + (a - d->base);
+    }
     void out(const std::string& s) override {
         fwrite(s.data(), 1, s.size(), stdout);
         if (s.find('\n') != std::string::npos) fflush(stdout);
