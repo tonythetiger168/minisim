@@ -1,5 +1,6 @@
-// Four instances of one small core (registers, a decoder, clocked
-// blocking temporaries, a register file written at a run-time index).
+// Four instances of one small core (registers, a decoder with a deferred
+// assertion, clocked blocking temporaries, a register file written at a
+// run-time index).
 // msim -compile emits one copy of each module's code and calls it with
 // each instance's signal offsets (codegen.hpp shareChunks,
 // emitDomainFns); every instance must still compute its own values.
@@ -14,6 +15,7 @@ module shcore #(parameter logic [7:0] SEED = 8'h01) (input logic clk, output log
       2'd2: dec = {acc[6:0], acc[7]};
       default: dec = ~acc;
     endcase
+    assert #0 (dec[2:0] != 3'b111) else $display("%m: dec=%h at %0t", dec, $time);
   end
   always @(posedge clk) begin
     t = dec;

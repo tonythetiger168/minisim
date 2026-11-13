@@ -18,6 +18,7 @@
 set(MINISIM_CORE_HEADERS
     annexd.inc
     clocking.hpp
+    compat.hpp
     cover.hpp
     cover_rt.inc
     cpu.hpp
@@ -61,6 +62,7 @@ set(MINISIM_CORE_HEADERS
     vpi_prim.inc
     vpi_constr.inc
     vpi_svcb.inc
+    vpi_thread.inc
     vpi_tchk.inc
     wave_reader.hpp)
 
@@ -100,6 +102,24 @@ if(MINISIM_WITH_FST)
   install(FILES ${FST_SRC}/fstapi.h ${FST_SRC}/fst_win_unistd.h
           DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/minisim)
 endif()
+
+# The virtual-platform engine keeps its vp/ directory in the package, because
+# mvplat and anything else built on it include "vp/machine.hpp" by that path.
+# Its own headers quote their siblings by bare name, which resolves inside the
+# directory, and "parallel.hpp", which resolves through the package's include
+# directory above.
+set(MINISIM_CORE_VP_HEADERS
+    bus.hpp
+    devices.hpp
+    elf.hpp
+    ext.hpp
+    json.hpp
+    machine.hpp
+    rv32.hpp)
+list(TRANSFORM MINISIM_CORE_VP_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vp/
+     OUTPUT_VARIABLE MINISIM_CORE_VP_HEADER_PATHS)
+install(FILES ${MINISIM_CORE_VP_HEADER_PATHS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/minisim/vp)
 
 list(TRANSFORM MINISIM_CORE_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/
      OUTPUT_VARIABLE MINISIM_CORE_HEADER_PATHS)
