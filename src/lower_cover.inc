@@ -339,8 +339,8 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         cgWideW = 0;
         if (c.wide) {   // wider than 64 bits: explicit value bins only
             for (const auto& b : c.bins)
-                if ((b.array && !b.trans.empty()) || b.wildcard || b.with || b.setIdx >= 0 || b.dfltSeq)
-                    unsupported("wildcard, with, set or transition array bins of a coverpoint wider than 64 bits");
+                if ((b.array && (!b.trans.empty() || b.wildcard)) || (b.wildcard && !b.trans.empty()) || b.with || b.setIdx >= 0 || b.dfltSeq)
+                    unsupported("with, set, wildcard transition or array bins with transitions or wildcards of a coverpoint wider than 64 bits");
         }
         cpIdx[cp] = (int)d.cps.size();
         d.cps.push_back(std::move(c));

@@ -586,7 +586,24 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
         std::vector<Val> xv;
         std::vector<std::pair<uint64_t, uint64_t>> wild;
         if (bd.allValues) seq.push_back({0, kmask(c.w)});
-        for (auto& it : bd.items) itemKeys(c, it, bd.wildcard, seq, &xv, &wild);
+        std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>> wwild;
+        for (auto& it : bd.items) {
+            if (c.wide && bd.wildcard && !it.range) {   // x, z and ? bits match anything (19.5.1)
+                Val v = eval(it.lo, rd);
+                if (unknownAny(v)) {
+                    int n = (c.w + 63) / 64;
+                    std::vector<uint64_t> care(n), val(n);
+                    for (int i = 0; i < n; i++) {
+                        uint64_t m = i == n - 1 && c.w % 64 ? (1ull << (c.w % 64)) - 1 : ~0ull;
+                        care[i] = ~limbX(v, i) & m;
+                        val[i] = limbV(v, i) & care[i];
+                    }
+                    wwild.push_back({std::move(care), std::move(val)});
+                    continue;
+                }
+            }
+            itemKeys(c, it, bd.wildcard, seq, &xv, &wild);
+        }
         if (bd.setIdx >= 0) {   // bins b = q; (19.5.1.2): its values now
             Val n = eval(bd.setSize, rd);
             for (uint64_t k = 0; !n.x && k < n.v; k++) {
@@ -641,6 +658,7 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
             mkBin(bd.name, seq);
             if (!bd.wildcard || !bd.array) {
                 ci.bins.back().wild = wild;
+                ci.bins.back().wwild = std::move(wwild);
                 ci.bins.back().xvals = xv;
             }
         } else if (!bd.count) {   // name[]: one bin per distinct value
@@ -696,7 +714,7 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
     // left out of coverage (19.5.5, 19.11.1).
     for (auto& b : ci.bins) {
         if (b.kind != 0 || b.trans) continue;
-        if (!b.wild.empty() || !b.xvals.empty()) continue;
+        if (!b.wild.empty() || !b.wwild.empty() || !b.xvals.empty()) continue;
         std::vector<KR> rs;
         for (auto& r : b.ranges) rs.push_back({r.first, r.second});
         if (rs.empty() || allCovered(rs, excl)) b.empty = true;
@@ -711,6 +729,11 @@ inline bool binMatch(const CgBin& b, uint64_t k, const Val& v, bool hasX) {
     if (inPairs(b.ranges, k)) return true;
     for (auto& [care, val] : b.wild)
         if ((k & care) == val) return true;
+    for (auto& [care, val] : b.wwild) {
+        bool ok = true;
+        for (size_t i = 0; i < care.size() && ok; i++) ok = (limbV(v, (int)i) & care[i]) == val[i];
+        if (ok) return true;
+    }
     return false;
 }
 // A cross bin select expression on one tuple (19.6.1).

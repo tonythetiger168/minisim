@@ -130,6 +130,9 @@ struct CgBin {
     std::vector<std::pair<uint64_t, uint64_t>> ranges;   // keys, inclusive
     std::vector<std::pair<uint64_t, uint64_t>> wild;     // (care mask, value): wildcard bins
     std::vector<Val> xvals;          // values with x/z, matched with === (19.5.4)
+    // A wildcard bin of a coverpoint wider than 64 bits: (care, value) per
+    // 64-bit limb, on the value itself (not on keys).
+    std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>> wwild;
     const sva::Node* trans = nullptr;   // a transition bin
     E iff;
     bool empty = false;              // no value left: not counted (19.11.1)
