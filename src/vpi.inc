@@ -13,6 +13,8 @@
 // calltf routines may read or write any signal at any time.
 
 #include <dlfcn.h>
+#include <atomic>
+#include <csignal>
 
 #include <deque>
 #include <fstream>
@@ -135,6 +137,10 @@ struct State {
     std::map<std::pair<const ProcCtl*, size_t>, Obj*> frameObjs;      // live frames with a handle
     std::unordered_set<const Obj*> softObjs;   // constraint items that are soft (vpiSoft, 37.31)
     std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
+    std::vector<Cb*> featCbs;             // save, restart and reset callbacks (38.36.3)
+    std::map<int, std::vector<Cb*>> sigCbs;   // cbSignal, by signal number (38.36.3)
+    bool resetDue = false;                // vpi_control(vpiReset) in a calltf: on its return (38.6)
+    long resetValue = 0, resetDiag = 0;
     bool inErrCb = false;
     std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
     int mode = vpiMode1800v2009;          // the compatibility mode of the running call (36.12)
@@ -174,6 +180,8 @@ inline void fireErrorCbs(int reason);
 inline void onTchk(int id);
 inline void onNewObj(int obj);
 inline void onSizeChange(int sig);
+inline bool covAnyFrozen();
+inline void covThaw();
 inline void onThread(int what, ProcCtl& c);
 inline void onFrame(int what, ProcCtl& c, size_t depth, const Prog* callee);
 inline void error(int level, const std::string& msg) {
@@ -1083,6 +1091,54 @@ inline void fireList(std::vector<Cb*>& l) {
     now.swap(l);
     for (Cb* c : now) fire(c);
 }
+// Save, restart and reset callbacks (38.36.3) fire each time, with only
+// reason, cb_rtn and user_data set.
+inline void fireFeature(int reason) {
+    auto due = st().featCbs;
+    for (Cb* c : due) {
+        if (!c->live || c->d.reason != reason) continue;
+        s_cb_data d = c->d;
+        d.obj = nullptr;
+        d.time = nullptr;
+        d.value = nullptr;
+        d.cb_rtn(&d);
+    }
+}
+inline void onFeature(annexd::Feature f) {
+    static const int reason[] = {cbStartOfSave, cbEndOfSave, cbStartOfRestart, cbEndOfRestart, cbStartOfReset};
+    fireFeature(reason[f]);
+}
+// cbSignal (38.36.3): the handler only notes the signal; its callbacks run
+// at the next safe point, the start of a time slot (or the end of the run).
+inline std::atomic<uint64_t> sigSeen{0};
+inline void sigNote(int n) { sigSeen.fetch_or(uint64_t(1) << n); }
+inline void trapSignal(int n) {
+    struct sigaction a {};
+    a.sa_handler = sigNote;
+    sigemptyset(&a.sa_mask);
+    a.sa_flags = SA_RESTART;
+    sigaction(n, &a, nullptr);
+}
+inline void pollSignals() {
+    uint64_t m = sigSeen.exchange(0);
+    if (!m) return;
+    auto& s = st();
+    for (int n = 1; n < 64; ++n) {
+        if (!(m & (uint64_t(1) << n))) continue;
+        auto it = s.sigCbs.find(n);
+        if (it == s.sigCbs.end()) continue;
+        auto due = it->second;
+        for (Cb* c : due) {
+            if (!c->live) continue;
+            s_cb_data d = c->d;
+            d.obj = nullptr;
+            d.time = nullptr;
+            d.value = nullptr;
+            d.index = n;
+            d.cb_rtn(&d);
+        }
+    }
+}
 inline void onChange(int s) {
     auto it = st().change.find(s);
     if (it == st().change.end()) return;
@@ -1092,6 +1148,8 @@ inline void onChange(int s) {
 inline bool onRegion(int r) {
     auto& s = st();
     if (r == Sim::VR_START) {
+        pollSignals();
+        if (covAnyFrozen()) covThaw();   // coverage stopped on an instance (40.5.1)
         auto [a, b] = s.timed.equal_range(S.now);
         std::vector<Cb*> due;
         for (auto it = a; it != b; ++it) due.push_back(it->second);
@@ -1152,6 +1210,10 @@ inline void callSite(const Instr& ins) {
     s.cur = site;
     f.d.calltf(f.d.user_data);
     s.cur = saved;
+    if (s.resetDue) {
+        s.resetDue = false;
+        annexd::reset(s.resetValue, s.resetDiag);
+    }
 }
 
 // The slang side of a user system task or function: any arguments (a
@@ -1281,6 +1343,32 @@ inline void fireSys(int reason) {
         d.cb_rtn(&d);
     }
 }
+
+// The failing expression of a failed attempt (39.4.2, failExpr): an
+// immediate assertion's condition; for a concurrent one, the expression
+// of a property that is a single boolean. NULL when the property has
+// sequence or property operators (msim's engine does not keep which part
+// of such a property failed).
+inline Obj* exprNode(const slang::ast::Expression* e, const Obj* parent);   // vpi_code.inc
+inline Obj* failExprOf(int id, const Obj* a) {
+    using namespace slang::ast;
+    const auto* st = static_cast<const Statement*>(asserts()[(size_t)id].stmt);
+    if (!st) return nullptr;
+    if (st->kind == StatementKind::ImmediateAssertion) return exprNode(&st->as<ImmediateAssertionStatement>().cond, a);
+    if (st->kind == StatementKind::ConcurrentAssertion) {
+        const AssertionExpr* p = &st->as<ConcurrentAssertionStatement>().propertySpec;
+        while (p->kind == AssertionExprKind::Clocking) p = &p->as<ClockingAssertionExpr>().expr;
+        if (p->kind == AssertionExprKind::DisableIff) {
+            p = &p->as<DisableIffAssertionExpr>().expr;
+            while (p->kind == AssertionExprKind::Clocking) p = &p->as<ClockingAssertionExpr>().expr;
+        }
+        if (p->kind == AssertionExprKind::Simple) {
+            const auto& sp = p->as<SimpleAssertionExpr>();
+            if (!sp.repetition) return exprNode(&sp.expr, a);
+        }
+    }
+    return nullptr;
+}
 inline void onAssert(int id, int ev, uint64_t start) {
     auto& s = st();
     if (id < 0) {   // the assertion system
@@ -1315,7 +1403,7 @@ inline void onAssert(int id, int ev, uint64_t start) {
         s_vpi_time t{vpiSimTime, (PLI_UINT32)(S.now >> 32), (PLI_UINT32)S.now, (double)S.now};
         s_vpi_attempt_info info{};
         info.attemptStartTime = s_vpi_time{vpiSimTime, (PLI_UINT32)(start >> 32), (PLI_UINT32)start, (double)start};
-        info.detail.failExpr = nullptr;
+        info.detail.failExpr = ev == AE_FAILURE ? H(failExprOf(id, a)) : nullptr;
         s_vpi_assertion_step_info step{};
         if (ev == AE_STEP_OK || ev == AE_STEP_FAIL) {   // 39.5.2: the states are the engine's, numbered per assertion as first seen
             auto num = [&](const void* n) {
@@ -1346,7 +1434,6 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         case vpiAssertionUnlock: ctl = AC_UNLOCK; break;
         case vpiAssertionDisable: ctl = AC_OFF; break;
         case vpiAssertionEnable: ctl = AC_ON; break;
-        case vpiAssertionKill: ctl = AC_KILL; break;
         case vpiAssertionReset: ctl = -1; break;
         case vpiAssertionDisablePassAction: ctl = AC_PASSOFF; break;
         case vpiAssertionEnablePassAction: ctl = AC_PASSON; break;
@@ -1367,33 +1454,70 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         case vpiAssertionSysDisableFailAction: ctl = AC_FAILOFF; sys = true; break;
         case vpiAssertionSysEnableNonvacuousAction: ctl = AC_NONVACON; sys = true; break;
         case vpiAssertionSysDisableVacuousAction: ctl = AC_VACOFF; sys = true; break;
+        case vpiAssertionKill:
         case vpiAssertionEnableStep:
-        case vpiAssertionDisableStep: {   // 39.5.2: report each clock step of the assertion's attempts
+        case vpiAssertionDisableStep: {   // 39.5.2: on one attempt, named by its start time
             Obj* o = O(va_arg(ap, vpiHandle));
+            p_vpi_time when = va_arg(ap, p_vpi_time);
+            const char* what = op == vpiAssertionKill ? "vpiAssertionKill" : "assertion stepping";
             if (!o || o->kind != Obj::Assertion) {
-                error(vpiError, "vpi_control: assertion stepping needs an assertion handle");
+                error(vpiError, std::string("vpi_control: ") + what + " needs an assertion handle");
+                return 0;
+            }
+            if (!when || (when->type != vpiSimTime && when->type != vpiScaledRealTime)) {
+                error(vpiError, std::string("vpi_control: ") + what + " needs the attempt start time (vpiSimTime or vpiScaledRealTime)");
                 return 0;
             }
             if (denied(o, "vpi_control")) return 0;
+            uint64_t start = (uint64_t)sigTicks(when, o);
             AssertInfo& a = asserts()[(size_t)o->idx];
+            if (op == vpiAssertionKill) {   // that attempt goes; the assertion stays enabled
+                if (a.locked) return 1;
+                assertEvent(o->idx, AE_CTL + AC_KILL);
+                if (a.type == AT_CONCURRENT) a.killAt.insert(start);
+                else a.killGen++;   // a deferred assertion: its pending reports (39.5.3)
+                return 1;
+            }
             if (a.type != AT_CONCURRENT) {   // a concurrent assertion: immediate ones have no steps
                 error(vpiError, "vpi_control: only a concurrent assertion has clock steps");
                 return 0;
             }
-            a.step = op == vpiAssertionEnableStep;
+            if (op == vpiAssertionDisableStep) {
+                a.stepAt.erase(start);
+                return 1;
+            }
+            if (va_arg(ap, PLI_INT32) != vpiAssertionClockSteps) {   // the only step control constant
+                error(vpiError, "vpi_control: vpiAssertionEnableStep needs vpiAssertionClockSteps");
+                return 0;
+            }
+            a.stepAt.insert(start);
             return 1;
         }
         case vpiAssertionClockSteps:
-            error(vpiError, "vpi_control: vpiAssertionClockSteps is not supported");
+            error(vpiError, "vpi_control: vpiAssertionClockSteps is a step control of vpiAssertionEnableStep, not an operation");
             return 0;
         default: return -1;   // not an assertion operation
     }
+    // The assertions: one (a handle), or (system control, 39.5.1) the ones
+    // in a scope and below it, or all of them (NULL).
     std::vector<int> ids;
+    std::vector<std::string> targets;
+    Obj* o = O(va_arg(ap, vpiHandle));
     if (sys) {
+        if (o && o->kind != Obj::Module && o->kind != Obj::Scope) {
+            error(vpiError, "vpi_control: assertion system control takes a scope handle or NULL");
+            return 0;
+        }
+        if (o) targets.push_back(fullName(*o->sym));
+        auto in = [&](const AssertInfo& a) {
+            if (targets.empty()) return true;
+            const std::string& t = targets[0];
+            auto under = [&](const std::string& x) { return x == t || (x.size() > t.size() && x.compare(0, t.size(), t) == 0 && x[t.size()] == '.'); };
+            return under(a.inst) || under(a.name);
+        };
         for (size_t k = 0; k < asserts().size(); k++)
-            if (!asserts()[k].hidden) ids.push_back((int)k);
+            if (!asserts()[k].hidden && in(asserts()[k])) ids.push_back((int)k);
     } else {
-        Obj* o = O(va_arg(ap, vpiHandle));
         if (!o || o->kind != Obj::Assertion) {
             error(vpiError, "vpi_control: an assertion operation needs an assertion handle");
             return 0;
@@ -1401,23 +1525,34 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         ids.push_back(o->idx);
     }
     if (ctl > 0) {
-        if (sys) assertControl(ctl, 15, 7, 0, {});
+        if (sys) assertControl(ctl, 15, 7, 0, targets);
         else assertControl(ctl, 255, 7, 0, {asserts()[(size_t)ids[0]].name});
-    } else {
-        // Reset: the attempts in flight are dropped and the assertion goes
-        // back to its state at the start (enabled, actions on, unlocked).
-        // SysEnd: the attempts are dropped and no more start.
-        for (int id : ids) {
-            AssertInfo& a = asserts()[(size_t)id];
-            a.killGen++;
-            if (ctl == -1) {
-                a.on = a.passOn = a.failOn = a.vacOn = true;
-                a.locked = false;
-                if (!sys) onAssert(id, AE_RESET, 0);
-            } else a.on = false;
-        }
-        if (sys) fireSys(ctl == -1 ? cbAssertionSysReset : cbAssertionSysEnd);
-        if (sys && ctl == -2) st().assertEnded = true;
+        return 1;
+    }
+    // Reset: the attempts in flight are dropped and the assertion goes
+    // back to its state at the start (enabled, actions on, unlocked, no
+    // stepping). SysEnd: the attempts are dropped and no more start.
+    auto& s = st();
+    for (int id : ids) {
+        AssertInfo& a = asserts()[(size_t)id];
+        a.killGen++;
+        a.stepAt.clear();
+        a.killAt.clear();
+        if (ctl == -1) {
+            a.on = a.passOn = a.failOn = a.vacOn = true;
+            a.locked = false;
+            if (!sys) onAssert(id, AE_RESET, 0);
+        } else a.on = false;
+        // SysReset removes the step callbacks, SysEnd every callback (39.5.1).
+        if (sys)
+            if (auto it = s.assertCbs.find(id); it != s.assertCbs.end())
+                for (Cb* c : it->second)
+                    if (ctl == -2 || c->d.reason == cbAssertionStepSuccess || c->d.reason == cbAssertionStepFailure) c->live = false;
+    }
+    if (sys) fireSys(ctl == -1 ? cbAssertionSysReset : cbAssertionSysEnd);
+    if (sys && ctl == -2) {
+        for (Cb* c : s.assertSys) c->live = false;
+        if (targets.empty()) s.assertEnded = true;
     }
     return 1;
 }
@@ -1539,7 +1674,9 @@ inline std::pair<int, int> assertCovOf(const InstanceSymbol* inst) {
         if (assertIn(k, inst)) { m++; n += k < st().assertCov.size() && st().assertCov[k][1] > 0; }
     return {n, m};
 }
+inline void covThaw();
 inline std::pair<int, int> covOf(int type, const InstanceSymbol* inst) {
+    covThaw();
     switch (type) {
         case vpiStatementCoverage: return stmtCov(inst);
         case vpiToggleCoverage: return togCov(inst);
@@ -1563,7 +1700,9 @@ inline int64_t covGet(int prop, const Obj* o) {
     if (o->kind == Obj::Assertion) {
         const auto& c = s.assertCov[(size_t)o->idx];
         switch (prop) {
-            case vpiCovered: return c[1] > 0;
+            case vpiCovered:   // 40.5.2: attempted, succeeded at least once and never failed;
+                               // a cover has no failures (a non-match is not one, 16.14.3)
+                return c[0] > 0 && c[1] > 0 && (c[2] == 0 || asserts()[(size_t)o->idx].dir == AD_COVER);
             case vpiCoveredCount: return (int64_t)c[1];
             case vpiCoveredMax: return 1;
             case vpiAssertAttemptCovered: return (int64_t)c[0];
@@ -1620,63 +1759,122 @@ inline void covReset(int type, const InstanceSymbol* inst, const Obj* a) {
             if (!inst || sigInst(fsmDefs()[k].sig) == inst) { S.fsmSeen[k].clear(); S.fsmTrans[k].clear(); }
     }
 }
+// Coverage stopped on one instance below the top (40.5.1): its counts are
+// kept as they were at vpiCoverageStop and written back (dropping what the
+// run counted since) before every read, at each new time step and at the
+// end, until vpiCoverageStart.
+struct CovFreeze {
+    int type = 0;
+    const InstanceSymbol* inst = nullptr;
+    std::vector<std::pair<Instr*, std::pair<uint64_t, uint64_t>>> stmts;
+    std::vector<std::pair<size_t, std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>> togs;
+    std::vector<std::tuple<size_t, std::map<uint64_t, uint64_t>, std::map<std::pair<uint64_t, uint64_t>, uint64_t>>> fsms;
+};
+inline std::vector<CovFreeze>& covFrozen() { static std::vector<CovFreeze> v; return v; }
+inline bool covAnyFrozen() { return !covFrozen().empty(); }
+inline void covThaw() {   // write the frozen counts back
+    for (auto& f : covFrozen()) {
+        for (auto& [i, v] : f.stmts) { i->hits = v.first; i->taken = v.second; }
+        for (auto& [g, v] : f.togs) {
+            if (g < S.togRise.size()) S.togRise[g] = v.first;
+            if (g < S.togFall.size()) S.togFall[g] = v.second;
+        }
+        for (auto& [k, seen, tr] : f.fsms)
+            if (k < S.fsmSeen.size() && k < S.fsmTrans.size()) { S.fsmSeen[k] = seen; S.fsmTrans[k] = tr; }
+    }
+}
+inline void covFreeze(int type, const InstanceSymbol* inst, bool stop) {
+    auto& v = covFrozen();
+    auto it = std::find_if(v.begin(), v.end(), [&](const CovFreeze& f) { return f.type == type && f.inst == inst; });
+    if (!stop) {   // vpiCoverageStart: counting goes on from the frozen counts
+        if (it != v.end()) { covThaw(); v.erase(it); }
+        return;
+    }
+    if (it != v.end()) return;
+    CovFreeze f;
+    f.type = type;
+    f.inst = inst;
+    if (type == vpiStatementCoverage) {
+        for (const Prog* p : st().progs)
+            if (p->inst == inst)
+                for (auto& i : const_cast<Prog*>(p)->code) f.stmts.push_back({&i, {i.hits, i.taken}});
+    } else if (type == vpiToggleCoverage) {
+        for (size_t g = 0; g < S.togRise.size(); g++)
+            if (sigInst((int)g) == inst) f.togs.push_back({g, {S.togRise[g], g < S.togFall.size() ? S.togFall[g] : std::vector<uint64_t>{}}});
+    } else {
+        for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++)
+            if (sigInst(fsmDefs()[k].sig) == inst) f.fsms.push_back({k, S.fsmSeen[k], S.fsmTrans[k]});
+    }
+    v.push_back(std::move(f));
+}
 #include "vpi_covmerge.inc"
 // vpi_control for coverage (40.5.1): vpiCoverageStart / Stop / Reset /
 // Check with a coverage type and an instance or assertion handle (null: the
 // whole design); vpiCoverageSave / Merge with a coverage type and a name.
 inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
-    if (op < vpiCoverageStart || op > vpiCoverageSave) return -1;
+    if (op < vpiCoverageStart || op > vpiCoverageSave) return INT32_MIN;   // not a coverage operation
     auto& s = st();
     int type = va_arg(ap, PLI_INT32);
     if (!isCovType(type)) {
         error(vpiError, "vpi_control: " + std::to_string(type) + " is not a coverage type (40.5.1)");
-        return 0;
+        return -1;   // SV_COV_ERROR
     }
-    if (type != vpiAssertCoverage && !g_cov) {
-        error(vpiWarning, "vpi_control: statement, toggle and FSM coverage are collected only with msim -cov");
-        return 0;
-    }
+    // The results are those of the system functions (40.5.3, 40.3.2):
+    // SV_COV_OK 1, SV_COV_NOCOV 0, SV_COV_ERROR -1.
+    constexpr PLI_INT32 OK = 1, NOCOV = 0, ERR = -1;
+    bool avail = type == vpiAssertCoverage || g_cov;   // statement, toggle and FSM coverage need msim -cov
+    covThaw();
     if (op == vpiCoverageSave || op == vpiCoverageMerge) {
         const char* name = va_arg(ap, const char*);
-        if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return 0; }
-        if (op == vpiCoverageMerge) return covMerge(type, name) ? 1 : 0;
-        if (!covSaveHook() || !covSaveHook()(name)) { error(vpiError, std::string("vpi_control: cannot write coverage to ") + name); return 0; }
-        return 1;
+        if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return ERR; }
+        if (!avail) return NOCOV;   // nothing saved; nothing of that type to merge into
+        if (op == vpiCoverageMerge) return covMerge(type, name) ? OK : ERR;
+        if (!covSaveHook() || !covSaveHook()(name)) { error(vpiError, std::string("vpi_control: cannot write coverage to ") + name); return ERR; }
+        return OK;
     }
     Obj* o = O(va_arg(ap, vpiHandle));
     if (o && o->kind != Obj::Module && o->kind != Obj::Assertion) {
         error(vpiError, "vpi_control: a coverage operation needs an instance or assertion handle (or null)");
-        return 0;
+        return ERR;
     }
     if (o && o->kind == Obj::Assertion && type != vpiAssertCoverage) {
         error(vpiError, "vpi_control: an assertion handle goes with vpiAssertCoverage");
-        return 0;
+        return ERR;
     }
-    if (o && denied(o, "vpi_control")) return 0;
+    if (o && denied(o, "vpi_control")) return ERR;
     const InstanceSymbol* inst = o && o->kind == Obj::Module ? &o->sym->as<InstanceSymbol>() : nullptr;
-    if (op == vpiCoverageCheck) {   // TRUE when every item of the type is covered
-        if (o && o->kind == Obj::Assertion) return s.assertCov[(size_t)o->idx][1] > 0;
-        auto [n, m] = covOf(type, inst);
-        return n == m ? 1 : 0;
+    // Check and start: whether there is coverage of that type there at all
+    // (not whether it is all covered); stop and reset of nothing succeed.
+    if (!avail) return op == vpiCoverageStop || op == vpiCoverageReset ? OK : NOCOV;
+    bool any = (o && o->kind == Obj::Assertion) || covOf(type, inst).second > 0;
+    if (op == vpiCoverageCheck) return any ? OK : NOCOV;
+    if (op == vpiCoverageReset) {
+        // A frozen instance (stopped below the top) stays stopped, from 0.
+        std::vector<const InstanceSymbol*> refreeze;
+        auto& fz = covFrozen();
+        for (auto it = fz.begin(); it != fz.end();)
+            if (it->type == type && (!inst || it->inst == inst)) { refreeze.push_back(it->inst); it = fz.erase(it); }
+            else ++it;
+        covReset(type, inst, o && o->kind == Obj::Assertion ? o : nullptr);
+        for (const InstanceSymbol* f : refreeze) covFreeze(type, f, true);
+        return 1;
     }
-    if (op == vpiCoverageReset) { covReset(type, inst, o && o->kind == Obj::Assertion ? o : nullptr); return 1; }
     bool stop = op == vpiCoverageStop;
     if (type == vpiAssertCoverage) {
         if (!o) s.assertCovAllOff = stop;
         for (size_t k = 0; k < s.assertCovOff.size(); k++)
             if (o && (o->kind == Obj::Assertion ? (int)k == o->idx : assertIn(k, inst))) s.assertCovOff[k] = stop;
             else if (!o) s.assertCovOff[k] = 0;
-        return 1;
+        return stop || any ? OK : NOCOV;
     }
-    // Statement, toggle and FSM counting stops for the whole design: a top
-    // instance (or null) only.
+    // Below the top: that instance's counts freeze until vpiCoverageStart.
     if (inst && inst->getParentScope() != &s.comp->getRoot()) {
-        error(vpiWarning, "vpi_control: statement, toggle and FSM coverage start and stop only for the whole design (a top instance or null)");
-        return 0;
+        covFreeze(type, inst, stop);
+        return stop || any ? OK : NOCOV;
     }
     int bit = type == vpiStatementCoverage ? 1 : type == vpiToggleCoverage ? 2 : 4;
     g_covStop = stop ? (g_covStop | bit) : (g_covStop & ~bit);
-    return 1;
+    return stop || any ? OK : NOCOV;
 }
 
 // ---- set-up from msim ----
@@ -1722,6 +1920,7 @@ inline void fireUnresolved(Compilation& comp) {
             d.obj = nullptr;
             d.time = nullptr;
             d.value = &val;
+            d.user_data = val.value.str;   // 38.36.3: user_data points to the name
             d.cb_rtn(&d);
         }
     }
@@ -1749,12 +1948,16 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
     assertHook() = onAssert;
     fireList(s.endCompile);
     fireList(s.start);
+    if (annexd::envLong("MSIM_RESET_COUNT") > 0 && !getenv("MSIM_RESTORE_AT")) fireFeature(cbEndOfReset);   // 38.36.3
     fireSys(cbAssertionSysInitialized);   // 39.4.1
     if (!s.rw.empty() || !s.ro.empty()) S.rare = true;
 }
 inline void end() {
+    pollSignals();
     if (!st().assertEnded) fireSys(cbAssertionSysEnd);
+    covThaw();
     fireList(st().endSim);
+    covThaw();   // before msim writes the coverage database
 }
 }   // namespace vpi
 
@@ -1938,7 +2141,18 @@ vpiHandle vpi_register_cb(p_cb_data d) {
         case cbStartOfRestart:
         case cbEndOfRestart:
         case cbStartOfReset:
-        case cbEndOfReset:   // 38.36.2: msim has no save, restart or reset, so these never fire
+        case cbEndOfReset:   // 38.36.3: around $save / $incsave, $restart and $reset (annex D.8, D.9)
+            s.featCbs.push_back(c);
+            annexd::featureHook = vpi::onFeature;
+            break;
+        case cbSignal:   // 38.36.3: index is the operating system's signal number
+            if (d->index <= 0 || d->index >= 64 || d->index == SIGKILL || d->index == SIGSTOP) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbSignal needs a signal number in index (not SIGKILL or SIGSTOP)");
+                return nullptr;
+            }
+            vpi::trapSignal(d->index);
+            s.sigCbs[d->index].push_back(c);
             break;
         case cbError:
         case cbPLIError:   // 38.36.3
@@ -3595,9 +3809,19 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap);
 inline PLI_INT32 control(PLI_INT32 op, va_list ap) {
     clearErr();
     if (PLI_INT32 r = assertControlOp(op, ap); r >= 0) return r;
-    if (PLI_INT32 r = covControlOp(op, ap); r >= 0) return r;
+    if (PLI_INT32 r = covControlOp(op, ap); r != INT32_MIN) return r;
     if (op == vpiFinish || op == vpiStop) {
         S.finished = true;
+        return 1;
+    }
+    if (op == vpiReset) {   // 38.6: $reset(stop_value, reset_value, diagnostics_value) on return of the routine
+        (void)va_arg(ap, PLI_INT32);   // stop_value: msim has no interactive mode (annex D.8)
+        long value = va_arg(ap, PLI_INT32), diag = va_arg(ap, PLI_INT32);
+        auto& s = st();
+        if (!s.cur) annexd::reset(value, diag);   // from a callback: it has returned once vpi_control does
+        s.resetDue = true;
+        s.resetValue = value;
+        s.resetDiag = diag;
         return 1;
     }
     error(vpiWarning, "vpi_control: operation " + std::to_string(op) + " is not supported");

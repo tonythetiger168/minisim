@@ -1,0 +1,11 @@
+{
+  "tool": "mlint",
+  "version": "0.1.0",
+  "findings": [
+    {"file": "tests/debug/lintme.sv", "line": 5, "col": 9, "rule": "UNU002", "group": "unused", "severity": "warning", "text": "'q' is driven but never read", "waived": false},
+    {"file": "tests/debug/lintme.sv", "line": 8, "col": 10, "rule": "W001", "group": "width", "severity": "warning", "text": "8 bits are assigned to 'y', which is 4 bits wide: the upper 4 bits are dropped", "waived": false},
+    {"file": "tests/debug/lintme.sv", "line": 3, "col": 15, "rule": "UNU001", "group": "unused", "severity": "info", "text": "the signal named here", "signal": "lintme.unused_r", "waived": true},
+    {"file": "elsewhere.sv", "line": 1, "col": 1, "rule": "STY001", "group": "style", "severity": "info", "text": "not in the design", "waived": false}
+  ],
+  "summary": {"error": 0, "warning": 2, "info": 2, "waived": 1}
+}

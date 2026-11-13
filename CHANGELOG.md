@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
+  the power intent, then writes a snapshot that `simv` reads with the UPF
+  file; processes of a power domain sleep while it is off and corrupt their
+  writes in the generated code. Without `-upf` the generated C++ is
+  unchanged. `tests/msim_compile.cmake` runs four UPF designs and the
+  low-power coverage report both ways.
 - `mlint -upf` rules `UPF008` to `UPF012`: isolation and retention controls
   driven from a domain that can be off, isolation or retention powered by
   the switched supply of the domain itself, a power switch controlled from
@@ -76,6 +82,25 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI assertion control as 39.5 reads: `vpiAssertionEnableStep` /
+  `DisableStep` and `vpiAssertionKill` act on one attempt, named by its
+  start time (`vpiAssertionClockSteps` accepted); kill no longer disables
+  the assertion. System control takes a scope handle (NULL: all);
+  `vpiAssertionSysReset` removes the step callbacks, `vpiAssertionSysEnd`
+  every assertion callback.
+- VPI save, restart and reset (38.6, 38.36.3): `vpi_control(vpiReset)`;
+  `cbStartOfSave` / `cbEndOfSave`, `cbStartOfRestart` / `cbEndOfRestart`
+  and `cbStartOfReset` / `cbEndOfReset` now run around `$save`,
+  `$restart` and `$reset`; `cbSignal` runs at the next time slot after the
+  signal. `cbUnresolvedSystf` now also passes the name in `user_data`.
+- VPI coverage stop and start on one instance below the top (40.5.1):
+  its statement, toggle or FSM counts freeze until `vpiCoverageStart`.
+- VPI coverage control as 40.5 reads: `vpi_control` returns the
+  `SV_COV_*` codes of the system functions (`vpiCoverageCheck` is 1 when
+  coverage is available, not when all is covered; errors are -1), and
+  `vpiCovered` of an assertion needs an attempt, a success and no failure.
+- VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
+  immediate assertion, or the boolean of a single-expression property.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -311,6 +336,9 @@ Spec references are IEEE 1800-2023 clauses.
   (next/previous time the selected signal takes it), Del to remove a row,
   Ctrl+arrows to step changes; the view lives in the page address, so a
   reload or a copied link opens on it.
+- `mdebug -lint FILE`: mlint's findings (`mlint -json`) in the page: a list
+  with a severity filter, marks on the source lines, and a click that opens
+  the line and selects the signal the finding names; script command `lint`.
 - `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
   signal's waves are sent when the page first shows it, so large waveforms
   are not cut to the one-file page's budget.
@@ -699,6 +727,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a write to an element of a multidimensional array whose indexes
+  have unknown bits (`m[r][c] <= d`) merges into every element the indexes
+  may name. Before, only one-dimensional arrays did, and the write was
+  skipped.
 - `-xprop`: a branch that calls a task or function with a nonblocking
   assignment is merged. The task's `<=` target becomes `x` when the branch
   only might be taken (each process calls its own copy of the task that
