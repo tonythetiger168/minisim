@@ -114,6 +114,9 @@ Spec references are IEEE 1800-2023 clauses.
   `upf_query_object_properties`, `upf_query_object_type`,
   `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
   phase 5 enforced after the first query (docs/LOWPOWER.md).
+- The UPF information model also holds abstract power sources, composite
+  domains, power state groups, state transitions, repeater strategies, power
+  models and attributes (IEEE 1801-2024 10.6.1, 10.6.3).
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction

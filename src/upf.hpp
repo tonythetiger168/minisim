@@ -1338,6 +1338,10 @@ struct Model {
     void resolveApplies(const std::function<std::vector<std::string>(const std::string&)>& instancesOf) {
         auto pend = std::move(pendingApplies);
         pendingApplies.clear();
+        // these are phase-4 commands replayed once the design is known: a query
+        // read since then (11.1.1) does not forbid them
+        struct Phase5 { bool& f; bool saved; ~Phase5() { f = saved; } } p5{phase5, phase5};
+        phase5 = false;
         for (auto& pa : pend) {
             const PowerModel& pm = powerModels.at(pa.c.w[1]);
             std::vector<std::string> mods = pm.fors.empty() ? std::vector<std::string>{pm.name} : pm.fors;

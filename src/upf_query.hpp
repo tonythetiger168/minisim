@@ -396,9 +396,11 @@ struct ImBuilder {
         return signal(n);
     }
     // A supply set or supply set handle by UPF name: "SS", "PD.primary".
+    // Objects whose supply set handles are named <object>.<handle>.
+    bool owner(const std::string& n) const { return m.domains.count(n) || m.composites.count(n) || m.sources.count(n); }
     std::string setHandle(const std::string& n) {
         size_t d = n.rfind('.');
-        if (d != std::string::npos && m.domains.count(n.substr(0, d))) return upfH(n.substr(0, d)) + "." + n.substr(d + 1);
+        if (d != std::string::npos && owner(n.substr(0, d))) return upfH(n.substr(0, d)) + "." + n.substr(d + 1);
         if (m.sets.count(n)) return upfH(n);
         return "";
     }
@@ -471,7 +473,7 @@ struct ImBuilder {
     void buildSets() {
         for (auto& [n, s] : m.sets) {
             size_t d = n.rfind('.');
-            if (d != std::string::npos && m.domains.count(n.substr(0, d))) continue;   // a domain's handle
+            if (d != std::string::npos && owner(n.substr(0, d))) continue;   // a handle of a domain or power source
             auto [sc, leaf] = splitName(n);
             std::string cs = upfScope(sc);
             supplySet(upfH(n), leaf, cs, cs, n);
@@ -757,15 +759,213 @@ struct ImBuilder {
             }
         }
     }
+    // add_state_transition (6.7): the transitions of an object at handle h.
+    void transitionsOf(const std::string& obj, const std::string& h, const char* prop) {
+        auto it = m.transitions.find(obj);
+        if (it == m.transitions.end() || !im.objs.count(h)) return;
+        const std::string cs = im.objs[h].get("upf_creation_scope") ? *im.objs[h].get("upf_creation_scope") : im.root;
+        for (auto& t : it->second.tr) {
+            std::string th = h + "." + t.name;
+            if (im.objs.count(th)) continue;
+            im.make(th, "upfPowerStateTransitionT", th);
+            named(im.objs[th], t.name, h, cs, t.where);
+            im.objs[th].set("upf_is_illegal", boolS(t.illegal));
+            for (auto& f : t.from) im.objs[th].add("upf_from_states", h + "." + f);
+            for (auto& to : t.to) im.objs[th].add("upf_to_states", h + "." + to);
+            for (auto& [f, to] : t.paired) {
+                im.objs[th].add("upf_from_states", h + "." + f);
+                im.objs[th].add("upf_to_states", h + "." + to);
+            }
+            im.objs[h].add(prop, th);
+        }
+    }
+    void buildTransitions() {
+        for (auto& dn : m.domainOrder) transitionsOf(dn, upfH(dn), "upf_pd_state_transitions");
+        for (auto& [obj, ts] : m.transitions) {
+            if (ts.kind != 's') continue;
+            std::string h = setHandle(obj);
+            if (!h.empty()) transitionsOf(obj, h, "upf_ss_transitions");
+        }
+    }
+    // create_composite_domain (6.17) and create_power_state_group (6.22): their
+    // states are kept as a group's.
+    void buildGroups() {
+        for (auto& gn : m.groupOrder) {
+            auto git = m.groups.find(gn);
+            if (git == m.groups.end()) continue;
+            const StateGroup& g = git->second;
+            bool comp = m.composites.count(gn) != 0;
+            auto [sc, leaf] = splitName(gn);
+            std::string h = upfH(gn), cs = upfScope(g.scope);
+            im.make(h, comp ? "upfCompositeDomainT" : "upfPowerStateGroupT", h);
+            named(im.objs[h], leaf, cs, cs, g.where);
+            ownedBy(cs, h);
+            const char* st = comp ? "upf_pd_states" : "upf_group_states";
+            for (auto& ps : g.states) im.objs[h].add(st, powerState(h, ps, cs, g.scope, false));
+            if (comp) {
+                for (auto& sd : m.composites.at(gn).subs) im.objs[h].add("upf_subdomains", upfH(sd));
+                if (m.setAlias.count(gn + ".primary") || m.sets.count(gn + ".primary")) {
+                    std::string sh = h + ".primary";
+                    supplySet(sh, "primary", h, cs, m.setOf(gn + ".primary"));
+                    im.objs[h].add("upf_supply_set_handles", sh);
+                }
+            }
+            transitionsOf(gn, h, comp ? "upf_pd_state_transitions" : "upf_group_state_transitions");
+        }
+    }
+    // create_abstract_power_source (6.16).
+    void buildSources() {
+        for (auto& [n, ps] : m.sources) {
+            auto [sc, leaf] = splitName(n);
+            std::string h = upfH(n), cs = upfScope(sc);
+            im.make(h, "upfAbstractPowerSourceT", h);
+            named(im.objs[h], leaf, cs, cs, ps.where);
+            ownedBy(cs, h);
+            auto handle = [&](const std::string& k) {
+                std::string sh = h + "." + k;
+                supplySet(sh, k, h, cs, m.setOf(n + "." + k));
+                im.objs[h].add("upf_supply_set_handles", sh);
+                return sh;
+            };
+            if (!ps.out.empty()) im.objs[h].set("upf_output_supply_set", handle(ps.out));
+            for (auto& i : ps.ins) im.objs[h].add("upf_input_supply_sets", handle(i));
+            for (auto& [p, net] : ps.ctrls) {
+                std::string ph = h + "/" + p;
+                im.make(ph, "upfLogicPortT", ph);
+                named(im.objs[ph], p, h, cs, ps.where);
+                im.objs[ph].set("upf_port_dir", "UPF_DIR_IN");
+                std::string s = net.empty() ? "" : signal(net);
+                if (!s.empty()) im.objs[ph].add("upf_hiconn", s);
+                im.objs[h].add("upf_control_ports", ph);
+            }
+            for (auto& a : ps.acks) {
+                std::string ph = h + "/" + a.port;
+                im.make(ph, "upfAckPortT", ph);
+                named(im.objs[ph], a.port, h, cs, ps.where);
+                im.objs[ph].set("upf_port_dir", "UPF_DIR_OUT");
+                std::string s = a.net.empty() ? "" : signal(a.net);
+                if (!s.empty()) im.objs[ph].add("upf_hiconn", s);
+                im.objs[ph].set("upf_ack_delay", std::to_string(a.delay));
+                std::string x = expr(a.e, sc);
+                if (!x.empty()) im.objs[ph].set("upf_ack_expr", x);
+                im.objs[h].add("upf_ack_ports", ph);
+            }
+            auto states = [&](const std::vector<SwitchState>& v) {
+                for (auto& st : v) {
+                    std::string sh = h + "." + st.name;
+                    im.make(sh, "upfPowerSourceStateT", sh);
+                    named(im.objs[sh], st.name, h, cs, ps.where);
+                    std::string x = expr(st.e, sc);
+                    if (!x.empty()) im.objs[sh].set("upf_power_source_expr", x);
+                    im.objs[h].add("upf_power_source_states", sh);
+                }
+            };
+            states(ps.on);
+            states(ps.off);
+            for (auto& sw : ps.switches) im.objs[h].add("upf_power_switches", upfH(sw));
+        }
+    }
+    // set_repeater (6.50).
+    void buildRepeaters() {
+        for (auto& r : m.reps) {
+            std::string h = strategy("upfRepeaterStrategyT", r.name, r.domain, r.where, "upf_repeater_strategies",
+                                     strategyEls(r.domain, r.elements, r.exclude));
+            std::string cs = *im.objs[h].get("upf_creation_scope");
+            localSet(h, "repeater_supply", r.supply, cs);
+            im.objs[h].set("upf_applies_to", appliesE(r.appliesTo));
+            if (!r.source.empty()) { std::string x = resolveName(r.source); if (!x.empty()) im.objs[h].set("upf_source_filter", x); }
+            if (!r.sink.empty()) { std::string x = resolveName(r.sink); if (!x.empty()) im.objs[h].set("upf_sink_filter", x); }
+            im.objs[h].set("upf_applies_to_boundary", r.boundary == 1 ? "UPF_BOUNDARY_LOWER" : r.boundary == 2 ? "UPF_BOUNDARY_UPPER" : "UPF_BOUNDARY_BOTH");
+        }
+    }
+    // define_power_model / begin_power_model (6.31, 6.11): the instances it is
+    // applied to are its extents.
+    void buildPowerModels() {
+        std::map<std::string, std::vector<std::string>> applied;
+        for (auto& [inst, pm] : m.appliedModels) applied[pm].push_back(inst);
+        for (auto& [n, pm] : m.powerModels) {
+            std::string h = upfH(n);
+            if (im.objs.count(h)) continue;
+            im.make(h, "upfPowerModelT", h);
+            im.objs[h].set("upf_name", splitName(n).second);
+            where(im.objs[h], pm.where);
+            std::string x = extents(h, applied[n]);
+            if (!x.empty()) im.objs[h].set("upf_effective_extents", x);
+            for (auto& f : pm.fors) im.objs[h].add("upf_for_models", f);
+        }
+    }
+    // set_design_attributes (6.44) and set_port_attributes (6.51): attribute
+    // objects (10.6.3) on the HDL objects they name.
+    void attr(const std::string& onH, const std::string& name, const std::string& value, const std::string& w) {
+        if (onH.empty() || !im.objs.count(onH)) return;
+        std::string x = im.gen("ATTR");
+        im.make(x, "upfAttributeT", "");
+        where(im.objs[x], w);
+        im.objs[x].set("upf_attr_name", name);
+        im.objs[x].set("upf_attr_value", value);
+        im.objs[onH].add("upf_hdl_attributes", x);
+    }
+    std::vector<std::string> instancesOf(const std::string& model) const {
+        std::vector<std::string> r;
+        if (!dv) return r;
+        for (auto& [p, md] : dv->model)
+            if (md == model && (m.top.empty() || p == m.top || p.rfind(m.top + ".", 0) == 0)) r.push_back(p);
+        return r;
+    }
+    void buildAttributes() {
+        for (auto& r : m.designAttrs) {
+            std::vector<std::string> hs;
+            if (r.hasElements) {
+                for (auto& e : r.elements)
+                    if (std::find(r.exclude.begin(), r.exclude.end(), e) == r.exclude.end()) hs.push_back(element(e));
+            } else {
+                for (auto& md : r.models) {
+                    if (md == ".") hs.push_back(upfScope(r.scope));
+                    else for (auto& p : instancesOf(md)) hs.push_back(scope(p));
+                }
+            }
+            for (auto& h : hs)
+                for (auto& [an, av] : r.attrs) attr(h, an, av, r.where);
+        }
+        for (auto& r : m.portAttrs) {
+            std::vector<std::string> hs;
+            auto portsOfInst = [&](const std::string& inst, const std::vector<std::string>& names) {
+                std::vector<std::string> ps = names;
+                if (ps.empty() && dv)
+                    if (auto it = dv->portsOf.find(inst); it != dv->portsOf.end())
+                        for (auto& [pn, pd] : it->second) ps.push_back(pn);
+                for (auto& pn : ps) {
+                    if (std::find(r.excludePorts.begin(), r.excludePorts.end(), pn) != r.excludePorts.end()) continue;
+                    hs.push_back(decl(inst.empty() ? pn : inst + "." + pn, dv != nullptr));
+                }
+            };
+            if (!r.model.empty()) {
+                for (auto& p : instancesOf(r.model)) portsOfInst(p, r.ports);
+            } else if (r.hasPorts) {
+                for (auto& pn : r.ports) hs.push_back(decl(m.design(pn), dv != nullptr));
+            } else {
+                for (auto& e : r.elements)
+                    if (std::find(r.exclude.begin(), r.exclude.end(), e) == r.exclude.end()) portsOfInst(m.design(e), {});
+            }
+            for (auto& h : hs)
+                for (auto& [an, av] : r.attrs) attr(h, an, av, r.where);
+        }
+    }
     void build() {
         topP = slash(m.top);
         buildDesign();
         buildSupplies();
         buildSwitches();
         buildSets();
+        buildSources();
         buildDomains();
+        buildGroups();
         buildStrategies();
+        buildRepeaters();
         buildPsts();
+        buildTransitions();
+        buildPowerModels();
+        buildAttributes();
     }
 };
 

@@ -108,6 +108,18 @@ execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}
 if(NOT rc EQUAL 0 OR NOT out MATCHES "0 findings")
   message(FATAL_ERROR "query.upf (mlint): ${rc}\n${out}${err}")
 endif()
+# More of the information model: each tests/upf/query/<name>.upf is read
+# after <name>.upf against <name>.sv and checks its own answers.
+foreach(t source transitions pmodel attributes)
+  file(READ ${D}/${t}.upf g)
+  file(READ ${D}/query/${t}.upf q)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/query_${t}.upf "${g}\n${q}")
+  execute_process(COMMAND ${MLINT} ${D}/${t}.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/query_${t}.upf -only upf
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "query/${t}.upf: ${rc}\n${out}${err}")
+  endif()
+endforeach()
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/badfind.upf "set_design_top dut\nfind_objects u_nope -pattern *\n")
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/badfind.upf
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
