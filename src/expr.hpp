@@ -1398,6 +1398,7 @@ enum class Op {
     DynBits, StreamPack,
     DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
     DynElemRef,   // element kids[0] of container sig, itself a container (7.5, 7.10): its id + 1, made if missing
+    Future,    // kids[0] read at the next global clock tick (16.9.4); gone once the assertion is built
     ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
@@ -2746,6 +2747,7 @@ inline Val eval(const E& e, const Reader& rd) {
             if (el.x || !el.v) el = dynNewElem(d);
             return make(el.v + 1, 0, 64);
         }
+        case Op::Future: return k(0);
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
             auto& d = dynStore()[R(e->sig)];

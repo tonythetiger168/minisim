@@ -347,7 +347,9 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n0) {
     using namespace slang::ast;
     // $past_gclk(v) is $past(v,,, @$global_clock), and so on (16.9.4).
     std::string_view n = n0;
-    bool gclk = n0.ends_with("_gclk") && n0 != "$future_gclk";
+    if (n0 == "$future_gclk" || n0 == "$rising_gclk" || n0 == "$falling_gclk" || n0 == "$steady_gclk" || n0 == "$changing_gclk")
+        return futureFn(call, n0);
+    bool gclk = n0.ends_with("_gclk");
     if (gclk) {
         n = n0.substr(0, n0.size() - 5);
         if (n != "$past" && n != "$rose" && n != "$fell" && n != "$stable" && n != "$changed") return nullptr;
@@ -379,6 +381,75 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n0) {
     E prev = pastOf(x, 1, nullptr, clockArg(call, 1));
     return sampledCompare(n, cur, prev, storeW(*x.type));
 }
+// The global clocking future sampled value functions (16.9.4): the value at
+// the next tick of the global clock. The assertion that uses them is checked
+// one global clock tick late (futureShift): then the future value is the
+// sampled value now, and every other value the one sampled a tick before.
+E futureFn(const slang::ast::CallExpression& call, std::string_view n) {
+    auto args = call.arguments();
+    if (args.empty()) unsupported("sampled value function without an argument");
+    if (!svb || !mkSig || !tempSeq) unsupported("a global clocking future sampled value function outside an assertion (16.9.4)");
+    svb->future = true;
+    const slang::ast::Expression& x = *args[0];
+    E cur = sampledE(expr(x));
+    E fut = node(Op::Future, {cur});
+    if (n == "$future_gclk") return fut;
+    std::string_view as = n == "$rising_gclk" ? "$rose" : n == "$falling_gclk" ? "$fell" : n == "$steady_gclk" ? "$stable" : "$changed";
+    return sampledCompare(as, fut, cur, storeW(*x.type));
+}
+// The global clock's sample clock (no gate), made if missing.
+SampleClock& gclkSampler() {
+    std::vector<std::pair<int, Edge>> gev;
+    if (!globalClocking()) unsupported("a global clocking future sampled value function with no global clocking (16.9.4)");
+    collectEvents(globalClocking()->getEvent(), gev);
+    for (auto& c : sampleClocks())
+        if (c.ev == gev && !c.gate) return c;
+    sampleClocks().push_back({gev, nullptr, {}});
+    return sampleClocks().back();
+}
+// Atom e of an assertion that uses future functions, read one global clock
+// tick late: each sampled value is replaced by its copy from the tick before
+// (a $past stage one further back), and a future value by the value now.
+E futureShift(const E& e) {
+    if (!e || e->op == Op::Const) return e;
+    if (e->op == Op::Future) return e->kids[0];
+    auto delay = [&](const E& src, int w) {
+        SampleClock::Line ln;
+        ln.src = src;
+        ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), w, false));
+        int st = ln.stages[0];
+        gclkSampler().lines.push_back(std::move(ln));
+        return ref(st, src->sgn);
+    };
+    if (e->op == Op::Ref) {
+        if (e->at || isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig) || svaLiveSigs().count(e->sig))
+            unsupported("a future sampled value function with automatic, local or class values (16.9.4)");
+        SampleClock& g = gclkSampler();
+        for (auto& c : sampleClocks())
+            for (auto& ln : c.lines)
+                for (size_t j = 0; j < ln.stages.size(); j++)
+                    if (ln.stages[j] == e->sig) {
+                        if (&c != &g) unsupported("a future sampled value function with $past on another clock (16.9.4)");
+                        if (j + 1 == ln.stages.size())
+                            ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), sigInfo()[e->sig].second, false));
+                        auto n = std::make_shared<Expr>(*e);
+                        n->sig = ln.stages[j + 1];
+                        return n;
+                    }
+        return delay(e, sigInfo()[e->sig].second);
+    }
+    if (e->op == Op::ArrRead) return delay(e, e->arr->elemW);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
+        e->op == Op::DynElemRef || e->op == Op::Addr || e->op == Op::AddrOf || e->op == Op::VifSig || e->op == Op::This)
+        unsupported("a future sampled value function with containers or class values (16.9.4)");
+    bool same = true;
+    std::vector<E> kids;
+    for (auto& k : e->kids) { kids.push_back(futureShift(k)); same = same && kids.back() == k; }
+    if (same) return e;
+    auto n = std::make_shared<Expr>(*e);
+    n->kids = std::move(kids);
+    return n;
+}
 // $rose / $fell / $stable / $changed from the current and previous samples.
 E sampledCompare(std::string_view n, E cur, E prev, int w) {
     cur = resize(cur, w, false, false);
@@ -405,6 +476,7 @@ struct SvaBuild {
     std::unordered_map<const slang::ast::Expression*, int> atomOf;
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
+    bool future = false;   // uses $future_gclk and friends (16.9.4)
 };
 SvaBuild* svb = nullptr;
 
@@ -877,6 +949,7 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     c.acts = std::move(b.acts);
     c.endSig = sg;
     c.more = std::move(b.more);
+    if (b.future) unsupported("a future sampled value function in a sequence end point (16.9.4)");
     svb = saved;
     sva::store().localAtoms = savedLocal;
     sva::store().clk = savedClk;
@@ -999,6 +1072,21 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.clearFlags = std::move(b.matchFlags);
     c.more = std::move(b.more);
     if (!c.more.empty() && !staticAssert) unsupported("a multiclock assertion in a procedure (16.14.6)");
+    if (b.future) {   // checked one global clock tick late (16.9.4)
+        SampleClock& g = gclkSampler();
+        if (c.ev != g.ev) unsupported("a future sampled value function in an assertion not clocked by the global clock (16.9.4)");
+        if (!c.more.empty() || !c.acts.empty() || !c.localSig.empty() || !staticAssert)
+            unsupported("a future sampled value function with local variables, several clocks or in a procedure (16.9.4)");
+        for (auto& at : c.atoms) at = futureShift(at);
+        if (c.clkIff) c.clkIff = futureShift(c.clkIff);
+        // No attempt at the first tick: nothing was sampled before it.
+        SampleClock::Line ln;
+        ln.src = konst(mk(1, 1));
+        ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), 1, false));
+        E started = ref(ln.stages[0]);
+        g.lines.push_back(std::move(ln));
+        c.clkIff = c.clkIff ? bin(Op::LogAnd, c.clkIff, started) : started;
+    }
     if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
         c.procedural = true;
         // Automatic variables are read as they were when the instance was
