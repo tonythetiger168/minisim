@@ -387,9 +387,13 @@ struct Deriv {
     int env = 0;               // the context environment
     uint32_t ticking = ~0u;    // the clocks that ticked in this step (16.13): all of them for one clock
     bool ticks(const Node* n) const { return (ticking >> (n->clk & 31)) & 1; }
+    // VPI stepping (39.5.2): the atoms read in this step and whether each held
+    std::vector<std::pair<int, bool>>* seen = nullptr;
     bool atom(const Node* n) const {
         bool v = (n->flags & LOCAL) && lh ? lh->atom(n->atom, env) : val[n->atom] != 0;
-        return v != ((n->flags & NEG) != 0);
+        v = v != ((n->flags & NEG) != 0);
+        if (seen) seen->push_back({n->atom, v});
+        return v;
     }
 
     const Node* d(const Node* n) {
@@ -674,6 +678,7 @@ struct ConcAssert {
     E clkIff;                                   // @(posedge clk iff c): c, current value
     E disable;                                  // disable iff, current values (16.12); null: none
     std::vector<E> atoms;                       // boolean atoms, on sampled values
+    std::vector<const void*> atomSrc;           // the source expression of each atom (slang Expression*), for VPI
     std::vector<const Prog*> pre;               // their function calls: run at each tick before the atoms are read
     const sva::Node* root = nullptr;
     bool coverSeq = false;

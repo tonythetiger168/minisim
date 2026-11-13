@@ -152,7 +152,23 @@ struct Hart {
     struct Tlb { uint64_t vpn, ppn; uint8_t pte; bool valid; };
     static constexpr unsigned TLB_SIZE = 256;
     Tlb tlb[TLB_SIZE] = {};
-    void flushTlb() { for (auto& t : tlb) t.valid = false; fpVpn = ~0ull; }
+    void flushTlb() {
+        for (auto& t : tlb) t.valid = false;
+        fpVpn = ~0ull;
+        flushDataPages();
+    }
+    // Pages of plain memory that loads (dl) and stores (ds) with paging on
+    // last went to: va >> 12, where the page is in host memory, and the
+    // privilege, SUM and MXR they were checked with. Each one was translated
+    // (with A, and D for a store, set) and found allowed by PMP as a whole.
+    // Emptied with the TLB and by PMP writes.
+    struct DataPage { uint64_t vpn = ~0ull; uint8_t* host = nullptr; uint32_t ctx = 0; };
+    static constexpr unsigned DP_SIZE = 64;
+    DataPage dl[DP_SIZE], ds[DP_SIZE];
+    void flushDataPages() {
+        for (auto& e : dl) e.vpn = ~0ull;
+        for (auto& e : ds) e.vpn = ~0ull;
+    }
     // The page instructions were last fetched from, translated and found
     // executable by PMP as a whole: va >> 12, the physical page, and the
     // privilege it was checked at. Emptied with the TLB and by PMP writes.
