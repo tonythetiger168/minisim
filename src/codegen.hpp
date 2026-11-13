@@ -123,6 +123,7 @@ public:
             if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
         }
         if (!dom.empty()) wakeEvents(procs, dom);
+        armK_.clear(); armIns_.clear(); armSet_.clear();
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
         std::vector<CodegenProc> wideProcs;
         if (!dom.empty() && privates && !std::getenv("MSIM_NOWIDE")) wideProcs = splitWide(procs, dom);
@@ -395,6 +396,17 @@ public:
             if (!c) o << "{0, 0, false}";
             o << "};\n";
             if (c) privInit_ = "    for (auto& e : PINIT) { PA[e.s].x = e.m; PA[e.s].z = e.net ? e.m : 0; }\n";
+        }
+        if (!armIns_.empty()) {   // armChk: the private inputs of each arming process, and their values when it began to wait
+            std::string in, off = "0";
+            size_t n = 0;
+            for (auto& a : armIns_) {
+                for (int x : a) in += (n++ ? ", " : "") + std::to_string(x);
+                off += ", " + std::to_string(n);
+            }
+            o << SV << "const uint32_t ARMIN[] = {" << in << "};\n" << SV << "const uint32_t ARMOFF[] = {" << off << "};\n"
+              << SV << "PSig ARMSNAP[" << n << "];\n" << SV << "uint8_t ARMST[" << armIns_.size() << "];   // 1 waiting, 2 done\n"
+              << SV << "uint32_t ARMLEFT = " << armIns_.size() << ";\n";
         }
         // Startup statements (one per line). Split, they go to functions
         // spread over the files: in main() they made design.cpp the slowest
@@ -729,6 +741,21 @@ private:
     // Private signals of the cycle domain (see privateSigs): kept in plain
     // static variables P<s> instead of S.sigs, like Verilator's model members.
     std::vector<char> priv_, sigNet_, clock_;
+    // `always @*` arming processes (msim.cpp rotateAtStar: wait once on the
+    // block's inputs, then set its $atstar flag) that wait on private
+    // signals: the waits on those never wake (a private signal changes in
+    // PA, not S.sigs), so the domain compares them with their values at the
+    // start of the wait instead (armChk). Per process: its arm number, or -1.
+    std::vector<int> armK_;
+    std::vector<std::vector<int>> armIns_;   // per arm: its private inputs
+    std::vector<const Instr*> armSet_;       // per arm: the flag's Assign
+    static bool armShape(const CodegenProc& p, const std::vector<CodegenSig>& sigs) {
+        if (p.seq || p.combRank >= 0 || !p.prog) return false;
+        const auto& c = p.prog->code;
+        return c.size() == 2 && c[0].k == IK::WaitEdge && !c[0].dynWait && !c[0].events.empty() && c[1].k == IK::Assign &&
+               c[1].sig >= 0 && (size_t)c[1].sig < sigs.size() && c[1].hi < 0 && !c[1].arr && !c[1].bidx && c[1].drv < 0 &&
+               sigs[c[1].sig].name.rfind("$atstar", 0) == 0;
+    }
     // A narrow variable no clocked process waits on: Sim::fastInit marks it
     // quiet, so a write is a store unless a process waits on it (or a VCD
     // or $monitor watches everything). `obs` is S.observed, read once per function.
@@ -1988,19 +2015,22 @@ private:
         size_t ns = sigs.size();
         bool anyArr = false;
         std::vector<char> cand(ns, 0), bad(ns, 0);
+        std::vector<int> arms;
+        std::vector<int> whyL(ns, 0), whyP(ns, -1);   // MSIM_WHYPRIV: the line that kept each candidate in S.sigs
         std::vector<int> owner(ns, -1);   // the branching comb process that writes a candidate
         std::vector<char> mine(procs.size(), 0);
         for (int i : dom) mine[i] = 1;
         for (size_t i = 0; i < procs.size(); i++) if (procs[i].combRank >= 0) mine[i] = 1;
+        int refP = -1;
         std::function<void(const E&)> refs = [&](const E& e) {
             if (!e) return;
-            if (e->op == Op::Ref && e->sig >= 0 && (size_t)e->sig < ns) bad[e->sig] = 1;
+            if (e->op == Op::Ref && e->sig >= 0 && (size_t)e->sig < ns) (bad[e->sig] = 1, whyL[e->sig] = __LINE__, whyP[e->sig] = refP);
             for (auto& k : e->kids) refs(k);
         };
         for (size_t i = 0; i < procs.size(); i++) {
             // A clock or reset stays in S.sigs when a process waits on it: the
             // domain waits on its wake signals only (wakeEvents).
-            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns && (!mine[i] || procs[i].combRank >= 0 || wakeSig(sg))) bad[sg] = 1;
+            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns && (!mine[i] || procs[i].combRank >= 0 || wakeSig(sg))) (bad[sg] = 1, whyL[sg] = __LINE__);
             if (procs[i].combRank >= 0) {
                 for (auto& in : procs[i].prog->code) {
                     if (in.k == IK::WaitEdge) break;
@@ -2021,17 +2051,18 @@ private:
                         // assigns of single bits or fields that msim merged (mergePartialDrivers).
                         cand[in.sig] = 1;
                         owner[in.sig] = (int)i;
-                    } else bad[in.sig] = 1;
+                    } else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
                 }
                 continue;
             }
             if (mine[i]) {
                 for (auto& in : procs[i].prog->code)
                     if (in.k == IK::Nba && in.sig >= 0 && (size_t)in.sig < ns) {
-                        if (in.hi < 0 || sigs[in.sig].w > 64) cand[in.sig] = 1; else bad[in.sig] = 1;
-                    } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) bad[in.sig] = 1;   // a temporary: kept in S.sigs
+                        if (in.hi < 0 || sigs[in.sig].w > 64) cand[in.sig] = 1; else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
+                    } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) (bad[in.sig] = 1, whyL[in.sig] = __LINE__);   // a temporary: kept in S.sigs
                 continue;
             }
+            if (armShape(procs[i], sigs)) { arms.push_back((int)i); continue; }   // its wait: armChk
             // Another process may still write one with a plain blocking
             // assign, read it in compiled code, or $display it (the value is
             // copied into S.sigs first). Anything else keeps it in S.sigs.
@@ -2050,10 +2081,11 @@ private:
             for (const Prog* p : progs)
                 for (auto& in : p->code) {
                     bool plainWrite = in.k == IK::Assign && in.hi < 0 && in.drv < 0 && !in.arr && in.aidx.empty() && !in.bidx;
-                    if (in.sig >= 0 && (size_t)in.sig < ns && !plainWrite) bad[in.sig] = 1;
-                    for (auto& [sg, ed] : in.events) if ((size_t)sg < ns) bad[sg] = 1;
+                    if (in.sig >= 0 && (size_t)in.sig < ns && !plainWrite) (bad[in.sig] = 1, whyL[in.sig] = __LINE__, whyP[in.sig] = (int)i);
+                    for (auto& [sg, ed] : in.events) if ((size_t)sg < ns) (bad[sg] = 1, whyL[sg] = __LINE__, whyP[sg] = (int)i);
                     bool compiled = in.k == IK::Assign || in.k == IK::JmpIfNot || in.k == IK::Nba || in.k == IK::WaitDelay;
-                    if (!compiled) { refs(in.e); refs(in.bidx); refs(in.de); for (auto& a : in.aidx) refs(a); }
+                    if (!compiled) { refP = (int)i; refs(in.e); refs(in.bidx); refs(in.de); for (auto& a : in.aidx) refs(a); }
+                    refP = (int)i;
                     if (in.k != IK::Display) for (auto& a : in.args) refs(a);
                     arr(in.e);
                     for (auto& a : in.args) arr(a);
@@ -2067,7 +2099,7 @@ private:
             auto range = [&](const ArrShape* a) {
                 if (!a) return;
                 for (int64_t k = 0; k < a->count; k++)
-                    if (a->base + k >= 0 && (size_t)(a->base + k) < ns) bad[(size_t)(a->base + k)] = 1;
+                    if (a->base + k >= 0 && (size_t)(a->base + k) < ns) (bad[(size_t)(a->base + k)] = 1, whyL[(size_t)(a->base + k)] = __LINE__);
             };
             std::function<void(const E&)> ea = [&](const E& e) {
                 if (!e) return;
@@ -2094,6 +2126,25 @@ private:
         for (size_t s = 0; s < ns; s++)
             priv_[s] = cand[s] && !bad[s] && sigs[s].w >= 1 && sigs[s].w <= 64 &&
                        sigs[s].name.find_first_of("[$") == std::string::npos;
+        armK_.assign(procs.size(), -1);
+        armIns_.clear();
+        armSet_.clear();
+        for (int i : arms) {
+            std::vector<int> in;
+            for (auto& [sg, ed] : procs[i].prog->code[0].events)
+                if (sg >= 0 && (size_t)sg < ns && priv_[sg]) in.push_back(sg);
+            if (in.empty()) continue;
+            armK_[i] = (int)armIns_.size();
+            armIns_.push_back(std::move(in));
+            armSet_.push_back(&procs[i].prog->code[1]);
+        }
+        if (std::getenv("MSIM_WHYPRIV"))
+            for (size_t s = 0; s < ns; s++)
+                if (cand[s] && !priv_[s])
+                    std::fprintf(stderr, "not private: %s (%d bits), codegen.hpp line %d%s%s\n", sigs[s].name.c_str(), sigs[s].w, whyL[s],
+                                 whyP[s] >= 0 ? ", by a process: " : "",
+                                 whyP[s] >= 0 ? (procs[whyP[s]].kind + " line " + std::to_string([&] { for (auto& in : procs[whyP[s]].prog->code) if (in.line) return (int)in.line; return 0; }()) +
+                                                 " (process " + std::to_string(whyP[s]) + ")").c_str() : "");
         wide_.assign(ns, 0);
         for (size_t s = 0; s < ns; s++)
             wide_[s] = cand[s] && !bad[s] && sigs[s].w > 64 && !noPriv.count((int)s) &&
@@ -2714,6 +2765,20 @@ private:
         std::string syncPriv_ = loop + "S.fw(e.s, Val{e.p->v, e.p->x, e.w, e.p->z, false});\n";
         for (auto& [sg, ps] : pieces_) syncPriv_ += "    S.fw(" + std::to_string(sg) + ", " + ex(piecesOf(sg, sigW_[sg] - 1, 0)) + ");\n";
         o << "static void combDead();\nstatic void syncP() {\n    combDead();\n" << syncPriv_ << "}\n";
+        // An arming process whose private inputs changed since it began to
+        // wait sets its flag, as it would have on waking (armShape).
+        if (!armIns_.empty()) {
+            o << "static void armSet(uint32_t k) {\n    switch (k) {\n";
+            for (size_t k = 0; k < armSet_.size(); k++) o << "    case " << k << ":" << assign(*armSet_[k]) << "    break;\n";
+            o << "    }\n}\n";
+            o << "static void armChk() {\n"
+                 "    for (uint32_t k = 0; k < " << armIns_.size() << "; k++) {\n"
+                 "        if (ARMST[k] != 1) continue;\n"
+                 "        for (uint32_t j = ARMOFF[k]; j < ARMOFF[k + 1]; j++) {\n"
+                 "            const PSig& a = PA[ARMIN[j]]; const PSig& b = ARMSNAP[j];\n"
+                 "            if (a.v != b.v || a.x != b.x || a.z != b.z) { ARMST[k] = 2; ARMLEFT--; armSet(k); break; }\n"
+                 "        }\n    }\n}\n";
+        }
         // Before the kernel starts (no waiters yet): the values only.
         o << "static void syncInit() {\n" << loop << "{ Val& g = S.sigs[e.s].val; g.v = e.p->v; g.x = e.p->x; g.z = e.p->z; }\n";
         for (auto& [sg, ps] : pieces_)
@@ -3163,7 +3228,7 @@ private:
                 o << "static void combCone(const void*) {\n";
                 for (auto& c : callsC) o << "    " << c << ";\n";
                 if (privW) o << "    scanP();\n";
-                o << "    if (S.observed) syncP();\n}\n";
+                o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
             }
         }
         o << "static void combAll(const void*) {\n";
@@ -3175,7 +3240,7 @@ private:
             o << "    scanP(); why4();\n    done: ;\n";
         } else
             for (auto& c : callsP) o << "    " << c << ";\n";
-        o << "    if (S.observed) syncP();\n}\n";
+        o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
         if (par) {
             // Per group: its slots' commits, then its comb statements in rank order.
             std::vector<std::string> gCommit(G), gComb(G), gComb2(G);
@@ -3198,7 +3263,7 @@ private:
                  "    S.parallelFor(" << G << ", [t](size_t g) { CMG[g](t); }, use);\n"
                  "    S.domainTune[2].done(S.threads);\n"
                  "    if (!t || cdirty.exchange(false)) scanP();\n"
-                 "    if (S.observed) syncP();\n}\n\n";
+              << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n\n";
             return;
         }
         // The commit is data: one table row per slot and one small loop
@@ -3254,7 +3319,7 @@ private:
         o << " const bool obs = S.observed;"
              " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) commitOne(CL[j], obs); }"
              " else for (uint32_t k = 0; k < " << slots.size() << "; k++) commitOne(k, obs);"
-             " CN = 0; CLOVF = false;";
+             " CN = 0; CLOVF = false;" << (armIns_.empty() ? "" : " if (ARMLEFT) armChk();");
         // The comb pass is queued, not run here: other NBAs of this time
         // step (a testbench driving the inputs) may still follow in the
         // queue, and one pass after all of them is enough.
@@ -3425,15 +3490,21 @@ private:
                         o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, tgt(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, tgt(i.xt)));
                         break;
                     case IK::Jmp: o << " goto " << tgt(i.target) << ";\n"; break;
-                    case IK::WaitEdge:
+                    case IK::WaitEdge: {
+                        const int ak = n >= 0 && (size_t)n < armK_.size() ? armK_[n] : -1;
+                        if (ak >= 0)
+                            o << " for (uint32_t j = ARMOFF[" << ak << "]; j < ARMOFF[" << ak + 1 << "]; j++) ARMSNAP[j] = PA[ARMIN[j]]; ARMST[" << ak
+                              << "] = 1;\n";
                         if (i.events.size() > 1) {
                             events_.push_back(i.events);
                             o << " co_await WaitAny{&EV" << events_.size() - 1 << "};";
                         } else
                             o << " co_await Wait{" << i.sig << ", " << edge(i.edge) << "};";
+                        if (ak >= 0) o << " if (ARMST[" << ak << "] == 2) co_return; ARMST[" << ak << "] = 2; ARMLEFT--;";
                         o << (asserting ? " ctl->epoch++;\n" : "\n");   // a deferred assertion flush point (16.4.2)
                         o << gate;
                         break;
+                    }
                     case IK::WaitDelay: o << " co_await Delay{" << i.delay << "ULL};\n" << gate; break;
                     case IK::Display:
                     case IK::Strobe:
