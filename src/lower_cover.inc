@@ -8,6 +8,7 @@ static std::unordered_map<const slang::ast::CovergroupType*, int>& cgIdxMap() {
     return m;
 }
 int cgItemSig = -1;   // the `item` of a bin's with clause (19.5.1.1)
+int cgWideW = 0;      // the width of the coverpoint wider than 64 bits whose bins are being built
 int cgWithSeq = 0;    // numbers the value signals of cross with filters
 std::unordered_map<std::string, int> cgIterSigs;   // a cross with filter's coverpoints, by name
 
@@ -21,6 +22,7 @@ E cgBound(const slang::ast::Expression& x0, bool& sg) {
         x = &x->as<ConversionExpression>().operand();
     if (!x->type->isIntegral()) unsupported("a coverage bin value that is not integral (real coverpoints, 19.5.1)");
     sg = x->type->isSigned();
+    if (cgWideW) return resize(expr(*x), cgWideW, sg, sg);   // a bound of a coverpoint wider than 64 bits
     if (x->type->getBitWidth() > 64) unsupported("a coverage bin value wider than 64 bits");
     return resize(expr(*x), 64, sg, sg);
 }
@@ -234,7 +236,7 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         } else {
             if (!ty.isIntegral()) unsupported("a coverpoint of this type (19.5)");
             c.w = (int)ty.getBitWidth();
-            if (c.w > 64) unsupported("a coverpoint wider than 64 bits");
+            c.wide = c.w > 64;
             c.sgn = ty.isSigned();
             c.expr = resize(expr(ce), c.w, ce.type->isSigned(), c.sgn);
         }
@@ -257,6 +259,8 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             }
         }
         cgOpts(cp->options, c.opts, &c.realInterval);
+        cgWideW = c.wide ? c.w : 0;
+        struct WideReset { int& w; ~WideReset() { w = 0; } } wideReset{cgWideW};
         for (const auto& bm : cp->members()) {
             const auto* b = bm.as_if<CoverageBinSymbol>();
             if (!b) continue;
@@ -326,6 +330,14 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         }
         if (c.isReal && std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0; }))
             unsupported("a real coverpoint without bins: there are no automatic bins for reals (19.5.3)");
+        cgWideW = 0;
+        if (c.wide) {   // wider than 64 bits: explicit value bins only
+            if (std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0 || b.dflt; }))
+                unsupported("automatic bins of a coverpoint wider than 64 bits (19.5.3)");
+            for (const auto& b : c.bins)
+                if (b.array || b.wildcard || !b.trans.empty() || b.with || b.setIdx >= 0 || b.dfltSeq)
+                    unsupported("array, wildcard, transition, with or set bins of a coverpoint wider than 64 bits");
+        }
         cpIdx[cp] = (int)d.cps.size();
         d.cps.push_back(std::move(c));
     }
@@ -337,6 +349,7 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         for (const CoverpointSymbol* cp : x->targets) {
             auto it = cpIdx.find(cp);
             if (it == cpIdx.end()) unsupported("a cross of this coverpoint");
+            if (d.cps[(size_t)it->second].wide) unsupported("a cross of a coverpoint wider than 64 bits");
             cd.cps.push_back(it->second);
         }
         if (const Expression* iff = x->getIffExpr()) cd.iff = expr(*iff);

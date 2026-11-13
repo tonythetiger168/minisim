@@ -71,6 +71,10 @@ struct CgCpDef {
     std::vector<std::pair<std::string, uint64_t>> enumVals;   // an enum coverpoint's values
     bool isEnum = false;
     bool isReal = false;        // a real coverpoint: keys order the doubles (19.5.1)
+    // Wider than 64 bits: explicit value bins only. A key is the value's
+    // place among the sorted bin bounds of the instance (CgCpInst::wb):
+    // 2i+1 on bound i, 2i between bounds i-1 and i.
+    bool wide = false;
     E realInterval;             // type_option.real_interval; null: the group's, else 1.0
     std::vector<CgBinDef> bins;
     std::vector<CgOptSet> opts;
@@ -135,6 +139,7 @@ struct CgBin {
 };
 struct CgCpInst {
     std::vector<CgBin> bins;
+    std::vector<Val> wb;             // a wide coverpoint: its bin bounds, sorted and distinct
     bool autoBins = false;
     std::vector<std::vector<std::pair<uint64_t, uint64_t>>> atoms;   // transition step value sets
     std::vector<int> hit;            // the bins this sample hit (for crosses)

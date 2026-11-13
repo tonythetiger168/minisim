@@ -35,9 +35,53 @@ inline std::string realName(double d) {
     if (s.find_first_of(".eni") == std::string::npos) s += ".0";
     return s;
 }
+// A coverpoint wider than 64 bits (CgCpDef::wide): the bin bounds of the
+// instance being built or sampled, and a value's place among them.
+inline const std::vector<Val>* g_cgWide = nullptr;
+inline bool wideLt(const CgCpDef& c, Val a, Val b) {
+    a.sgn = b.sgn = c.sgn;
+    return v_lt(a, b).v & 1;
+}
+inline uint64_t wideKey(const CgCpDef& c, const Val& v) {
+    if (!g_cgWide) return 0;
+    const auto& wb = *g_cgWide;
+    size_t lo = 0, hi = wb.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (wideLt(c, wb[mid], v)) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < wb.size() && !wideLt(c, v, wb[lo]) ? 2 * lo + 1 : 2 * lo;
+}
+inline bool unknownAny(const Val& v) { return v.x || anyX(v); }
+inline std::string wideDec(const CgCpDef& c, const Val& v) {   // a wide value in a report, in decimal
+    std::vector<uint64_t> l((size_t)(c.w + 63) / 64, 0);
+    for (size_t i = 0; i < l.size(); i++) l[i] = i == 0 ? v.v : i - 1 < v.hi.size() ? v.hi[i - 1].v : 0;
+    if (c.w % 64) l.back() &= (1ull << (c.w % 64)) - 1;
+    bool neg = c.sgn && (l.back() >> ((c.w - 1) % 64) & 1);
+    if (neg) {   // two's complement on w bits
+        unsigned __int128 carry = 1;
+        for (auto& x : l) { carry += (unsigned __int128)~x; x = (uint64_t)carry; carry >>= 64; }
+        if (c.w % 64) l.back() &= (1ull << (c.w % 64)) - 1;
+    }
+    std::string s;
+    auto zero = [&] { for (auto x : l) if (x) return false; return true; };
+    while (!zero()) {
+        unsigned __int128 r = 0;
+        for (size_t i = l.size(); i-- > 0;) {
+            unsigned __int128 cur = (r << 64) | l[i];
+            l[i] = (uint64_t)(cur / 10);
+            r = cur % 10;
+        }
+        s.insert(s.begin(), char('0' + (int)r));
+    }
+    if (s.empty()) s = "0";
+    return neg ? "-" + s : s;
+}
 // A sampled value's key: its w bits, the sign bit flipped when signed.
 inline uint64_t keyOf(const CgCpDef& c, const Val& v) {
     if (c.isReal) return rkey(realOfVal(v));
+    if (c.wide) return wideKey(c, v);
     uint64_t x = v.v & kmask(c.w);
     return c.sgn ? x ^ (1ull << (c.w - 1)) : x;
 }
@@ -88,6 +132,22 @@ inline void itemKeys(const CgCpDef& c, const CgItem& it, bool wildcard, std::vec
     if (c.isReal) {
         RealItem r = realItem(it);
         out.push_back({r.lo == -INFINITY ? 0 : rkey(r.lo), r.hi == INFINITY ? ~0ull : rkey(r.hi)});
+        return;
+    }
+    if (c.wide) {   // keys among the bounds (keyOf)
+        uint64_t top = 2 * (g_cgWide ? g_cgWide->size() : 0);
+        if (!it.range) {
+            Val v = eval(it.lo, rd);
+            if (unknownAny(v)) { if (xv) xv->push_back(v); return; }
+            uint64_t k = keyOf(c, v);
+            out.push_back({k, k});
+            return;
+        }
+        uint64_t a = 0, b = top;
+        if (!it.loMin) { Val v = eval(it.lo, rd); if (unknownAny(v)) return; a = keyOf(c, v); }
+        if (!it.hiMax) { Val v = eval(it.hi, rd); if (unknownAny(v)) return; b = keyOf(c, v); }
+        if (a > b) std::swap(a, b);
+        out.push_back({a, b});
         return;
     }
     i128 lo = tmin(c), hi = tmax(c);
@@ -374,6 +434,19 @@ inline void realBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci, double 
 inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double realInterval = 1.0) {
     std::vector<KR> excl;   // ignored and illegal values
     bool explicitBins = false;
+    if (c.wide) {   // the bounds of every value bin, in order (keyOf)
+        for (const auto& bd : c.bins)
+            for (const auto& it : bd.items)
+                for (const E& e : {it.range && it.loMin ? E() : it.lo, it.range && !it.hiMax ? it.hi : E()})
+                    if (e) {
+                        Val v = eval(e, rd);
+                        if (!unknownAny(v)) ci.wb.push_back(v);
+                    }
+        std::sort(ci.wb.begin(), ci.wb.end(), [&](const Val& a, const Val& b) { return wideLt(c, a, b); });
+        ci.wb.erase(std::unique(ci.wb.begin(), ci.wb.end(), [&](const Val& a, const Val& b) {
+                        return !wideLt(c, a, b) && !wideLt(c, b, a); }), ci.wb.end());
+    }
+    g_cgWide = c.wide ? &ci.wb : nullptr;
     for (const auto& bd : c.bins) {
         if (!bd.trans.empty()) {
             transBins(c, bd, ci);
@@ -506,7 +579,7 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
 inline bool binMatch(const CgBin& b, uint64_t k, const Val& v, bool hasX) {
     if (hasX) {
         for (auto& x : b.xvals)
-            if (((x.v ^ v.v) & kmask(x.w)) == 0 && ((x.x ^ v.x) & kmask(x.w)) == 0 && ((x.z ^ v.z) & kmask(x.w)) == 0) return true;
+            if (x.w > 64 ? x == v : ((x.v ^ v.v) & kmask(x.w)) == 0 && ((x.x ^ v.x) & kmask(x.w)) == 0 && ((x.z ^ v.z) & kmask(x.w)) == 0) return true;
         return false;
     }
     if (inPairs(b.ranges, k)) return true;
@@ -695,14 +768,15 @@ inline void sampleInst(CgInst& in) {
         for (const auto& [t, e] : c.pre) S.set(t, eval(e, rd));
         if (c.preProg) runPre(*c.preProg);
         Val v = eval(c.expr, rd);
-        bool hasX = !c.isReal && (v.x & kmask(c.w)) != 0;
+        bool hasX = !c.isReal && (c.wide ? unknownAny(v) : (v.x & kmask(c.w)) != 0);
+        g_cgWide = c.wide ? &cp.wb : nullptr;
         uint64_t k = keyOf(c, v);
         auto iffOk = [&](const CgBin& b) { return !b.iff || truth(eval(b.iff, rd)) == 1; };
         bool illegal = false, ignored = false;
         for (auto& b : cp.bins)
             if (!b.trans && (b.kind == 1 || b.kind == 2) && binMatch(b, k, v, hasX) && iffOk(b)) {
                 b.hits++;
-                if (b.kind == 2) { illegal = true; report(in, "", c.name + "." + b.name, hasX ? "x" : keyName(c, k)); }
+                if (b.kind == 2) { illegal = true; report(in, "", c.name + "." + b.name, hasX ? "x" : c.wide ? wideDec(c, v) : keyName(c, k)); }
                 else ignored = true;
             }
         if (!illegal && !ignored) {
