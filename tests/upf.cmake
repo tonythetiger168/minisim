@@ -449,3 +449,24 @@ file(READ ${CMAKE_CURRENT_BINARY_DIR}/lpcov.cov got)
 if(NOT rc EQUAL 0 OR NOT got STREQUAL want)
   message(FATAL_ERROR "lpcov: ${rc}\n--- got\n${got}${err}--- want\n${want}")
 endif()
+# Controls and supplies of the strategies: UPF008 to UPF012.
+execute_process(COMMAND ${MLINT} ${D}/retlatch.sv -upf ${D}/lint_ctl.upf -only upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+foreach(want
+    "[UPF008] isolation ISO_C: control u_a.en is in PD_A"
+    "[UPF009] isolation ISO_F: -isolation_supply SS_A is the switched supply of PD_A"
+    "[UPF010] retention RET_F: control u_a.en is in PD_A"
+    "[UPF010] retention RET_L: -retention_supply SS_A is the switched supply of PD_A"
+    "[UPF011] power switch SW_A: control c (u_a.en) is in PD_A"
+    "7 findings")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "mlint lint_ctl.upf: missing: ${want}\n${out}${err}")
+  endif()
+endforeach()
+execute_process(COMMAND ${MLINT} ${D}/gating.sv -upf ${D}/lint_ls.upf -only upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+string(FIND "${out}" "[UPF012] level shifter on u_dut.u_core.d (PD_TOP -> PD_CORE), but both sides are always at the same voltage" pos)
+if(pos EQUAL -1 OR NOT out MATCHES "1 finding")
+  message(FATAL_ERROR "mlint lint_ls.upf: UPF012 not reported alone\n${out}${err}")
+endif()
