@@ -343,8 +343,15 @@ E pastOf(const slang::ast::Expression& x, int n, E gate, const std::vector<std::
 }
 // $sampled, $rose, $fell, $stable, $changed, $past (16.9.3). Null if n is
 // none of them.
-E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
+E sampledFn(const slang::ast::CallExpression& call, std::string_view n0) {
     using namespace slang::ast;
+    // $past_gclk(v) is $past(v,,, @$global_clock), and so on (16.9.4).
+    std::string_view n = n0;
+    bool gclk = n0.ends_with("_gclk") && n0 != "$future_gclk";
+    if (gclk) {
+        n = n0.substr(0, n0.size() - 5);
+        if (n != "$past" && n != "$rose" && n != "$fell" && n != "$stable" && n != "$changed") return nullptr;
+    }
     bool past = n == "$past";
     if (n != "$sampled" && n != "$rose" && n != "$fell" && n != "$stable" && n != "$changed" && !past) return nullptr;
     auto args = call.arguments();
@@ -352,6 +359,14 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
     if (!mkSig || !tempSeq) unsupported("sampled value function here");
     const Expression& x = *args[0];
     if (n == "$sampled") return sampledE(expr(x));
+    std::vector<std::pair<int, Edge>> gev;
+    if (gclk) collectEvents(globalClocking()->getEvent(), gev);
+    if (gclk) {
+        E cur = sampledE(expr(x));
+        E prev = pastOf(x, 1, nullptr, gev);
+        if (past) return prev;
+        return sampledCompare(n, cur, prev, storeW(*x.type));
+    }
     if (past) {
         int k = 1;
         if (args.size() > 1 && args[1]->kind != ExpressionKind::EmptyArgument) k = (int)constInt(*args[1]);
@@ -362,7 +377,10 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
     }
     E cur = sampledE(expr(x));
     E prev = pastOf(x, 1, nullptr, clockArg(call, 1));
-    int w = storeW(*x.type);
+    return sampledCompare(n, cur, prev, storeW(*x.type));
+}
+// $rose / $fell / $stable / $changed from the current and previous samples.
+E sampledCompare(std::string_view n, E cur, E prev, int w) {
     cur = resize(cur, w, false, false);
     if (n == "$stable" || n == "$changed") {
         E st = bin(Op::CaseEq, cur, prev);
