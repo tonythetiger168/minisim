@@ -432,10 +432,86 @@ inline void realBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci, double 
         mkBin(bd.name + "[" + std::to_string(k) + "]", in);
     }
 }
+// The bins of name[] or name[N] (19.5.1) of a coverpoint wider than 64
+// bits: for each bin its value runs [lo, hi]. The values are taken in the
+// order written, as offsets from the lowest value (w + 2 bits, so a sum of
+// sizes cannot wrap); name[] makes one bin per value, name[N] N bins of
+// total / N values, the last taking the rest.
+inline std::vector<std::vector<std::pair<Val, Val>>> wideArrayParts(const CgCpDef& c, const CgBinDef& bd) {
+    int W = c.w + 2;
+    auto off = [&](Val v) {   // a value as an offset from the lowest value
+        v = v_resize(v, c.w, false);
+        if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+        v.sgn = false;
+        return v_resize(v, W, false);
+    };
+    auto val = [&](const Val& o) {   // and back
+        Val v = v_resize(o, c.w, false);
+        if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+        return v;
+    };
+    auto lt = [](const Val& a, const Val& b) { return (v_lt(a, b).v & 1) != 0; };
+    std::vector<std::pair<Val, Val>> runs;   // offsets, as written
+    for (const auto& it : bd.items) {
+        Val lo, hi;
+        if (!it.range) {
+            Val v = eval(it.lo, rd);
+            if (unknownAny(v)) continue;
+            lo = hi = off(v);
+        } else {
+            lo = it.loMin ? mk(0, W) : off(eval(it.lo, rd));
+            hi = it.hiMax ? v_sub(v_shl(mk(1, W), mk((uint64_t)c.w, 32)), mk(1, W)) : off(eval(it.hi, rd));
+            if (unknownAny(lo) || unknownAny(hi)) continue;
+            if (lt(hi, lo)) std::swap(lo, hi);
+        }
+        runs.push_back({lo, hi});
+    }
+    std::vector<std::vector<std::pair<Val, Val>>> parts;
+    if (!bd.count) {   // name[]: each distinct value
+        std::vector<Val> vals;
+        for (auto& [lo, hi] : runs)
+            for (Val v = lo;; v = v_add(v, mk(1, W))) {
+                vals.push_back(v);
+                if (vals.size() > kMaxBins) fail("too many bins in " + bd.name + "[]");
+                if (!lt(v, hi)) break;
+            }
+        std::sort(vals.begin(), vals.end(), lt);
+        vals.erase(std::unique(vals.begin(), vals.end(), [&](const Val& a, const Val& b) { return !lt(a, b) && !lt(b, a); }), vals.end());
+        for (auto& v : vals) parts.push_back({{val(v), val(v)}});
+        return parts;
+    }
+    Val nv = eval(bd.count, rd);
+    int64_t n = (int64_t)nv.v;
+    if (nv.x || n <= 0 || (size_t)n > kMaxBins) fail("bad number of bins for " + bd.name);
+    Val total = mk(0, W);
+    for (auto& [lo, hi] : runs) total = v_add(total, v_add(v_sub(hi, lo), mk(1, W)));
+    Val per = v_div(total, mk((uint64_t)n, W));
+    if (!lt(mk(0, W), per)) per = mk(1, W);
+    // The values from global offset a up to (not including) b, as runs.
+    auto slice = [&](Val a, Val b) {
+        std::vector<std::pair<Val, Val>> out;
+        Val base = mk(0, W);
+        for (auto& [lo, hi] : runs) {
+            Val sz = v_add(v_sub(hi, lo), mk(1, W)), end = v_add(base, sz);
+            Val s = lt(base, a) ? a : base, e = lt(b, end) ? b : end;   // [s, e) of this run
+            if (lt(s, e)) out.push_back({val(v_add(lo, v_sub(s, base))), val(v_add(lo, v_sub(v_sub(e, base), mk(1, W))))});
+            base = end;
+        }
+        return out;
+    };
+    for (int64_t k = 0; k < n; k++) {
+        Val a = v_mul(per, mk((uint64_t)k, W));
+        Val b = k == n - 1 ? total : v_mul(per, mk((uint64_t)k + 1, W));
+        if (lt(total, b)) b = total;
+        parts.push_back(lt(a, b) ? slice(a, b) : std::vector<std::pair<Val, Val>>{});
+    }
+    return parts;
+}
 inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double realInterval = 1.0) {
     std::vector<KR> excl;   // ignored and illegal values
     bool explicitBins = false;
     std::vector<std::pair<Val, Val>> wideAuto;   // a wide coverpoint's automatic bins, [lo, hi]
+    std::unordered_map<size_t, std::vector<std::vector<std::pair<Val, Val>>>> wideParts;   // array bins of a wide coverpoint
     if (c.wide) {   // the bounds of every value bin, in order (keyOf)
         if (std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0 || b.dflt; })) {
             // Automatic bins (19.5.3): the 2^w values in autoBinMax equal parts,
@@ -464,6 +540,16 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
                         Val v = eval(e, rd);
                         if (!unknownAny(v)) ci.wb.push_back(v);
                     }
+        // name[] and name[N] (19.5.1): the values that start or end a bin
+        // become bounds too, so each bin is a run of keys.
+        for (size_t bi = 0; bi < c.bins.size(); bi++) {
+            const CgBinDef& bd = c.bins[bi];
+            if (!bd.array) continue;
+            auto parts = wideArrayParts(c, bd);
+            for (auto& p : parts)
+                for (auto& [a, b] : p) { ci.wb.push_back(a); ci.wb.push_back(b); }
+            wideParts[bi] = std::move(parts);
+        }
         std::sort(ci.wb.begin(), ci.wb.end(), [&](const Val& a, const Val& b) { return wideLt(c, a, b); });
         ci.wb.erase(std::unique(ci.wb.begin(), ci.wb.end(), [&](const Val& a, const Val& b) {
                         return !wideLt(c, a, b) && !wideLt(c, b, a); }), ci.wb.end());
@@ -538,7 +624,14 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
             for (auto& r : rs) b.ranges.push_back({r.a, r.b});
             ci.bins.push_back(std::move(b));
         };
-        if (!bd.array) {
+        if (bd.array && c.wide) {   // the parts found with the bounds: each its runs of keys
+            const auto& parts = wideParts[(size_t)(&bd - c.bins.data())];
+            for (size_t k = 0; k < parts.size(); k++) {
+                std::vector<KR> rs;
+                for (auto& [a, b] : parts[k]) rs.push_back({keyOf(c, a), keyOf(c, b)});
+                mkBin(bd.name + "[" + (bd.count || parts[k].empty() ? std::to_string(k) : wideDec(c, parts[k].front().first)) + "]", rs);
+            }
+        } else if (!bd.array) {
             mkBin(bd.name, seq);
             if (!bd.wildcard || !bd.array) {
                 ci.bins.back().wild = wild;
