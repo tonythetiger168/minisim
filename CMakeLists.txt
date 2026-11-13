@@ -55,6 +55,15 @@ if(OPENSSL_FOUND)
   target_link_libraries(test_protect PRIVATE OpenSSL::SSL OpenSSL::Crypto)
   target_compile_options(test_protect PRIVATE -UNDEBUG)
   add_test(NAME test_protect COMMAND test_protect)
+  # Interop: envelopes msim did not make, built with the openssl command line
+  # tool alone in the shapes other IEEE 1735 encryptors emit.
+  find_program(MINISIM_OPENSSL_CLI openssl)
+  if(MINISIM_OPENSSL_CLI AND UNIX)
+    add_test(NAME protect_interop
+             COMMAND sh ${CMAKE_SOURCE_DIR}/tests/protect_interop.sh $<TARGET_FILE:msim>
+                     ${MINISIM_OPENSSL_CLI} ${CMAKE_SOURCE_DIR}
+                     ${CMAKE_CURRENT_BINARY_DIR}/protect_interop)
+  endif()
 else()
   message(STATUS "OpenSSL not found: building without protected envelope support")
 endif()

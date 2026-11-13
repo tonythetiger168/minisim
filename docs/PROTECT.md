@@ -354,9 +354,30 @@ IP is opaque, even to clear text below it).
 A version 3 envelope opens in any IEEE 1735 tool that holds the private key
 of one of its tool blocks. To encrypt for a commercial simulator, get that
 vendor's public key (in the key exchange format above) and add it with
-`-keyring`; each tool block carries its own rights. The reverse, opening an
-envelope encrypted only for a commercial tool, needs that vendor's private
-key, which minisim does not have and does not try to obtain.
+`-keyring`; each tool block carries its own rights.
+
+The other direction is tested, within what a published format and a public
+key allow. `tests/protect_interop.sh` builds envelopes msim did not make,
+with the `openssl` command line tool alone, in the shapes other encryptors
+emit, and checks that msim:
+
+- opens a version 3 envelope whose first tool block belongs to another
+  vendor, by walking past it to its own (5.4.2), and honours the rights in
+  the block it used;
+- opens the same file with CR LF line ends, because the signature is over
+  the text with the carriage returns removed (5.8);
+- opens an IEEE 1800 clause 34 envelope with a PKCS#1 `key_block`,
+  `data_method="aes128-cbc"`, no `key_public_key`, and `encoding`
+  directives;
+- says whose key it wants, and nothing of the text, when it has a key for no
+  tool block.
+
+What this cannot show is opening an envelope encrypted **only** for a
+commercial tool: that needs that vendor's private key, which minisim does not
+have and does not try to obtain. Nor can it show a vendor's own tool opening
+a minisim envelope. Those two need the tools themselves; the cryptography and
+the envelope syntax on both sides of the exchange are what is checked here
+and in `tests/protect_openssl.cmake`.
 
 ## IEEE 1735-2023 coverage
 
