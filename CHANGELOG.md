@@ -595,6 +595,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a write to an element of a multidimensional array whose indexes
+  have unknown bits (`m[r][c] <= d`) merges into every element the indexes
+  may name. Before, only one-dimensional arrays did, and the write was
+  skipped.
 - `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
   `forever` loops are merged; once a break or the condition of an unbounded
   loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or

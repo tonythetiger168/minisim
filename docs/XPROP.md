@@ -111,8 +111,9 @@ tmerge and `4'bxxxx` under xmerge.
   its present value and the new one. An index with an unknown bit, inside
   a branch or not, names every element it may match (a bit known in both
   must agree), and each takes that merge (`x` under xmerge); without
-  `-xprop` such a write is skipped (7.4.6). This needs a one-dimensional
-  array.
+  `-xprop` such a write is skipped (7.4.6). In an array of several
+  dimensions (`m[r][c] <= d`) the element must match in every dimension, so
+  a known index limits the others; every index must be given.
 
 Only `always`, `always_comb`, `always_ff` and `always_latch` are affected
 (with the tasks and functions they call). `initial` and `final` blocks,
@@ -168,8 +169,7 @@ An array element merges with its present value, which is exact for one
 write such as `if (we) mem[addr] <= d;`. When several possible branches
 write the same element, or a branch reads back an element it wrote, the
 result has `x` where the present value differs, even if every branch
-agrees. An unknown index of a multidimensional array keeps the standard
-behavior (the write is skipped).
+agrees.
 
 Known limit: two signals of one event list that change in the same time
 step but in different delta cycles, the first with a clean edge and the

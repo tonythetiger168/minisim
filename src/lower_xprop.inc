@@ -449,14 +449,16 @@ void xpEmit(Instr i, const slang::ast::Expression& target) {
     // An index with an unknown bit (7.4.6 skips the write). tmerge reads
     // mem[a] = d as a case on a: every element the index may name takes
     // the merge of its present value and d (xmerge: x).
-    E idxX;
-    if (arrOk && i.arr->dims.size() == 1 && !i.aidx.empty())
-        idxX = xpIsX(un(Op::RedXor, i.aidx[0]));
+    E idxX, idxP;   // idxP: x or z in some index bit (as a 1-bit value)
+    if (arrOk && !i.aidx.empty() && i.aidx.size() == i.arr->dims.size()) {
+        for (const E& ix : i.aidx) idxP = idxP ? bin(Op::Xor, idxP, un(Op::RedXor, ix)) : un(Op::RedXor, ix);
+        idxX = xpIsX(idxP);
+    }
     if (xp.clean) {   // the clean copy: an unknown index goes to the merging copy
         if (idxX) {
             std::vector<size_t> to = xp.cleanSite(&target);
             if (!to.empty()) {
-                size_t jx = emitJmpIfNot(un(Op::RedXor, i.aidx[0]));   // 0 or 1: go on
+                size_t jx = emitJmpIfNot(idxP);   // 0 or 1: go on
                 prog.code[jx].target = prog.here();
                 prog.code[jx].xt = to[0];
             }
@@ -485,17 +487,32 @@ void xpEmit(Instr i, const slang::ast::Expression& target) {
         xp.sites[&target].push_back({chk});
         jidx = emitJmpIfNot(idxX);
         const ArrShape& a = *i.arr;
-        auto [l, r] = a.dims[0];
+        int64_t total = 1;
+        for (size_t d = 0; d < a.dims.size(); d++) total *= a.size(d);
         int k = xpTemp(32);
         auto s32 = [](int64_t v) { return konst(make((uint64_t)v, 0, 32, 0, true)); };
         xpSet(k, s32(0));
         size_t top = prog.here();
-        size_t jend = emitJmpIfNot(bin(Op::Lt, ref(k, true), s32(a.size(0))));
-        E kidx = l <= r ? bin(Op::Add, s32(l), ref(k, true)) : bin(Op::Sub, s32(l), ref(k, true));
-        // May the index name element k? Not when a bit known in both differs.
-        E same = un(Op::RedAnd, un(Op::Not, bin(Op::Xor, resize(i.aidx[0], 64, false, false), resize(kidx, 64, true, false))));
+        size_t jend = emitJmpIfNot(bin(Op::Lt, ref(k, true), s32(total)));
+        // Element k (row-major, the last dimension fastest): its index in
+        // each dimension. May the index name it? Not when, in some
+        // dimension, a bit known in both differs.
+        std::vector<E> kidx;
+        E same;
+        int64_t stride = total;
+        for (size_t d = 0; d < a.dims.size(); d++) {
+            auto [l, r] = a.dims[d];
+            stride /= a.size(d);
+            E o = ref(k, true);
+            if (stride > 1) o = bin(Op::Div, o, s32(stride));
+            if (d > 0) o = bin(Op::Mod, o, s32(a.size(d)));
+            E kd = l <= r ? bin(Op::Add, s32(l), o) : bin(Op::Sub, s32(l), o);
+            E sd = un(Op::RedAnd, un(Op::Not, bin(Op::Xor, resize(i.aidx[d], 64, false, false), resize(kd, 64, true, false))));
+            same = same ? bin(Op::And, same, sd) : sd;
+            kidx.push_back(kd);
+        }
         size_t jn = emitJmpIfNot(xpNot(xpIs(same, 0)));
-        xp.okArr.insert(prog.emit(merged({kidx})));
+        xp.okArr.insert(prog.emit(merged(kidx)));
         prog.code[jn].target = prog.here();
         xpSet(k, bin(Op::Add, ref(k, true), s32(1)));
         xpJmp(top);
