@@ -908,6 +908,9 @@ private:
             }
             case Op::Mux: return "v_mux(" + k(0) + ", " + k(1) + ", " + k(2) + ")";
             case Op::WildEq: return f2("v_wild_eq");
+            case Op::SysFn:
+                if (e->hi == SF_TO_2STATE) return "v_to_2state(" + k(0) + ")";
+                break;
             default: break;
         }
         // Any other operator (==?, real math, strings, system functions, ...):
@@ -1033,6 +1036,9 @@ private:
                 fi = fa;
                 return true;
             }
+            case Op::SysFn:   // a 2-state conversion: these values have no x or z bits
+                if (e->hi != SF_TO_2STATE || !kid(0, out, fi)) return false;
+                return true;
             case Op::Resize: {
                 if (!kid(0, A, fa)) return false;
                 int w = e->hi;
