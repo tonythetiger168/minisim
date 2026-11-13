@@ -35,9 +35,53 @@ inline std::string realName(double d) {
     if (s.find_first_of(".eni") == std::string::npos) s += ".0";
     return s;
 }
+// A coverpoint wider than 64 bits (CgCpDef::wide): the bin bounds of the
+// instance being built or sampled, and a value's place among them.
+inline const std::vector<Val>* g_cgWide = nullptr;
+inline bool wideLt(const CgCpDef& c, Val a, Val b) {
+    a.sgn = b.sgn = c.sgn;
+    return v_lt(a, b).v & 1;
+}
+inline uint64_t wideKey(const CgCpDef& c, const Val& v) {
+    if (!g_cgWide) return 0;
+    const auto& wb = *g_cgWide;
+    size_t lo = 0, hi = wb.size();
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (wideLt(c, wb[mid], v)) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < wb.size() && !wideLt(c, v, wb[lo]) ? 2 * lo + 1 : 2 * lo;
+}
+inline bool unknownAny(const Val& v) { return v.x || anyX(v); }
+inline std::string wideDec(const CgCpDef& c, const Val& v) {   // a wide value in a report, in decimal
+    std::vector<uint64_t> l((size_t)(c.w + 63) / 64, 0);
+    for (size_t i = 0; i < l.size(); i++) l[i] = i == 0 ? v.v : i - 1 < v.hi.size() ? v.hi[i - 1].v : 0;
+    if (c.w % 64) l.back() &= (1ull << (c.w % 64)) - 1;
+    bool neg = c.sgn && (l.back() >> ((c.w - 1) % 64) & 1);
+    if (neg) {   // two's complement on w bits
+        unsigned __int128 carry = 1;
+        for (auto& x : l) { carry += (unsigned __int128)~x; x = (uint64_t)carry; carry >>= 64; }
+        if (c.w % 64) l.back() &= (1ull << (c.w % 64)) - 1;
+    }
+    std::string s;
+    auto zero = [&] { for (auto x : l) if (x) return false; return true; };
+    while (!zero()) {
+        unsigned __int128 r = 0;
+        for (size_t i = l.size(); i-- > 0;) {
+            unsigned __int128 cur = (r << 64) | l[i];
+            l[i] = (uint64_t)(cur / 10);
+            r = cur % 10;
+        }
+        s.insert(s.begin(), char('0' + (int)r));
+    }
+    if (s.empty()) s = "0";
+    return neg ? "-" + s : s;
+}
 // A sampled value's key: its w bits, the sign bit flipped when signed.
 inline uint64_t keyOf(const CgCpDef& c, const Val& v) {
     if (c.isReal) return rkey(realOfVal(v));
+    if (c.wide) return wideKey(c, v);
     uint64_t x = v.v & kmask(c.w);
     return c.sgn ? x ^ (1ull << (c.w - 1)) : x;
 }
@@ -88,6 +132,22 @@ inline void itemKeys(const CgCpDef& c, const CgItem& it, bool wildcard, std::vec
     if (c.isReal) {
         RealItem r = realItem(it);
         out.push_back({r.lo == -INFINITY ? 0 : rkey(r.lo), r.hi == INFINITY ? ~0ull : rkey(r.hi)});
+        return;
+    }
+    if (c.wide) {   // keys among the bounds (keyOf)
+        uint64_t top = 2 * (g_cgWide ? g_cgWide->size() : 0);
+        if (!it.range) {
+            Val v = eval(it.lo, rd);
+            if (unknownAny(v)) { if (xv) xv->push_back(v); return; }
+            uint64_t k = keyOf(c, v);
+            out.push_back({k, k});
+            return;
+        }
+        uint64_t a = 0, b = top;
+        if (!it.loMin) { Val v = eval(it.lo, rd); if (unknownAny(v)) return; a = keyOf(c, v); }
+        if (!it.hiMax) { Val v = eval(it.hi, rd); if (unknownAny(v)) return; b = keyOf(c, v); }
+        if (a > b) std::swap(a, b);
+        out.push_back({a, b});
         return;
     }
     i128 lo = tmin(c), hi = tmax(c);
@@ -372,9 +432,135 @@ inline void realBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci, double 
         mkBin(bd.name + "[" + std::to_string(k) + "]", in);
     }
 }
+// The bins of name[] or name[N] (19.5.1) of a coverpoint wider than 64
+// bits: for each bin its value runs [lo, hi]. The values are taken in the
+// order written, as offsets from the lowest value (w + 2 bits, so a sum of
+// sizes cannot wrap); name[] makes one bin per value, name[N] N bins of
+// total / N values, the last taking the rest.
+inline std::vector<std::vector<std::pair<Val, Val>>> wideArrayParts(const CgCpDef& c, const CgBinDef& bd) {
+    int W = c.w + 2;
+    auto off = [&](Val v) {   // a value as an offset from the lowest value
+        v = v_resize(v, c.w, false);
+        if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+        v.sgn = false;
+        return v_resize(v, W, false);
+    };
+    auto val = [&](const Val& o) {   // and back
+        Val v = v_resize(o, c.w, false);
+        if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+        return v;
+    };
+    auto lt = [](const Val& a, const Val& b) { return (v_lt(a, b).v & 1) != 0; };
+    std::vector<std::pair<Val, Val>> runs;   // offsets, as written
+    for (const auto& it : bd.items) {
+        Val lo, hi;
+        if (!it.range) {
+            Val v = eval(it.lo, rd);
+            if (unknownAny(v)) continue;
+            lo = hi = off(v);
+        } else {
+            lo = it.loMin ? mk(0, W) : off(eval(it.lo, rd));
+            hi = it.hiMax ? v_sub(v_shl(mk(1, W), mk((uint64_t)c.w, 32)), mk(1, W)) : off(eval(it.hi, rd));
+            if (unknownAny(lo) || unknownAny(hi)) continue;
+            if (lt(hi, lo)) std::swap(lo, hi);
+        }
+        runs.push_back({lo, hi});
+    }
+    std::vector<std::vector<std::pair<Val, Val>>> parts;
+    if (!bd.count) {   // name[]: each distinct value
+        std::vector<Val> vals;
+        for (auto& [lo, hi] : runs)
+            for (Val v = lo;; v = v_add(v, mk(1, W))) {
+                vals.push_back(v);
+                if (vals.size() > kMaxBins) fail("too many bins in " + bd.name + "[]");
+                if (!lt(v, hi)) break;
+            }
+        std::sort(vals.begin(), vals.end(), lt);
+        vals.erase(std::unique(vals.begin(), vals.end(), [&](const Val& a, const Val& b) { return !lt(a, b) && !lt(b, a); }), vals.end());
+        for (auto& v : vals) parts.push_back({{val(v), val(v)}});
+        return parts;
+    }
+    Val nv = eval(bd.count, rd);
+    int64_t n = (int64_t)nv.v;
+    if (nv.x || n <= 0 || (size_t)n > kMaxBins) fail("bad number of bins for " + bd.name);
+    Val total = mk(0, W);
+    for (auto& [lo, hi] : runs) total = v_add(total, v_add(v_sub(hi, lo), mk(1, W)));
+    Val per = v_div(total, mk((uint64_t)n, W));
+    if (!lt(mk(0, W), per)) per = mk(1, W);
+    // The values from global offset a up to (not including) b, as runs.
+    auto slice = [&](Val a, Val b) {
+        std::vector<std::pair<Val, Val>> out;
+        Val base = mk(0, W);
+        for (auto& [lo, hi] : runs) {
+            Val sz = v_add(v_sub(hi, lo), mk(1, W)), end = v_add(base, sz);
+            Val s = lt(base, a) ? a : base, e = lt(b, end) ? b : end;   // [s, e) of this run
+            if (lt(s, e)) out.push_back({val(v_add(lo, v_sub(s, base))), val(v_add(lo, v_sub(v_sub(e, base), mk(1, W))))});
+            base = end;
+        }
+        return out;
+    };
+    for (int64_t k = 0; k < n; k++) {
+        Val a = v_mul(per, mk((uint64_t)k, W));
+        Val b = k == n - 1 ? total : v_mul(per, mk((uint64_t)k + 1, W));
+        if (lt(total, b)) b = total;
+        parts.push_back(lt(a, b) ? slice(a, b) : std::vector<std::pair<Val, Val>>{});
+    }
+    return parts;
+}
 inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double realInterval = 1.0) {
     std::vector<KR> excl;   // ignored and illegal values
     bool explicitBins = false;
+    std::vector<std::pair<Val, Val>> wideAuto;   // a wide coverpoint's automatic bins, [lo, hi]
+    std::unordered_map<size_t, std::vector<std::vector<std::pair<Val, Val>>>> wideParts;   // array bins of a wide coverpoint
+    if (c.wide) {   // the bounds of every value bin, in order (keyOf)
+        if (std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0 || b.dflt; })) {
+            // Automatic bins (19.5.3): the 2^w values in autoBinMax equal parts,
+            // the last taking the rest, counted from the lowest value.
+            int W = c.w + 2;
+            int64_t n = std::max<int64_t>(autoBinMax, 1);
+            Val space = v_shl(mk(1, W), mk((uint64_t)c.w, 32));
+            Val per = v_div(space, mk((uint64_t)n, W));
+            auto asVal = [&](const Val& off) {   // an offset from the lowest value, as a value
+                Val v = v_resize(off, c.w, false);
+                if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+                return v;
+            };
+            for (int64_t k = 0; k < n; k++) {
+                Val a = v_mul(per, mk((uint64_t)k, W));
+                Val b = k == n - 1 ? v_sub(space, mk(1, W)) : v_sub(v_mul(per, mk((uint64_t)k + 1, W)), mk(1, W));
+                wideAuto.push_back({asVal(a), asVal(b)});
+                ci.wb.push_back(wideAuto.back().first);
+                ci.wb.push_back(wideAuto.back().second);
+            }
+        }
+        auto bounds = [&](const CgItem& it) {
+            for (const E& e : {it.range && it.loMin ? E() : it.lo, it.range && !it.hiMax ? it.hi : E()})
+                if (e) {
+                    Val v = eval(e, rd);
+                    if (!unknownAny(v)) ci.wb.push_back(v);
+                }
+        };
+        for (const auto& bd : c.bins) {
+            for (const auto& it : bd.items) bounds(it);
+            for (const auto& seq : bd.trans)   // transition steps (19.5.2)
+                for (const auto& s : seq)
+                    for (const auto& it : s.items) bounds(it);
+        }
+        // name[] and name[N] (19.5.1): the values that start or end a bin
+        // become bounds too, so each bin is a run of keys.
+        for (size_t bi = 0; bi < c.bins.size(); bi++) {
+            const CgBinDef& bd = c.bins[bi];
+            if (!bd.array) continue;
+            auto parts = wideArrayParts(c, bd);
+            for (auto& p : parts)
+                for (auto& [a, b] : p) { ci.wb.push_back(a); ci.wb.push_back(b); }
+            wideParts[bi] = std::move(parts);
+        }
+        std::sort(ci.wb.begin(), ci.wb.end(), [&](const Val& a, const Val& b) { return wideLt(c, a, b); });
+        ci.wb.erase(std::unique(ci.wb.begin(), ci.wb.end(), [&](const Val& a, const Val& b) {
+                        return !wideLt(c, a, b) && !wideLt(c, b, a); }), ci.wb.end());
+    }
+    g_cgWide = c.wide ? &ci.wb : nullptr;
     for (const auto& bd : c.bins) {
         if (!bd.trans.empty()) {
             transBins(c, bd, ci);
@@ -400,7 +586,24 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
         std::vector<Val> xv;
         std::vector<std::pair<uint64_t, uint64_t>> wild;
         if (bd.allValues) seq.push_back({0, kmask(c.w)});
-        for (auto& it : bd.items) itemKeys(c, it, bd.wildcard, seq, &xv, &wild);
+        std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>> wwild;
+        for (auto& it : bd.items) {
+            if (c.wide && bd.wildcard && !it.range) {   // x, z and ? bits match anything (19.5.1)
+                Val v = eval(it.lo, rd);
+                if (unknownAny(v)) {
+                    int n = (c.w + 63) / 64;
+                    std::vector<uint64_t> care(n), val(n);
+                    for (int i = 0; i < n; i++) {
+                        uint64_t m = i == n - 1 && c.w % 64 ? (1ull << (c.w % 64)) - 1 : ~0ull;
+                        care[i] = ~limbX(v, i) & m;
+                        val[i] = limbV(v, i) & care[i];
+                    }
+                    wwild.push_back({std::move(care), std::move(val)});
+                    continue;
+                }
+            }
+            itemKeys(c, it, bd.wildcard, seq, &xv, &wild);
+        }
         if (bd.setIdx >= 0) {   // bins b = q; (19.5.1.2): its values now
             Val n = eval(bd.setSize, rd);
             for (uint64_t k = 0; !n.x && k < n.v; k++) {
@@ -444,10 +647,18 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
             for (auto& r : rs) b.ranges.push_back({r.a, r.b});
             ci.bins.push_back(std::move(b));
         };
-        if (!bd.array) {
+        if (bd.array && c.wide) {   // the parts found with the bounds: each its runs of keys
+            const auto& parts = wideParts[(size_t)(&bd - c.bins.data())];
+            for (size_t k = 0; k < parts.size(); k++) {
+                std::vector<KR> rs;
+                for (auto& [a, b] : parts[k]) rs.push_back({keyOf(c, a), keyOf(c, b)});
+                mkBin(bd.name + "[" + (bd.count || parts[k].empty() ? std::to_string(k) : wideDec(c, parts[k].front().first)) + "]", rs);
+            }
+        } else if (!bd.array) {
             mkBin(bd.name, seq);
             if (!bd.wildcard || !bd.array) {
                 ci.bins.back().wild = wild;
+                ci.bins.back().wwild = std::move(wwild);
                 ci.bins.back().xvals = xv;
             }
         } else if (!bd.count) {   // name[]: one bin per distinct value
@@ -479,7 +690,12 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
             bin.ranges.push_back({a, b});
             ci.bins.push_back(std::move(bin));
         };
-        if (c.isEnum)
+        if (c.wide)
+            for (auto& [a, b] : wideAuto) {
+                uint64_t ka = keyOf(c, a), kb = keyOf(c, b);
+                add(ka == kb ? "auto[" + wideDec(c, a) + "]" : "auto[" + wideDec(c, a) + ":" + wideDec(c, b) + "]", ka, kb);
+            }
+        else if (c.isEnum)
             for (auto& [name, v] : c.enumVals) {
                 uint64_t k = keyOf(c, make(v, 0, c.w, 0));
                 add("auto[" + name + "]", k, k);
@@ -498,7 +714,7 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
     // left out of coverage (19.5.5, 19.11.1).
     for (auto& b : ci.bins) {
         if (b.kind != 0 || b.trans) continue;
-        if (!b.wild.empty() || !b.xvals.empty()) continue;
+        if (!b.wild.empty() || !b.wwild.empty() || !b.xvals.empty()) continue;
         std::vector<KR> rs;
         for (auto& r : b.ranges) rs.push_back({r.first, r.second});
         if (rs.empty() || allCovered(rs, excl)) b.empty = true;
@@ -507,12 +723,17 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
 inline bool binMatch(const CgBin& b, uint64_t k, const Val& v, bool hasX) {
     if (hasX) {
         for (auto& x : b.xvals)
-            if (((x.v ^ v.v) & kmask(x.w)) == 0 && ((x.x ^ v.x) & kmask(x.w)) == 0 && ((x.z ^ v.z) & kmask(x.w)) == 0) return true;
+            if (x.w > 64 ? x == v : ((x.v ^ v.v) & kmask(x.w)) == 0 && ((x.x ^ v.x) & kmask(x.w)) == 0 && ((x.z ^ v.z) & kmask(x.w)) == 0) return true;
         return false;
     }
     if (inPairs(b.ranges, k)) return true;
     for (auto& [care, val] : b.wild)
         if ((k & care) == val) return true;
+    for (auto& [care, val] : b.wwild) {
+        bool ok = true;
+        for (size_t i = 0; i < care.size() && ok; i++) ok = (limbV(v, (int)i) & care[i]) == val[i];
+        if (ok) return true;
+    }
     return false;
 }
 // A cross bin select expression on one tuple (19.6.1).
@@ -565,6 +786,34 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
             }
             return s.all ? true : yes >= need;
         }
+        case 6: {   // the tuples of the cross whose bins hold enough of the set's value tuples (19.6.1.3)
+            size_t n = tuple.size();
+            uint64_t need = 1;
+            if (s.matches) { Val m = eval(s.matches, rd); need = m.x ? 1 : m.v; }
+            uint64_t yes = 0;
+            for (const auto& vt : s.tuples) {
+                bool in = true;
+                for (size_t j = 0; j < n && in; j++) {
+                    const CgCpDef& c = cx.d->cps[cx.xd->cps[j]];
+                    int bi = cx.xi->dims[j][tuple[j]];
+                    uint64_t key = keyOf(c, vt[j]);
+                    in = false;
+                    for (auto& r : cx.in->cps[cx.xd->cps[j]].bins[bi].ranges)
+                        if (r.first <= key && key <= r.second) { in = true; break; }
+                }
+                if (in) yes++;
+            }
+            if (s.all) {   // matches $: every value tuple of the bins is in the set
+                uint64_t total = 1;
+                for (size_t j = 0; j < n; j++) {
+                    uint64_t c = 0;
+                    for (auto& r : cx.in->cps[cx.xd->cps[j]].bins[cx.xi->dims[j][tuple[j]]].ranges) c += r.second - r.first + 1;
+                    total *= c;
+                }
+                return yes > 0 && yes >= total;
+            }
+            return yes >= need;
+        }
         default: break;
     }
     int bi = cx.xi->dims[s.cp][tuple[s.cp]];
@@ -601,7 +850,9 @@ inline void buildCross(const CgDef& d, CgInst& in, const CgCrossDef& xd, CgCross
     std::function<void(const CgSel&)> prep = [&](const CgSel& s) {
         if (!s.isect.empty()) {
             std::vector<KR> ks;
+            g_cgWide = d.cps[xd.cps[s.cp]].wide ? &in.cps[xd.cps[s.cp]].wb : nullptr;   // keys among its bounds
             for (auto& it : s.isect) itemKeys(d.cps[xd.cps[s.cp]], it, false, ks, nullptr, nullptr);
+            g_cgWide = nullptr;
             cx.isect[&s] = std::move(ks);
         }
         for (auto& k : s.kids) prep(*k);
@@ -696,14 +947,15 @@ inline void sampleInst(CgInst& in) {
         for (const auto& [t, e] : c.pre) S.set(t, eval(e, rd));
         if (c.preProg) runPre(*c.preProg);
         Val v = eval(c.expr, rd);
-        bool hasX = !c.isReal && (v.x & kmask(c.w)) != 0;
+        bool hasX = !c.isReal && (c.wide ? unknownAny(v) : (v.x & kmask(c.w)) != 0);
+        g_cgWide = c.wide ? &cp.wb : nullptr;
         uint64_t k = keyOf(c, v);
         auto iffOk = [&](const CgBin& b) { return !b.iff || truth(eval(b.iff, rd)) == 1; };
         bool illegal = false, ignored = false;
         for (auto& b : cp.bins)
             if (!b.trans && (b.kind == 1 || b.kind == 2) && binMatch(b, k, v, hasX) && iffOk(b)) {
                 b.hits++;
-                if (b.kind == 2) { illegal = true; report(in, "", c.name + "." + b.name, hasX ? "x" : keyName(c, k)); }
+                if (b.kind == 2) { illegal = true; report(in, "", c.name + "." + b.name, hasX ? "x" : c.wide ? wideDec(c, v) : keyName(c, k)); }
                 else ignored = true;
             }
         if (!illegal && !ignored) {

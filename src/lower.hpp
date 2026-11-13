@@ -617,7 +617,7 @@ inline void dpiStructFields(const slang::ast::Type& t0, int lo, size_t& cur, std
         for (int k = 0; k < n; k++) dpiStructFields(a.elementType, lo + (n - 1 - k) * ew, cur, out);
         return;
     }
-    if (t.isUnpackedUnion() || t.isString()) throw std::runtime_error("lower: unsupported DPI struct member of type " + t0.toString());
+    if (t.isUnpackedUnion()) throw std::runtime_error("lower: unsupported DPI struct member of type " + t0.toString());
     DpiField f;
     f.t = dpiType(t, f.w, f.sgn);
     f.lo = lo;
@@ -1828,6 +1828,123 @@ struct Lowerer {
         return wantValue ? ref(res, sym.getReturnType().isSigned()) : nullptr;
     }
     const slang::ast::SubroutineSymbol* vifTarget = nullptr;
+    const slang::ast::SubroutineSymbol* externImpl = nullptr;   // the exporter one fork branch calls
+    // extern forkjoin task exported by several modules (25.7.4): the call
+    // runs every exporter's task at once, as fork ... join, and returns when
+    // all of them have.
+    E forkJoinCall(const slang::ast::CallExpression& call, const slang::ast::MethodPrototypeSymbol& pr, bool wantValue) {
+        if (wantValue || pr.subroutineKind != slang::ast::SubroutineKind::Task) unsupported("extern function with more than one export");
+        if (!store) unsupported("extern forkjoin task call here");
+        Instr f; f.k = IK::Fork; f.join = 0;
+        for (auto* im = pr.getFirstExternImpl(); im; im = im->getNextImpl()) {
+            Lowerer lw(sigmap);
+            lw.bind(subs, mkSig, tempSeq, store);
+            lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+            lw.current = current;
+            lw.scope = scope;
+            lw.sampleEv = sampleEv;
+            lw.curClass = curClass;
+            FrameLayout* bl = newLayout("forkjoin branch");
+            lw.frames = frames;
+            lw.frames.push_back(bl);
+            if (frames.empty()) lw.frames.clear();
+            f.blays.push_back(frames.empty() ? nullptr : bl);
+            lw.stmtDepth = stmtDepth;
+            lw.externImpl = im->impl;
+            lw.emitUserCall(call, false);
+            lw.finishImplicit();
+            store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+            f.branches.push_back(store->back().get());
+        }
+        prog.emit(f);
+        return nullptr;
+    }
+    E dynGetAt0(int d) {
+        auto g = node(Op::DynGet, {konst(make(0, 0, 32, 0, true))});
+        g->sig = d;
+        return g;
+    }
+    static bool mailboxArrayType(const slang::ast::Type& t) {
+        return t.getCanonicalType().isUnpackedArray();
+    }
+    // put / get / peek and their try_ forms on a mailbox of arrays or
+    // containers (15.4): the method waits and counts, then the message is
+    // copied into the mailbox's queue, or out of its front, here.
+    bool mailboxArrayCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym,
+                          const Subr& sub, bool wantValue, E& result) {
+        using namespace slang::ast;
+        auto n = sym.name;
+        bool isPut = n == "put" || n == "try_put", isGet = n == "get" || n == "try_get";
+        bool isPeek = n == "peek" || n == "try_peek";
+        if (!(isPut || isGet || isPeek) || !call.thisClass() || call.arguments().size() != 1) return false;
+        const ClassInfo* ci = classInfo(*call.thisClass()->type);
+        if (!ci || ci->builtin != 3 || sym.getArguments().empty() || !mailboxArrayType(sym.getArguments()[0]->getType()))
+            return false;
+        const DynObj* shape = nullptr;
+        for (auto& [off, o] : ci->lay->dyn) if (off == ci->bslot) shape = &o;
+        if (!shape) unsupported("mailbox of arrays: queue shape");
+        const Type& T = sym.getArguments()[0]->getType();
+        bool packed = !shape->elem;   // a fixed-size array: one packed element (uWidth)
+        if (packed && uWidth(T) <= 0) unsupported("mailbox of arrays of this element type");
+        int h = fresh(64);
+        { Instr i; i.k = IK::Assign; i.sig = h; i.e = exprH(*call.thisClass()); prog.emit(i); }
+        bool tries = n.starts_with("try_");
+        E r = emitAutoCall(sub, {}, tries, ref(h));
+        size_t skip = 0;
+        if (tries) {
+            Instr j; j.k = IK::JmpIfNot; j.e = r;
+            skip = prog.emit(j);
+        }
+        int q = indSlot(ref(h), ci->bslot);
+        indShape[q] = *shape;
+        const Expression& a = *call.arguments()[0];
+        if (isPut && packed) { Instr i = dynCmd(q, D_PUSH_BACK); i.e = packedValue(T, a); prog.emit(i); }
+        else if (isPut) pushContainer(q, D_PUSH_BACK, a);
+        else if (packed) {
+            const Expression& tgt = peel(outArg(a));
+            auto ts = tgt.kind == ExpressionKind::NamedValue ? arrFind(&tgt.as<ValueExpressionBase>().symbol) : nullptr;
+            if (!ts || ts->dynElem) unsupported("mailbox message into this target");
+            const Type* leaf = &T.getCanonicalType();
+            while (leaf->kind == SymbolKind::FixedSizeUnpackedArrayType)
+                leaf = &leaf->as<FixedSizeUnpackedArrayType>().elementType.getCanonicalType();
+            int lw = uWidth(*leaf);
+            if (lw <= 0 || uWidth(T) / lw != ts->count) unsupported("mailbox message into an array of another shape");
+            int v = fresh(uWidth(T));
+            { Instr i; i.k = IK::Assign; i.sig = v; i.e = dynGetAt0(q); prog.emit(i); }
+            for (int k = 0; k < ts->count; k++) {
+                auto sl = node(Op::Slice, {ref(v)});
+                sl->hi = uWidth(T) - k * lw - 1;
+                sl->lo = sl->hi - lw + 1;
+                Instr i; i.k = IK::Assign; i.sig = ts->base + k;
+                i.e = leaf->isIntegral() ? resize(sl, lw, false, leaf->isSigned()) : E(sl);
+                prog.emit(i);
+            }
+            if (isGet) { Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i); }
+        } else {
+            const Expression& tgt = peel(outArg(a));
+            auto first = node(Op::DynElemRef, {konst(mk(0, 32))});
+            first->sig = q;
+            int e = elemRef(q, first);
+            if (isDynType(*tgt.type)) {
+                int t = dynSig(tgt);
+                if (t < 0) unsupported("mailbox message into this target");
+                Instr i = dynCmd(t, D_COPY); i.dsrc = e; prog.emit(i);
+            } else {
+                auto ts = tgt.kind == ExpressionKind::NamedValue ? arrFind(&tgt.as<ValueExpressionBase>().symbol) : nullptr;
+                if (!ts) unsupported("mailbox message into this target");
+                for (int k = 0; k < ts->count; k++) {
+                    auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                    g->sig = e;
+                    Instr i; i.k = IK::Assign; i.sig = ts->base + k; i.e = g;
+                    prog.emit(i);
+                }
+            }
+            if (isGet) { Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i); }
+        }
+        if (tries) prog.code[skip].target = prog.here();
+        result = wantValue ? r : nullptr;
+        return true;
+    }
     E emitUserCall(const slang::ast::CallExpression& call, bool wantValue) {
         using namespace slang::ast;
         if (call.isSystemCall()) unsupported("system call");
@@ -1860,9 +1977,10 @@ struct Lowerer {
                 return nullptr;
             }
         }
-        if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
+        if (externImpl) { sym = externImpl; externImpl = nullptr; }
+        else if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
             if (const auto* pr = sym->getPrototype(); pr && pr->getFirstExternImpl()) {
-                if (pr->getFirstExternImpl()->getNextImpl()) unsupported("extern forkjoin task with more than one export");
+                if (pr->getFirstExternImpl()->getNextImpl()) return forkJoinCall(call, *pr, wantValue);
                 sym = pr->getFirstExternImpl()->impl;
             }
         auto it = subs->find(sym);
@@ -1875,6 +1993,7 @@ struct Lowerer {
 
         auto args = call.arguments();
         if (args.size() != sub->args.size()) unsupported("subroutine argument count");
+        if (E r; isClassMethod(*sym) && mailboxArrayCall(call, *sym, *sub, wantValue, r)) return r;
         if (isClassMethod(*sym)) {   // 8.6, 8.10, 8.20
             bool isStatic = sym->flags.has(MethodFlags::Static);
             E self;
@@ -2003,6 +2122,24 @@ struct Lowerer {
         for (size_t n = 0; n < args.size(); n++) {
             const DpiArg& formal = f->args[n];
             const Expression& a = *args[n];
+            if (formal.popen && formal.udims.empty()) {   // bit [] (35.5.6.1): the vector as a one-element array
+                const Expression* x = &a;
+                if (formal.dir != 0) {
+                    if (a.kind != ExpressionKind::Assignment) unsupported("DPI output argument");
+                    x = &a.as<AssignmentExpression>().left();
+                }
+                if (!x->type->isIntegral()) unsupported("DPI packed open array argument that is not a packed value");
+                int W = (int)x->type->getBitWidth();
+                auto A = std::make_shared<ArrShape>();
+                A->base = freshStatic(W);
+                A->count = 1;
+                A->elemW = W;
+                A->twoState = !x->type->isFourState();
+                if (formal.dir != 1) { Instr i; i.k = IK::Assign; i.sig = A->base; i.e = resize(expr(*x), W, false, false); prog.emit(i); }
+                c.dact[n].arr = A;
+                c.dact[n].pw = W;
+                continue;
+            }
             if (formal.uarr) {
                 const Expression* x = &a;
                 if (formal.dir != 0) {
@@ -2010,6 +2147,12 @@ struct Lowerer {
                     x = &a.as<AssignmentExpression>().left();
                 }
                 x = &peel(*x);
+                if (formal.popen) {   // logic [] v []: the elements' packed width
+                    const Type* et = x->type;
+                    while (et->getCanonicalType().isUnpackedArray()) et = et->getCanonicalType().getArrayElementType();
+                    if (!et->isIntegral()) unsupported("DPI packed open array argument that is not packed");
+                    c.dact[n].pw = (int)et->getBitWidth();
+                }
                 if (!ValueExpressionBase::isKind(x->kind)) unsupported("DPI array argument that is not a variable");
                 const Symbol* as = &x->as<ValueExpressionBase>().symbol;
                 if (auto it = arrMap().find(as); it != arrMap().end()) c.dact[n].arr = it->second;
@@ -2051,6 +2194,13 @@ struct Lowerer {
         prog.emit(c);
         for (size_t n = 0; n < args.size(); n++) {
             const DpiArg& formal = f->args[n];
+            if (formal.popen && formal.udims.empty() && formal.dir != 0) {   // bit []: the vector back
+                Instr i; i.k = IK::Assign;
+                lhs(args[n]->as<AssignmentExpression>().left(), i);
+                i.e = ref(c.dact[n].arr->base);
+                prog.emit(i);
+                continue;
+            }
             if (formal.dir == 0 || formal.uarr) continue;
             const Expression& a = *args[n];
             if (a.kind == ExpressionKind::EmptyArgument) continue;
@@ -2658,10 +2808,18 @@ struct Lowerer {
                     if (isDynType(f.getType()) || f.getType().isUnpackedArray()) unsupported("a mailbox of arrays");
                     return sigAt(&f);
                 };
-                auto push = [&]() { Instr i = dynCmd(q, D_PUSH_BACK); i.e = arg(0); prog.emit(i); bump(chg); };
+                // A mailbox of arrays or containers: the body only waits and
+                // counts; the call site moves the message (mailboxArrayCall).
+                bool arrMsg = !sub.sym->getArguments().empty() && mailboxArrayType(sub.sym->getArguments()[0]->getType());
+                auto push = [&]() {
+                    if (!arrMsg) { Instr i = dynCmd(q, D_PUSH_BACK); i.e = arg(0); prog.emit(i); }
+                    bump(chg);
+                };
                 auto pop = [&]() {
-                    set(msg(), front());
-                    Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i);
+                    if (!arrMsg) {
+                        set(msg(), front());
+                        Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i);
+                    }
                     bump(chg);
                 };
                 if (n == "new") set(thisRel(bound), arg(0));
@@ -2670,8 +2828,8 @@ struct Lowerer {
                 else if (n == "try_put") tryDo(node(Op::LogNot, {full()}), push);
                 else if (n == "get") { waitWhile(empty, chg); pop(); }
                 else if (n == "try_get") tryDo(node(Op::LogNot, {empty()}), pop);
-                else if (n == "peek") { waitWhile(empty, chg); set(msg(), front()); }
-                else if (n == "try_peek") tryDo(node(Op::LogNot, {empty()}), [&]() { set(msg(), front()); });
+                else if (n == "peek") { waitWhile(empty, chg); if (!arrMsg) set(msg(), front()); }
+                else if (n == "try_peek") tryDo(node(Op::LogNot, {empty()}), [&]() { if (!arrMsg) set(msg(), front()); });
                 return;
             }
             case 4: {   // process
@@ -3609,6 +3767,10 @@ struct Lowerer {
         const Type& t = t0.getCanonicalType();
         if (t.kind != SymbolKind::FixedSizeUnpackedArrayType) {
             if (t.isUnpackedArray()) unsupported("a container inside a fixed-size array");
+            if ((t.isUnpackedStruct() || t.isUnpackedUnion()) && uWidth(t) > 0) {   // a struct element: its bits (7.2)
+                out.push_back(expr(x0));
+                return;
+            }
             if (!t.isIntegral() && !t.isFloating() && !t.isString()) unsupported("array of this element type");
             int w = (int)t.getBitWidth();
             const Expression& x = peel(x0);
@@ -4465,13 +4627,15 @@ struct Lowerer {
         assignInto(d, x);
         return d;
     }
-    int fixedAsQueue(const slang::ast::Expression& x) {
+    // anyRange: the method neither returns nor reads indices, so the
+    // declared range of the array does not matter.
+    int fixedAsQueue(const slang::ast::Expression& x, bool anyRange = false) {
         using namespace slang::ast;
         const Type& at = x.type->getCanonicalType();
         if (!isFixedArr(x)) unsupported("array method of this array");
         if (!stmtDepth) unsupported("array method of a fixed-size array outside a procedural statement");
         auto r = at.as<FixedSizeUnpackedArrayType>().range;
-        if (r.left != 0 || r.right < 0) unsupported("array method of an array not declared [N] or [0:N-1]");
+        if (!anyRange && (r.left != 0 || r.right < 0)) unsupported("array method of an array not declared [N] or [0:N-1]");
         int q = keyQueue(*at.getArrayElementType());
         dynAppend(q, x);
         lastFixedQueue = q;
@@ -4716,13 +4880,15 @@ struct Lowerer {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
         auto args = call.arguments();
-        int d = dynValue(*args[0]);
-        if (d < 0) d = fixedAsQueue(*args[0]);
-        const DynObj& o = dynShape(d);
         const Expression* withE = nullptr;
         const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
             std::tie(withE, itSym) = sci->getIteratorInfo();
+        int d = dynValue(*args[0]);
+        if (d < 0)
+            d = fixedAsQueue(*args[0], !withE && (n == "sort" || n == "rsort" || n == "reverse" || n == "shuffle" ||
+                                                  n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor"));
+        const DynObj& o = dynShape(d);
         if (withE && consDepth) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
             static const std::pair<const char*, int> red[] = {{"sum", 0}, {"product", 1}, {"and", 2}, {"or", 3}, {"xor", 4}};
             for (auto& [s, id] : red)
@@ -7678,7 +7844,23 @@ struct Lowerer {
                     }
                     return;
                 }
-                if (classMember(x)) unsupported("ordering method of an array property");
+                if (classMember(x)) {   // h.a.sort() (8.4): each element back through the handle
+                    const auto& m = x.as<slang::ast::MemberAccessExpression>();
+                    const PropSlot* ps = memberSlot(m);
+                    if (!ps || ps->kind != 1 || ps->arr->dynElem || ps->arr->count != n)
+                        unsupported("ordering method of this array property");
+                    const ArrShape& P = *ps->arr;
+                    auto A = std::make_shared<ArrShape>(P);
+                    A->base = indSlot(exprH(m.value()), P.base);
+                    auto [lo, ro] = P.dims[0];
+                    for (int k = 0; k < n; k++) {
+                        Instr i; i.k = IK::Assign;
+                        i.sig = A->base; i.arr = A; i.e = resize(parts[(size_t)k], P.elemW, P.sgn, P.sgn);
+                        i.aidx.push_back(konst(make((uint64_t)(lo <= ro ? lo + k : lo - k), 0, 32, 0, true)));
+                        prog.emit(i);
+                    }
+                    return;
+                }
                 Instr i; i.k = IK::Assign;   // held packed (a struct member): all its bits at once
                 i.e = parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
                 lhs(x, i);
@@ -9110,7 +9292,9 @@ struct Lowerer {
                     labelSym = b.blockSymbol;   // label: assert ... names the assertion
                     labelOf = &b.body;
                     size_t s0 = prog.here();
+                    blockEventSample(b.blockSymbol, true);   // @@(begin blk) (19.3)
                     stmt(b.body);
+                    blockEventSample(b.blockSymbol, false);
                     if (blockIds().targets.count(b.blockSymbol))   // another process may disable it (9.6.2)
                     { prog.spans.push_back({blockIds().of(b.blockSymbol), s0, prog.here()}); anySpans() = true; }
                     patch(named[k].second, prog.here());   // disable blk: jump past it
@@ -12561,7 +12745,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             while (t->kind == SymbolKind::FixedSizeUnpackedArrayType || t->kind == SymbolKind::DPIOpenArrayType) {
                 if (t->kind == SymbolKind::DPIOpenArrayType) {
                     const auto& o = t->as<DPIOpenArrayType>();
-                    if (o.isPacked) Lowerer::unsupported("DPI packed open array argument (bit [])");
+                    if (o.isPacked) {   // bit [] / logic []: the element's width comes from the actual
+                        if (f.isExport) Lowerer::unsupported("open array argument of a DPI export");
+                        a.popen = true;
+                        a.open = true;
+                        a.uarr = true;
+                        a.t = o.elementType.isFourState() ? DT_LOGICVEC : DT_BITVEC;
+                        a.w = 0;
+                        break;
+                    }
                     a.open = true;
                     a.udims.push_back({0, 0});
                     a.uopen.push_back(true);
@@ -12575,7 +12767,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 a.uarr = true;
             }
             if (t->isUnpackedStruct()) {
-                if (a.uarr) Lowerer::unsupported("DPI array of unpacked structs");
                 if (f.isExport) Lowerer::unsupported("unpacked struct argument of a DPI export");
                 a.t = DT_STRUCT;
                 a.w = uWidth(*t);
@@ -12583,15 +12774,22 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 size_t cur = 0;
                 dpiStructFields(*t, 0, cur, a.fields);
                 a.cSize = cur;
-                const Type& named = formal->getType();
-                a.cName = named.name.empty() ? "void" : std::string(named.name);
-            } else
+                const Type* named = &formal->getType();   // an array of structs: the element's name
+                while (named->getCanonicalType().isUnpackedArray() || named->getCanonicalType().kind == SymbolKind::DPIOpenArrayType)
+                    named = named->getArrayElementType();
+                a.cName = named->name.empty() ? "void" : std::string(named->name);
+            } else if (!a.popen)
             a.t = dpiType(*t, a.w, a.sgn);
             if (!a.uarr) {
                 auto it = sigmap.find(formal);
                 if (it == sigmap.end()) Lowerer::unsupported("DPI argument");
                 a.sig = it->second;
-            } else if (f.isExport) Lowerer::unsupported("unpacked array argument of a DPI export");
+            } else if (f.isExport) {   // sized only (open arrays are for imports, 35.5.6.1)
+                if (a.open) Lowerer::unsupported("open array argument of a DPI export");
+                auto it = arrMap().find(formal);
+                if (it == arrMap().end() || !it->second || it->second->dynElem) Lowerer::unsupported("unpacked array argument of a DPI export");
+                a.sarr = it->second;
+            }
             f.args.push_back(std::move(a));
         }
     };
