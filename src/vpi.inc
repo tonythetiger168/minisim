@@ -14,6 +14,10 @@
 
 #include <dlfcn.h>
 
+#include <deque>
+#include <fstream>
+#include <functional>
+#include <sstream>
 #include <cstdarg>
 #include <cmath>
 
@@ -139,6 +143,8 @@ struct State {
     const LowerResult* lr = nullptr;
     std::vector<std::string> argv;
     std::vector<char*> argvp;
+    std::deque<std::vector<std::string>> fileArgs;   // -f files: name, then their arguments
+    std::deque<std::vector<char*>> fileArgvp;
     // Strings and vectors handed to C live until the next call that returns one (38.18).
     std::string strBuf, valBuf;   // vpi_get_str, vpi_get_value
     std::vector<s_vpi_vecval> vecBuf;
@@ -3523,10 +3529,43 @@ PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info info) {
     if (!info) return 0;
     static char product[] = "minisim";
     static char version[] = MINISIM_VERSION;
-    s.argvp.clear();
-    for (auto& a : s.argv) s.argvp.push_back(a.data());
+    // A -f / -F option is followed by a pointer to a null-terminated array:
+    // the file's name, then the arguments read from it (38.36), nested
+    // the same way for a -f inside the file.
+    s.argvp.clear(); s.fileArgs.clear(); s.fileArgvp.clear();
+    std::function<char*(const std::string&, int)> fileArr = [&](const std::string& name, int depth) -> char* {
+        auto& toks = s.fileArgs.emplace_back();
+        toks.push_back(name);
+        if (std::ifstream in(name); in && depth < 16) {
+            std::string line, t;
+            while (std::getline(in, line)) {
+                if (auto c = line.find("//"); c != std::string::npos) line.erase(c);
+                std::istringstream ls(line);
+                while (ls >> t) toks.push_back(t);
+            }
+        }
+        size_t at = s.fileArgvp.size();
+        s.fileArgvp.emplace_back();
+        std::vector<char*> v;
+        for (size_t k = 0; k < toks.size(); k++) {
+            v.push_back(toks[k].data());
+            if (k > 0 && (toks[k] == "-f" || toks[k] == "-F") && k + 1 < toks.size()) {
+                std::string inner = toks[k + 1];
+                k++;
+                v.push_back(fileArr(inner, depth + 1));
+            }
+        }
+        v.push_back(nullptr);
+        s.fileArgvp[at] = std::move(v);
+        return (char*)s.fileArgvp[at].data();
+    };
+    for (size_t k = 0; k < s.argv.size(); k++) {
+        s.argvp.push_back(s.argv[k].data());
+        if (k > 0 && (s.argv[k] == "-f" || s.argv[k] == "-F") && k + 1 < s.argv.size())
+            s.argvp.push_back(fileArr(s.argv[++k], 0));
+    }
     s.argvp.push_back(nullptr);
-    info->argc = (PLI_INT32)s.argv.size();
+    info->argc = (PLI_INT32)s.argvp.size() - 1;
     info->argv = s.argvp.data();
     info->product = product;
     info->version = version;
