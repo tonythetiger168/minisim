@@ -23,6 +23,46 @@ A finding is one line, `file:line:col: severity: [RULE] text`, sorted by file
 and line. The last line counts them per rule. Findings can be filed as issues
 with `mbug lint`.
 
+## Goals
+
+A goal is a named set of rules for one purpose, like SpyGlass's lint goals.
+`-goal NAME` (or `goal NAME` in a config file) runs that set and nothing
+else; `-enable`, `-disable` and `-severity` after it adjust it.
+`mlint -list-goals` prints them.
+
+| Goal | Rules | For |
+|---|---|---|
+| `lint_rtl` | latch, comb, case, assign, driver, width, unused, connect, clock, reset, fsm, synth | RTL correctness before simulation and synthesis |
+| `lint_synth` | latch, comb, case, driver, synth, SEQ001, SEQ002, W001, RST006, RST007 | what synthesis rejects or builds differently from simulation |
+| `lint_style` | naming, style, format, suspicious | naming, layout and coding style |
+| `starc` | `lint_rtl` + naming, style | the STARC RTL design style guide (table below) |
+| `openmore` | `lint_rtl` without fsm + naming, style, format | the OpenMORE / Reuse Methodology Manual checklist |
+| `verible` | the rules after Verible's (FMT, STY004..STY015, SUS, NAME014..NAME019, W009, TIDY009) | a Verible-like style check |
+| `cdc` | cdc, rdc | clock- and reset-domain crossings |
+| `formal` | formal | dead branches, out-of-range indexes, stuck registers |
+| `signoff` | `lint_rtl` + formal, cdc, rdc, soc | everything that can break hardware, before handing a block off |
+
+A goal turns on the rules of its groups that are off by default, too.
+
+The STARC guide's topics, and the mlint rules that cover them (the guide's
+own wording and numbering are not reproduced here):
+
+| STARC topic | mlint rules |
+|---|---|
+| Naming: modules, signals, parameters, clocks, resets, active-low, instances, ports, length, case clashes, keywords of other languages | `NAME001`..`NAME013`, `NAME018` |
+| One module per file, the file named after it | `STY001`, `STY002` |
+| Combinational logic: complete sensitivity lists, no latches, no loops | `COMB001`, `COMB002`, `L001`, `LAT001`, `LAT002` |
+| Case statements: default or full coverage, no `casex`, no X/Z items, no duplicates, constant items, no `full_case`/`parallel_case` | `CASE001`..`CASE007` |
+| Blocking in combinational, non-blocking in sequential logic | `L002`, `L003`, `SEQ001`..`SEQ003` |
+| One driver per signal | `L004`, `L005` |
+| Widths and signs of assignments, comparisons, shifts and conditions | `W001`..`W010`, `EXP003`, `EXP005` |
+| Synthesizable constructs: no initial, delays, real, `===`, X, dynamic types, while loops, tasks, integer signals | `SYN001`..`SYN020`, `EXP006` |
+| Clocks: no clock as data, one edge, no derived clocks | `CLK001`..`CLK004` |
+| Resets: polarity, sync/async consistency, reset values, reset style | `RST001`..`RST007` |
+| State machines | `FSM001`..`FSM004` |
+| Unused and unconnected signals and ports | `UNU001`..`UNU005`, `CON001`..`CON004` |
+| Clock-domain crossings | `CDC`, `RDC` (docs/CDC.md) |
+
 ## What is checked
 
 Rules are grouped; a group name works wherever a rule name does
@@ -54,6 +94,9 @@ a module with no ports, or a module named in `tb.modules`.
 | `CASE002` | warning | on | Casex |
 | `CASE003` | warning | on | An X or Z in an item of a plain case |
 | `CASE004` | warning | on | The same value appears in two items of one case |
+| `CASE005` | warning | off | A case item that is not a constant (priority logic; two items can match) |
+| `CASE006` | warning | off | A `full_case` or `parallel_case` pragma (synthesis and simulation can differ) |
+| `CASE007` | info | off | A case on a constant selector (`case (1'b1)`) |
 
 ### Assignments (`assign`)
 
@@ -71,6 +114,7 @@ a module with no ports, or a module named in `tb.modules`.
 | Rule | Severity | Default | What it finds |
 |---|---|---|---|
 | `L004` | warning | on | One value is assigned by more than one process |
+| `L005` | warning | on | A resolved (VHDL std_logic) signal driven by several processes, not all of them tri-state |
 
 ### Widths and signs (`width`)
 
@@ -84,6 +128,10 @@ a module with no ports, or a module named in `tb.modules`.
 | `W006` | info | off | A multi-bit value is used as a condition |
 | `W007` | info | off | A logical operator (!, &&, ||) is applied to a multi-bit value |
 | `W008` | warning | on | The two branches of ?: have different widths |
+| `W010` | warning | off | A shift by a constant at least as wide as the value |
+| `EXP003` | info | off | A reduction operator on a 1-bit value |
+| `EXP005` | warning | off | A comparison of an unsigned value that is always true or false (`x < 0`, `x4 > 15`) |
+| `EXP006` | info | off | An `if` on a literal constant in procedural code |
 
 ### Synthesizability (`synth`)
 
@@ -106,6 +154,9 @@ a module with no ports, or a module named in `tb.modules`.
 | `SYN015` | warning | on | Defparam |
 | `SYN016` | info | on | A tri-state driver on a signal that is not an inout port |
 | `SYN017` | warning | on | A hierarchical reference in design code |
+| `SYN018` | warning | off | A `while` or `do ... while` loop in design code |
+| `SYN019` | info | off | A task called in design code |
+| `SYN020` | info | off | An `integer` or `int` signal that is not only a loop index |
 
 ### Unused and undriven signals (`unused`)
 
@@ -133,6 +184,7 @@ a module with no ports, or a module named in `tb.modules`.
 | `CLK001` | warning | on | A clock is used as data |
 | `CLK002` | info | off | A flop on the falling edge of its clock |
 | `CLK003` | warning | on | One signal is used both as a clock and as a reset |
+| `CLK004` | warning | off | A flop clocked by the output of another flop (a divided or ripple clock) |
 
 ### Resets (`reset`)
 

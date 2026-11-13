@@ -511,6 +511,8 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
     Shape shape;
     bool inCont = false, inPort = false;
     int inAssert = 0, loopDepth = 0;
+    std::vector<const ValueSymbol*> intSignals;           // SYN020 candidates
+    std::unordered_set<const Symbol*> loopIndex;          // for (i = ...): i is an index
     const SubroutineSymbol* func = nullptr;
 
     BodyRules(const InstanceBodySymbol& b, Report& r, const Params& p, BodyOut& o)
@@ -653,6 +655,10 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             rep.add("CON004", s.location,
                     "'" + name + "' is not declared, so it is an implicit 1-bit net; declare it (or fix the typo)");
         if (tb || iface) return;
+        if (on("SYN020") && !isNet && ty.isPredefinedInteger() && !isPort &&
+            (ty.as<PredefinedIntegerType>().integerKind == PredefinedIntegerType::Integer ||
+             ty.as<PredefinedIntegerType>().integerKind == PredefinedIntegerType::Int))
+            intSignals.push_back(&s);   // reported in finish() unless it is only a loop index
         if (ty.isFloating())
             rep.add("SYN006", s.location, "'" + name + "' is a real number, which is not synthesizable");
         else if (ty.isString() || ty.isDynamicallySizedArray() || ty.isClass() || ty.isEvent() || ty.isCHandle() ||
@@ -1019,9 +1025,24 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         visitDefault(l);
         loopDepth--;
     }
-    void handle(const ForLoopStatement& l) { loop(l); }
-    void handle(const WhileLoopStatement& l) { loop(l); }
-    void handle(const DoWhileLoopStatement& l) { loop(l); }
+    void handle(const ForLoopStatement& l) {
+        for (const Expression* e : l.initializers)
+            if (e->kind == ExpressionKind::Assignment)
+                if (const Symbol* t = firstTarget(e->as<AssignmentExpression>().left())) loopIndex.insert(t);
+        loop(l);
+    }
+    void handle(const WhileLoopStatement& l) {
+        if (hw() && !iface && !func)
+            rep.add("SYN018", l.sourceRange.start() ? l.sourceRange.start() : proc->location,
+                    "a while loop in design code: synthesis needs a loop whose count is known; use for with constant bounds");
+        loop(l);
+    }
+    void handle(const DoWhileLoopStatement& l) {
+        if (hw() && !iface && !func)
+            rep.add("SYN018", l.sourceRange.start() ? l.sourceRange.start() : proc->location,
+                    "a do ... while loop in design code: synthesis needs a loop whose count is known; use for with constant bounds");
+        loop(l);
+    }
     void handle(const RepeatLoopStatement& l) { loop(l); }
     void handle(const ForeachLoopStatement& l) { loop(l); }
     void handle(const ForeverLoopStatement& l) {
@@ -1084,6 +1105,12 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
     void handle(const ConditionalStatement& c) {
         if (on("W006"))
             for (auto& cond : c.conditions) multiBitCond(*cond.expr);
+        if (on("EXP006") && design() && c.conditions.size() == 1 && !c.conditions[0].pattern) {
+            const Expression& e = strip(*c.conditions[0].expr);
+            if (e.kind == ExpressionKind::IntegerLiteral || e.kind == ExpressionKind::UnbasedUnsizedIntegerLiteral)
+                rep.add("EXP006", at(e, body.location),
+                        "an if on a literal constant: one branch never runs; use a parameter (or remove the dead branch)");
+        }
         visitDefault(c);
     }
 
@@ -1094,6 +1121,20 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
     }
 
     void caseRules(const CaseStatement& c, SourceLocation loc) {
+        if (design() && !iface) {
+            if (isConstExpr(c.expr)) {
+                rep.add("CASE007", loc, "a case on a constant (case (1'b1)): the items are tested in order, as an if ... else if chain");
+            } else {
+                for (auto& g : c.items)
+                    for (const Expression* e : g.expressions)
+                        if (!isConstExpr(*e) && e->kind != ExpressionKind::ValueRange) {
+                            rep.add("CASE005", at(*e, loc),
+                                    "a case item that is not a constant: it builds priority logic, and two items can match at once");
+                            goto items_done;
+                        }
+            items_done:;
+            }
+        }
         if (c.condition == CaseStatementCondition::WildcardXOrZ)
             rep.add("CASE002", loc, "casex also treats X and Z in the selector as wildcards; use casez or case ... inside");
         bool wild = c.condition == CaseStatementCondition::WildcardXOrZ || c.condition == CaseStatementCondition::WildcardJustZ;
@@ -1268,6 +1309,52 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                                                            : "a power whose base is not a constant power of two builds a multiplier chain");
             }
         }
+        // x << 8 on 8 bits: always 0.
+        if (on("W010") && (b.op == BinaryOperator::LogicalShiftLeft || b.op == BinaryOperator::LogicalShiftRight ||
+                           b.op == BinaryOperator::ArithmeticShiftLeft || b.op == BinaryOperator::ArithmeticShiftRight) &&
+            integral(l) && !isConstExpr(l) && isConstExpr(r)) {
+            EvalContext ctx(ASTContext(body, LookupLocation::max));
+            ConstantValue cv = r.eval(ctx);
+            if (cv.isInteger() && !cv.integer().hasUnknown()) {
+                auto v = cv.integer().as<uint64_t>();
+                if (v && *v >= widthOf(l) && !(b.op == BinaryOperator::ArithmeticShiftRight && l.type->isSigned()))
+                    rep.add("W010", loc,
+                            "a shift by " + std::to_string(*v) + " of a " + std::to_string(widthOf(l)) +
+                                "-bit value: every bit is shifted out");
+            }
+        }
+        // unsigned < 0, unsigned >= 0: a comparison with one answer.
+        if (on("EXP005") && integral(l) && integral(r) &&
+            (b.op == BinaryOperator::LessThan || b.op == BinaryOperator::GreaterThanEqual ||
+             b.op == BinaryOperator::GreaterThan || b.op == BinaryOperator::LessThanEqual)) {
+            bool lc = isConstExpr(l), rc = isConstExpr(r);
+            if (lc != rc) {
+                const Expression& v = lc ? r : l;
+                const Expression& k = lc ? l : r;
+                EvalContext ctx(ASTContext(body, LookupLocation::max));
+                ConstantValue cv = k.eval(ctx);
+                if (!v.type->isSigned() && cv.isInteger() && !cv.integer().hasUnknown() && !(cv.integer().isSigned() && cv.integer().isNegative())) {
+                    auto kv = cv.integer().as<uint64_t>();
+                    bitwidth_t w = widthOf(v);
+                    uint64_t max = w >= 64 ? ~0ull : ((1ull << w) - 1);
+                    // as written with the constant on the right: v OP k
+                    BinaryOperator op = b.op;
+                    if (lc)
+                        op = op == BinaryOperator::LessThan            ? BinaryOperator::GreaterThan
+                             : op == BinaryOperator::GreaterThan       ? BinaryOperator::LessThan
+                             : op == BinaryOperator::LessThanEqual     ? BinaryOperator::GreaterThanEqual
+                                                                       : BinaryOperator::LessThanEqual;
+                    const char* always = nullptr;
+                    if (kv && *kv == 0 && op == BinaryOperator::LessThan) always = "false";
+                    else if (kv && *kv == 0 && op == BinaryOperator::GreaterThanEqual) always = "true";
+                    else if (kv && *kv >= max && op == BinaryOperator::GreaterThan) always = "false";
+                    else if (kv && *kv >= max && op == BinaryOperator::LessThanEqual) always = "true";
+                    if (always)
+                        rep.add("EXP005", loc,
+                                std::string("this comparison of an unsigned ") + std::to_string(w) + "-bit value is always " + always);
+                }
+            }
+        }
         if (on("W007") && (b.op == BinaryOperator::LogicalAnd || b.op == BinaryOperator::LogicalOr))
             for (const Expression* o : {&l, &r})
                 if (integral(*o) && widthOf(*o) > 1)
@@ -1277,6 +1364,10 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
 
     void handle(const UnaryExpression& u) {
         const Expression& o = strip(u.operand());
+        if (on("EXP003") && integral(o) && widthOf(o) == 1 &&
+            (u.op == UnaryOperator::BitwiseAnd || u.op == UnaryOperator::BitwiseOr || u.op == UnaryOperator::BitwiseXor ||
+             u.op == UnaryOperator::BitwiseNand || u.op == UnaryOperator::BitwiseNor || u.op == UnaryOperator::BitwiseXnor))
+            rep.add("EXP003", at(u, body.location), "a reduction operator on a 1-bit value does nothing (or only inverts it)");
         if (on("W007") && u.op == UnaryOperator::LogicalNot && integral(o) && widthOf(o) > 1)
             rep.add("W007", at(u, body.location),
                     "! is applied to a value of " + std::to_string(widthOf(o)) + " bits; ~ is the bitwise operator");
@@ -1298,6 +1389,12 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
     }
 
     void handle(const CallExpression& c) {
+        if (!c.isSystemCall() && hw() && !iface && on("SYN019")) {
+            if (auto* sub = std::get_if<const SubroutineSymbol*>(&c.subroutine);
+                sub && *sub && (*sub)->subroutineKind == SubroutineKind::Task)
+                rep.add("SYN019", at(c, body.location),
+                        "a task called in design code; synthesis handles tasks poorly (no timing, no return value): use a function");
+        }
         if (c.isSystemCall()) {
             std::string_view n = c.getSubroutineName();
             if (hw() && !iface && badSystemCall(n))
@@ -1311,6 +1408,11 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
     // ------------------------------------------------------------------ the end
 
     void finish() {
+        for (const ValueSymbol* v : intSignals)
+            if (!loopIndex.count(v))
+                rep.add("SYN020", v->location,
+                        "'" + shown(*v) + "' is an " + v->getType().toString() +
+                            " signal: 32 signed bits whether used or not; give it the width it needs");
         for (auto& [s, u] : use)
             if ((u.bits & UseBlk) && (u.bits & UseNba))
                 rep.add("SEQ001", s->location,
@@ -1368,6 +1470,7 @@ struct Global : ASTVisitor<Global, VisitFlags::Symbols> {
         SourceLocation loc;
     };
     std::vector<FlopRec> flops;
+    std::vector<const Symbol*> flopOuts;   // what flops write, for CLK004
     bool tb = false;
     const Scope* scope = nullptr;  // the module body the walk is in
 
@@ -1654,7 +1757,13 @@ struct Global : ASTVisitor<Global, VisitFlags::Symbols> {
             CombWalk w{*this, {}, {}};
             w.stmt(*s.inner);
         } else if (s.cls == Cls::Seq || s.cls == Cls::Latch) {
-            if (s.cls == Cls::Seq && !tb) flops.push_back({flopOf(s), p.location});
+            if (s.cls == Cls::Seq && !tb) {
+                flops.push_back({flopOf(s), p.location});
+                s.inner->visit(makeVisitor([&](auto& v, const AssignmentExpression& a) {
+                    if (const Symbol* t = firstTarget(a.left())) flopOuts.push_back(t);
+                    v.visitDefault(a);
+                }));
+            }
             // q <= ~q is a divider, which the DFT rules report; here only
             // reads by other logic count.
             s.inner->visit(makeVisitor(
@@ -1713,6 +1822,16 @@ struct Global : ASTVisitor<Global, VisitFlags::Symbols> {
                         "reset '" + n + "' is synchronous here but asynchronous in another block");
             if (clocks.count(c))
                 rep.add("CLK003", c->location, "'" + n + "' is used both as a clock and as a reset");
+        }
+        if (rep.rules.enabled("CLK004")) {
+            std::unordered_set<const Symbol*> outs;
+            for (const Symbol* o : flopOuts) outs.insert(find(o));
+            std::unordered_set<const Symbol*> said;
+            for (auto& fr : flops)
+                if (fr.f.clk && outs.count(find(fr.f.clk)) && said.insert(find(fr.f.clk)).second)
+                    rep.add("CLK004", fr.loc,
+                            "this flop is clocked by '" + shown(*fr.f.clk) +
+                                "', which a flop drives (a divided or ripple clock); make it an enable, or a clock from a clock generator");
         }
         for (const Symbol* s : dataOrder)
             if (clocks.count(find(s)))

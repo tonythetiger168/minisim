@@ -401,6 +401,11 @@ struct Gather : ASTVisitor<Gather> {
     // separate bits (assign x[i] = ... in a generate loop) are not a conflict.
     std::set<const Symbol*> wholeDriven;
     std::set<const Symbol*> resolved;
+    // VHDL resolved signals: the per-process drivers of each (x__drvN), and
+    // which of those ever drive Z, for L005.
+    std::map<const Symbol*, std::vector<const Symbol*>> drvOf;
+    std::set<const Symbol*> zDriven;
+    std::set<const Symbol*> wholeWritten;   // assigned as a whole somewhere in a process
 
     Gather(Report& r, Join& j, std::vector<Block>& b) : rep(r), join(j), blocks(b) {}
 
@@ -447,14 +452,34 @@ struct Gather : ASTVisitor<Gather> {
                                       ? a.right().as<ConversionExpression>().operand()
                                       : a.right();
             if (r.kind == ExpressionKind::NamedValue &&
-                r.as<NamedValueExpression>().symbol.name.starts_with(std::string(t->name) + "__drv"))
+                r.as<NamedValueExpression>().symbol.name.starts_with(std::string(t->name) + "__drv")) {
                 resolved.insert(t);
+                drvOf[t].push_back(&r.as<NamedValueExpression>().symbol);
+            }
             else if (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue)
                 wholeDriven.insert(t);
         }
     }
 
+    static bool hasZ(const Expression& e) {
+        bool z = false;
+        e.visit(makeVisitor(
+            [&](auto&, const IntegerLiteral& l) {
+                SVInt v = l.getValue();
+                if (v.hasUnknown())
+                    for (bitwidth_t i = 0; i < v.getBitWidth() && !z; i++) z = v[(int32_t)i].value == logic_t::Z_VALUE;
+            },
+            [&](auto&, const UnbasedUnsizedIntegerLiteral& l) { z |= l.getLiteralValue().value == logic_t::Z_VALUE; }));
+        return z;
+    }
     void handle(const ProceduralBlockSymbol& p) {
+        p.getBody().visit(makeVisitor([&](auto& v, const AssignmentExpression& a) {
+            if (const Symbol* t = lhsSymbol(a.left())) {
+                if (hasZ(a.right())) zDriven.insert(t);
+                if (a.left().kind == ExpressionKind::NamedValue) wholeWritten.insert(t);
+            }
+            v.visitDefault(a);
+        }));
         Block b;
         b.sym = &p;
         const Statement& body = p.getBody();
@@ -533,6 +558,8 @@ struct Design {
     std::vector<Block> blocks;
     std::map<const Symbol*, std::vector<SourceLocation>> drivers;
     std::set<const Symbol*> wholeDriven;
+    // L005: a resolved signal with a driver that never lets go (never drives Z).
+    std::vector<std::pair<const Symbol*, size_t>> contention;   // signal, drivers
 
     void gather(Compilation& comp, Report& rep) {
         Gather g(rep, join, blocks);
@@ -540,6 +567,14 @@ struct Design {
         drivers = std::move(g.drivers);
         wholeDriven = std::move(g.wholeDriven);
         for (const Symbol* r : g.resolved) wholeDriven.erase(r);
+        for (auto& [sig, drvs] : g.drvOf) {
+            if (drvs.size() < 2) continue;
+            size_t firm = 0;
+            // A driver that writes only some bits or fields leaves the rest at its 'Z' start value.
+            for (const Symbol* d : drvs) firm += g.wholeWritten.count(d) && !g.zDriven.count(d);
+            if (firm)
+                contention.push_back({sig, drvs.size()});
+        }
     }
 };
 

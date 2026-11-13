@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <iomanip>
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/diagnostics/AnalysisDiags.h"
@@ -126,6 +127,7 @@ void usage() {
                  "  -enable X        turn on a rule, a group (naming, width, synth, ...) or all (repeatable)\n"
                  "  -disable X       turn off a rule or a group (repeatable)\n"
                  "  -only X[,Y]      run these rules or groups and nothing else\n"
+                 "  -goal NAME       run one methodology goal (lint_rtl, starc, ...); -list-goals\n"
                  "  -severity R=L    report rule or group R as error, warning or info\n"
                  "  -set NAME=VALUE  a setting, such as name.module='^[a-z][a-z0-9_]*$'\n"
                  "  -config FILE     directives, one per line: enable, disable, only, severity, set, waive\n"
@@ -403,6 +405,11 @@ int main(int argc, char** argv) {
         const std::string origin = "command line";
         if (a == "-h" || a == "--help" || a == "-help") { usage(); return 0; }
         if (a == "-list" || a == "--list") { list = true; continue; }
+        if (a == "-goal") { cfg.directive({"goal", next("a goal name")}, origin); continue; }
+        if (a == "-list-goals") {
+            for (auto& g : lintcfg::goals()) std::cout << std::left << std::setw(12) << g.name << g.what << "\n";
+            return 0;
+        }
         if (a == "-explain") { explainRule = next("a rule name"); continue; }
         if (a == "-version" || a == "--version" || a == "-v") {
             std::cout << "mlint " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
@@ -600,6 +607,10 @@ int main(int argc, char** argv) {
         if (i == 0) {
             for (const Block& b : d.blocks) checkBlock(b, r);
             checkDrivers(d.drivers, d.wholeDriven, r);
+            for (auto& [sig, n] : d.contention)
+                r.add("L005", sig->location,
+                      "'" + path(*sig) + "' is a resolved signal driven by " + std::to_string(n) +
+                          " processes, and not every one releases it with 'Z': the values fight (X in simulation, contention in hardware)");
         } else if (i == 1) {
             global.analyze(r);
         } else if (i == 2) {
