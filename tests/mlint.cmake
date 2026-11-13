@@ -353,6 +353,19 @@ run(cdc_pulse.sv "-top;cdc_pulse;-only;cdc")
 if(NOT out MATCHES "0 findings")
   message(FATAL_ERROR "cdc_pulse.sv without -sdc:\n${out}")
 endif()
+# A register struct filled field by field (ports on fields and on a
+# concatenation of fields), copied whole and passed whole down: only the
+# field that crosses is reported, and the scan-muxed clock is clk_b_func.
+run(cdc_regs.sv "-top;cdc_regs;-only;cdc")
+if(NOT out MATCHES "\\[CDC001\\] 'cdc_regs.u_c.q' \\(clocked by cdc_regs.clk_a\\) is read by logic clocked by cdc_regs.clk_b_func"
+   OR NOT out MATCHES "1 finding \\(CDC001 1\\)")
+  message(FATAL_ERROR "cdc_regs.sv:\n${out}")
+endif()
+# -static takes a pattern.
+run(cdc_regs.sv "-top;cdc_regs;-only;cdc;-static;u_c.*")
+if(NOT out MATCHES "0 findings")
+  message(FATAL_ERROR "cdc_regs.sv -static u_c.*:\n${out}")
+endif()
 message(STATUS "mlint: ok")
 
 # SoC flow: a block signed off on its own writes the abstract the top-level

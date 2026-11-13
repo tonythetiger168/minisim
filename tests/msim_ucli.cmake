@@ -77,3 +77,31 @@ foreach(want "Error: no statement at .*ucli.sv:2\n" "Error: bad condition 'q =='
     message(FATAL_ERROR "msim -do errors: no match for '${want}' in\n${out}")
   endif()
 endforeach()
+
+# drivers / loads, call (static and automatic functions, a task with an
+# output), save, restore (the replay goes on reading this file after the
+# restore) and restart from time 0: tests/debug/ucli_call.do.
+set(SV2 ${SRC}/tests/debug/ucli_call.sv)
+execute_process(COMMAND ${MSIM} ${SV2} -do ${SRC}/tests/debug/ucli_call.do WORKING_DIRECTORY ${OUT}
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT rc EQUAL 0)
+  message(FATAL_ERROR "msim -do ucli_call.do exited ${rc}: ${err}\n${out}")
+endif()
+foreach(want
+    "tb.acc: 3 drivers\n  \\(initializer in tb\\)\n  ucli_call.sv:18  always @\\(posedge clk\\) acc <= acc \\+ 1;  \\(always in tb\\)\n  ucli_call.sv:14  acc = acc \\+ by;  \\(subroutine bump\\)\n"
+    "tb.clk: 2 loads\n  ucli_call.sv:17  always #5 clk = ~clk;  \\(always in tb\\)\n  ucli_call.sv:18 "
+    "twice returned 42\naddup returned 7\nbump returned now = 17\ntb.acc = 8'h11\ntb.calls = 32'h1\n"
+    "Error: no task or function 'nope' here \\(scope tb\\)\nError: twice needs v\n"
+    "saved the simulation at time 12 in ck2\ntime 42: ran to time 42 \\(next event at 45\\)\ntb.acc = 8'h14\n"
+    "restored the checkpoint at time 12\ntb.acc = 8'h11\ntb.calls = 32'h1\n"
+    "restarted at time 0\ntb.acc = 8'h0\ntime 20: ran to time 20 \\(next event at 25\\)\ntb.acc = 8'h2\nacc=10 calls=0\n")
+  if(NOT out MATCHES "${want}")
+    message(FATAL_ERROR "msim -do ucli_call.do: no match for '${want}' in\n${out}${err}")
+  endif()
+endforeach()
+# msim -restore takes a checkpoint of msim -i save too, and reads the standard input after it.
+file(WRITE ${OUT}/after.do "print tb.acc\nrun 10\nprint tb.acc\n")
+execute_process(COMMAND ${MSIM} -restore ${OUT}/ck2 INPUT_FILE ${OUT}/after.do OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(NOT out MATCHES "restored the checkpoint at time 12\ntb.acc = 8'h11\ntime 22: ran to time 22 \\(next event at 25\\)\ntb.acc = 8'h12\n")
+  message(FATAL_ERROR "msim -restore of a save checkpoint:\n${out}${err}")
+endif()

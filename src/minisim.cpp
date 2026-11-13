@@ -1403,14 +1403,18 @@ struct Sim {
     Val tranValue(int n, bool unkOn, vector<int>& seen) {
         // Best path to each net: the fewest resistive steps, then any switch
         // at all. Bit b of n is bit b + delta of the net reached, for b in [lo, hi).
+        // A net can be reached more than once, each time for a different
+        // range of n's bits (an inout port on {p[0], p[1]}), so a path is
+        // keyed by the net, the shift and the first bit.
         struct Reach { int k; bool crossed; int delta, lo, hi; };
         const Sig& g = sigs[(size_t)n];
-        map<int, Reach> best;
-        deque<int> q{n};
-        best[n] = {0, false, 0, 0, g.w};
+        map<std::tuple<int, int, int>, Reach> best;
+        deque<std::tuple<int, int, int>> q{{n, 0, 0}};
+        best[{n, 0, 0}] = {0, false, 0, 0, g.w};
         while (!q.empty()) {
-            int m = q.front(); q.pop_front();
-            Reach r = best[m];
+            auto key = q.front(); q.pop_front();
+            int m = std::get<0>(key);
+            Reach r = best[key];
             for (int id : tranOf[(size_t)m]) {
                 const TranSw& t = trans[(size_t)id];
                 if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
@@ -1423,16 +1427,18 @@ struct Sim {
                     nb.delta = r.delta + oLo - mLo;
                     if (nb.lo >= nb.hi) continue;
                 }
-                auto it = best.find(o);
+                std::tuple<int, int, int> ok{o, nb.delta, nb.lo};
+                auto it = best.find(ok);
                 if (it != best.end() && it->second.k <= nb.k) continue;
-                best[o] = nb;
-                q.push_back(o);
+                best[ok] = nb;
+                q.push_back(ok);
             }
         }
         vector<Drv> all;
         uint8_t kind = g.kind;
-        for (auto& [m, r] : best) {
-            seen.push_back(m);
+        for (auto& [key, r] : best) {
+            int m = std::get<0>(key);
+            if (seen.empty() || seen.back() != m) seen.push_back(m);   // keys of one net are neighbours
             const Sig& sm = sigs[(size_t)m];
             if (kind == NR_WIRE && sm.kind != NR_WIRE && r.lo == 0 && r.hi == g.w) kind = sm.kind;   // a wire joined to a tri1 is pulled too
             bool same = r.delta == 0 && r.lo == 0 && r.hi == g.w && sm.w == g.w;

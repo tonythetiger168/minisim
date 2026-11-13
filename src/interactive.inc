@@ -8,7 +8,8 @@
 //   step, next                 one statement (any process / this process)
 //   stop ...                   on a signal, a value, a line, a time or a condition (UCLI and xrun forms)
 //   get, print/value, force, release, change/deposit, scope, show, search, signals, describe,
-//   where/stack, listing, dump/probe, senv, alias, time, help, quit/exit/finish
+//   where/stack, listing, dump/probe, drivers/loads, call, save/restore/restart, senv, alias,
+//   time, help, quit/exit/finish
 // The kernel is driven one time slot at a time through Sim::run(end), so a
 // normal run pays nothing for this mode. A stop at a line or a step pauses
 // inside the statement hook (prog.hpp g_stmtHook) and reads commands there;
@@ -63,6 +64,14 @@ struct Session {
     bool hooked = false, allMarked = false;
     void (*prevHook)(const Instr&) = nullptr;
     std::map<uint32_t, std::vector<std::string>> srcCache;
+    // save / restore: every command read so far, replayed by a restore.
+    std::vector<std::string> history;
+    std::string doPath;                     // -do FILE (msim.cpp), for a restore to go on reading it
+    std::unique_ptr<std::istream> own;      // the input after a restore, or the replay
+    std::istream* after = nullptr;          // the input that follows the replay
+    bool replaying = false;
+    std::string replayState;                // the checkpoint's digest
+    std::vector<std::unique_ptr<Prog>> calls;   // the wrapper processes of call
 
     // ---- names ----
     void names() {
@@ -601,9 +610,14 @@ struct Session {
         std::string line;
         for (;;) {
             if (prompt) std::cout << (buf.empty() ? (nest ? "msim(stopped)> " : "msim> ") : "...   ") << std::flush;
-            if (!std::getline(*in, line)) return !buf.empty();
+            if (!std::getline(*in, line)) {
+                if (replaying && after) { endReplay(); continue; }
+                if (buf.empty()) return false;
+                history.push_back(buf);
+                return true;
+            }
             buf += line + "\n";
-            if (tcl::Interp::complete(buf)) return true;
+            if (tcl::Interp::complete(buf)) { history.push_back(buf); return true; }
         }
     }
     void run(const std::string& text) {
@@ -1013,6 +1027,272 @@ struct Session {
         return s;
     }
 
+
+    // ---- drivers and loads: the statements of the simulation that write or read a signal ----
+    std::string who(const Prog* p) {
+        if (auto it = procOf.find(p); it != procOf.end()) {
+            const LoweredProc* lp = it->second;
+            std::string sc = lp->scope.empty() ? S.vcdTop : S.vcdTop + "." + lp->scope;
+            if (!lp->port.empty()) return "port " + S.vcdTop + "." + lp->port;
+            static const std::map<std::string, std::string> kinds = {
+                {"Always", "always"}, {"AlwaysFF", "always_ff"}, {"AlwaysComb", "always_comb"}, {"AlwaysLatch", "always_latch"},
+                {"Initial", "initial"}, {"Final", "final"}, {"init", "initializer"}, {"assign", "assign"}};
+            auto k = kinds.find(lp->kind);
+            return (k == kinds.end() ? lp->kind : k->second) + " in " + sc;
+        }
+        if (p && p->sub) return std::string("subroutine ") + std::string(static_cast<const slang::ast::SubroutineSymbol*>(p->sub)->name);
+        return "process";
+    }
+    static bool reads(const E& e, int s) {
+        if (!e) return false;
+        if ((e->op == Op::Ref && e->sig == s) || (e->arr && s >= e->arr->base && s < e->arr->base + e->arr->count)) return true;
+        if (reads(e->at, s)) return true;
+        for (auto& k : e->kids) if (reads(k, s)) return true;
+        return false;
+    }
+    std::string cmdDrivers(const W& a) {
+        bool load = a[0] == "loads";
+        if (a.size() < 2) throw tcl::Error(a[0] + " SIG ...");
+        index();
+        std::string out;
+        for (size_t n = 1; n < a.size(); n++) {
+            if (a[n][0] == '-') continue;   // -full and the like: accepted
+            int s = sigArg(a, n);
+            std::vector<std::string> rows;
+            for (auto& r : ranges)
+                for (const Instr* i = r.b; i < r.e; i++) {
+                    bool hit;
+                    if (load) {
+                        hit = reads(i->e, s) || (i->k == IK::WaitEdge && i->sig == s);
+                        for (auto& x : i->args) hit = hit || reads(x, s);
+                        for (auto& [sg, ed] : i->events) hit = hit || sg == s;
+                        for (auto& [off, x] : i->init) hit = hit || reads(x, s);
+                    } else hit = (i->k == IK::Assign || i->k == IK::Nba || i->k == IK::Force) && i->sig == s;
+                    if (!hit) continue;
+                    std::string what = who(r.p) + (i->k == IK::Force ? ", force" : "");
+                    std::string row = i->line ? "  " + here(i->file, i->line) + "  (" + what + ")" : "  (" + what + ")";
+                    if (std::find(rows.begin(), rows.end(), row) == rows.end()) rows.push_back(row);
+                }
+            if (!load)
+                if (auto h = S.holds.find(s); h != S.holds.end() && (h->second.fe || !h->second.parts.empty())) rows.push_back("  (forced now)");
+            out += (out.empty() ? "" : "\n") + shown(s) + ": " + std::to_string(rows.size()) + (load ? " load" : " driver") + (rows.size() == 1 ? "" : "s");
+            for (auto& r : rows) out += "\n" + r;
+        }
+        return out;
+    }
+
+    // ---- call: a task or function of the design, from the prompt ----
+    const Subr* subrNamed(const std::string& n) {
+        if (!lr) return nullptr;
+        std::string scopePart, name = n;
+        if (size_t d = n.rfind('.'); d != std::string::npos) { scopePart = n.substr(0, d); name = n.substr(d + 1); }
+        std::vector<std::string> tries;
+        if (scopePart.empty()) { tries.push_back(scope); if (!scope.empty()) tries.push_back(""); }
+        else if (auto sc = scopeName(scopePart)) tries.push_back(*sc);
+        for (auto& t : tries) {
+            const slang::ast::Scope* sc = scopeAt(t);
+            if (!sc) continue;
+            const slang::ast::Symbol* m = sc->find(name);
+            if (!m || m->kind != slang::ast::SymbolKind::Subroutine) continue;
+            for (auto& sb : lr->subrs) if (sb->sym == &m->as<slang::ast::SubroutineSymbol>()) return sb.get();
+        }
+        return nullptr;
+    }
+    std::string cmdCall(const W& a0) {
+        // call name arg ...   call {name(arg, ...)}   call name(arg, ...)
+        std::string text;
+        for (size_t i = 1; i < a0.size(); i++) text += (i > 1 ? " " : "") + a0[i];
+        std::string name = text;
+        std::vector<std::string> args;
+        if (size_t p = text.find('('); p != std::string::npos) {
+            name = text.substr(0, p);
+            size_t e = text.rfind(')');
+            std::string in = text.substr(p + 1, e == std::string::npos ? std::string::npos : e - p - 1);
+            std::stringstream ss(in);
+            for (std::string x; std::getline(ss, x, ',');) {
+                size_t b = x.find_first_not_of(" \t"), f = x.find_last_not_of(" \t");
+                if (b != std::string::npos) args.push_back(x.substr(b, f - b + 1));
+            }
+        } else {
+            std::istringstream ss(text);
+            ss >> name;
+            for (std::string x; ss >> x;) args.push_back(x);
+        }
+        while (!name.empty() && std::isspace((unsigned char)name.back())) name.pop_back();
+        if (name.empty()) throw tcl::Error("call TASK(ARGS) or call TASK ARG ...");
+        const Subr* sb = subrNamed(name);
+        if (!sb || !sb->prog) throw tcl::Error("no task or function '" + name + "' here (scope " + scopeShown() + ")");
+        if (sb->cls) throw tcl::Error(name + " is a class method: call it from the design");
+        auto w = std::make_unique<Prog>();
+        Instr c;
+        c.k = IK::Call;
+        c.callee = sb->prog;
+        c.lay = sb->lay;
+        c.noSelf = true;
+        size_t k = 0;
+        std::vector<std::pair<std::string, const Subr::Arg*>> outs;
+        const auto& formals = sb->sym->getArguments();
+        for (size_t n = 0; n < sb->args.size(); n++) {
+            const Subr::Arg& f = sb->args[n];
+            std::string fname = n < formals.size() ? std::string(formals[n]->name) : "arg" + std::to_string(n);
+            if (f.arr) throw tcl::Error(name + ": array argument '" + fname + "' cannot be given from the prompt");
+            if (f.dir == slang::ast::ArgumentDirection::Out) { outs.push_back({fname, &f}); continue; }
+            if (f.dir == slang::ast::ArgumentDirection::Ref) throw tcl::Error(name + ": ref argument '" + fname + "' cannot be given from the prompt");
+            Val v;
+            if (k < args.size()) {
+                if (!parse(args[k], std::min(f.w, 64), v)) throw tcl::Error("bad value '" + args[k] + "' for " + fname);
+                k++;
+            } else if (n < formals.size() && formals[n]->getDefaultValue()) {
+                throw tcl::Error(name + ": give " + fname + " (default arguments are not read from the prompt)");
+            } else throw tcl::Error(name + " needs " + fname);
+            v = v_resize(v, f.w, false);
+            if (f.dir == slang::ast::ArgumentDirection::InOut) outs.push_back({fname, &f});
+            if (sb->lay) c.init.push_back({f.sig, konst(v)});
+            else {
+                Instr as;
+                as.k = IK::Assign;
+                as.sig = f.sig;
+                as.e = konst(v);
+                w->code.push_back(as);
+            }
+        }
+        if (k < args.size()) throw tcl::Error(name + ": too many arguments");
+        w->code.push_back(c);
+        // What it gives back, printed when it returns.
+        Instr d;
+        d.k = IK::Display;
+        std::string fmt = name + " returned";
+        auto val = [&](int sig) { return ref(sb->lay ? relSig(kRelRet, sig) : sig); };
+        bool any = false;
+        if (sb->retSig >= 0 && !sb->retDyn) { fmt += " %0d"; d.args.push_back(val(sb->retSig)); any = true; }
+        for (auto& [fn, f] : outs) { fmt += std::string(any ? "," : "") + " " + fn + " = %0d"; d.args.push_back(val(f->sig)); any = true; }
+        if (!any) fmt = name + " done";
+        d.fmt = fmt;
+        w->code.push_back(d);
+        const Prog* wp = w.get();
+        calls.push_back(std::move(w));
+        index();
+        ranges.push_back({wp->code.data(), wp->code.data() + wp->code.size(), wp});
+        if (!started) { started = true; S.run(S.now, true); }
+        S.spawn(process(wp));
+        if (nest) return "the call runs when the simulation goes on";
+        settle();
+        return "";
+    }
+
+    // ---- save / restore / restart: by replay, as $save and msim -restore (annexd.inc) ----
+    std::string cmdSave(const W& a) {
+        std::string f;
+        for (size_t i = 1; i < a.size(); i++) if (a[i][0] != '-') f = a[i];
+        if (f.empty()) throw tcl::Error("save FILE");
+        std::ofstream o(f);
+        if (!o) throw tcl::Error("cannot write " + f);
+        char cwd[4096];
+        o << "msim checkpoint\nsave 0\ntime " << S.now << "\nstate " << annexd::stateDigest() << "\n";
+        if (getcwd(cwd, sizeof cwd)) o << "cwd " << cwd << "\n";
+        for (auto& x : annexd::argv0()) o << "arg " << x << "\n";
+        // The commands up to this one: a restore runs them again.
+        for (size_t i = 0; i + 1 < history.size(); i++) {
+            std::istringstream is(history[i]);
+            for (std::string ln; std::getline(is, ln);) o << "ucli " << ln << "\n";
+        }
+        if (!o) throw tcl::Error("cannot write " + f);
+        return "saved the simulation at time " + std::to_string(S.now) + " in " + f;
+    }
+    // Runs msim again with the checkpoint's command line; the new run replays
+    // its commands quietly and goes on reading where this one is now.
+    [[noreturn]] void again(const std::string& ckpt, bool fromZero) {
+        if (!fromZero) setenv("MSIM_UCLI_RESTORE", ckpt.c_str(), 1);
+        else setenv("MSIM_UCLI_RESTART", "1", 1);
+        if (!doPath.empty() && in != &std::cin) {
+            setenv("MSIM_UCLI_DO", std::filesystem::absolute(doPath).string().c_str(), 1);
+            setenv("MSIM_UCLI_AT", std::to_string((long long)in->tellg()).c_str(), 1);
+        } else {   // standard input: a file goes on at the next command; a terminal anyway
+            long pos = ftell(stdin);
+            if (pos >= 0) lseek(0, pos, SEEK_SET);
+        }
+        annexd::again();
+    }
+    std::string cmdRestore(const W& a) {
+        bool restart = a[0] == "restart";
+        std::string f;
+        for (size_t i = 1; i < a.size(); i++) if (a[i][0] != '-') f = a[i];
+        if (restart && f.empty()) again("", true);   // UCLI restart: from time 0
+        if (f.empty()) throw tcl::Error("restore FILE");
+        std::ifstream c(f);
+        std::string magic, ln;
+        std::getline(c, magic);
+        std::vector<std::string> args;
+        std::string cwd;
+        bool ucli = false;
+        while (std::getline(c, ln)) {
+            if (ln.rfind("arg ", 0) == 0) args.push_back(ln.substr(4));
+            else if (ln.rfind("cwd ", 0) == 0) cwd = ln.substr(4);
+            else if (ln == "save 0") ucli = true;
+        }
+        if (magic != "msim checkpoint" || args.empty()) throw tcl::Error(f + " is not a checkpoint");
+        if (!ucli) throw tcl::Error(f + " was written by $save: use $restart or msim -restore");
+        std::string abs = std::filesystem::absolute(f).string();
+        if (!doPath.empty()) doPath = std::filesystem::absolute(doPath).string();
+        if (!cwd.empty() && chdir(cwd.c_str()) != 0) throw tcl::Error("cannot go to " + cwd);
+        annexd::argv0() = args;
+        again(abs, false);
+    }
+    // At the start: a restore's replay, or a restart's input.
+    void startReplay() {
+        const char* r = getenv("MSIM_UCLI_RESTORE");
+        const char* z = getenv("MSIM_UCLI_RESTART");
+        if (!r && !z) return;
+        std::string ck = r ? r : "";
+        const char* dp = getenv("MSIM_UCLI_DO");
+        const char* at = getenv("MSIM_UCLI_AT");
+        std::istream* next = &std::cin;
+        if (dp) {
+            auto f = std::make_unique<std::ifstream>(dp);
+            if (at) f->seekg(std::atoll(at));
+            doPath = dp;
+            own = std::move(f);
+            next = own.get();
+        }
+        prompt = !dp && isatty(0);
+        unsetenv("MSIM_UCLI_RESTORE"); unsetenv("MSIM_UCLI_RESTART"); unsetenv("MSIM_UCLI_DO"); unsetenv("MSIM_UCLI_AT");
+        if (z) { in = next; std::cout << "restarted at time 0\n"; return; }
+        std::ifstream c(ck);
+        std::string text, ln;
+        uint64_t t = 0;
+        while (std::getline(c, ln)) {
+            if (ln.rfind("ucli ", 0) == 0) text += ln.substr(5) + "\n";
+            else if (ln.rfind("state ", 0) == 0) replayState = ln.substr(6);
+            else if (ln.rfind("time ", 0) == 0) t = std::strtoull(ln.c_str() + 5, nullptr, 10);
+        }
+        (void)t;
+        replay = std::make_unique<std::istringstream>(text);
+        after = next;
+        in = replay.get();
+        replaying = true;
+        savedPrompt = prompt;
+        prompt = false;
+        std::cout.flush();
+        fflush(nullptr);
+        annexd::savedOut = dup(1);
+        annexd::savedErr = dup(2);
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); close(nul); }
+    }
+    std::unique_ptr<std::istringstream> replay;
+    bool savedPrompt = false;
+    void endReplay() {
+        replaying = false;
+        annexd::unmute();
+        in = after;
+        after = nullptr;
+        prompt = savedPrompt;
+        if (!replayState.empty() && annexd::stateDigest() != replayState)
+            std::cerr << "msim: warning: the state at the checkpoint differs from the one saved; the run is "
+                         "not repeatable (it reads the clock, the environment or a DPI model?)\n";
+        std::cout << "restored the checkpoint at time " << S.now << "\n";
+    }
+
     void help() {
         std::cout <<
             "run [T [unit]] [-absolute] | run -posedge/-negedge/-change SIG | run -slot [N] | step | next\n"
@@ -1023,6 +1303,7 @@ struct Session {
             "force SIG VALUE | release SIG | deposit/change SIG VALUE\n"
             "scope [PATH|-up] | show [-scopes|-signals|-ports] [-value] [SCOPE] | search PATTERN | signals [TEXT]\n"
             "where/stack | listing [N] | dump -file F | dump -add NAMES [-depth N] | probe NAMES | dump -off/-on/-flush/-close\n"
+            "drivers SIG | loads SIG | call TASK(ARGS) | save FILE | restore FILE | restart\n"
             "senv [NAME] | alias NAME COMMAND | time | help | quit/exit/finish\n"
             "Tcl: set, if, foreach, while, proc, expr, source, [command] ...\n";
     }
@@ -1091,6 +1372,10 @@ struct Session {
         for (const char* s : {"search", "signals"}) tcl.addCommand(s, [this](const W& a) { return cmdSearch(a); });
         for (const char* d : {"dump", "probe"}) tcl.addCommand(d, [this](const W& a) { return cmdDump(a); });
         tcl.addCommand("senv", [this](const W& a) { return cmdSenv(a); });
+        for (const char* d : {"drivers", "loads"}) tcl.addCommand(d, [this](const W& a) { return cmdDrivers(a); });
+        tcl.addCommand("call", [this](const W& a) { return cmdCall(a); });
+        for (const char* sv : {"save", "checkpoint"}) tcl.addCommand(sv, [this](const W& a) { return cmdSave(a); });
+        for (const char* r : {"restore", "restart"}) tcl.addCommand(r, [this](const W& a) { return cmdRestore(a); });
         tcl.addCommand("alias", [this](const W& a) {
             if (a.size() < 3) throw tcl::Error("alias NAME COMMAND ...");
             std::string body;
@@ -1116,6 +1401,7 @@ struct Session {
         in = &is;
         g_ses = this;
         commands();
+        startReplay();
         std::string buf;
         while (!ended && !quitNow && !S.finished) {
             if (!read(buf)) break;

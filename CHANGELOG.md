@@ -14,6 +14,12 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiNamedEvent`, `vpiParameter` (with `vpiLocalParam`), `vpiTypedef` and
   `vpiInternalScope` iterate its events, parameters, typedefs and methods.
   `tests/spec/37.31-vpi-class-defn.sv`.
+- `mlint` CDC on generated register blocks: a register struct written field
+  by field through ports on fields or on concatenations of fields, copied
+  whole (`assign hw2reg_regtop = hw2reg`) and passed whole down a port, is
+  kept field by field, so one field's crossing no longer spreads to every
+  register. A clock behind a scan mux is the functional clock. `-static`
+  takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
 - VPI containers of structs, classes and containers (37.18): an element of
   a queue, dynamic or associative array of unpacked structs is a
   `vpiStructVar` whose members read and write the element; one of class
@@ -46,6 +52,15 @@ Spec references are IEEE 1800-2023 clauses.
   `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
   `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
   (plusarg-assignment: `$test$plusargs`).
+- UPF language rules of IEEE 1801-2024 clause 5 and 8.3 in `msim -upf` and
+  `mlint -upf`: identifier and name-conflict checks, references to objects
+  that do not exist, `-update` refinement of strategies and switches,
+  conflicting port attributes, `{.}` with `-models`, `-instance` cells that
+  are not in the design, and supply ports named like HDL logic ports are
+  errors. Expressions gain `<`, `<=`, `>`, `>=`, `.voltage` and `.state`;
+  Tcl `catch` sets `errorInfo` and `errorCode`. Strategies are chosen by the
+  precedence of 5.7.3 and 5.7.4 (port, instance, domain; then options),
+  not by the order they were written; a tie is an error.
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their
@@ -412,6 +427,10 @@ Spec references are IEEE 1800-2023 clauses.
   (next/previous time the selected signal takes it), Del to remove a row,
   Ctrl+arrows to step changes; the view lives in the page address, so a
   reload or a copied link opens on it.
+- `msim -i`: `drivers` / `loads` of a signal, `call` of a task or function
+  (static or automatic, with its return value and outputs), `save` /
+  `restore` checkpoints by replay of the run and its commands (also read by
+  `msim -restore`), and `restart` from time 0.
 - `msim -i` / `-do` is a UCLI on the shared Tcl interpreter: `set`, `if`,
   `foreach`, `proc`, `source` around the commands; stops at a line
   (`stop -line N -file F`), at a time, on a condition, with `-command`,
