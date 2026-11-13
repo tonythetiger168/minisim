@@ -25,5 +25,6 @@ added at restore that the design reads before the checkpoint.
   image, which is faster for long runs.
 - The sources and the command line must still be what they were at
   `$save` time. msim checks the resulting state, not the files.
-- Interactive mode (`msim -i`) has no `save` / `restore` commands yet; put a
-  `$save` in the design or the testbench.
+- Interactive mode (`msim -i`): `save FILE` writes a checkpoint that also
+  records the commands given so far; `restore FILE` and `msim -restore FILE`
+  replay them (docs/DEBUG.md).

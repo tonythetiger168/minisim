@@ -119,6 +119,20 @@ int main() {
         assert(rc == 3 && t.exited && !t.get("never"));
         assert(out.str() == "0\n12\nError: unknown command 'oops' (<in>:6)\n");
     }
+    // catch sets the global errorInfo and errorCode (UPF 1801-2024 5.12).
+    {
+        Interp t;
+        t.parse("set r [catch {error boom} m]\n"
+                "set i $errorInfo\n"
+                "set c $errorCode\n"
+                "proc f {} { error inner {my info} {UPF BAD} }\n"
+                "set r2 [catch {f} m2]\n",
+                "err.tcl");
+        assert(*t.get("r") == "1" && *t.get("m") == "boom" && *t.get("c") == "NONE");
+        assert(t.get("i")->find("boom") == 0);
+        assert(*t.get("r2") == "1" && *t.get("m2") == "inner" && *t.get("errorInfo") == "my info" && *t.get("errorCode") == "UPF BAD");
+        assert(t.diags.empty());
+    }
     std::cout << "test_tcl: ok\n";
     return 0;
 }
