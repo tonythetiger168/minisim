@@ -18,6 +18,7 @@
 set(MINISIM_CORE_HEADERS
     annexd.inc
     clocking.hpp
+    compat.hpp
     cover.hpp
     cover_rt.inc
     cpu.hpp
