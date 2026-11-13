@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A UCIS 1.0 XML database in the shape another simulator writes:
+     namespace-qualified root, a case statement with three arms, blocks
+     (not statements), a state value as a SystemVerilog literal, a cross,
+     and an instance tree given by parentInstanceId. Read by mcov_ucis. -->
+<ucis:UCIS xmlns:ucis="http://www.ucis.org/ucis/1.0" ucisVersion="1.0" writtenBy="other" writtenTime="2026-01-01T00:00:00">
+  <sourceFiles fileName="rtl/top.sv" id="1"/>
+  <sourceFiles fileName="rtl/alu.sv" id="2"/>
+  <historyNodes historyNodeId="0" logicalName="smoke" testStatus="true" date="2026-01-01T00:00:00"
+                toolCategory="UCIS:simulator" ucisVersion="1.0" vendorId="other" vendorTool="sim" vendorToolVersion="1"/>
+  <instanceCoverages name="top" key="0" instanceId="0" moduleName="top">
+    <id file="1" line="1" inlineCount="1"/>
+    <blockCoverage>
+      <block><statementId file="1" line="5" inlineCount="1"/><blockBin><contents coverageCount="3"/></blockBin><blockId file="1" line="5" inlineCount="1"/></block>
+      <block><statementId file="1" line="6" inlineCount="1"/><blockBin><contents coverageCount="0"/></blockBin><blockId file="1" line="6" inlineCount="1"/></block>
+    </blockCoverage>
+    <assertionCoverage>
+      <assertion name="a_ok" assertionKind="assert"><passBin><contents coverageCount="4"/></passBin><failBin><contents coverageCount="0"/></failBin><attemptBin><contents coverageCount="4"/></attemptBin></assertion>
+      <assertion name="c_seen" assertionKind="cover"><coverBin><contents coverageCount="0"/></coverBin></assertion>
+    </assertionCoverage>
+  </instanceCoverages>
+  <instanceCoverages name="u_alu" key="1" instanceId="1" parentInstanceId="0" moduleName="alu">
+    <id file="2" line="1" inlineCount="1"/>
+    <toggleCoverage>
+      <toggleObject name="op" key="0">
+        <id file="2" line="2" inlineCount="1"/>
+        <toggleBit name="op[0]" key="0"><index>0</index>
+          <toggle from="0" to="1"><bin><contents coverageCount="2"/></bin></toggle>
+          <toggle from="1" to="0"><bin><contents coverageCount="1"/></bin></toggle></toggleBit>
+        <toggleBit name="op[1]" key="1"><index>1</index>
+          <toggle from="0" to="1"><bin><contents coverageCount="1"/></bin></toggle>
+          <toggle from="1" to="0"><bin><contents coverageCount="0"/></bin></toggle></toggleBit>
+      </toggleObject>
+    </toggleCoverage>
+    <blockCoverage>
+      <statement><id file="2" line="8" inlineCount="1"/><bin><contents coverageCount="5"/></bin></statement>
+      <statement><id file="2" line="9" inlineCount="1"/><bin><contents coverageCount="2"/></bin></statement>
+    </blockCoverage>
+    <conditionCoverage metricMode="FEC">
+      <expr name="e0" key="0" exprString="a &amp;&amp; b" index="12" width="2">
+        <id file="2" line="9" inlineCount="1"/><subExpr>a</subExpr><subExpr>b</subExpr>
+        <bin><contents coverageCount="2"/></bin><bin><contents coverageCount="1"/></bin><bin><contents coverageCount="0"/></bin>
+      </expr>
+    </conditionCoverage>
+    <branchCoverage>
+      <statement statementType="case" branchExpr="op">
+        <id file="2" line="10" inlineCount="1"/>
+        <branch><id file="2" line="11" inlineCount="1"/><branchBin><contents coverageCount="3"/></branchBin></branch>
+        <branch><id file="2" line="12" inlineCount="1"/><branchBin><contents coverageCount="2"/></branchBin></branch>
+        <branch><id file="2" line="13" inlineCount="1"/><branchBin><contents coverageCount="0"/></branchBin></branch>
+      </statement>
+    </branchCoverage>
+    <fsmCoverage>
+      <fsm name="st" type="enum" width="2">
+        <state stateName="IDLE" stateValue="2'b00"><stateBin><contents coverageCount="4"/></stateBin></state>
+        <state stateName="BUSY" stateValue="2'b01"><stateBin><contents coverageCount="2"/></stateBin></state>
+        <state stateName="DONE" stateValue="2'b10"><stateBin><contents coverageCount="0"/></stateBin></state>
+        <stateTransition><state>IDLE</state><state>BUSY</state><transitionBin><contents coverageCount="2"/></transitionBin></stateTransition>
+        <stateTransition><state>BUSY</state><state>DONE</state><transitionBin><contents coverageCount="0"/></transitionBin></stateTransition>
+        <stateTransition><state>BUSY</state><state>IDLE</state><transitionBin><contents coverageCount="1"/></transitionBin></stateTransition>
+      </fsm>
+    </fsmCoverage>
+    <covergroupCoverage>
+      <cgInstance name="cg_op" key="0">
+        <options weight="1" goal="100"/>
+        <cgId cgName="cg_op" moduleName="alu"><cginstSourceId file="2" line="20" inlineCount="1"/><cgSourceId file="2" line="20" inlineCount="1"/></cgId>
+        <coverpoint name="cp_op" key="0">
+          <options at_least="1"/>
+          <coverpointBin name="add" key="0" type="bins"><range from="0" to="0"><contents coverageCount="3"/></range></coverpointBin>
+          <coverpointBin name="sub" key="1" type="bins"><range from="1" to="1"><contents coverageCount="0"/></range></coverpointBin>
+          <coverpointBin name="bad" key="2" type="illegal"><range from="3" to="3"><contents coverageCount="0"/></range></coverpointBin>
+        </coverpoint>
+      </cgInstance>
+    </covergroupCoverage>
+  </instanceCoverages>
+</ucis:UCIS>

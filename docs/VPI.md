@@ -366,6 +366,30 @@ class. `cbSizeChange` on a dynamic array, queue or associative array runs
 each time its size changes (push, pop, insert, delete, a new key, a new
 size); a write to an existing element does not.
 
+**Threads and frames (38.36.1).** A thread is one process: an initial,
+always or final procedure, a fork branch, an assertion action. A frame is
+one running call of a task or function. In a `calltf`,
+`vpi_handle(vpiThread, NULL)` gives the calling thread and
+`vpi_handle(vpiFrame, NULL)` its innermost call (NULL outside a task or
+function). A thread has `vpiParent` (the thread that forked it),
+`vpiFrame` (its innermost call) and `vpi_iterate(vpiThread, thread)` (the
+children still running); a frame has `vpiScope` (the task or function),
+`vpiParent` (the caller's frame), `vpiThread` and `vpiAutomatic`. Both have
+`vpiValid`, 0 once the thread ends or the call returns. `cbStartOfThread`
+runs as a thread starts (registered on a thread: as it forks a child),
+`cbEndOfThread` as it ends and `cbEnterThread` each time it runs again after
+a wait (registered on a thread: that one; obj NULL: every thread);
+`cbStartOfFrame` and `cbEndOfFrame` run as a call starts and returns
+(obj NULL, a thread, or for `cbEndOfFrame` one frame). The callback's `obj`
+is the thread or frame. Threads that started before the first such
+callback or handle was asked for are not reported as starting.
+
+**Unresolved system tasks and functions (38.36.3).** A `cbUnresolvedSystf`
+callback registered at startup runs before elaboration, once for each
+system task or function name in the source that is neither built in nor
+registered, with the name in `cb_data->value` (`vpiStringVal`). It may
+register the name with `vpi_register_systf`; the calls then run as usual.
+
 **Save, restart and reset (38.36.2).** msim has no save, restart or reset,
 so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
 `cbStartOfReset` and `cbEndOfReset` register (with a handle) and never run.
@@ -379,16 +403,14 @@ loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
-callbacks, thread and frame callbacks (`cbStartOfThread`, `cbEndOfThread`,
-`cbEnterThread`, `cbStartOfFrame`, `cbEndOfFrame`), `cbReclaimObj` /
-`cbEndOfObject` (msim does not reclaim objects), `cbSignal`,
-`cbUnresolvedSystf`, and `vpi_control(vpiReset)`. A call to something not
+callbacks, `cbReclaimObj` /
+`cbEndOfObject` (msim does not reclaim objects), `cbSignal` and `vpi_control(vpiReset)`. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
