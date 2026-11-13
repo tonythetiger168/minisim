@@ -1,0 +1,7 @@
+1 on: y=0101 z=1
+2 on, new data: y=1100 z=0
+3 isolating: y=0000 z=0
+4 off, isolated: y=0000 z=0
+5 on again: y=0101 z=1
+6 unknown isolation signal: y=0x0x z=x
+7 isolation supply off: y=xxxx z=x

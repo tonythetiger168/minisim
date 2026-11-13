@@ -401,6 +401,13 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
         std::vector<std::pair<uint64_t, uint64_t>> wild;
         if (bd.allValues) seq.push_back({0, kmask(c.w)});
         for (auto& it : bd.items) itemKeys(c, it, bd.wildcard, seq, &xv, &wild);
+        if (bd.setIdx >= 0) {   // bins b = q; (19.5.1.2): its values now
+            Val n = eval(bd.setSize, rd);
+            for (uint64_t k = 0; !n.x && k < n.v; k++) {
+                S.set(bd.setIdx, mk(k, 32));
+                itemKeys(c, bd.setItem, bd.wildcard, seq, &xv, &wild);
+            }
+        }
         if (bd.with) {   // keep the values for which the with expression is true (19.5.1.1)
             std::vector<KR> kept;
             size_t n = 0;
@@ -510,6 +517,7 @@ inline bool binMatch(const CgBin& b, uint64_t k, const Val& v, bool hasX) {
 }
 // A cross bin select expression on one tuple (19.6.1).
 struct SelCtx {
+    const CgDef* d;
     const CgInst* in;
     const CgCrossDef* xd;
     const CgCrossInst* xi;
@@ -520,6 +528,43 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
         case 1: return !selEval(*s.kids[0], tuple, cx);
         case 2: return selEval(*s.kids[0], tuple, cx) && selEval(*s.kids[1], tuple, cx);
         case 3: return selEval(*s.kids[0], tuple, cx) || selEval(*s.kids[1], tuple, cx);
+        case 4: return true;
+        case 5: {   // the tuples of kids[0] for which enough value tuples make `with` true (19.6.1.2)
+            if (!selEval(*s.kids[0], tuple, cx)) return false;
+            size_t n = tuple.size();
+            std::vector<std::vector<std::pair<uint64_t, uint64_t>>> rs(n);
+            for (size_t j = 0; j < n; j++) {
+                int bi = cx.xi->dims[j][tuple[j]];
+                rs[j] = cx.in->cps[cx.xd->cps[j]].bins[bi].ranges;
+                if (rs[j].empty()) return false;
+            }
+            uint64_t need = 1;
+            if (s.matches) { Val m = eval(s.matches, rd); need = m.x ? 1 : m.v; }
+            uint64_t yes = 0, tried = 0;
+            std::vector<size_t> ri(n, 0);
+            std::vector<uint64_t> k(n);
+            for (size_t j = 0; j < n; j++) k[j] = rs[j][0].first;
+            for (;;) {
+                if (++tried > (1u << 22)) fail("too many value tuples for a cross with filter");
+                for (size_t j = 0; j < n; j++) {
+                    const CgCpDef& c = cx.d->cps[cx.xd->cps[j]];
+                    S.set(s.valSigs[j], make((uint64_t)valOfKey(c, k[j]) & kmask(c.w), 0, c.w, 0));
+                }
+                bool t = truth(eval(s.with, rd)) == 1;
+                if (t) yes++;
+                if (!s.all && yes >= need) return true;
+                if (s.all && !t) return false;
+                size_t j = n;
+                while (j-- > 0) {   // the next value tuple
+                    if (k[j] < rs[j][ri[j]].second) { k[j]++; break; }
+                    if (++ri[j] < rs[j].size()) { k[j] = rs[j][ri[j]].first; break; }
+                    ri[j] = 0;
+                    k[j] = rs[j][0].first;
+                }
+                if (j == (size_t)-1) break;
+            }
+            return s.all ? true : yes >= need;
+        }
         default: break;
     }
     int bi = cx.xi->dims[s.cp][tuple[s.cp]];
@@ -552,7 +597,7 @@ inline void buildCross(const CgDef& d, CgInst& in, const CgCrossDef& xd, CgCross
     xi.cls.assign(total, -1);
     xi.userOf.assign(total, {});
     xi.autoHits.assign(total, 0);
-    SelCtx cx{&in, &xd, &xi, {}};
+    SelCtx cx{&d, &in, &xd, &xi, {}};
     std::function<void(const CgSel&)> prep = [&](const CgSel& s) {
         if (!s.isect.empty()) {
             std::vector<KR> ks;

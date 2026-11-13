@@ -12,6 +12,19 @@ Spec references are IEEE 1800-2023 clauses.
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
   check no longer counts the reset value as a change.
+- The Tcl interpreter of the tool line (`src/tcl.hpp`, used by UPF, SDC and
+  the tool shells) has `upvar`, `uplevel`, `namespace eval` with `variable`
+  and namespace procs, `namespace current / exists / qualifiers / tail /
+  which / delete`, `regexp` and `regsub` (ECMAScript syntax), and
+  `info level / procs`. `tests/test_tcl.cpp` now runs in ctest.
+- `msim -upf_cov <file>`: a low-power coverage report of power states,
+  named state transitions, isolation enables and retention saves and
+  restores, with the bins not hit marked.
+- UPF `set_retention -applies_to flop | latch` (IEEE 1801-2024 6.54) selects
+  flip-flops or latches: `always_latch` and latches inferred from a
+  level-sensitive `always` that leaves a variable unassigned on some path.
+  Level-sensitive logic of a domain now re-evaluates at power-up (9.5.3)
+  even when no input changed while the domain was off.
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
@@ -30,6 +43,14 @@ Spec references are IEEE 1800-2023 clauses.
   the `v` environment with paging on), all passing.
 - The `minisimCore` package installs `compat.hpp`, so a tool built against the
   installed kernel can register its vendor command-line rules too.
+- UPF `use_interface_cell -force_function` (IEEE 1801-2024 6.62) is
+  simulated: each isolated port runs through the HDL model of the first
+  library cell, wired by `-port_map` to the isolation signal (or its
+  inverse) and supplies, in place of the strategy's clamp and sense.
+- UPF `map_retention_cell -lib_model_name` (IEEE 1801-2024 6.39) is
+  simulated: the mapped register runs as the verification model, wired to
+  the clock, data and async set/reset inferred from its always block, the
+  strategy's save and restore signals and its supplies.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
@@ -66,6 +87,14 @@ Spec references are IEEE 1800-2023 clauses.
   toggles, FSMs, assertions and covergroups. It also reads what other tools
   write, such as blocks, case statements with more than two arms and
   SystemVerilog literal state values.
+- `mcov` takes other vendors' coverage command lines:
+  - URG options with `--compat=synopsys`
+  - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
+  - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
+  - the same through a symlink named `urg`, `imc` or `vcover`
+
+  The engine is mcov's own, and it reads mcov's own databases.
+  A database that does not exist is now a one-line error instead of a traceback.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
