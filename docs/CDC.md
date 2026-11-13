@@ -185,8 +185,8 @@ msim rtl/*.sv cdc_sva.sv -top soc_tb -top mlint_cdc_sva
 | --- | --- |
 | One-bit synchronizer | The source holds each value for at least two edges of the reading clock, or a pulse can fall between them. It counts reading edges between changes of the source, because a toggle faster than the reading clock can look stable when sampled on it |
 | Gray-coded or multi-bit bus | At most one bit changes per edge of the source clock, so the reader sees the old value or the new one (`$countones(x ^ $past(x)) <= 1`) |
-| Enable-qualified bus | The data does not change on a reading edge where the synchronized control changes |
-| Handshake: a request whose flop reads a synchronized copy of a signal from the reading domain (the acknowledge) | The request changes only when the acknowledge has caught up with it: `$changed(req) \|-> $past(ack_sync) == $past(req)`. That holds for a two-phase (toggle) and a four-phase handshake alike. The responder's acknowledge, a plain copy of the synchronized request, needs no check of its own |
+| Enable-qualified bus | The data does not change on a reading edge where the synchronized control changes. Storage wider than what the reader takes (a FIFO memory, read one entry at a time) or an unpacked array is not checked as one value, since another entry may be written while one is read; its Gray pointers are checked instead |
+| Handshake: a synchronized signal whose flop also reads (directly or through logic) a synchronized copy of a signal from the reading domain | The two sides alternate: each changes only after the other side's synchronized signal has changed since its own last change (the first change after reset may start a transfer). That holds for the side that starts a transfer and the side that answers, two-phase (toggle) or four-phase. A plain copy of the synchronized signal (an acknowledge that just follows) needs no check of its own |
 
 Crossings already reported (no synchronizer, logic in front of one) get no
 check; crossings in protected code are skipped.
