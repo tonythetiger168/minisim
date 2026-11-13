@@ -448,3 +448,13 @@ execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -tr ${SRC}/tests/deb
 if(rc EQUAL 0 OR NOT err MATCHES "no UVM transaction streams")
   message(FATAL_ERROR "-tr on a file that is not one passed: ${rc}\n${out}${err}")
 endif()
+
+# The viewer's radix and find-value helpers, when Node is installed.
+find_program(NODE node)
+if(NODE)
+  execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/alu.sv -top tb -vcd ${OUT}/alu.vcd -html ${OUT}/view.html RESULT_VARIABLE rc OUTPUT_QUIET)
+  execute_process(COMMAND ${NODE} ${SRC}/tests/mdebug_view_test.js ${OUT}/view.html RESULT_VARIABLE rc OUTPUT_VARIABLE o ERROR_VARIABLE e)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "viewer helpers: ${o}${e}")
+  endif()
+endif()

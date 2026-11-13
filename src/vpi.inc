@@ -14,6 +14,10 @@
 
 #include <dlfcn.h>
 
+#include <deque>
+#include <fstream>
+#include <functional>
+#include <sstream>
 #include <cstdarg>
 #include <cmath>
 
@@ -114,6 +118,7 @@ struct State {
     std::map<std::pair<int, size_t>, Obj*> fsmStateObj;
     const VpiSite* cur = nullptr;         // the call whose calltf / compiletf is running
     std::vector<Cb*> start, endCompile, endSim, rw, ro, next;
+    std::vector<Cb*> unresolved;          // cbUnresolvedSystf (38.36.3)
     std::multimap<uint64_t, Cb*> timed;   // cbAfterDelay, cbAtStartOfSimTime, and delayed synch callbacks
     std::unordered_map<int, std::vector<Cb*>> change;   // signal -> its cbValueChange callbacks
     std::vector<std::unique_ptr<Cb>> cbs;
@@ -138,6 +143,8 @@ struct State {
     const LowerResult* lr = nullptr;
     std::vector<std::string> argv;
     std::vector<char*> argvp;
+    std::deque<std::vector<std::string>> fileArgs;   // -f files: name, then their arguments
+    std::deque<std::vector<char*>> fileArgvp;
     // Strings and vectors handed to C live until the next call that returns one (38.18).
     std::string strBuf, valBuf;   // vpi_get_str, vpi_get_value
     std::vector<s_vpi_vecval> vecBuf;
@@ -1688,7 +1695,39 @@ inline bool load(const std::string& path, const std::string& boot, std::string& 
     return true;
 }
 // Make the registered names known to slang before elaboration.
+// cbUnresolvedSystf (38.36.3): each system task or function name in the
+// source that is neither built in nor registered, once, with the name in
+// cb_data->value (vpiStringVal); the callback may vpi_register_systf it.
+struct SysNames : slang::syntax::SyntaxVisitor<SysNames> {
+    std::vector<std::string> names;
+    void visitToken(slang::parsing::Token t) {
+        if (t.kind == slang::parsing::TokenKind::SystemIdentifier) names.emplace_back(t.valueText());
+    }
+};
+inline void fireUnresolved(Compilation& comp) {
+    auto& s = st();
+    if (s.unresolved.empty()) return;
+    SysNames v;
+    for (const auto& t : comp.getSyntaxTrees()) t->root().visit(v);
+    std::set<std::string> done;
+    for (const std::string& n : v.names) {
+        if (!done.insert(n).second || vpiSystfNames().count(n) || comp.getSystemSubroutine(n)) continue;
+        auto due = s.unresolved;
+        for (Cb* c : due) {
+            if (!c->live) continue;
+            s_cb_data d = c->d;
+            s_vpi_value val{};
+            val.format = vpiStringVal;
+            val.value.str = const_cast<PLI_BYTE8*>(n.c_str());
+            d.obj = nullptr;
+            d.time = nullptr;
+            d.value = &val;
+            d.cb_rtn(&d);
+        }
+    }
+}
 inline void declare(Compilation& comp) {
+    fireUnresolved(comp);
     for (auto& [n, i] : vpiSystfNames()) comp.addSystemSubroutine(std::make_shared<UserSystf>(n, i));
 }
 inline void setup(Compilation& comp, const LowerResult& lr) {
@@ -1907,6 +1946,7 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             if (d->reason == cbError) g_errHook = vpi::onRunError;
             break;
         case cbEndOfCompile: s.endCompile.push_back(c); break;
+        case cbUnresolvedSystf: s.unresolved.push_back(c); break;   // runs before elaboration (declare)
         case cbStartOfSimulation: s.start.push_back(c); break;
         case cbEndOfSimulation: s.endSim.push_back(c); break;
         default:
@@ -3489,10 +3529,43 @@ PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info info) {
     if (!info) return 0;
     static char product[] = "minisim";
     static char version[] = MINISIM_VERSION;
-    s.argvp.clear();
-    for (auto& a : s.argv) s.argvp.push_back(a.data());
+    // A -f / -F option is followed by a pointer to a null-terminated array:
+    // the file's name, then the arguments read from it (38.36), nested
+    // the same way for a -f inside the file.
+    s.argvp.clear(); s.fileArgs.clear(); s.fileArgvp.clear();
+    std::function<char*(const std::string&, int)> fileArr = [&](const std::string& name, int depth) -> char* {
+        auto& toks = s.fileArgs.emplace_back();
+        toks.push_back(name);
+        if (std::ifstream in(name); in && depth < 16) {
+            std::string line, t;
+            while (std::getline(in, line)) {
+                if (auto c = line.find("//"); c != std::string::npos) line.erase(c);
+                std::istringstream ls(line);
+                while (ls >> t) toks.push_back(t);
+            }
+        }
+        size_t at = s.fileArgvp.size();
+        s.fileArgvp.emplace_back();
+        std::vector<char*> v;
+        for (size_t k = 0; k < toks.size(); k++) {
+            v.push_back(toks[k].data());
+            if (k > 0 && (toks[k] == "-f" || toks[k] == "-F") && k + 1 < toks.size()) {
+                std::string inner = toks[k + 1];
+                k++;
+                v.push_back(fileArr(inner, depth + 1));
+            }
+        }
+        v.push_back(nullptr);
+        s.fileArgvp[at] = std::move(v);
+        return (char*)s.fileArgvp[at].data();
+    };
+    for (size_t k = 0; k < s.argv.size(); k++) {
+        s.argvp.push_back(s.argv[k].data());
+        if (k > 0 && (s.argv[k] == "-f" || s.argv[k] == "-F") && k + 1 < s.argv.size())
+            s.argvp.push_back(fileArr(s.argv[++k], 0));
+    }
     s.argvp.push_back(nullptr);
-    info->argc = (PLI_INT32)s.argv.size();
+    info->argc = (PLI_INT32)s.argvp.size() - 1;
     info->argv = s.argvp.data();
     info->product = product;
     info->version = version;

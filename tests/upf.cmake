@@ -27,8 +27,9 @@ endforeach()
 # abstract power source (6.16); value conversion methods in UPF libraries,
 # for real, enum, integer and upfSupplyTypeT ports (4.10, 5.11, 6.29, 6.30,
 # 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9); supply ports
-# connected by pg_type (4.5.4.6.2, 6.14, 6.15).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn)
+# connected by pg_type (4.5.4.6.2, 6.14, 6.15); table VCMs on fields of
+# packed and unpacked struct ports (6.30 -field).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -407,3 +408,6 @@ upf_error_in(gating e_ps1 "define_power_switch_cell -cells S -type header" "defi
 upf_error_in(gating e_ps2 "define_power_switch_cell -cells S -type footer -stage_1_enable en -power_switchable V -power P" "a footer cell switches ground, not -power_switchable (7.6)")
 upf_error_in(gating e_ret1 "define_retention_cell -cells R -power P -ground G -save_function {pg high} -restore_function {pg high}" "-save_function and -restore_function are both {pg high} (7.7)")
 upf_error_in(gating e_ret2 "define_retention_cell -cells R -power P -ground G -hold_check clk -save_check !clk -restore_check clk" "-restore_check needs clk high, -save_check needs it low, and -hold_check holds clk (7.7)")
+upf_error_in(vcmfield e_fld1 "create_vcm WHOLE -hdl_type {sv pw_pkg::stat_t} -conversion_direction hdl2upf -table {{{3} {FULL_ON}} {{0} {OFF}}}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm WHOLE" "converts the whole struct pw_pkg::stat_t; a struct with several fields needs -field (6.30)")
+upf_error_in(vcmfield e_fld2 "create_vcm NOPE -hdl_type {sv pw_pkg::stat_t} -field nope -conversion_direction hdl2upf -table {{{3} {FULL_ON}} {{0} {OFF}}}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm NOPE" "VCM IEEE::NOPE -field nope: it has no field nope (6.30)")
+upf_error_in(vcmfield e_fld3 "create_vcm K2U -hdl_type {sv pw_pkg::stat_t} -field ok -conversion_direction hdl2upf -table {{{1} {FULL_ON}} {{0} {OFF}}}\ncreate_vcm BOTH -vcms {M2U K2U}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm BOTH" "only a struct input takes one upf2hdl VCM for each of its fields (6.30)")

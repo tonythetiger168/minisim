@@ -244,6 +244,22 @@ inline AV aeval(const E& e, bool& exact) {
                                          : ival::IV{0, ival::ceilMask(std::max(ua.hi, ub.hi))};
             return conv(AV{q.lo, q.hi, w, false}, w, s);
         }
+        case Op::Slice: {   // v[hi:lo]: the bits of every value in the range
+            AV a = aeval(e->kids[0], exact);
+            if (exact) return concrete(e, exact);
+            int n = e->hi - e->lo + 1;
+            if (isFull(a) || n < 1 || n > 64 || e->lo < 0 || e->lo >= a.w) return full(n < 1 ? 1 : n, false);
+            AV u = conv(a, a.w, false);
+            if (isFull(u)) return full(n, false);
+            // Above the low bits the values are still consecutive: all of
+            // the n-bit values when they span that many, else the range
+            // unless it wraps.
+            i128 lo = u.lo >> e->lo, hi = u.hi >> e->lo;
+            if (hi - lo >= ((i128)1 << n) - 1) return full(n, false);
+            i128 m = ((i128)1 << n) - 1;
+            if ((lo & m) > (hi & m)) return full(n, false);
+            return {lo & m, hi & m, n, false};
+        }
         case Op::Shl: case Op::Shr: {
             bool ea, eb;
             AV a = aeval(e->kids[0], ea), b = aeval(e->kids[1], eb);
@@ -1158,7 +1174,12 @@ static int doRandomize(int obj, const RandCall* rc) {
         g_fr = callFr;
         for (const E& a : rc->args) {
             int addr = a->at ? (int)eval(a->at, rd).v + a->sig : R(a->sig);
-            scalars.push_back({addr, S.sigs[addr].w, a->sgn, false, obj});
+            bool cyc = false;   // a randc property stays cyclic when named (18.11)
+            if (obj > 0 && !S.sigs[obj].val.x && S.sigs[obj].val.v < classRt().size())
+                if (const auto& sp = classRt()[(size_t)S.sigs[obj].val.v].rand)
+                    for (const RandVar& rv : sp->vars)
+                        if (!rv.dyn && !rv.obj && addr >= obj + rv.off && addr < obj + rv.off + rv.count) cyc = rv.randc;
+            scalars.push_back({addr, S.sigs[addr].w, a->sgn, cyc, obj});
         }
         for (const auto& ca : rc->contArgs) {   // randomize(q): its size and elements
             RCont c;
