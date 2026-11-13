@@ -103,41 +103,6 @@ inline std::vector<std::string> fileWords(const std::string& path, bool& ok) {
     return w;
 }
 
-// An -input Tcl file in the msim -do language (interactive.inc): commands
-// split at ';' and new lines, `run 100 ns` and `run 100ns` kept with their
-// unit, `value` as print, `deposit x = 1` as deposit x 1. Waveform and
-// database commands have no counterpart here and are dropped with a note.
-inline bool tclToDo(const std::string& in, const std::string& outPath, const std::string& tool) {
-    std::ifstream f(in);
-    if (!f) return false;
-    std::ofstream o(outPath);
-    std::string line;
-    while (std::getline(f, line)) {
-        std::stringstream parts(line);
-        for (std::string cmd; std::getline(parts, cmd, ';');) {
-            std::istringstream is(cmd);
-            std::vector<std::string> a;
-            for (std::string t; is >> t;) {
-                if (t == "=") continue;
-                a.push_back(t);
-            }
-            if (a.empty() || a[0][0] == '#') continue;
-            std::string c = a[0];
-            if (c == "value") c = "print";
-            if (c == "finish") c = "quit";
-            if (c == "database" || c == "probe" || c == "dumptcf" || c == "assertion" || c == "set" || c == "source" ||
-                c == "simvision") {
-                std::cerr << tool << ": the -input command '" << c << "' is not supported; ignored\n";
-                continue;
-            }
-            o << c;
-            for (size_t k = 1; k < a.size(); k++) o << ' ' << a[k];
-            o << '\n';
-        }
-    }
-    return true;
-}
-
 // msim's one table of Cadence options in the shared compatibility layer
 // (compat.hpp): the plain renames, and the options accepted with no effect
 // here. What needs more than a rename (-f files, -incdir and -define values,
@@ -182,7 +147,7 @@ inline std::span<const compat::Rule> cadenceRules() {
         {C, "-covdut", Act::Drop, {}, true}, {C, "-uvmlinedebug", Act::Drop, {}, true},
         {C, "-xmlibdirpath", Act::Drop, {}, true}, {C, "-nclibdirpath", Act::Drop, {}, true},
         {C, "-cdslib", Act::Drop, {}, true}, {C, "-hdlvar", Act::Drop, {}, true}, {C, "-work", Act::Drop, {}, true},
-        {C, "-snapshot", Act::Drop, {}, true}, {C, "-tcl", Act::Drop, {}, true}, {C, "-vlog_ext", Act::Drop, {}, true},
+        {C, "-snapshot", Act::Drop, {}, true}, {C, "-tcl", Act::Rename, "-i"}, {C, "-vlog_ext", Act::Drop, {}, true},
         {C, "-sysv_ext", Act::Drop, {}, true}, {C, "-vhdl_ext", Act::Drop, {}, true},
         {C, "-amsfastspice", Act::Drop, {}, true}, {C, "-licqueue_time", Act::Drop, {}, true},
         {C, "-hostname", Act::Drop, {}, true}, {C, "-layout", Act::Drop, {}, true},
