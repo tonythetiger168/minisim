@@ -97,6 +97,7 @@ public:
     // 'event history) becomes `always @*` instead of a loop that waits on its
     // signals, which simulates the same but is not a synthesizable form.
     bool synth = false;
+    bool firstRunWait = true;   // false for mlint: the #0 before a process's first run is a simulation detail
 
     void add(const std::vector<UP>& units) {
         for (auto& u : units) {
@@ -117,6 +118,7 @@ public:
         std::vector<std::string> r;
         for (auto& u : order)
             if (u->k == Unit::Entity) r.push_back(u->text);
+        for (auto& [n, c] : configs) r.push_back(c->text);
         return r;
     }
     std::string entityText(const std::string& lowName) const {
@@ -155,6 +157,13 @@ public:
             if (u->k == Unit::Package || u->k == Unit::PackageInst) emitPkg(u);
         for (auto& u : order)
             if (u->k == Unit::Entity) o << emitEntity(u);
+        // a configuration declaration is a module of its own name: the entity with
+        // the configuration's architecture and bindings (-top or an instance names it)
+        for (auto& [n, c] : configs) {
+            auto e = entities.find(c->of);
+            if (e == entities.end()) throw Error(c->file + ":" + std::to_string(c->line) + ": configuration '" + c->text + "' of an unknown entity '" + c->ofText + "'");
+            variant(e->second, c->configArch, c, svId(c->text), {});
+        }
         emitVariants();
         o << lateModules.str();
         return o.str();
@@ -173,6 +182,7 @@ private:
         std::set<std::string> prev;            // signals whose previous value the process keeps ('event)
         std::map<std::string, std::string> drv;   // signal SV name -> driver variable
         bool active = false;
+        bool waits = false;   // a process with wait statements (no sensitivity list)
         std::string label;
         std::map<std::string, TP> drvTypes;
     };
@@ -199,6 +209,10 @@ private:
         std::string file;
         int indent = 1;
         std::map<std::string, std::string> drvNames;   // module: signals with driver variables
+        UP cfgUnit;                     // module: bindings from a configuration
+        std::vector<UP> cfgSpecs;       // module: configuration specifications of the architecture
+        std::ostringstream* helpers = nullptr;   // module: implicit-signal helpers, before the processes
+        std::set<std::string> helperDone;
     };
     Ctx* cx = nullptr;
     int uniq = 0;
@@ -2017,31 +2031,161 @@ private:
         return v;
     }
 
+    // The signal of an attribute prefix: a helper process at module level can
+    // name it when it is a module signal or port, or a package signal.
+    bool helperReach(const EP& pe) {
+        if (!cx->helpers) return false;
+        EP b = pe;
+        while (b && (b->k == EK::Call || (b->k == EK::Sel && b->a && b->a->k != EK::Name))) {
+            if (b->k == EK::Call)
+                for (auto& x : b->args)   // s(i) inside a loop or generate: i is not visible at module level
+                    if (!x.actual || (x.actual->k != EK::Int && x.actual->k != EK::Char)) return false;
+            b = b->a;
+        }
+        if (!b) return false;
+        std::string n = b->k == EK::Name ? b->name : b->a ? b->a->name : "";
+        for (size_t i = 1; i < cx->scopes.size(); ++i)
+            if (cx->scopes[i].count(n)) return false;   // declared in a block, process or subprogram
+        if (cx->inFunc) return false;
+        return true;
+    }
+    // Implicit signals of S (16.2.4), kept by one helper process per signal:
+    //   H__v  S as of the last event the helper saw, H__l the value before it,
+    //   H__t  time of the last event (-1: none), H__e set in the delta of the event,
+    //   H__ta / H__ae the same for transactions, H__tr S'transaction, H__i ready.
+    // A process that runs in the delta of an event before the helper sees
+    // S !== H__v, so every reader gets the delta right whatever the order.
+    std::string sigHelper(const Val& p) {
+        std::string h;
+        for (char c : p.s) h.push_back(std::isalnum((unsigned char)c) || c == '_' ? c : '_');
+        h += "__a";
+        if (cx->helperDone.insert(h).second) {
+            TP t = p.t ? p.t : bt["std_ulogic"];
+            std::vector<std::string> ev;
+            addEvent(ev, p.s, t);
+            auto& o = *cx->helpers;
+            o << "  " << svDecl(t, h + "__v") << ";\n  " << svDecl(t, h + "__l") << ";\n";
+            o << "  bit " << h << "__e, " << h << "__ae, " << h << "__tr, " << h << "__i, " << h << "__q, " << h << "__qv;\n";
+            o << "  realtime " << h << "__t = -1, " << h << "__ta = -1;\n";
+            o << "  always begin\n    #0; " << h << "__v = " << p.s << "; " << h << "__l = " << p.s << "; " << h << "__qv = " << h << "__q; " << h << "__i = 1;\n";
+            o << "    forever begin\n      @(" << eventList(ev) << " or " << h << "__q);\n";
+            o << "      if (" << p.s << " !== " << h << "__v) begin " << h << "__l = " << h << "__v; " << h << "__v = " << p.s << "; "
+              << h << "__e = 1; " << h << "__e <= 0; " << h << "__t = $realtime; end\n";
+            o << "      " << h << "__qv = " << h << "__q; " << h << "__ae = 1; " << h << "__ae <= 0; " << h << "__ta = $realtime; " << h << "__tr = !" << h << "__tr;\n";
+            o << "    end\n  end\n";
+        }
+        return h;
+    }
+    // a signal assignment is a transaction of its target ('active, 'transaction, 'quiet)
+    std::string transactionOf(const EP& target) {
+        if (!target || trNames.empty()) return "";
+        EP b = target;
+        while (b && (b->k == EK::Call || b->k == EK::Sel)) b = b->a;
+        if (!b || b->k != EK::Name || !trNames.count(b->name) || !helperReach(b)) return "";
+        Val v = ex(b, nullptr);
+        std::string h = sigHelper(v);
+        return " " + h + "__q <= !" + h + "__q;";
+    }
+    std::set<std::string> trNames;   // signals whose transactions are observed
+    void scanTr(const EP& e) {
+        if (!e) return;
+        if (e->k == EK::Attr && (e->name == "transaction" || e->name == "active" || e->name == "quiet" || e->name == "last_active")) {
+            EP b = e->a;
+            while (b && (b->k == EK::Call || b->k == EK::Sel)) b = b->a;
+            if (b && b->k == EK::Name) trNames.insert(b->name);
+        }
+        scanTr(e->a); scanTr(e->b);
+        for (auto& x : e->args) scanTr(x.actual);
+        for (auto& x : e->agg) scanTr(x.value);
+    }
+
+    void scanTrStmts(const std::vector<SP>& v) {
+        for (auto& st : v) {
+            if (!st) continue;
+            scanTr(st->target); scanTr(st->value); scanTr(st->cond); scanTr(st->range); scanTr(st->forTime);
+            scanTr(st->report); scanTr(st->call);
+            for (auto& w : st->waves) { scanTr(w.val); scanTr(w.after); }
+            for (auto& a : st->alts) {
+                scanTr(a.cond);
+                for (auto& w : a.waves) { scanTr(w.val); scanTr(w.after); }
+                scanTrStmts(a.body);
+            }
+            for (auto& x : st->on) scanTr(x);
+            for (auto& x : st->sens) scanTr(x);
+            for (auto& x : st->portMap) scanTr(x.actual);
+            scanTrStmts(st->body);
+        }
+    }
+
     Val signalAttr(const EP& e, const Val& p) {
         Val v;
         const std::string& a = e->name;
         std::string prev = prevName(p.s);
-        if (a == "event" || a == "active") {
-            requirePrev(p.s);
-            v.s = "(" + p.s + " !== " + prev + ")";
-            v.t = bt["boolean"];
-            return v;
+        static const std::string HIGH = "(9223372036854775807.0*1fs)";
+        bool T = e->b != nullptr;
+        bool helper = helperReach(e->a);
+        // in a process with a sensitivity list the value at its last resume is the previous value
+        bool usePrev = cx->proc && !cx->proc->waits && !T;
+        if (a == "event" || a == "active" || a == "last_value" || a == "stable" || a == "quiet") {
+            if (usePrev || !helper) {
+                if (T) fail(e->line, "'" + a + "(T) of a signal declared in a block or process is not supported yet");
+                requirePrev(p.s);
+                if (a == "last_value") { v.s = prev; v.t = p.t; return v; }
+                v.t = bt["boolean"];
+                v.s = "(" + p.s + (a == "stable" || a == "quiet" ? " === " : " !== ") + prev + ")";
+                return v;
+            }
         }
-        if (a == "last_value") {
-            requirePrev(p.s);
-            v.s = prev;
-            v.t = p.t;
-            return v;
-        }
+        if (!helper) fail(e->line, "signal attribute '" + a + " of a signal declared in a block or process is not supported yet");
+        std::string h = sigHelper(p);
+        std::string chg = "(" + h + "__i && " + p.s + " !== " + h + "__v)";
+        std::string evNow = "(" + chg + " || " + h + "__e)";
+        std::string actNow = "(" + chg + " || (" + h + "__i && " + h + "__q !== " + h + "__qv) || " + h + "__ae)";
+        std::string lastEv = "(" + chg + " ? 0.0 : " + h + "__t < 0 ? " + HIGH + " : $realtime - " + h + "__t)";
+        std::string lastAct = "((" + chg + " || (" + h + "__i && " + h + "__q !== " + h + "__qv)) ? 0.0 : " + h + "__ta < 0 ? " + HIGH + " : $realtime - " + h + "__ta)";
+        v.t = bt["boolean"];
+        if (a == "event") { v.s = evNow; return v; }
+        if (a == "active") { v.s = actNow; return v; }
+        if (a == "last_value") { v.s = "(" + chg + " ? " + h + "__v : " + h + "__i ? " + h + "__l : " + p.s + ")"; v.t = p.t; return v; }
+        if (a == "last_event" || a == "last_active") { v.s = a == "last_event" ? lastEv : lastAct; v.t = bt["time"]; return v; }
+        if (a == "transaction") { v.s = h + "__tr"; v.t = bt["bit"]; return v; }
         if (a == "stable" || a == "quiet") {
-            if (e->b) fail(e->line, "'" + a + "(T) is not supported yet");
-            requirePrev(p.s);
-            v.s = "(" + p.s + " === " + prev + ")";
-            v.t = bt["boolean"];
+            std::string now = a == "stable" ? evNow : actNow, last = a == "stable" ? lastEv : lastAct;
+            if (!T) { v.s = "(!" + now + ")"; return v; }
+            std::string tm = ex(e->b, bt["time"]).s;
+            v.s = "((" + tm + ") == 0 ? !" + now + " : " + last + " >= (" + tm + "))";
+            // for a process sensitive to S'stable(T): an event when it may change, at a change of S and T later
+            if (!wakeOf.count(v.s)) {
+                std::string w = h + "__w" + std::to_string(++uniq);
+                wakeOf[v.s] = w;
+                *cx->helpers << "  bit " << w << ";\n  always begin @(" << (a == "stable" ? h + "__v" : h + "__tr") << "); "
+                             << w << " = !" << w << "; " << w << " <= #(" << tm << ") !" << w << "; end\n";
+            }
+            return v;
+        }
+        if (a == "delayed") {
+            std::string tm = T ? ex(e->b, bt["time"]).s : "0";
+            std::string d = h + "__d" + std::to_string(++uniq);
+            std::string key = h + "|delayed|" + tm;
+            auto it = delayedNames.find(cx->container + "|" + key);
+            if (it != delayedNames.end()) d = it->second;
+            else {
+                delayedNames[cx->container + "|" + key] = d;
+                std::vector<std::string> ev;
+                addEvent(ev, p.s, p.t);
+                auto& o = *cx->helpers;
+                o << "  " << svDecl(p.t, d) << ";\n";
+                o << "  always begin\n    #0; " << d << " = " << p.s << ";\n    forever begin @(" << eventList(ev) << "); "
+                  << d << " <= " << (T ? "#(" + tm + ") " : "") << p.s << "; end\n  end\n";
+            }
+            v.s = d;
+            v.t = p.t;
             return v;
         }
         fail(e->line, "signal attribute '" + a + " is not supported yet");
     }
+    std::map<std::string, std::string> delayedNames;
+    std::map<std::string, std::string> wakeOf;   // S'stable(T) expression -> its wake-up variable
     std::string prevName(const std::string& s) {
         std::string r;
         for (char c : s) r.push_back(std::isalnum((unsigned char)c) || c == '_' ? c : '_');
@@ -3967,7 +4111,7 @@ endpackage
             for (auto& w : s.waves) {
                 if (w.val->k == EK::Null) continue;
                 std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                r += I + tg + " <= " + d + assignRhs(w.val, tt) + ";\n";
+                r += I + tg + " <= " + d + assignRhs(w.val, tt) + ";" + transactionOf(s.target) + "\n";
             }
             break;
         }
@@ -3980,7 +4124,7 @@ endpackage
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + "; ";
+                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + ";" + (sig ? transactionOf(s.target) : "") + " ";
                 }
                 if (a.cond) r += I + (i ? "else if (" : "if (") + boolOf(ex(a.cond, bt["boolean"])).s + ") begin " + body + "end\n";
                 else r += I + "else begin " + body + "end\n";
@@ -3999,7 +4143,7 @@ endpackage
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + "; ";
+                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + ";" + (sig ? transactionOf(s.target) : "") + " ";
                 }
                 r += I + "  " + labels[ai] + ": begin " + body + "end\n";
             }
@@ -4210,6 +4354,14 @@ endpackage
             static const std::set<std::string> arrayAttrs = {"length", "left", "right", "high", "low", "range", "reverse_range", "ascending", "element", "subtype", "base"};
             if (!arrayAttrs.count(e->name)) readSignals(e->a, out);   // 'length etc. do not read the value
             readSignals(e->b, out);
+            // implicit signals (16.2.4): S'delayed, S'transaction, and the times S'stable(T) / S'quiet(T) change
+            if (e->name == "delayed" || e->name == "transaction" || ((e->name == "stable" || e->name == "quiet") && e->b)) {
+                Val v = exQuiet(e);
+                if (!v.s.empty()) {
+                    auto w = wakeOf.find(v.s);
+                    addUnique(out, w != wakeOf.end() ? w->second : v.s);
+                }
+            }
             return;
         }
         case EK::Agg:
@@ -4601,33 +4753,148 @@ endpackage
     // an instance whose actual is ascending uses a copy of the module, emitted
     // once per set of ascending ports, where those ports are ascending.
     const std::set<std::string>* ascPorts = nullptr;
-    std::string modSuffix;
-    std::set<std::string> variantsDone;
     std::ostringstream lateModules;
-    std::string unconVariant(const UP& ent, const std::set<std::string>& asc) {
-        std::string suf = "__to";
-        for (auto& n : asc) suf += "_" + n;
-        if (variantsDone.insert(ent->name + suf).second) variantsTodo.push_back({ent, asc});
-        return suf;
+    // A copy of an entity's module: another architecture (entity e(a), a
+    // configuration), other bindings for its component instances, ascending
+    // unconstrained ports. Emitted once per distinct copy, after the others.
+    // the actuals of an entity's generic types and subprograms (6.5.6.1), per instance
+    struct GenBind {
+        std::vector<std::pair<std::string, TP>> types;
+        std::vector<std::pair<std::string, std::vector<Sym>>> subs;
+        std::string key;
+    };
+    struct Variant {
+        UP ent;
+        std::string arch;              // "" : the most recently analyzed
+        UP cfg;                        // bindings (Unit::binds), may be null
+        std::set<std::string> asc;
+        std::string name;
+        std::shared_ptr<GenBind> gen;
+    };
+    static bool hasTypeGenerics(const UP& ent) {
+        for (auto& g : ent->generics)
+            if (g->cls == "type" || g->cls == "subprogram") return true;
+        return false;
     }
-    std::deque<std::pair<UP, std::set<std::string>>> variantsTodo;
+    std::map<std::string, int> genIds;
+    // resolve the generic type and subprogram actuals of an instance in the instantiating context
+    std::shared_ptr<GenBind> genericBinding(const UP& ent, const std::vector<Assoc>& gm, int line) {
+        auto gb = std::make_shared<GenBind>();
+        size_t pos = 0;
+        for (auto& g : ent->generics)
+            for (size_t k = 0; k < g->names.size(); ++k, ++pos) {
+                if (g->cls != "type" && g->cls != "subprogram") continue;
+                const std::string& n = g->names[k];
+                EP act;
+                for (size_t i = 0; i < gm.size(); ++i) {
+                    if (gm[i].formal && gm[i].formal->k == EK::Name && gm[i].formal->name == n) act = gm[i].actual;
+                    if (!gm[i].formal && i == pos) act = gm[i].actual;
+                }
+                if (act && act->k == EK::Open) act = nullptr;
+                if (g->cls == "type") {
+                    if (!act) fail(line, "no actual for generic type '" + g->texts[k] + "'");
+                    TP t;
+                    if (act->k == EK::Call) {
+                        SubInd si;
+                        si.mark = act->a;
+                        for (auto& a : act->args) si.idx.push_back(a.actual);
+                        t = subtype(si);
+                    } else t = typeOfMark(act);
+                    gb->types.push_back({n, t});
+                    gb->key += "T" + n + "=" + svDecl(t, "") + ";";
+                    continue;
+                }
+                std::string look = n;
+                if (act && (act->k == EK::Name || act->k == EK::Sel)) look = act->name;
+                else if (act && act->k == EK::Str) look = "\"" + lowerStr(act->text) + "\"";
+                else if (!act && g->target) look = g->target->name;
+                const std::vector<Sym>* syms = lookupAll(look);
+                std::vector<Sym> v;
+                if (syms)
+                    for (auto& y : *syms)
+                        if (y.k == Sym::Sub) {
+                            if (y.home.empty() && y.builtin.empty())
+                                fail(line, "the actual of generic subprogram '" + g->texts[k] + "' must be declared in a package");
+                            v.push_back(y);
+                        }
+                if (v.empty()) {
+                    if (n.size() > 2 && n[0] == '"') continue;   // a predefined operator stays predefined
+                    fail(line, "no subprogram '" + look + "' for generic '" + g->texts[k] + "'");
+                }
+                gb->subs.push_back({n, v});
+                gb->key += "S" + n + "=" + look + "@" + v.front().home + ";";
+            }
+        return gb;
+    }
+    std::map<std::string, std::string> variantByKey;
+    std::map<const Unit*, int> cfgIds;
+    std::deque<Variant> variantsTodo;
+    std::string variant(const UP& ent, std::string arch, const UP& cfg, std::string base, const std::set<std::string>& asc, std::shared_ptr<GenBind> gen = nullptr) {
+        UP def = archOf(ent->name);
+        if (def && arch == def->name) arch.clear();
+        if (!arch.empty() && !archOf(ent->name, arch).get()) {
+            bool found = false;
+            if (auto it = archs.find(ent->name); it != archs.end())
+                for (auto& a : it->second) found = found || a->name == arch;
+            if (!found) throw Error(ent->file + ":" + std::to_string(ent->line) + ": entity '" + ent->text + "' has no architecture '" + arch + "'");
+        }
+        bool plainCfg = !cfg || cfg->binds.empty();
+        bool named = !base.empty();   // a configuration: a module of its own name
+        if (!named) {
+            base = svId(ent->text);
+            if (!arch.empty()) base += "__" + arch;
+            if (!plainCfg) {
+                auto it = cfgIds.insert({cfg.get(), (int)cfgIds.size() + 1}).first;
+                base += "__cfg" + std::to_string(it->second);
+            }
+        }
+        std::string name = base;
+        if (gen && !gen->key.empty()) {
+            auto it = genIds.insert({ent->name + "|" + gen->key, (int)genIds.size() + 1}).first;
+            name += "__g" + std::to_string(it->second);
+        }
+        if (!asc.empty()) { name += "__to"; for (auto& n : asc) name += "_" + n; }
+        if (!named && arch.empty() && plainCfg && asc.empty() && !(gen && !gen->key.empty())) return name;   // the entity's own module
+        if (variantByKey.insert({name, name}).second) variantsTodo.push_back({ent, arch, plainCfg ? nullptr : cfg, asc, name, gen});
+        return name;
+    }
     // after the other modules (emitting one is not reentrant)
     void emitVariants() {
         while (!variantsTodo.empty()) {
-            auto [ent, asc] = variantsTodo.front();
+            Variant v = variantsTodo.front();
             variantsTodo.pop_front();
-            std::string suf = "__to";
-            for (auto& n : asc) suf += "_" + n;
-            ascPorts = &asc;
-            modSuffix = suf;
-            try { lateModules << emitEntity(ent); } catch (...) { ascPorts = nullptr; modSuffix.clear(); throw; }
+            ascPorts = &v.asc;
+            modNameOverride = v.name;
+            wantArch = v.arch;
+            curCfg = v.cfg;
+            curGen = v.gen;
+            try { lateModules << emitEntity(v.ent); } catch (...) { ascPorts = nullptr; modNameOverride.clear(); wantArch.clear(); curCfg = nullptr; curGen = nullptr; throw; }
             ascPorts = nullptr;
-            modSuffix.clear();
+            modNameOverride.clear();
+            wantArch.clear();
+            curCfg = nullptr;
+            curGen = nullptr;
         }
+    }
+    std::shared_ptr<GenBind> curGen;
+    std::string modNameOverride, wantArch;
+    UP curCfg;   // the configuration whose bindings apply to the module being emitted
+    // the binding of a component instance: the configuration's, else a configuration specification
+    const Unit::Bind* bindingOf(const std::string& label, const std::string& comp) {
+        auto pick = [&](const std::vector<Unit::Bind>& v) -> const Unit::Bind* {
+            for (auto& b : v) if (b.label == label && b.comp == comp) return &b;
+            for (auto& b : v) if (b.label == "all" && b.comp == comp) return &b;
+            for (auto& b : v) if (b.label == "others" && b.comp == comp) return &b;
+            return nullptr;
+        };
+        if (cx->cfgUnit) if (auto b = pick(cx->cfgUnit->binds)) return b;
+        for (auto& c : cx->cfgSpecs) if (auto b = pick(c->binds)) return b;
+        return nullptr;
     }
 
     std::string emitEntity(const UP& ent) {
-        UP arch = archOf(ent->name);
+        if (hasTypeGenerics(ent) && !curGen) return "";   // emitted per instance (variant)
+        UP arch = archOf(ent->name, wantArch);
         Ctx c;
         c.container = ent->text;
         c.scopes.push_back(Scope());
@@ -4636,6 +4903,11 @@ endpackage
         std::set<std::string> specDone;
         c.extra = &extra;
         c.specDone = &specDone;
+        c.cfgUnit = curCfg;
+        if (arch)
+            for (auto& d : arch->decls)
+                if (d->k == DK::Config && d->cfg) c.cfgSpecs.push_back(d->cfg);
+        std::string modName = modNameOverride.empty() ? svId(ent->text) : modNameOverride;
         Ctx* saved = cx;
         cx = &c;
         litNames.clear();
@@ -4654,7 +4926,28 @@ endpackage
             // generics
             std::vector<std::string> plist;
             for (auto& g : ent->generics) {
-                if (g->cls == "type" || g->cls == "subprogram" || g->cls == "package") fail(g->line, "generic types, subprograms and packages are not supported yet");
+                if (g->cls == "package") fail(g->line, "package generics are not supported yet");
+                if (g->cls == "type" || g->cls == "subprogram") {
+                    for (size_t k = 0; k < g->names.size(); ++k) {
+                        const std::string& n = g->names[k];
+                        if (g->cls == "type") {
+                            for (auto& [tn, tt] : curGen->types)
+                                if (tn == n) {
+                                    Sym y;
+                                    y.k = Sym::TypeK;
+                                    y.name = n;
+                                    y.text = g->texts[k];
+                                    y.type = tt;
+                                    declare(y);
+                                }
+                        } else {
+                            for (auto& [sn, syms] : curGen->subs)
+                                if (sn == n)
+                                    for (auto y : syms) { y.name = n; declare(y); }
+                        }
+                    }
+                    continue;
+                }
                 TP t = subtype(g->type);
                 for (size_t k = 0; k < g->names.size(); ++k) {
                     Sym y;
@@ -4683,7 +4976,7 @@ endpackage
                 TP t = subtype(p->type);
                 if (isUnconstrained(t)) {
                     // an unconstrained array port (6.5.6.3): the actual gives its range, through
-                    // two parameters per port; the direction is the module's (see unconVariant)
+                    // two parameters per port; the direction is the module's (see variant)
                     if (t->k != Type::Array || t->dims.size() != 1 || !t->dims[0].box || (t->elem && isUnconstrained(t->elem)))
                         fail(p->line, "unconstrained port '" + p->texts[0] + "': only a one-dimensional array with a constrained element is supported");
                     for (size_t k = 0; k < p->names.size(); ++k) {
@@ -4739,7 +5032,7 @@ endpackage
             std::string imports = "import vhdl_rt::*;";
             for (auto& pk : c.usePkgs) imports += " import " + svId(pk) + "::*;";
             for (auto& [n, pi] : c.useItems) imports += " import " + svId(pi.first) + "::" + svIdOfPkgItem(pi.first, pi.second) + ";";
-            o << lineDir(ent->line) << "module " << svId(ent->text) << modSuffix << " " << imports;
+            o << lineDir(ent->line) << "module " << modName << " " << imports;
             if (!plist.empty()) {
                 o << " #(";
                 for (size_t i = 0; i < plist.size(); ++i) o << (i ? ", " : "") << plist[i];
@@ -4763,10 +5056,14 @@ endpackage
                 emitDecls(body, arch->decls, "module");
             }
             // concurrent statements
+            std::ostringstream conc, helpers;
+            c.helpers = &helpers;
+            trNames.clear();
+            scanTrStmts(stmts);
             curDrivers = &di;
-            for (auto& s : stmts) body << concStmt(*s, "");
+            for (auto& s : stmts) conc << concStmt(*s, "");
             curDrivers = nullptr;
-            o << body.str() << extra.str() << "endmodule\n";
+            o << body.str() << helpers.str() << conc.str() << extra.str() << "endmodule\n";
         } catch (...) {
             cx = saved;
             throw;
@@ -4906,7 +5203,7 @@ endpackage
     // included, hold their initial values (14.7.5.2). Port connections are
     // continuous assignments, so the first run waits one #0: the connections
     // settle in the active region first.
-    std::string firstRun() const { return synth ? "" : "    static bit vhdl_go; if (!vhdl_go) begin vhdl_go = 1; #0; end\n"; }
+    std::string firstRun() const { return synth || !firstRunWait ? "" : "    static bit vhdl_go; if (!vhdl_go) begin vhdl_go = 1; #0; end\n"; }
 
     std::string procName(const std::string& label) { return label.empty() ? "" : " : " + svId(label); }
 
@@ -5094,6 +5391,7 @@ endpackage
     std::string process(const Stmt& s) {
         Proc pr;
         pr.active = true;
+        pr.waits = !s.hasSens;
         pr.label = s.label;
         setupDrivers(pr, s);
         Proc* saved = cx->proc;
@@ -5215,7 +5513,34 @@ endpackage
     std::string instance(const Stmt& s) {
         std::string unit = s.unit->name;
         std::string label = s.label.empty() ? "u" + std::to_string(++uniq) : s.label;
-        if (s.unitKind == "configuration") fail(s.line, "configuration instantiation is not supported yet");
+        std::string bindEntity;
+        // the architecture and bindings to use: entity e(a), a configuration, a binding
+        std::string useArch = s.arch;
+        UP useCfg;
+        std::string cfgBase;
+        if (s.unitKind == "configuration") {
+            auto c = configs.find(unit);
+            if (c == configs.end()) fail(s.line, "unknown configuration '" + s.unit->text + "'");
+            useCfg = c->second;
+            unit = useCfg->of;
+            useArch = useCfg->configArch;
+            cfgBase = svId(useCfg->text);
+        } else if (s.unitKind != "entity") {
+            if (const Unit::Bind* b = bindingOf(lowerStr(label), unit)) {
+                if (b->isConfig) {
+                    auto c = configs.find(b->entity);
+                    if (c == configs.end()) fail(s.line, "unknown configuration '" + b->entity + "'");
+                    useCfg = c->second;
+                    useArch = useCfg->configArch;
+                    cfgBase = svId(useCfg->text);
+                    bindEntity = useCfg->of;
+                } else {
+                    if (!b->entity.empty()) bindEntity = b->entity;
+                    useArch = b->arch;
+                    if (b->sub) { useCfg = b->sub; if (useArch.empty()) useArch = b->sub->configArch; }
+                }
+            }
+        }
         // the design unit: a VHDL entity (by component name or entity name), else an SV module
         std::string modName;
         std::vector<std::string> formalPorts, formalGenerics;   // in declaration order (SV spelling)
@@ -5223,10 +5548,12 @@ endpackage
         std::vector<TP> portTypes;
         std::vector<TP> genTypes;
         UP ent;
-        if (auto e = entities.find(unit); e != entities.end()) ent = e->second;
-        const Sym* comp = s.unitKind == "entity" ? nullptr : lookup(unit);
+        if (auto e = entities.find(bindEntity.empty() ? unit : bindEntity); e != entities.end()) ent = e->second;
+        const Sym* comp = s.unitKind == "entity" || s.unitKind == "configuration" ? nullptr : lookup(unit);
         if (comp && comp->k != Sym::Comp) comp = nullptr;
         // component without an entity: an SV module of the same name (case-insensitively)
+        std::shared_ptr<GenBind> genBind;
+        if (ent && hasTypeGenerics(ent)) genBind = genericBinding(ent, s.genericMap, s.line);
         if (ent) {
             modName = svId(ent->text);
             Ctx tmp;
@@ -5243,6 +5570,17 @@ endpackage
             try {
                 for (auto& d : allCtx(*ent)) for (auto& n : d->uses) useClause(n);
                 for (auto& g : ent->generics) {
+                    if (g->cls == "type" || g->cls == "subprogram") {   // bound per copy (genericBinding)
+                        for (auto& [tn, tt] : genBind->types) {
+                            Sym y;
+                            y.k = Sym::TypeK;
+                            y.name = tn;
+                            y.text = tn;
+                            y.type = tt;
+                            declare(y);
+                        }
+                        continue;
+                    }
                     TP t = g->cls.empty() || g->cls == "constant" ? subtype(g->type) : nullptr;
                     for (size_t k = 0; k < g->names.size(); ++k) {
                         lowerGenerics.push_back(g->names[k]);
@@ -5389,10 +5727,28 @@ endpackage
             }
             return items;
         };
-        std::vector<std::string> gens = mapList(s.genericMap, formalGenerics, lowerGenerics, genTypes, compGenerics, compGenTypes, false);
+        // generic types and subprograms: a copy of the module per set of actuals
+        std::vector<Assoc> genMap = s.genericMap;
+        if (ent && hasTypeGenerics(ent)) {
+            std::set<std::string> tg;
+            std::vector<bool> tgPos;
+            for (auto& g : ent->generics)
+                for (auto& n : g->names) {
+                    bool t = g->cls == "type" || g->cls == "subprogram";
+                    if (t) tg.insert(n);
+                    tgPos.push_back(t);
+                }
+            genMap.clear();
+            for (size_t i = 0; i < s.genericMap.size(); ++i) {
+                auto& a = s.genericMap[i];
+                if (a.formal ? (a.formal->k == EK::Name && tg.count(a.formal->name)) : (i < tgPos.size() && tgPos[i])) continue;
+                genMap.push_back(a);
+            }
+        }
+        std::vector<std::string> gens = mapList(genMap, formalGenerics, lowerGenerics, genTypes, compGenerics, compGenTypes, false);
         std::vector<std::string> ports = mapList(s.portMap, formalPorts, lowerPorts, portTypes, compPorts, compPortTypes, true);
         gens.insert(gens.end(), unconGens.begin(), unconGens.end());
-        if (!unconAsc.empty() && ent) modName += unconVariant(ent, unconAsc);
+        if (ent) modName = variant(ent, useArch, useCfg, cfgBase, unconAsc, genBind);
         // component generics with defaults that the instance does not map: pass the component's default
         if (comp && comp->decl) {
             for (auto& g : comp->decl->generics)

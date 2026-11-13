@@ -164,6 +164,7 @@ struct Decl {
     EP target;                         // alias target, file name, attribute value
     EP openKind;                       // file open kind
     std::string attrName;              // attribute spec
+    std::shared_ptr<struct Unit> cfg;  // configuration specification: its bindings (Unit::binds)
 };
 
 struct Subprog {
@@ -192,7 +193,11 @@ struct Unit {
     int line = 0;
     // configuration: architecture chosen for the top
     std::string configArch;
-    struct Bind { std::string label, comp, entity, arch; };
+    struct Bind {
+        std::string label, comp, entity, arch;
+        bool isConfig = false;              // use configuration <entity>
+        std::shared_ptr<Unit> sub;          // nested block configuration of the bound architecture
+    };
     std::vector<Bind> binds;
 };
 

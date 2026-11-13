@@ -11,6 +11,14 @@ Spec references are IEEE 1800-2023 clauses.
 - msim VHDL: unconstrained array ports (6.5.6.3). Each port's index range
   comes from the actual, ascending or descending, also through another
   unconstrained port; a SystemVerilog parent sets `<port>__L`/`<port>__R`.
+- msim VHDL: the signal attributes `'last_event`, `'last_active`,
+  `'delayed(T)`, `'transaction`, `'stable(T)`, `'quiet(T)` (16.2.4), also in
+  sensitivity lists; `'event`, `'active` and `'stable` in a process with
+  wait statements now see the delta of the event.
+- msim VHDL: configurations (3.4, 7.3): configuration declarations (also as
+  `-top`), configuration specifications, nested block configurations,
+  `entity e(a)` and `configuration` instances.
+- msim VHDL: generic types and generic subprograms on entities (6.5.6.1).
 - mvplat: Zbkb, Zbkx, Zabha, Zacas, Zfh (half precision), the CBO.*
   instructions (Zicboz in the device tree) and Svnapot. riscv-tests: 837
   programs (uzbkb, uzbkx, uzabha, uzacas, uzabha_zacas, uzfh, mzicbo and

@@ -29,6 +29,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | VHDL | msim |
 |---|---|
 | entity + architecture (the last analyzed one) | a module with the entity's name; generics are parameters |
+| `entity e(a)`, a configuration specification (`for u : c use entity e(a);`), a configuration declaration (3.4) | another architecture or other bindings are a copy of the module, named `e__a` or `e__cfgN`; a configuration declaration is a module with the configuration's name, so `-top cfg` and `configuration cfg` instances run it. Nested block configurations bind the instances inside the bound architecture |
 | package + package body | a package; deferred constants get the body's value |
 | process | `always` that runs the body once at time 0, then waits on the sensitivity list (VHDL's equivalent `wait on` at the end). The first run waits one `#0`, so port connections already hold their initial values (14.7.5.2) |
 | `process (clk)` + `if rising_edge(clk)`, and the async-reset form | `always @(posedge clk ...)` |
@@ -40,11 +41,13 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | component / entity / SV module instance | a module instance; a VHDL component binds to the VHDL entity or SV module with its name, matched case-insensitively |
 | for / if / case generate, block | generate blocks |
 | a resolved signal with several drivers (tri-state buses) | a wire; every driving process drives its own variable |
+| `S'delayed(T)`, `S'stable(T)`, `S'last_event`, `S'transaction` and the other implicit signals (16.2.4) | one helper process per signal keeps the time and value of its last event and transaction; `S'delayed(T)` is a nonblocking assignment delayed by T. A process with a sensitivity list reads `'event` from the value at its last resume |
 | function, procedure | `function automatic`; a procedure is a `function automatic void` unless it waits or assigns a signal (then a `task automatic`), so VHDL functions can call it. Ones with unconstrained array parameters or results, or signal parameters, are specialized per call so the widths are known |
 | protected type (5.6) | a class; `shared variable` and protected variables hold an object made at elaboration; methods are class methods (a method that needs a per-call specialization is a function taking the object) |
 | access type (5.4) | a class handle: `new`, `null`, `.all`, implicit dereference, `deallocate`. A designated record's elements are the class's own members (so a list node may hold the access type); an array is a dynamic array with its left bound and direction |
 | incomplete type | a forward `typedef class`, completed by the full declaration |
 | unconstrained array port (6.5.6.3) | the parameters `<port>__L` and `<port>__R` hold the index range the actual gives it; an instance whose actual is ascending uses a copy of the module named `<entity>__to_<ports>`. A SystemVerilog parent sets the two parameters (`par #(.d__L(7), .d__R(0)) u (.d(v), ...)`); from SystemVerilog the range is descending |
+| entity generic type and subprogram (6.5.6.1) | one copy of the module per set of actuals (`e__g1`, `e__g2`, ...), where the type and subprogram names stand for the actuals |
 | generic package, package instantiation (4.7, 4.9) | one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals |
 | `report`, `assert` | a message in GHDL's format (`file:line:col:@time:(report note): text`); severity failure stops the run with a non-zero exit |
 | `std.env.stop` / `finish` | `$stop` / `$finish` |
@@ -57,7 +60,7 @@ declared name.
 
 ### Supported language
 
-Design units: entity, architecture, package, package body, context clauses
+Design units: entity, architecture, package, package body, configuration, context clauses
 (`library`, `use`). Types: enumeration, integer and real ranges, physical
 types, constrained and unconstrained arrays (multi-dimensional too), records,
 subtypes, `line`/`text`, access types (to scalars, records, arrays and
@@ -79,8 +82,9 @@ readline/writeline, files), `std.env`, `ieee.std_logic_1164`,
 `to_hstring`, `to_ostring`, `minimum`, `maximum`, reduction operators,
 matching relational operators and `??`, `justify`, and VHDL-2019's
 `std.env` tool and source queries (`tool_name`, `vhdl_version`,
-`file_name`, `file_path`, `file_line`). Attributes: `'event`,
-`'last_value`, `'stable`, `'length`, `'range`, `'reverse_range`, `'left`,
+`file_name`, `file_path`, `file_line`). Attributes: `'event`, `'active`,
+`'last_value`, `'last_event`, `'last_active`, `'stable`, `'stable(T)`,
+`'quiet`, `'quiet(T)`, `'delayed`, `'delayed(T)`, `'transaction`, `'length`, `'range`, `'reverse_range`, `'left`,
 `'right`, `'high`, `'low`, `'ascending`, `'image`, `'value`, `'pos`, `'val`,
 `'succ`, `'pred`, `'subtype`, `'element`.
 
@@ -99,16 +103,24 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   never assigned.
 - A character of a `string(1 to n)` variable that was never assigned is a
   space, where VHDL has NUL (SystemVerilog strings hold no NUL).
-- Configurations (choosing an architecture other than the last analyzed),
-  configuration instances, and conversion functions in port maps.
+- Conversion functions in port maps.
 - Guarded signals and blocks with ports; package generics (a generic
-  package passed to another); generic types and subprograms on entities and
-  subprograms (generic packages have them); package instantiation inside a
+  package passed to another); generic types and subprograms on subprograms
+  (entities and generic packages have them); package instantiation inside a
   declarative region (library-level instances work).
+- The actual of an entity's generic subprogram is declared in a package (or
+  predefined), and the actual of a generic type is a predefined type or one
+  declared in a package. A SystemVerilog parent cannot instantiate an
+  entity with generic types.
 - Access types: to a bit vector or a multidimensional array; a slice
   through an access value read as a whole array starts at index 0 inside a
   specialized subprogram (`'left` reads 0).
-- `'delayed`, `'transaction`, `'last_event`, `'stable(T)`, `'quiet(T)`.
+- Transactions (`'active`, `'quiet`, `'transaction`, `'last_active`) are
+  seen from assignments in the signal's own architecture; through a port
+  only the events of the actual count. The signal attributes other than
+  `'event`, `'last_value` and `'stable` need a signal of the architecture,
+  a port or a package signal (not one declared in a block), and a constant
+  index (`s(3)'delayed`, not `s(i)'delayed` in a generate loop).
 - Integer range checks: an out-of-range value is not an error.
 - `'image` of a real prints `%g`-style text, not exactly GHDL's.
 - VHDL-2019 additions.

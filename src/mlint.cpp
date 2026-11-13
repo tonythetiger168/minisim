@@ -685,6 +685,7 @@ int main(int argc, char** argv) {
         fwd.push_back(vhdlStub);
         fe.afterParse = [&](driver::Driver& drv) {
             vhdl::Translator tr;
+            tr.firstRunWait = false;
             return vhdl::addVhdl(drv, vhdlFiles, "", "mlint", tr);
         };
     }

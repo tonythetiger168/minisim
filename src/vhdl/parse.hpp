@@ -205,22 +205,12 @@ private:
             auto [comp, compText] = ident();
             Unit::Bind b;
             b.comp = comp;
-            if (accept("use")) {
-                if (accept("entity")) {
-                    EP en = name();
-                    if (en->k == EK::Call) {   // e(arch)
-                        if (!en->args.empty() && en->args[0].actual) b.arch = lastName(en->args[0].actual);
-                        en = en->a;
-                    }
-                    b.entity = lastName(en);
-                } else if (accept("configuration")) {
-                    b.entity = lastName(name());
-                } else if (accept("open")) {
-                }
-                while (isKw("generic") || isKw("port")) { next(); expect("map"); assocList(); }
-                expect(";");
+            if (accept("use")) bindingIndication(b);
+            if (isKw("for")) {   // the bound architecture's own configuration
+                b.sub = std::make_shared<Unit>();
+                b.sub->k = Unit::Config;
+                configBlock(*b.sub, true);
             }
-            if (isKw("for")) configBlock(u, false);
             for (auto& l : labels) { auto bb = b; bb.label = l; u.binds.push_back(bb); }
             expect("end");
             expect("for");
@@ -228,6 +218,23 @@ private:
         }
         expect("end");
         expect("for");
+        expect(";");
+    }
+    // entity lib.e(a) | configuration lib.c | open, then optional maps and ';'
+    void bindingIndication(Unit::Bind& b) {
+        if (accept("entity")) {
+            EP en = name();
+            if (en->k == EK::Call) {   // e(arch)
+                if (!en->args.empty() && en->args[0].actual) b.arch = lastName(en->args[0].actual);
+                en = en->a;
+            }
+            b.entity = lastName(en);
+        } else if (accept("configuration")) {
+            b.entity = lastName(name());
+            b.isConfig = true;
+        } else if (accept("open")) {
+        }
+        while (isKw("generic") || isKw("port")) { next(); expect("map"); assocList(); }
         expect(";");
     }
     void skipParens() {
@@ -528,8 +535,18 @@ private:
             out.push_back(libraryClause());
         } else if (isKw("for")) {   // configuration specification: for u : c use entity ...;
             auto d = one(DK::Config);
-            while (!isOp(";")) next();
             next();
+            std::vector<std::string> labels;
+            do { labels.push_back(cur().low); next(); } while (accept(","));
+            expect(":");
+            auto [comp, compText] = ident();
+            Unit::Bind b;
+            b.comp = comp;
+            if (accept("use")) bindingIndication(b);
+            else expect(";");
+            d->cfg = std::make_shared<Unit>();
+            d->cfg->k = Unit::Config;
+            for (auto& l : labels) { auto bb = b; bb.label = l; d->cfg->binds.push_back(bb); }
             if (isKw("end") && peekKw(1, "for")) { next(); next(); expect(";"); }
         } else if (isKw("disconnect")) {
             one(DK::Disconnect);

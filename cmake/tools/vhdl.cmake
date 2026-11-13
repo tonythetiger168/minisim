@@ -19,6 +19,10 @@ if(TARGET msim)
     "generic_pkg_tb|generic_pkg.vhd|ghdl"
     "sim_order_tb|sim_order.vhd|ghdl"
     "uncon_ports_tb|uncon_ports.vhd|ghdl"
+    "sigattr_tb|sigattr.vhd|ghdl"
+    "config_tb|config.vhd|ghdl"
+    "top_cfg|config.vhd|ghdl"
+    "gentype_tb|gentype.vhd|ghdl"
     "mixed_sv_top|counter.vhd,mixed_sv_top.sv|"
     "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|"
     "mixed_uncon|uncon_ports.vhd,mixed_uncon.sv|")
