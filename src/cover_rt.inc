@@ -700,7 +700,9 @@ inline void buildCross(const CgDef& d, CgInst& in, const CgCrossDef& xd, CgCross
     std::function<void(const CgSel&)> prep = [&](const CgSel& s) {
         if (!s.isect.empty()) {
             std::vector<KR> ks;
+            g_cgWide = d.cps[xd.cps[s.cp]].wide ? &in.cps[xd.cps[s.cp]].wb : nullptr;   // keys among its bounds
             for (auto& it : s.isect) itemKeys(d.cps[xd.cps[s.cp]], it, false, ks, nullptr, nullptr);
+            g_cgWide = nullptr;
             cx.isect[&s] = std::move(ks);
         }
         for (auto& k : s.kids) prep(*k);

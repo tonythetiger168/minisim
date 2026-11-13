@@ -121,8 +121,13 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             for (size_t k = 0; k < x.targets.size(); k++)
                 if (x.targets[k] == cp) s->cp = (int)k;
             if (s->cp < 0) unsupported("binsof of a coverpoint not in the cross");
-            bool real = x.targets[s->cp]->getType().isFloating();
+            const Type& ct = x.targets[s->cp]->getType();
+            bool real = ct.isFloating();
+            // intersect values of a coverpoint wider than 64 bits keep its width
+            int savedW = cgWideW;
+            cgWideW = !real && ct.getBitWidth() > 64 ? (int)ct.getBitWidth() : 0;
             for (const Expression* e : c.intersects) s->isect.push_back(real ? cgItemReal(*e) : cgItem(*e));
+            cgWideW = savedW;
             return s;
         }
         case BinsSelectExprKind::Unary:
@@ -146,6 +151,7 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             for (size_t k = 0; k < x.targets.size(); k++) {
                 const Type& t = x.targets[k]->getType();
                 if (t.isFloating() || !t.isIntegral()) unsupported("a cross with filter over a real coverpoint (19.6.1.2)");
+                if (t.getBitWidth() > 64) unsupported("a cross with filter over a coverpoint wider than 64 bits (19.6.1.2)");
                 int sg = mkSig(x.getHierarchicalPath() + "$with" + std::to_string(cgWithSeq++) + "." + std::string(x.targets[k]->name),
                                (int)t.getBitWidth(), false);
                 s->valSigs.push_back(sg);
@@ -347,7 +353,6 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         for (const CoverpointSymbol* cp : x->targets) {
             auto it = cpIdx.find(cp);
             if (it == cpIdx.end()) unsupported("a cross of this coverpoint");
-            if (d.cps[(size_t)it->second].wide) unsupported("a cross of a coverpoint wider than 64 bits");
             cd.cps.push_back(it->second);
         }
         if (const Expression* iff = x->getIffExpr()) cd.iff = expr(*iff);
@@ -361,6 +366,14 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
                     const BinsSelectExpr* sel = b->getCrossSelectExpr();
                     if (!sel) unsupported("this cross bin");
                     xb.sel = cgSel(*sel, *x);
+                    std::function<bool(const CgSel&)> setSel = [&](const CgSel& q) {
+                        if (q.kind == 6) return true;
+                        for (const auto& k : q.kids) if (setSel(*k)) return true;
+                        return false;
+                    };
+                    for (int c : cd.cps)
+                        if (d.cps[(size_t)c].wide && setSel(*xb.sel))
+                            unsupported("a cross set expression over a coverpoint wider than 64 bits (19.6.1.3)");
                     cd.bins.push_back(std::move(xb));
                 } else if (const auto* body = bm.as_if<CoverCrossBodySymbol>())
                     bins(*body);
