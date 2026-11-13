@@ -132,9 +132,10 @@ Object names are the ones timing tools use: `/` between instance levels and no t
 
 `-cdc-html FILE` writes one self-contained page (no network, opens from
 disk) with the clock domains in colour, every crossing in a table that can be
-filtered by name or to those with a finding, the path of the selected
-crossing from its source flop through the synchronizer stages, and the reset
-synchronizers with their length. It follows the light or dark setting of the
+filtered by name or to those with a finding, a schematic of the selected
+crossing (the source flop, the nets and logic between it and the reader, the
+synchronizer stages, and for an enable-qualified bus the synchronized control
+that says when to take it), and the reset synchronizers with their length. It follows the light or dark setting of the
 browser.
 
 ## Block models
