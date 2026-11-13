@@ -13,11 +13,13 @@ Spec references are IEEE 1800-2023 clauses.
   `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
   declaration that hides one of the same name in an enclosing scope). Both
   off by default.
-- `mlint`: four more rules after Verible's, off by default: `STY013`
-  (explicit-begin: `if`/`else`/loop/`always` bodies without `begin`),
-  `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
-  `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
-  (plusarg-assignment: `$test$plusargs`).
+- VPI instance arrays (37.11): `vpi_iterate(vpiModuleArray /
+  vpiInterfaceArray / vpiProgramArray / vpiPrimitiveArray /
+  vpiInstanceArray, module)`, an array's name, size, ranges and elements,
+  `vpi_handle_by_index` / `vpi_handle_by_multi_index` on it, and from an
+  element `vpiIndex` and its array. Array elements are now named `u[2]`, and
+  `vpi_handle_by_name` picks the right element of a descending array
+  (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
 - `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
   flop, the nets and logic between it and the reader (a glitch source for
   CDC003), the synchronizer stages, and the qualifier of an enable-qualified
@@ -32,6 +34,11 @@ Spec references are IEEE 1800-2023 clauses.
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
   the reader takes), which failed on correct FIFOs such as common_cells
   `cdc_fifo_gray`.
+- `mlint`: four more rules after Verible's, off by default: `STY013`
+  (explicit-begin: `if`/`else`/loop/`always` bodies without `begin`),
+  `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
+  `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
+  (plusarg-assignment: `$test$plusargs`).
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their
@@ -75,6 +82,10 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` runs RV64: RV64IMAC harts (chosen by the program's ELF class),
+  the W instructions, LD/SD/LWU, 64-bit atomics, RV64C and Sv39 paging. The
+  riscv-tests run grows to 342 programs, RV32 and RV64, all passing. The
+  extension ABI is 3.
 - `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
   `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
   TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
@@ -794,6 +805,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `disable` of a named block from inside it is merged: it sets
+  a flag (and the break flags of the loops between) instead of jumping, and
+  the rest of the block runs under the flag, so an unknown condition around
+  it merges the rest with not running it.
 - `-xprop`: blocking writes to an element of an array of 64 elements or
   fewer chosen at run time merge exactly: the branch saves, puts back and
   merges the array's elements like variables, so two branches that write
