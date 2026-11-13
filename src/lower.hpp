@@ -12319,7 +12319,12 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 auto it = sigmap.find(formal);
                 if (it == sigmap.end()) Lowerer::unsupported("DPI argument");
                 a.sig = it->second;
-            } else if (f.isExport) Lowerer::unsupported("unpacked array argument of a DPI export");
+            } else if (f.isExport) {   // sized only (open arrays are for imports, 35.5.6.1)
+                if (a.open) Lowerer::unsupported("open array argument of a DPI export");
+                auto it = arrMap().find(formal);
+                if (it == arrMap().end() || !it->second || it->second->dynElem) Lowerer::unsupported("unpacked array argument of a DPI export");
+                a.sarr = it->second;
+            }
             f.args.push_back(std::move(a));
         }
     };

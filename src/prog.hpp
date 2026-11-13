@@ -209,6 +209,8 @@ struct DpiArg {
     std::vector<DpiField> fields;
     size_t cSize = 0;
     std::string cName;
+    // An unpacked array formal of an export: the SV formal's elements.
+    std::shared_ptr<const ArrShape> sarr;
 
     std::string name;
 };

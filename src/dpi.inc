@@ -477,6 +477,16 @@ extern "C" int msim_dpi_export(int id, void** args, void* ret) {
     for (size_t k = 0; k < f.args.size(); k++) {
         const DpiArg& a = f.args[k];
         if (a.dir == 1) continue;
+        if (a.sarr) {   // a sized array: C passes its first element's address
+            const char* base = *(const char* const*)args[k];
+            size_t eb = elemBytes(a.t, a.w);
+            for (int e = 0; e < a.sarr->count; e++) {
+                Val v = fromC(base + (size_t)e * eb, a.t, a.w, a.sgn);
+                if (a.sarr->twoState) { v.x = 0; v.z = 0; for (auto& h : v.hi) { h.x = h.z = 0; } }
+                S.set(a.sarr->base + e, v);
+            }
+            continue;
+        }
         bool vec = a.t == DT_BITVEC || a.t == DT_LOGICVEC;
         const void* p = args[k];
         if (vec || a.dir != 0) p = *(void* const*)args[k];   // by pointer
@@ -509,6 +519,20 @@ extern "C" int msim_dpi_export(int id, void** args, void* ret) {
         const DpiArg& a = f.args[k];
         if (a.dir == 0) continue;
         void* p = *(void**)args[k];
+        if (a.sarr) {
+            size_t eb = elemBytes(a.t, a.w);
+            for (int e = 0; e < a.sarr->count; e++) {
+                Val v = S.get(a.sarr->base + e);
+                if (a.t == DT_REAL || a.t == DT_SHORTREAL) v.real = true;
+                char* q = (char*)p + (size_t)e * eb;
+                if (a.t == DT_STRING) {
+                    Val s = v; s.str = true;
+                    const char* c = strPool().text[s.v < strPool().text.size() ? s.v : 0].c_str();
+                    memcpy(q, &c, sizeof c);
+                } else toC(q, a.t, a.w, v, keep);
+            }
+            continue;
+        }
         Val v = S.get(a.sig);
         if (a.t == DT_REAL || a.t == DT_SHORTREAL) v.real = true;
         if (a.t == DT_STRING) {   // the text must outlive the call: keep it in the string pool
@@ -777,7 +801,7 @@ inline std::string exportStubs(const std::vector<const DpiFunc*>& ex) {
         s += "0};\n";
         std::string rt = cRetType(f);
         if (rt == "void") s += "    msim_dpi_export(" + std::to_string(id) + ", args, 0);\n}\n";
-        else s += "    " + rt + " r = 0;\n    msim_dpi_export(" + std::to_string(id) + ", args, (void*)&r);\n    return r;\n}\n";
+        else s += "    " + rt + " msim_ret_ = 0;\n    msim_dpi_export(" + std::to_string(id) + ", args, (void*)&msim_ret_);\n    return msim_ret_;\n}\n";
     }
     return s;
 }
