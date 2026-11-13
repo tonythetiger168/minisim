@@ -952,6 +952,48 @@ inline std::vector<const Symbol*> simNet(const Symbol* s) {
     }
     return set;
 }
+// The force and assign statements of the design by source line, with the
+// procedure or task they are in (lazily, once).
+struct HoldStmt { const ProceduralAssignStatement* st; const Symbol* in; };
+inline const std::map<std::pair<uint32_t, uint32_t>, HoldStmt>& holdStmts() {
+    static std::map<std::pair<uint32_t, uint32_t>, HoldStmt> m;
+    static bool built = false;
+    if (built || !st().comp || !srcMgr()) return m;
+    built = true;
+    const Symbol* in = nullptr;
+    auto inner = slang::ast::makeVisitor([&](auto&, const ProceduralAssignStatement& p) {
+        auto ol = srcMgr()->getFullyOriginalLoc(p.sourceRange.start());
+        uint32_t file = covFileId(std::string(srcMgr()->getFullPath(ol.buffer()).string()));
+        m.emplace(std::make_pair(file, (uint32_t)srcMgr()->getLineNumber(ol)), HoldStmt{&p, in});
+    });
+    auto outer = slang::ast::makeVisitor(
+        [&](auto&, const ProceduralBlockSymbol& p) { in = &p; p.getBody().visit(inner); },
+        [&](auto&, const SubroutineSymbol& f) { in = &f; f.getBody().visit(inner); });
+    st().comp->getRoot().visit(outer);
+    return m;
+}
+// The force (and, for a variable, assign) statements in effect on signal
+// `o` that drive it, or (load) that read it, as statement objects.
+inline void holdConn(const Obj* o, bool drv, bool local, Bits bits, std::vector<Obj*>& out) {
+    const InstanceBodySymbol* home = bodyOf(o->sym);
+    bool net = o->sym->kind == SymbolKind::Net;
+    for (auto& [key, src] : st().holdSrcs) {
+        auto [sg, force, hi, lo] = key;
+        auto it = holdStmts().find(src);
+        if (it == holdStmts().end()) continue;
+        const HoldStmt& h = it->second;
+        if (local && bodyOf(h.in) != home) continue;
+        const auto& a = h.st->assignment;
+        if (a.kind != ExpressionKind::Assignment) continue;
+        if (drv) {   // a net: forces only (detail 15); a variable: forces and assigns (37.21)
+            if (sg != o->sig || (net && !force)) continue;
+            if (bits.lo >= 0 && hi >= 0 && (hi < bits.lo || lo > bits.hi)) continue;
+        } else if (!reads(a.as<AssignmentExpression>().right(), o->sym, bits))
+            continue;
+        Obj* so = stmtNode(h.st, h.in->kind == SymbolKind::ProceduralBlock ? processObj(h.in->as<ProceduralBlockSymbol>()) : nullptr);
+        if (so && std::find(out.begin(), out.end(), so) == out.end()) out.push_back(so);
+    }
+}
 inline bool netConn(int type, const Obj* o, std::vector<vpiHandle>& items) {
     if (type != vpiDriver && type != vpiLoad && type != vpiLocalDriver && type != vpiLocalLoad && type != vpiPortInst) return false;
     // A bit or part select of a vector: the drivers and loads that touch
@@ -984,7 +1026,9 @@ inline bool netConn(int type, const Obj* o, std::vector<vpiHandle>& items) {
             if (type == vpiLocalDriver ? in : outp) out.push_back(portOf(q->as<PortSymbol>()));
         }
         localConn(*b, o->sym, type == vpiLocalDriver, false, out, bits);
+        holdConn(o, type == vpiLocalDriver, true, bits, out);
     } else {
+        holdConn(o, type == vpiDriver, false, bits, out);
         for (const Symbol* x : simNet(o->sym))
             if (const auto* xb = bodyOf(x)) localConn(*xb, x, type == vpiDriver, true, out, bits);   // whole connections: the same bits
     }

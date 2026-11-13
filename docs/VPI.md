@@ -258,9 +258,12 @@ ports of the signal's own module are local drivers (input, inout) and
 local loads (output, inout) of it (37.16 detail 17). On a bit or part
 select handle, only the drivers and loads that touch those bits count
 (detail 18); a select with a non-constant index counts as touching every
-bit. Procedural assignments are neither drivers nor loads. Checked against
-the 1800-2023 text of 37.16, 37.21 and 37.46; forces and procedural
-continuous assignments (`assign` / `force` statements) are not listed yet.
+bit. A `force` statement in effect drives what it forces, and a
+procedural `assign` statement in effect drives the variable it assigns (a
+net has only force drivers, 37.16 detail 15); both are loads of what
+their right side reads (detail 14); once released or deassigned they are
+neither. Other procedural assignments are neither drivers nor loads.
+Checked against the 1800-2023 text of 37.16, 37.21 and 37.46.
 
 **Processes, statements and expressions (37.32 to 37.51).**
 `vpi_iterate(vpiProcess, module)` gives the `initial`, `always` (with
@@ -449,8 +452,7 @@ waveform tools (`mwave`, the FST and VCD readers).
 
 The non-static property
 declarations of a class definition, containers of structs,
-classes or containers, the value of a non-constant expression, drivers and
-loads that are force or procedural continuous assign statements,
+classes or containers, the value of a non-constant expression,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode

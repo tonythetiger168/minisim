@@ -86,6 +86,8 @@ Spec references are IEEE 1800-2023 clauses.
 - VPI drivers and loads as 37.16 and 37.46 read: of a bit or part select
   (only what touches those bits), primitive terminals, and the ports of
   the net's own module as local drivers (inputs) and loads (outputs).
+- VPI: `force` and procedural `assign` statements in effect are drivers
+  (a net: forces only) and loads of what they read (37.16, 37.21).
 - VPI `cbEndOfObject` (38.36.1) on a thread or frame runs when it ends;
   `cbReclaimObj` and `cbEndOfObject` on class objects register (msim never
   reclaims class objects).

@@ -1566,7 +1566,12 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 else writeMem(i);
                 pc++; break;
             }
-            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
+            case IK::Force:
+                S.holdSrc = {i.file, i.line};
+                S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey);
+                S.holdSrc = {};
+                pc++;
+                break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::Udp: udpExec(i); pc++; break;
