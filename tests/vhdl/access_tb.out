@@ -1,0 +1,7 @@
+access.vhd:67:5:@0ms:(report note): list sum=30 first=16 second=9
+access.vhd:71:5:@0ms:(report note): after write=121
+access.vhd:77:5:@0ms:(report note): arr length=3 left=1 right=3 a(2)=20
+access.vhd:85:5:@0ms:(report note): grown length=6 a(3)=30 a(6)=7 old null=true
+access.vhd:88:5:@0ms:(report note): from value length=3 a(1)=5 sum=18
+access.vhd:93:5:@0ms:(report note): int=42
+access.vhd:100:5:@0ms:(report note): mode=sum total=3
