@@ -1237,8 +1237,15 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     }
     vector<ConcAssert::Attempt> next;
     bool ended = false;   // a match of an end point tracker
+    // With VPI callbacks: the atoms each step reads, for matched_exprs and
+    // failExpr (39.4.2, 39.5.2).
+    vector<std::pair<int, bool>> seen;
+    bool track = assertHook() && !a.hidden && !c.atomSrc.empty();
+    auto srcOf = [&](int k) { return (size_t)k < c.atomSrc.size() ? c.atomSrc[(size_t)k] : nullptr; };
     for (auto& at : c.att) {
         values(at.caps);
+        seen.clear();
+        dv.seen = track ? &seen : nullptr;
         if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
         dv.env = 0;
         dv.memo.clear();
@@ -1247,8 +1254,19 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
         const sva::Node* t = dv.d(at.t);
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
+        dv.seen = nullptr;
+        const void* failed = nullptr;   // the last atom that did not hold
+        if (track && t->k == sva::PFALSE)
+            for (auto it = seen.rbegin(); it != seen.rend() && !failed; ++it)
+                if (!it->second) failed = srcOf(it->first);
         if (!a.stepAt.empty() && a.stepAt.count(at.start) && assertHook() && !a.hidden) {   // VPI stepping (39.5.2): this attempt's step
-            assertStep() = {at.t, t};
+            AssertStep& s = assertStep();
+            s.from = at.t;
+            s.to = t;
+            s.failed = failed;
+            s.matched.clear();
+            for (auto [k, ok] : seen)
+                if (const void* x = srcOf(k); ok && x && std::find(s.matched.begin(), s.matched.end(), x) == s.matched.end()) s.matched.push_back(x);
             for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, t->k == sva::PFALSE ? AE_STEP_FAIL : AE_STEP_OK, at.start);
         }
         if (c.coverSeq) {   // every match counts (16.14.3)
@@ -1267,7 +1285,9 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            assertStep().failed = failed;
             for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
+            assertStep().failed = nullptr;
             expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;

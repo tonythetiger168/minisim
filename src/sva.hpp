@@ -68,8 +68,16 @@ enum AssertEvent : int {
 };
 // The states an attempt went from and to in the step being reported: the
 // engine's terms (equal terms are the same state).
-struct AssertStep { const void* from = nullptr; const void* to = nullptr; };
-inline AssertStep& assertStep() { static AssertStep s; return s; }
+// The step VPI reports (39.5.2): the states, the expressions that matched in
+// it, and the one that failed (slang Expression*; null when the failure is
+// not one expression's).
+struct AssertStep {
+    const void* from = nullptr;
+    const void* to = nullptr;
+    std::vector<const void*> matched;
+    const void* failed = nullptr;
+};
+inline AssertStep& assertStep() { thread_local AssertStep s; return s; }
 using AssertHook = void (*)(int id, int ev, uint64_t start);
 inline AssertHook& assertHook() { static AssertHook h = nullptr; return h; }
 inline void assertEvent(int id, int ev, uint64_t start = 0) {
