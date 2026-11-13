@@ -65,6 +65,13 @@ Spec references are IEEE 1800-2023 clauses.
   declaration that hides one of the same name in an enclosing scope). Both
   off by default.
 
+### Changed
+- `msim -compile` builds the kernel once into a cached object
+  (`$MSIM_KCACHE`, default `~/.cache/msim`) that every `simv` links, instead
+  of compiling it into each design: a small design's C++ build goes from
+  21 s to 8 s and OpenTitan Ibex from 68 s to 50 s. `MSIM_NOKOBJ=1` turns it
+  off.
+
 ### Fixed
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
   the reader takes), which failed on correct FIFOs such as common_cells
