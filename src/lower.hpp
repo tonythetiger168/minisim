@@ -4112,6 +4112,13 @@ struct Lowerer {
             }
             return;
         }
+        if (x.kind != ExpressionKind::NamedValue && isFixedArr(x) && x.type->getCanonicalType()
+                .as<FixedSizeUnpackedArrayType>().elementType.isIntegral()) {   // s.a, m[i]: its elements, left first
+            std::vector<E> vals;
+            arrayElems(*x.type, x, vals);
+            for (auto& v : vals) { Instr i = dynCmd(t, D_PUSH_BACK); i.e = v; prog.emit(i); }
+            return;
+        }
         if (x.kind == ExpressionKind::Concatenation && isDynType(*x.type)) {
             for (auto* op : x.as<ConcatenationExpression>().operands()) dynAppend(t, *op);
             return;
@@ -7422,7 +7429,41 @@ struct Lowerer {
             const auto& x = peel(*call.arguments()[0]);
             auto a = x.kind == slang::ast::ExpressionKind::NamedValue
                          ? arrFind(&x.as<slang::ast::NamedValueExpression>().symbol) : nullptr;
-            if (!a || a->dims.size() != 1 || a->dynElem) unsupported("ordering method of this fixed-size array");
+            if (!a || a->dims.size() != 1 || a->dynElem) {
+                // A struct member, a row of a bigger array, ...: sort a copy,
+                // then write the whole array back in one go (7.12.2).
+                const Type& at = x.type->getCanonicalType();
+                const auto& ft = at.as<slang::ast::FixedSizeUnpackedArrayType>();
+                const Type& et = ft.elementType.getCanonicalType();
+                if (!et.isIntegral() || uWidth(at) <= 0) unsupported("ordering method of this fixed-size array");
+                dynMethod(call, false);
+                int q = lastFixedQueue, n = (int)ft.range.width(), ew = (int)et.getBitWidth();
+                std::vector<E> parts;
+                for (int k = 0; k < n; k++) {
+                    auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                    g->sig = q;
+                    parts.push_back(resize(std::move(g), ew, et.isSigned(), et.isSigned()));
+                }
+                // The values are read from the scratch queue, not from the
+                // array, so the writes can go one by one.
+                if (auto sa = subArraySel(x)) {   // m[i].sort(): the elements of the row
+                    auto idxs = subArrayIdx(*sa);
+                    if (idxs.size() != parts.size()) unsupported("ordering method of this fixed-size array");
+                    for (size_t k = 0; k < idxs.size(); k++) {
+                        Instr i; i.k = IK::Assign;
+                        i.sig = sa->a->base; i.arr = sa->a; i.e = parts[k];
+                        i.aidx = std::move(idxs[k]);
+                        prog.emit(i);
+                    }
+                    return;
+                }
+                if (classMember(x)) unsupported("ordering method of an array property");
+                Instr i; i.k = IK::Assign;   // held packed (a struct member): all its bits at once
+                i.e = parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+                lhs(x, i);
+                prog.emit(i);
+                return;
+            }
             dynMethod(call, false);   // on a scratch queue holding a copy; then the elements go back
             int q = lastFixedQueue;
             for (int k = 0; k < a->count; k++) {
