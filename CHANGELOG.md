@@ -661,6 +661,12 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `case ... inside` is merged: an item may match when its `==?`
+  or range compare is unknown. The merging code of a combinational block
+  now writes without change events and publishes each final value once, so
+  blocks that read each other no longer wake each other forever (the
+  CV32E40P decoder and controller hung at time 0). CV32E40P runs with all
+  753 `if` / `case` / edge constructs merged and the same result.
 - `-xprop`: a write to an element of a multidimensional array whose indexes
   have unknown bits (`m[r][c] <= d`) merges into every element the indexes
   may name. Before, only one-dimensional arrays did, and the write was

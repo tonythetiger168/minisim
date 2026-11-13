@@ -303,6 +303,10 @@ struct Instr {
     // Assign to a temporary only this process uses (msim -xprop): nothing
     // watches it, so the value is stored at once (Sim::poke).
     bool tmp = false;
+    // Assign inside the merging copy of a combinational block (msim -xprop):
+    // stored at once with no change event; the block's end publishes the
+    // final value of each such variable once (xpQuiet).
+    bool xq = false;
     const UdpTable* udp = nullptr;   // Udp
     // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
     // signal-name prefixes relative to the top ("" is the top, "u1." an

@@ -1210,7 +1210,7 @@ private:
     std::string assign(const Instr& i, std::string val = "") {
         if (val.empty()) val = fast(i.e);
         std::ostringstream o;
-        if (i.tmp) {   // a temporary of the process: nothing watches it
+        if (i.tmp || i.xq) {   // a temporary of the process, or a quiet -xprop write: no change event
             o << " S.poke(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
             return o.str();
         }
