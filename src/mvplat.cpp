@@ -6,7 +6,7 @@
 //   mvplat prog.elf -harts 4                four harts, on every core
 //   mvplat prog.elf -trace commits.log      a commit log, in spike's format
 //
-// The platform is RV32GC or RV64GC harts (machine, supervisor and user mode, PMP, Sv32 or Sv39) on a bus of
+// The platform is RV32GC or RV64GC harts (machine, supervisor and user mode, PMP, Sv32, or Sv39/48/57) on a bus of
 // RAM, ROM, a 16550 UART, a CLINT, a PLIC and a test finisher. Several harts
 // run on several threads with the same result as on one (vp/machine.hpp says
 // how). Options and device types this file does not know go to an extension
@@ -61,6 +61,9 @@ void setMac(VirtioNet& v, const std::string& t, const std::string& where) {
     for (int i = 0; i < 6; i++) v.mac[i] = (uint8_t)b[i];
 }
 Ext* g_ext = nullptr;
+// The largest paging mode the device tree offers (the platform's "mmu" or
+// -mmu): sv39, sv48 or sv57 on RV64. The harts take every mode either way.
+std::string g_mmu = "sv39";
 
 void usage() {
     std::cout <<
@@ -90,6 +93,8 @@ void usage() {
         "  -net-pcap FILE     write the first interface's frames to a pcap file\n"
         "  -vcon              a virtio console (Linux: console=hvc0); -input then goes to it\n"
         "  -dump-dtb FILE     write the platform's device tree blob and exit\n"
+        "  -mmu MODE          the largest paging mode the device tree offers an RV64 OS:\n"
+        "                     sv39 (default), sv48 or sv57\n"
         "  -map               print the memory map\n"
         "  -q                 no summary line on stderr\n"
         "  -version           print the version\n"
@@ -104,6 +109,7 @@ struct Options {
     std::vector<std::string> disks, nets;
     std::string netPcap;
     bool vcon = false;
+    std::string mmu;
     bool diskWrite = false;
     bool haveAppend = false;
     int harts = -1;
@@ -148,6 +154,10 @@ Ext* loadExt(int argc, char** argv, const char* why) {
 
 void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options& o) {
     auto rel = [&](const std::string& p) { return fs::path(p).is_absolute() ? p : (dir / p).string(); };
+    if (pl.get("mmu")) g_mmu = pl.get("mmu")->str();
+    if (!o.mmu.empty()) g_mmu = o.mmu;
+    if (g_mmu != "sv39" && g_mmu != "sv48" && g_mmu != "sv57")
+        throw std::runtime_error("mmu must be sv39, sv48 or sv57, not '" + g_mmu + "'");
     unsigned nh = pl.get("harts") ? (unsigned)pl.get("harts")->u64() : 1;
     if (o.harts > 0) nh = (unsigned)o.harts;
     if (nh < 1 || nh > 1024) throw std::runtime_error("harts must be 1 to 1024");
@@ -385,6 +395,7 @@ bool bootOs(Machine& m, const Options& o) {
 
     BootArgs args;
     args.bootargs = o.append;
+    args.mmu = g_mmu;
     std::vector<uint8_t> initrd;
     if (!o.initrd.empty()) {
         initrd = readFile(o.initrd);
@@ -493,6 +504,7 @@ int main(int argc, char** argv) {
         else if (s == "-net") o.nets.push_back(next("user or dgram:LOCAL,REMOTE"));
         else if (s == "-net-pcap") o.netPcap = next("a file");
         else if (s == "-vcon") o.vcon = true;
+        else if (s == "-mmu") o.mmu = next("sv39, sv48 or sv57");
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
         else if (!s.empty() && s[0] == '-') {

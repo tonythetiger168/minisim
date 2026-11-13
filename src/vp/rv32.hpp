@@ -141,8 +141,8 @@ struct Hart {
     uint32_t scounteren = 0;
     uint32_t medeleg = 0, mideleg = 0;
     uint32_t mipSw = 0;  // SSIP, STIP, SEIP as software wrote them
-    // Is paging on (Sv32 on RV32, Sv39 on RV64)?
-    bool paging() const { return rv64 ? (satp >> 60) == 8 : (satp >> 31) != 0; }
+    // Is paging on (Sv32 on RV32; Sv39, Sv48 or Sv57 on RV64)?
+    bool paging() const { return rv64 ? (satp >> 60) != 0 : (satp >> 31) != 0; }
     // Values as the hart's XLEN sees them: sign-extended from bit 31 on RV32.
     uint64_t sx(uint64_t v) const { return rv64 ? v : (uint64_t)(int64_t)(int32_t)v; }
     // Addresses and the pc: zero-extended from bit 31 on RV32.
