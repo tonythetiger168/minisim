@@ -64,6 +64,25 @@ Tcl shell commands of the other vendors (Genus or Innovus `set_db`, Conformal
 dofiles, JasperGold Tcl, ...) are not handled here. They are commands
 registered in each tool's shell on `src/tcl.hpp`.
 
+## msim: VCS partition compile
+
+msim takes the VCS partition compile options as spellings of its compiled
+mode (`-compile`), directly and through the xrun front end:
+
+| VCS | msim |
+|---|---|
+| `-partcomp`, `-partcomp=<mode>`, `-fastpartcomp` | `-compile` |
+| `-fastpartcomp=j<n>` | `-compile -cfiles <n>` (build up to n generated C++ files in parallel) |
+| `-partcomp_dir=<dir>`, `-Mdir=<dir>` | `-o <dir>` (the build directory) |
+| `-partcomp_sharedlib`, `-pcmakeprof` | accepted, no effect |
+
+msim chooses its own parts: the generated C++ files of the design. The build
+directory keeps them, a file that did not change is not rebuilt, and a design
+that did not change reuses the `simv` already there. There is no per-module
+partition yet (an edit to one module does not yet rebuild only that module's
+part), and partition configuration files are not read. msim prints one note
+saying so (`tests/msim_partcomp.cmake`).
+
 ## Limits / Not yet
 
 - No tool uses the layer yet. Each tool's owner adds its own rule table.
