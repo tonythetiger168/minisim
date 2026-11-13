@@ -149,13 +149,15 @@ of the attempt that starts at `start` (it may not have started yet) call
 `detail.step` giving `stateFrom` and `stateTo`: the engine's states for the
 attempt, numbered per assertion in the order they are first seen (two
 attempts in the same state have the same number).
-`vpiAssertionDisableStep` (h, start) turns it off. Not supported: the matched
-expressions of a step (`matched_expression_count` is 0). On
-`cbAssertionFailure`, `info->detail.failExpr` is the failing expression: an
-immediate assertion's condition, or the boolean of a concurrent property
-that is a single expression (under its clock and `disable iff`); it is NULL
-for a property with sequence or property operators, because msim's engine
-does not keep which part of such a property failed.
+`detail.step` also lists the expressions that matched in the step
+(`matched_expression_count`, `matched_exprs`): each boolean of the property
+the engine read in that step and found true, once, in the order read.
+`vpiAssertionDisableStep` (h, start) turns it off. On `cbAssertionFailure`,
+`info->detail.failExpr` is the failing expression: an immediate assertion's
+condition; for a concurrent property, the boolean that did not hold in the
+step that failed (`c` in `b |-> ##1 c`; the whole boolean of a
+single-expression property). It is NULL only when no boolean failed, such as
+a strong property still pending at the end of the simulation.
 
 **Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
 instance)` gives the covered items of that instance: `vpiStatementCoverage`

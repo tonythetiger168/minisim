@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI assertion steps list their matched expressions
+  (`matched_expression_count`, `matched_exprs`, 39.5.2), and `failExpr` of a
+  concurrent assertion with sequence operators is the boolean that did not
+  hold (39.4.2). `vpiDecompile` of a net, variable or parameter is its name.
 - VPI parameters (37.28): type parameters (`vpiTypeParameter`) in
   `vpi_iterate(vpiParameter, module)`, a parameter's default through
   `vpiExpr`, param assigns (`vpiParamAssign`: the `#(...)` overrides with

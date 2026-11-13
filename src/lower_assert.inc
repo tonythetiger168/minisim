@@ -1036,6 +1036,9 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
+    c.atomSrc.assign(c.atoms.size(), nullptr);
+    for (const auto& [x, id] : b.atomOf)
+        if ((size_t)id < c.atomSrc.size()) c.atomSrc[(size_t)id] = x;
     c.pre = std::move(b.pre);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
@@ -1167,6 +1170,9 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
+    c.atomSrc.assign(c.atoms.size(), nullptr);
+    for (const auto& [x, id] : b.atomOf)
+        if ((size_t)id < c.atomSrc.size()) c.atomSrc[(size_t)id] = x;
     c.pre = std::move(b.pre);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);

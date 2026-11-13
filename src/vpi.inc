@@ -1356,11 +1356,9 @@ inline void fireSys(int reason) {
     }
 }
 
-// The failing expression of a failed attempt (39.4.2, failExpr): an
-// immediate assertion's condition; for a concurrent one, the expression
-// of a property that is a single boolean. NULL when the property has
-// sequence or property operators (msim's engine does not keep which part
-// of such a property failed).
+// The failing expression of a failed attempt (39.4.2, failExpr) when the
+// engine did not name the atom that failed: an immediate assertion's
+// condition, or a concurrent property that is a single boolean.
 inline Obj* exprNode(const slang::ast::Expression* e, const Obj* parent);   // vpi_code.inc
 inline Obj* failExprOf(int id, const Obj* a) {
     using namespace slang::ast;
@@ -1415,8 +1413,12 @@ inline void onAssert(int id, int ev, uint64_t start) {
         s_vpi_time t{vpiSimTime, (PLI_UINT32)(S.now >> 32), (PLI_UINT32)S.now, (double)S.now};
         s_vpi_attempt_info info{};
         info.attemptStartTime = s_vpi_time{vpiSimTime, (PLI_UINT32)(start >> 32), (PLI_UINT32)start, (double)start};
-        info.detail.failExpr = ev == AE_FAILURE ? H(failExprOf(id, a)) : nullptr;
+        if (ev == AE_FAILURE) {   // the atom that did not hold, else the property's single boolean
+            const auto* fx = static_cast<const slang::ast::Expression*>(assertStep().failed);
+            info.detail.failExpr = H(fx ? exprNode(fx, a) : failExprOf(id, a));
+        }
         s_vpi_assertion_step_info step{};
+        std::vector<vpiHandle> matched;
         if (ev == AE_STEP_OK || ev == AE_STEP_FAIL) {   // 39.5.2: the states are the engine's, numbered per assertion as first seen
             auto num = [&](const void* n) {
                 auto [it2, fresh] = s.stepStates.try_emplace({id, n}, 0);
@@ -1430,6 +1432,10 @@ inline void onAssert(int id, int ev, uint64_t start) {
             };
             step.stateFrom = num(assertStep().from);
             step.stateTo = num(assertStep().to);
+            for (const void* x : assertStep().matched)
+                if (Obj* e = exprNode(static_cast<const slang::ast::Expression*>(x), a)) matched.push_back(H(e));
+            step.matched_expression_count = (PLI_INT32)matched.size();
+            step.matched_exprs = matched.empty() ? nullptr : matched.data();
             info.detail.step = &step;
         }
         bool attempt = ev <= AE_DISABLED || ev == AE_STEP_OK || ev == AE_STEP_FAIL;
@@ -3291,6 +3297,10 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
         return have ? vpi::retStr(r) : nullptr;
     }
     if (o->kind == Obj::InterModPath && prop != vpiType) return nullptr;
+    // A net, variable or parameter used as an expression (an operand, a
+    // matched expression of an assertion step): its source text is its name.
+    if (prop == vpiDecompile && o->sym && (o->kind == Obj::Signal || o->kind == Obj::Param || o->kind == Obj::TypeParam))
+        return vpi::retStr(std::string(o->sym->name));
     if ((o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) && prop != vpiType) {
         std::string r;
         return vpi::tchkGetStr(prop, o, r) ? vpi::retStr(r) : nullptr;
