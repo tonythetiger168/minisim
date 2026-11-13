@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI inter-module paths on a net with several sources each have their own
+  delay (`vpi_put_delays` / `vpi_get_delays`, 38.21), and `msim -i` / `-do`
+  runs `cbEnterInteractive`, `cbExitInteractive` and
+  `cbInteractiveScopeChange` (38.36.3).
 - VPI assertion steps list their matched expressions
   (`matched_expression_count`, `matched_exprs`, 39.5.2), and `failExpr` of a
   concurrent assertion with sequence operators is the boolean that did not

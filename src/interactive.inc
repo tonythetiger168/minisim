@@ -443,11 +443,13 @@ struct Session {
         curProg = p;
         nest++;
         resume = false;
+        vpi::interactiveCb(cbEnterInteractive, "");
         std::string buf;
         while (!resume && !S.finished && !quitNow) {
             if (!read(buf)) { rest(); break; }
             run(buf);
         }
+        vpi::interactiveCb(cbExitInteractive, "");
         nest--;
         resume = false;
     }
@@ -594,8 +596,10 @@ struct Session {
     // Starts the run asked for, or lets a paused one go on.
     void go() {
         if (nest) { resume = true; return; }
+        vpi::interactiveCb(cbExitInteractive, "");   // 38.36.3: the run goes on, then stops again
         if (!advance()) { ended = true; std::cout << "simulation ended at time " << S.now << "\n"; return; }
         if (why != "-") std::cout << "time " << S.now << ": " << why << "\n";
+        vpi::interactiveCb(cbEnterInteractive, "");
     }
     // A value written from here takes effect in a slot at the current time.
     void settle() {
@@ -799,6 +803,11 @@ struct Session {
 
     std::string cmdScope(const W& a) {
         if (a.size() == 1 || (a.size() == 2 && flag(a[1], {"-show", "-get"}))) return scopeShown();
+        std::string r = setScope(a);
+        vpi::interactiveCb(cbInteractiveScopeChange, scopeShown());   // 38.36.3
+        return r;
+    }
+    std::string setScope(const W& a) {
         std::string to = a.back();
         if (a[1] == "-up" || to == "..") {
             size_t d = scope.rfind('.');
@@ -1402,11 +1411,13 @@ struct Session {
         g_ses = this;
         commands();
         startReplay();
+        vpi::interactiveCb(cbEnterInteractive, "");   // 38.36.3
         std::string buf;
         while (!ended && !quitNow && !S.finished) {
             if (!read(buf)) break;
             run(buf);
         }
+        if (!ended) vpi::interactiveCb(cbExitInteractive, "");
         if (quitNow || ended) return;
         // No more commands: the rest of the run.
         rest();
