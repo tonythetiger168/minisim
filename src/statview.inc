@@ -41,7 +41,7 @@ inline size_t sva() {
     size_t made = 0, from = S.statViews.size();
     for (size_t i = 0; i < asserts().size(); i++) {
         const AssertInfo& a = asserts()[i];
-        if (a.hidden || a.prot || a.name.empty()) continue;
+        if (a.hidden || a.prot || a.msgProt || a.name.empty()) continue;   // protected code (1735) stays out
         std::string n = rel(a.name);
         S.statViews.push_back({mk(n + ".passes", 32), [i] { return asserts()[i].passes; }});
         S.statViews.push_back({mk(n + ".fails", 32), [i] { return asserts()[i].fails; }});
