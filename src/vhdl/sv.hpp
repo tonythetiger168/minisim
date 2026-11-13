@@ -727,6 +727,19 @@ private:
         case Type::Enum:
             if (t->range && !t->range->l.empty()) return t->range->l;
             return "";
+        case Type::Array: case Type::String:
+            // string(1 to n): n characters. SystemVerilog strings hold no NUL, so a
+            // character never assigned reads as a space where VHDL has NUL (5.3.2.1).
+            if ((t->k == Type::String || t->flavor == "string") && t->dims.size() == 1 && !t->dims[0].box && !t->dims[0].l.empty()) {
+                const Rng& r = t->dims[0];
+                if (r.lv && r.rv) {
+                    int64_t n = r.downto ? *r.lv - *r.rv + 1 : *r.rv - *r.lv + 1;
+                    return n > 0 ? "vhdl_rt::spaces(" + num(n) + ")" : "";
+                }
+                return r.downto ? "vhdl_rt::spaces((" + r.l + ") - (" + r.r + ") + 1)"
+                                : "vhdl_rt::spaces((" + r.r + ") - (" + r.l + ") + 1)";
+            }
+            return "";
         default: return "";
         }
     }
@@ -855,8 +868,17 @@ private:
             }
             return n;
         }
-        if (!si.idx.empty() && t->k == Type::String) {
-            return t;
+        if (si.idx.size() == 1 && t->k == Type::String && si.idx[0]->k != EK::Open) {
+            // string(1 to n): still a SystemVerilog string; the range gives its initial length
+            TP n = std::make_shared<Type>(*t);
+            n->base = baseOf(t);
+            n->name = n->text = "";
+            n->dims.clear();
+            TP it;
+            Rng g = rangeOf(si.idx[0], &it);
+            if (!g.idx) g.idx = it ? it : bt["positive"];
+            n->dims.push_back(g);
+            return n;
         }
         return t;
     }
@@ -1187,7 +1209,13 @@ private:
                     std::map<int64_t, std::string> bits;
                     std::string others;
                     std::vector<std::pair<std::string, std::string>> dynamic;
+                    int64_t pos = 0;   // positional elements before others (9.3.3.3): from the left bound
                     for (auto& el : e->agg) {
+                        if (el.choices.empty()) {
+                            bits[d.downto ? hi - pos : lo + pos] = ex(el.value, elemT).s;
+                            ++pos;
+                            continue;
+                        }
                         for (auto& c : el.choices) {
                             if (c->k == EK::Others) { others = ex(el.value, elemT).s; continue; }
                             if (c->k == EK::Range || (c->k == EK::Attr && c->name == "range")) {
@@ -1227,8 +1255,19 @@ private:
         {
             std::string s = "'{";
             bool first = true;
+            int64_t pos = 0;   // positional elements before others (9.3.3.3): from the left bound
             for (auto& el : e->agg) {
                 Val x = ex(el.value, elemT);
+                if (el.choices.empty()) {
+                    if (want->dims.empty() || want->dims[0].box) fail(e->line, "positional elements and others need a constrained aggregate type");
+                    const Rng& d = want->dims[0];
+                    std::string k = d.lv ? std::to_string(d.downto ? *d.lv - pos : *d.lv + pos)
+                                         : "(" + d.l + (d.downto ? ") - " : ") + ") + std::to_string(pos);
+                    s += std::string(first ? "" : ", ") + k + ": " + x.s;
+                    first = false;
+                    ++pos;
+                    continue;
+                }
                 for (auto& c : el.choices) {
                     if (c->k == EK::Others) s += std::string(first ? "" : ", ") + "default: " + x.s;
                     else if (c->k == EK::Range) {
@@ -2529,6 +2568,12 @@ package vhdl_rt;
     string pad = "";
     for (int i = s.len(); i < field; i++) pad = {pad, " "};
     return left ? {s, pad} : {pad, s};
+  endfunction
+  event tick;   // triggered in the NBA region: wait for T resumes after the updates due at T
+  function automatic string spaces(int n);   // a constrained string's initial value
+    string r = "";
+    for (int i = 0; i < n; i++) r = {r, " "};
+    return r;
   endfunction
   function automatic byte unsigned str_max(string s);
     byte unsigned r = 0;
@@ -4254,7 +4299,12 @@ endpackage
         if (s.on.empty() && s.cond) readSignals(s.cond, sigs);
         std::string tm = s.forTime ? ex(s.forTime, bt["time"]).s : "";
         if (!s.cond && sigs.empty() && tm.empty()) return I + pu + "wait (0);\n";   // wait; : forever
-        if (!s.cond && sigs.empty()) return I + pu + "#(" + tm + ");\n";
+        // wait for T: VHDL updates the signals with transactions due at T before any
+        // process resumes (14.7.5.2), and SystemVerilog applies a delayed nonblocking
+        // assignment in the NBA region, after the active one. Resuming on an event
+        // triggered in the NBA region of T (->>, 15.5.2) puts the process after them.
+        if (!s.cond && sigs.empty())
+            return I + pu + "#(" + tm + ");" + (synth ? "" : " ->> vhdl_rt::tick; @(vhdl_rt::tick);") + "\n";
         std::string cond = s.cond ? boolOf(ex(s.cond, bt["boolean"])).s : "";
         if (tm.empty()) {
             if (!s.cond) return I + pu + "@(" + eventList(sigs) + ");\n";

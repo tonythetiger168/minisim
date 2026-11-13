@@ -33,6 +33,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | process | `always` that runs the body once at time 0, then waits on the sensitivity list (VHDL's equivalent `wait on` at the end) |
 | `process (clk)` + `if rising_edge(clk)`, and the async-reset form | `always @(posedge clk ...)` |
 | signal assignment | nonblocking assignment (the next delta); `after` gives the delay |
+| `wait for T` | `#T`, then the process resumes on an event triggered in the NBA region (`->>`), so it sees the signal updates due at T as VHDL's simulation cycle does (14.7.5) |
 | concurrent, conditional and selected signal assignment | an equivalent process, so a derived signal lags one delta like in VHDL |
 | `q <= d when rising_edge(clk);` | `always @(posedge clk)` |
 | variable | a static variable of the process |
@@ -95,6 +96,8 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   become `'X'`, `'L'` becomes `'0'`, `'H'` becomes `'1'`. `std_logic'image`
   and `to_string` therefore print `X` where GHDL prints `U` for a signal
   never assigned.
+- A character of a `string(1 to n)` variable that was never assigned is a
+  space, where VHDL has NUL (SystemVerilog strings hold no NUL).
 - Configurations (choosing an architecture other than the last analyzed),
   configuration instances, and conversion functions in port maps.
 - Unconstrained ports (an entity port without a range).

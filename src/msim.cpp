@@ -50,7 +50,7 @@
 //                    for -saif: a library one adds state- and path-dependent
 //                    activity of its cells, an RTL one keeps only its mapped
 //                    points (repeatable)
-//   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
+//   -maxtime <n>     stop after simulation time n: time-precision ticks, or with a unit (3ms, 500ns) (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
 //   -seed <n>        seed for $urandom / $urandom_range (also +ntb_random_seed=<n>)
@@ -2469,7 +2469,7 @@ static void usage() {
                  "                 select_coverage / deselect_coverage commands (as an Xcelium covfile)\n"
                  "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
                  "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
-                 "  -maxtime <n>   stop after simulation time n\n"
+                 "  -maxtime <n>   stop after simulation time n (ticks, or with a unit: 3ms)\n"
                  "  -i             interactive: run, step, stop on a signal, print (signals and class objects),\n"
                  "                 force, release, deposit; commands on the standard input (help lists them)\n"
                  "  -do <file>     the same, with the commands from a file; then the run goes on to its end\n"
@@ -2557,6 +2557,8 @@ int main(int argc, char** argv) {
     std::vector<std::string> saifForward;   // -saif_forward (IEEE 1801-2024 Annex J)
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
+    double maxTimeVal = 0;   // -maxtime with a unit: converted once the time precision is known
+    std::optional<int> maxTimeExp;
     bool interactiveMode = false;   // -i / -do FILE
     std::string doPath;
     bool elabOnly = false;   // -elab: stop after elaboration (xrun -elaborate)
@@ -2797,8 +2799,21 @@ int main(int argc, char** argv) {
         }
         if (a == "-maxtime") {
             std::string n = next("a time");
-            try { maxTime = std::stoull(n); }
-            catch (...) { std::cerr << "msim: bad -maxtime " << n << "\n"; return 2; }
+            // a number of time-precision ticks, or with a unit: 3ms, 500ns, 1.5us
+            try {
+                size_t used = 0;
+                double val = std::stod(n, &used);
+                std::string u = n.substr(used);
+                static const std::pair<const char*, int> units[] = {{"fs", -15}, {"ps", -12}, {"ns", -9}, {"us", -6}, {"ms", -3}, {"s", 0}};
+                if (u.empty()) maxTime = std::stoull(n);
+                else {
+                    auto it = std::find_if(std::begin(units), std::end(units), [&](auto& x) { return u == x.first; });
+                    if (it == std::end(units) || val < 0) throw std::invalid_argument(n);
+                    maxTimeVal = val;
+                    maxTimeExp = it->second;
+                }
+            }
+            catch (...) { std::cerr << "msim: bad -maxtime " << n << " (a number, or with fs, ps, ns, us, ms or s)\n"; return 2; }
             continue;
         }
         if (a == "-seed") {
@@ -3116,6 +3131,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (maxTimeExp) maxTime = (uint64_t)std::llround(maxTimeVal * std::pow(10.0, *maxTimeExp - lowered.precExp));
     if (elabOnly) { std::cout << "msim: elaborated " << lowered.procs.size() << " processes; not run (-elab)\n"; return 0; }
     if (g_cov) {   // FSM coverage: the kernel records the state registers' values
         std::vector<int> watch;

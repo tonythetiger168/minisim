@@ -5261,6 +5261,8 @@ struct Lowerer {
                     }
                     return sysFnNode(SF_TO_2STATE, {std::move(v)});
                 }
+                if ((c.type->isUnpackedStruct() || c.type->isUnpackedUnion()) && c.operand().type->isEquivalent(*c.type))
+                    return expr(c.operand(), ctx);   // T'(x) of an x already of type T (6.24.1): the value itself
                 if (peel(c.operand()).kind == ExpressionKind::Streaming && c.type->isIntegral()) {
                     // a stream into a wider integral type is left-aligned,
                     // padded with zeros on the right (11.4.14)
@@ -9463,8 +9465,16 @@ struct Lowerer {
         switch (s.kind) {
             case StatementKind::Empty: break;
             // slang leaves a statement it could not bind as Invalid without an error only
-            // in a branch it proved dead (a constant-false condition): nothing to run
-            case StatementKind::Invalid: break;
+            // in a branch it proved dead (a constant-false condition). The dead
+            // statement itself does nothing; a block, list, if or loop around it
+            // is marked Invalid too, and runs its other statements as usual.
+            case StatementKind::Invalid: {
+                const Statement* c = s.as<InvalidStatement>().child;
+                if (c && c->kind != StatementKind::ExpressionStatement && c->kind != StatementKind::ProceduralAssign &&
+                    c->kind != StatementKind::ProceduralDeassign)
+                    stmt(*c);
+                break;
+            }
             case StatementKind::List:
                 if ((!loops.empty() && loops.back().xpBrk >= 0) || (!xp.dis.empty() && !xp.clean)) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
@@ -10914,6 +10924,23 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
 
+    // The signals of variables (not nets), and of the elements of unpacked
+    // arrays of variables, made on first use.
+    std::unordered_set<int> varSigs;
+    bool varSigsMade = false;
+    bool isVarSig(int sg) {
+        using namespace slang::ast;
+        if (!varSigsMade) {
+            varSigsMade = true;
+            for (auto& [sym, id] : sigmap)
+                if (sym->kind == SymbolKind::Variable) varSigs.insert(id);
+            for (auto& [sym, shape] : arrMap())
+                if (sym && sym->kind == SymbolKind::Variable && shape)
+                    for (int k = 0; k < shape->count; k++) varSigs.insert(shape->base + k);
+        }
+        return varSigs.count(sg) > 0;
+    }
+
     // One driver, then wait on every signal the right-hand side reads.
     // Several assigns to one wire each own a driver slot and resolve.
     void finishAssign(Lowerer& lw, Instr i) {
@@ -10934,6 +10961,22 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
             }
             out.procs.push_back({std::move(lw.prog), !rs.empty(), "assign"});
+            return;
+        }
+        // A continuous assign to part of a variable (a bit, a slice, a member of a
+        // struct): no other continuous or procedural assignment may write those
+        // bits (6.5), but procedures may write the other bits. Without a driver
+        // slot, which would make the rest of the variable Z, it writes its bits.
+        if (i.hi >= 0 && i.dly.empty() && i.s0 == STR_STRONG && i.s1 == STR_STRONG && isVarSig(i.sig)) {
+            lw.prog.emit(i);
+            auto rs = combReadSet(lw.prog);
+            bool loops = !rs.empty();
+            if (loops) {
+                lw.prog.emit(waitInstr(rs));
+                Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j);
+            }
+            out.procs.push_back({std::move(lw.prog), loops, "assign", curScope, curPort, curPortDir,
+                                 program, checkerDepth > 0});
             return;
         }
         i.drv = newDriver(i.sig);

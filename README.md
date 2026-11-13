@@ -109,7 +109,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
 | `-vcd-class [N]` | Also write class objects: each property of the object a module's class handle variable points to, as `tb.p.addr` (x while the handle is null), following handle properties N levels (default 1). See `docs/DEBUG.md` |
 | `-vcd-arrays [N]` | Also write the elements of unpacked arrays (memories) with at most N elements (default 1024) to the VCD or FST, as `mem[3]`. Off by default: memories are left out, as `$dumpvars` does. `mdebug` uses them to trace through a memory |
-| `-maxtime <n>` | Stop after simulation time `n`. Without it, run until `$finish` or no events remain |
+| `-maxtime <n>` | Stop after simulation time `n`: time-precision ticks, or with a unit (`3ms`, `500ns`). Without it, run until `$finish` or no events remain |
 | `-sv`, `-sverilog` | Accepted and ignored |
 | `+<arg>` | Any other plusarg is accepted (not yet visible to `$test$plusargs`) |
 | `-compile` | Compiled mode: generate C++ for the design, build `<dir>/simv`, run it |
