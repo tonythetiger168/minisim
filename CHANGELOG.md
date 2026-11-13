@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -upf` rules `UPF008` to `UPF012`: isolation and retention controls
+  driven from a domain that can be off, isolation or retention powered by
+  the switched supply of the domain itself, a power switch controlled from
+  the domain it powers, and redundant level shifters.
 - `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
