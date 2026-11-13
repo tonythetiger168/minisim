@@ -94,6 +94,7 @@ private:
 struct BootArgs {
     std::string bootargs;
     uint64_t initrdStart = 0, initrdEnd = 0;  // both 0: no initrd
+    std::string mmu = "sv39";                 // RV64: the largest paging mode offered
 };
 
 inline std::string hexName(const std::string& node, uint64_t a) {
@@ -152,7 +153,7 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
         f.propStr("riscv,isa-base", {xl + "i"});
         f.propStr("riscv,isa-extensions", {"i", "m", "a", "f", "d", "c", "b", "zicntr", "zicond", "zicsr", "zifencei",
                                             "zba", "zbb", "zbc", "zbs"});
-        f.propStr("mmu-type", {rv64 ? "riscv,sv39" : "riscv,sv32"});
+        f.propStr("mmu-type", {rv64 ? "riscv," + boot.mmu : "riscv,sv32"});
         f.propU32("clock-frequency", {(uint32_t)cpuHz});
         f.begin("interrupt-controller");
         f.propU32("#interrupt-cells", {1});

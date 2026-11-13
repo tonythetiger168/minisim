@@ -1,11 +1,12 @@
 #!/bin/bash
 # mvplat_isa.sh - the RISC-V architecture tests (riscv-tests, BSD-3-Clause:
 # github.com/riscv-software-src/riscv-tests) on mvplat: every ui, um, ua, uc,
-# uf, ud, uzba, uzbb, uzbc, uzbs, uzicond, si and mi test, for RV32 and RV64, in its "p" environment (physical memory),
-# and the user-level ones again in the "v" environment, which runs them in
-# user mode under Sv32 or Sv39 paging with a small supervisor that maps pages
-# on demand. A test ends through HTIF tohost with the number of the first
-# failing case.
+# uf, ud, uzba, uzbb, uzbc, uzbs, uzicond, si and mi test, for RV32 and RV64,
+# in its "p" environment (physical memory), and the user-level ones again in
+# the "v" environment, which runs them in user mode under Sv32 or Sv39 paging
+# (and RV64's ui, um, ua and uc again under Sv48) with a small supervisor
+# that maps pages on demand. A test ends through HTIF tohost with the number
+# of the first failing case.
 #
 # The tests are fetched at a pinned commit and built with clang; nothing from
 # them is shipped. Without git access or a clang that targets riscv32 (and
@@ -112,6 +113,24 @@ for X in 32 64; do
       run $t
     done
   done
+  # RV64 again under Sv48 (4 levels): the supervisor built with -DSv48.
+  if [ $X = 64 ]; then
+    for suite in rv64ui rv64um rv64ua rv64uc; do
+      for n in $(tests_of $suite); do
+        f=$RT/isa/$suite/$n.S
+        t=$suite-v48-$n
+        $CL -E -I"$RT/env/v" -I"$RT/isa/macros/scalar" "$f" -o $t.s
+        unweak $t.s
+        entropy=0x$(echo $t | md5sum | cut -c 1-7)
+        if ! $VCC -c -x assembler $t.s -o $t.o 2> $t.err ||
+           ! $VCC -march=$VM -DSv48 -DENTROPY=$entropy -c "$RT/env/v/vm.c" -o $t.vm.o 2>> $t.err ||
+           ! $VCC -static -fuse-ld=lld -Tv-link.ld v$X-entry.o $t.vm.o v$X-string.o $t.o -o $t 2>> $t.err; then
+          failed="$failed $t(build)"; continue
+        fi
+        run $t
+      done
+    done
+  fi
 done
 echo "riscv-tests: $pass passed"
 if [ -n "$failed" ]; then echo "failed:$failed"; exit 1; fi
