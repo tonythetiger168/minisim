@@ -26,6 +26,9 @@ Spec references are IEEE 1800-2023 clauses.
   kept field by field, so one field's crossing no longer spreads to every
   register. A clock behind a scan mux is the functional clock. `-static`
   takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
+- `include/msim_upf.h`: C and C++ (SystemC, TLM) models called through
+  DPI-C read the current power state and simstate of a power domain or
+  supply set under `msim -upf` (IEEE 1801-2024 5.14).
 - VPI containers of structs, classes and containers (37.18): an element of
   a queue, dynamic or associative array of unpacked structs is a
   `vpiStructVar` whose members read and write the element; one of class
