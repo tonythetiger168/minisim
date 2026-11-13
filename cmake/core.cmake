@@ -125,6 +125,15 @@ list(TRANSFORM MINISIM_CORE_VP_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vp/
 install(FILES ${MINISIM_CORE_VP_HEADER_PATHS}
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/minisim/vp)
 
+# The VHDL front end (src/vhdl) is header-only and keeps its directory too:
+# a tool that reads VHDL includes "vhdl/front.hpp" (slang-based hook) or
+# "vhdl/vhdl.hpp" (translator only), as msim does.
+set(MINISIM_CORE_VHDL_HEADERS ast.hpp front.hpp lex.hpp parse.hpp sv.hpp types.hpp vhdl.hpp)
+list(TRANSFORM MINISIM_CORE_VHDL_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vhdl/
+     OUTPUT_VARIABLE MINISIM_CORE_VHDL_HEADER_PATHS)
+install(FILES ${MINISIM_CORE_VHDL_HEADER_PATHS}
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/minisim/vhdl)
+
 list(TRANSFORM MINISIM_CORE_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/
      OUTPUT_VARIABLE MINISIM_CORE_HEADER_PATHS)
 install(FILES ${MINISIM_CORE_HEADER_PATHS} ${CMAKE_BINARY_DIR}/gen/version.hpp
