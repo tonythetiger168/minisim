@@ -240,6 +240,8 @@ or single rules.
 | `NAME015` | warning | off | An interface name does not match `name.interface` | interface-name-style |
 | `NAME016` | warning | off | A constraint name does not match `name.constraint` | constraint-name-style |
 | `NAME017` | info | off | A parameter named for what it disables (`DisableFoo`) | positive-meaning-parameter-name |
+| `NAME018` | info | off | A register written in `always_ff` does not match `name.dff` | dff-name-style |
+| `NAME019` | info | off | A declaration hides one of the same name in an enclosing scope | instance-shadowing |
 | `W009` | info | off | A sized binary literal with fewer digits than its width (`8'b101`) | undersized-binary-literal |
 
 Verible's suspicious-semicolon (`if (c);`) is slang's own `-Wempty-body`
@@ -431,6 +433,7 @@ Severities: an `error` finding makes mlint exit 1; a `warning` does with
 | `unused.ignore` | `^_?unused\|_unused$\|^_?nc_\|_nc$` (any case) | `UNU001`..`UNU005` |
 | `name.macro` | `^[A-Z_][A-Z0-9_]*$` | `NAME014` |
 | `name.interface` | `_if$` | `NAME015` |
+| `name.dff` | `(_q\|_ff\|_reg\|_r)[0-9]*$` | `NAME018` |
 | `name.constraint` | `_c$` | `NAME016` |
 | `fmt.line_length` | `100` | `FMT001` |
 | `formal.max_bits` | `16` | `FML001`..`FML003`: free bits one question may enumerate |

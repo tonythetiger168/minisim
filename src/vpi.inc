@@ -72,6 +72,7 @@ struct Obj {
     ProcCtl* thr = nullptr;               // Thread, Frame: the process (not used once gone)
     size_t depth = 0;                     // Frame: the frames below it in its thread
     bool gone = false;                    // Thread, Frame: it ended (vpiValid 0)
+    bool decl = false;                    // a property declaration reached from its class defn (37.31): no value
 };
 struct Cb {
     s_cb_data d{};
@@ -2469,6 +2470,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
     if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return H(vpi::constrHandle(type, o));   // 37.31
+    if (o->decl && (type == vpiParent || type == vpiScope)) return H(const_cast<Obj*>(o->parent));   // a declaration's class defn (37.31)
     if (o->kind == Obj::Thread || o->kind == Obj::Frame) return H(vpi::thrHandle(type, o));
     if (type == vpiClassDefn || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return H(vpi::classHandle(type, o));
     if (o->kind == Obj::InterModPath) return nullptr;
@@ -3236,7 +3238,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
             if (o->kind == Obj::Scope && (o->type == vpiTask || o->type == vpiFunction))
                 return o->sym->kind != SymbolKind::Subroutine ||
                        o->sym->as<slang::ast::SubroutineSymbol>().defaultLifetime == slang::ast::VariableLifetime::Automatic;
-            if (o->kind == Obj::Signal && o->sym->kind == SymbolKind::Variable)
+            if (o->kind == Obj::Signal && o->sym && (o->sym->kind == SymbolKind::Variable || o->sym->kind == SymbolKind::ClassProperty))
                 return o->sym->as<slang::ast::VariableSymbol>().lifetime == slang::ast::VariableLifetime::Automatic;
             return 0;
         case vpiConstantVariable:
@@ -3449,6 +3451,10 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
         vpi::getValueOf(o, val, v);
         return;
     }
+    if (o->decl) {   // 37.31 detail 2
+        vpi::error(vpiError, "vpi_get_value: a property obtained from a class defn has no value");
+        return;
+    }
     if (o->kind == Obj::Iter || o->kind == Obj::Callback || o->kind == Obj::Systf || o->kind == Obj::Module ||
         o->kind == Obj::Scope || o->kind == Obj::Typespec || o->kind == Obj::Member || o->kind == Obj::Range ||
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
@@ -3482,6 +3488,7 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
         if (!vpi::dynWrite(o, val)) vpi::error(vpiError, "vpi_put_value: the element is no longer in the array");
         return nullptr;
     }
+    if (o->decl) { vpi::error(vpiError, "vpi_put_value: a property obtained from a class defn cannot be written"); return nullptr; }   // 37.31 detail 2
     if (const Obj* r = vpi::dynRoot(o)) {   // a member of a struct element of a container (37.18): written now
         Val val;
         if ((flags & 0xfff) == vpiForceFlag || (flags & 0xfff) == vpiReleaseFlag) { vpi::error(vpiError, "vpi_put_value: an element of a dynamic array, queue or associative array cannot be forced"); return nullptr; }

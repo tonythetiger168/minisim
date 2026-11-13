@@ -9,6 +9,7 @@ __pycache__/
 lib/sky130/pdk/
 tests/spec/spec_*.hex
 tests/spec/spec_d_*
+tests/spec/spec_38_36_*
 tests/spec/spec_*.bin
 tests/spec/spec_*.txt
 *.mcovsave
