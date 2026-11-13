@@ -446,6 +446,20 @@ int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
     if (ai.localVars.empty()) return -1;
     std::vector<ConcAssert::Item> init;
     for (const LocalAssertionVarSymbol* lv : ai.localVars) {
+        if (lv->formalPort && lv->formalPort->direction && *lv->formalPort->direction != ArgumentDirection::In) {
+            // An output or inout local argument (16.8.2) is the caller's
+            // local variable itself: what the instance assigns flows out.
+            const Expression* to = nullptr;
+            for (auto& [port, actual] : ai.arguments)
+                if (port == lv->formalPort)
+                    if (auto* x = std::get_if<const Expression*>(&actual)) to = *x;
+            const Symbol* at = to ? to->getSymbolReference() : nullptr;
+            auto it = at ? sigmap.find(at) : sigmap.end();
+            if (!at || at->kind != SymbolKind::LocalAssertionVar || it == sigmap.end())
+                unsupported("an output or inout local argument whose actual is not a local variable (16.8.2)");
+            sigmap[lv] = it->second;
+            continue;
+        }
         const Type& t = lv->getType();
         if (!t.isIntegral()) unsupported("a local variable that is not integral (16.10)");
         int w = (int)t.getBitWidth();
@@ -457,8 +471,6 @@ int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
         svb->localSigs.push_back(sg);
         const Expression* from = nullptr;
         if (lv->formalPort) {
-            if (lv->formalPort->direction && *lv->formalPort->direction != ArgumentDirection::In)
-                unsupported("a local variable argument that is output or inout (16.8.2)");
             for (auto& [port, actual] : ai.arguments)
                 if (port == lv->formalPort)
                     if (auto* x = std::get_if<const Expression*>(&actual)) from = *x;
