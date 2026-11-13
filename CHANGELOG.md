@@ -15,6 +15,21 @@ Spec references are IEEE 1800-2023 clauses.
   element `vpiIndex` and its array. Array elements are now named `u[2]`, and
   `vpi_handle_by_name` picks the right element of a descending array
   (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
+- `mlint -cdc-sva`: handshake checks are now an alternation check that
+  holds on both sides (the side that starts a transfer and the side that
+  answers), and an acknowledge read back through logic (an FSM) counts.
+  Checked by simulation on pulp common_cells `cdc_2phase`, `cdc_4phase`,
+  `cdc_fifo_2phase` and `cdc_fifo_gray`: no assertion fails.
+
+### Fixed
+- `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
+  the reader takes), which failed on correct FIFOs such as common_cells
+  `cdc_fifo_gray`.
+- `mlint`: four more rules after Verible's, off by default: `STY013`
+  (explicit-begin: `if`/`else`/loop/`always` bodies without `begin`),
+  `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
+  `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
+  (plusarg-assignment: `$test$plusargs`).
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their

@@ -231,6 +231,12 @@ inline const std::vector<RuleInfo>& table() {
         {"STY010", "style", Sev::Info, false, "a string literal carried over the line with a backslash", "Verible rule forbid-line-continuations."},
         {"STY011", "style", Sev::Info, false, "a semicolon after a UVM macro", "Verible rule uvm-macro-semicolon."},
         {"STY012", "style", Sev::Info, false, "disable of a name that is not an enclosing begin block", "Verible rule disable-statement."},
+        {"STY013", "style", Sev::Info, false, "an if, else, loop, always or initial body with no begin ... end",
+         "Verible rule explicit-begin. else if chains are fine."},
+        {"STY014", "style", Sev::Info, false, "parameter declared outside a #(...) list (module body, package, class body)",
+         "Verible rule proper-parameter-declaration: use localparam, or move it into the parameter list."},
+        {"STY015", "style", Sev::Info, false, "a hex or binary format with no 0x/0b prefix, or %d after one",
+         "Verible rule numeric-format-string-style."},
         {"FUNC001", "style", Sev::Info, true, "a function reads or writes a signal that is not one of its arguments",
          "always @* does not see signals read inside a function, and the function cannot be reused."},
 
@@ -269,6 +275,8 @@ inline const std::vector<RuleInfo>& table() {
         {"SUS002", "suspicious", Sev::Warning, false, "void'() around randomize() or uvm_hdl_read()", "Verible rule void-cast."},
         {"SUS003", "suspicious", Sev::Info, false, "$psprintf, $random, $srandom or a $dist_ function",
          "Verible rule invalid-system-task-function."},
+        {"SUS004", "suspicious", Sev::Info, false, "$test$plusargs: +NAME=0 still reads as given",
+         "Verible rule plusarg-assignment: read the value with $value$plusargs."},
         {"W009", "width", Sev::Info, false, "a sized binary literal with fewer digits than its width (8'b101)", "Verible rule undersized-binary-literal."},
         // ------------------------------------------------------------------ formal
         // lintformal.hpp: answered by enumerating the values the logic can take.
