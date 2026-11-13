@@ -180,6 +180,7 @@
 #include "dpi.inc"
 #include "vpi.inc"
 #include "interactive.inc"
+#include "vendor_tasks.hpp"
 #include "objview.inc"
 #include "xrun.inc"
 #include "vhdl/front.hpp"
@@ -2981,6 +2982,7 @@ int main(int argc, char** argv) {
         }
     }
     if (vpi::st().active) vpi::declare(*comp);
+    vendor::declare(*comp);   // $fsdbDumpvars, $vcdpluson, $shm_probe, ... (after VPI: a real PLI library wins)
     driver.reportCompilation(*comp, /*quiet*/ true);
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
 
@@ -3027,6 +3029,8 @@ int main(int argc, char** argv) {
                 driver.syntaxTrees.push_back(slang::syntax::SyntaxTree::fromText(bindText, driver.sourceManager, "upf_bind_checker.sv", "",
                                                                                  driver.createOptionBag()));
                 comp = driver.createCompilation();
+                if (vpi::st().active) vpi::declare(*comp);
+                vendor::declare(*comp);
                 driver.reportCompilation(*comp, /*quiet*/ true);
                 if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
                 if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);

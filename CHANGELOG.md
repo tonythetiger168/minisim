@@ -12,6 +12,13 @@ Spec references are IEEE 1800-2023 clauses.
   delay (`vpi_put_delays` / `vpi_get_delays`, 38.21), and `msim -i` / `-do`
   runs `cbEnterInteractive`, `cbExitInteractive` and
   `cbInteractiveScopeChange` (38.36.3).
+- Verdi, VCS and Xcelium waveform tasks: `$fsdbDumpfile`, `$fsdbDumpvars`,
+  `$fsdbDumpon` / `off`, `$fsdbDumpMDA`, `$vcdpluson`, `$vcdplusfile`,
+  `$vcdplusmemon`, `$shm_open`, `$shm_probe`, `$recordvars` and the rest
+  compile on msim and write FST under the same name (the vendor formats are
+  closed); msim, mdebug and mlint all accept them, and `msim -i` takes the
+  UCLI commands `fsdbDumpfile` / `fsdbDumpvars` / `fsdbDumpoff`.
+  `docs/DEBUG.md`, `tests/msim_vendor_dump.cmake`.
 - VPI assertion steps list their matched expressions
   (`matched_expression_count`, `matched_exprs`, 39.5.2), and `failExpr` of a
   concurrent assertion with sequence operators is the boolean that did not
