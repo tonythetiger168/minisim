@@ -2,7 +2,7 @@
 # mvplat_isa.sh - the RISC-V architecture tests (riscv-tests, BSD-3-Clause:
 # github.com/riscv-software-src/riscv-tests) on mvplat: every ui, um, ua, uc,
 # uf, ud, uzba, uzbb, uzbc, uzbs, uzicond, uzbkb, uzbkx, uzabha, uzacas,
-# uzabha_zacas, si and mi test, for RV32 and RV64 (and RV64's mzicbo and
+# uzabha_zacas, uzfh, si and mi test, for RV32 and RV64 (and RV64's mzicbo and
 # ssvnapot),
 # in its "p" environment (physical memory), and the user-level ones again in
 # the "v" environment, which runs them in user mode under Sv32 or Sv39 paging
@@ -65,6 +65,21 @@ zabha() {
       do { my ($o, $w, $q, $d, $b, $a) = ($1, $2, $3 \/\/ "", $4, $5, $6);
         sprintf(".insn r 0x2f, %d, %d, %s, %s, %s", $w eq "b" ? 0 : 1, $f{$o} << 2 | (index($q, "aq") >= 0 ? 2 : 0) | (index($q, "rl") >= 0 ? 1 : 0), $d, $a, $b) }/ge' "$1"
 }
+# clang 18 has no .float16: write each value as the half's bits (Python
+# rounds a decimal to half to nearest even, as the GNU assembler does).
+float16() {
+  grep -q '\.float16' "$1" || return 0
+  python3 -I -c '
+import re, struct, sys
+def h(m):
+    v = m.group(1).strip()
+    if v.startswith("0h:"): return ".half 0x" + v[3:]
+    if v.lower() == "nan": return ".half 0x7e00"
+    return ".half 0x%04x" % struct.unpack("<H", struct.pack("<e", float(v)))[0]
+p = sys.argv[1]
+s = open(p).read()
+open(p, "w").write(re.sub(r"\.float16\s+([^;\n]+)", h, s))' "$1"
+}
 run() {  # run TEST
   timeout 60 "$MVPLAT" $1 -q -max-cycles 20000000 > $1.out 2>&1
   local rc=$?
@@ -84,10 +99,10 @@ printf '#include <stddef.h>\nvoid *memcpy(void *, const void *, size_t);\nvoid *
 sed 's/^  \.bss : { \*(\.bss) }/  .bss : { *(.bss) }\n  .sbss : { *(.sbss) }/' "$RT/env/v/link.ld" > v-link.ld
 
 for X in 32 64; do
-  B=_zba_zbb_zbc_zbs_zicond_zbkb_zbkx_zacas1p0
+  B=_zba_zbb_zbc_zbs_zicond_zbkb_zbkx_zacas1p0_zfh
   if [ $X = 32 ]; then CL="$CLANG --target=riscv32-unknown-elf -march=rv32imafdc_zicsr_zifencei$B -menable-experimental-extensions -mabi=ilp32"; VM=rv32imafdc_zicsr_zifencei
   else CL="$CLANG --target=riscv64-unknown-elf -march=rv64imafdc_zicsr_zifencei$B -menable-experimental-extensions -mabi=lp64 -mcmodel=medany"; VM=rv64imafdc_zicsr_zifencei; fi
-  BSUITES="rv${X}uzba rv${X}uzbb rv${X}uzbc rv${X}uzbs rv${X}uzicond rv${X}uzbkb rv${X}uzbkx rv${X}uzabha rv${X}uzacas rv${X}uzabha_zacas"
+  BSUITES="rv${X}uzba rv${X}uzbb rv${X}uzbc rv${X}uzbs rv${X}uzicond rv${X}uzbkb rv${X}uzbkx rv${X}uzabha rv${X}uzacas rv${X}uzabha_zacas rv${X}uzfh"
   PONLY="rv${X}si rv${X}mi"
   [ $X = 64 ] && PONLY="$PONLY rv64mzicbo rv64ssvnapot"
   for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}uf rv${X}ud $BSUITES $PONLY; do
@@ -99,6 +114,7 @@ for X in 32 64; do
       sed -i 's/\btcontrol\b/0x7a5/g' $t.s   # a CSR name clang 18 does not know
       [ $X = 32 ] && rv32li $t.s
       zabha $t.s
+      float16 $t.s
       if ! $CL -nostdlib -static -fuse-ld=lld -T"$RT/env/p/link.ld" -x assembler $t.s -o $t 2> $t.err; then
         failed="$failed $t(build)"; continue
       fi
@@ -118,6 +134,7 @@ for X in 32 64; do
       unweak $t.s
       [ $X = 32 ] && rv32li $t.s
       zabha $t.s
+      float16 $t.s
       # As upstream: the supervisor's page placement is seeded from the test name.
       entropy=0x$(echo $t | md5sum | cut -c 1-7)
       if ! $VCC -c -x assembler $t.s -o $t.o 2> $t.err ||

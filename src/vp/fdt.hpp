@@ -149,11 +149,11 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
         f.propU32("reg", {h});
         f.propStr("status", {"okay"});
         f.propStr("compatible", {"riscv"});
-        f.propStr("riscv,isa", {xl + "imafdc_zicboz_zicntr_zicond_zicsr_zifencei_zabha_zacas_zba_zbb_zbc_zbkb_zbkx_zbs" +
+        f.propStr("riscv,isa", {xl + "imafdc_zicboz_zicntr_zicond_zicsr_zifencei_zabha_zacas_zfh_zfhmin_zba_zbb_zbc_zbkb_zbkx_zbs" +
                                 (rv64 ? "_svnapot" : "")});
         f.propStr("riscv,isa-base", {xl + "i"});
         std::vector<std::string> exts = {"i", "m", "a", "f", "d", "c", "b", "zicboz", "zicntr", "zicond", "zicsr", "zifencei",
-                                         "zabha", "zacas", "zba", "zbb", "zbc", "zbkb", "zbkx", "zbs"};
+                                         "zabha", "zacas", "zfh", "zfhmin", "zba", "zbb", "zbc", "zbkb", "zbkx", "zbs"};
         if (rv64) exts.push_back("svnapot");
         f.propStr("riscv,isa-extensions", exts);
         f.propU32("riscv,cboz-block-size", {64});

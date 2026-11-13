@@ -43,7 +43,8 @@ names what is missing. Sections marked *(extension)* describe these parts.
 extension's Zba, Zbb and Zbs, Zbc, Zicond, the scalar-crypto bit
 manipulation Zbkb and Zbkx, the byte and halfword atomics Zabha, compare and
 swap Zacas (AMOCAS.W/D, AMOCAS.Q on RV64 and AMOCAS.D on RV32 with register
-pairs, AMOCAS.B/H), and the cache-block operations CBO.ZERO, CBO.CLEAN,
+pairs, AMOCAS.B/H), half-precision floating point Zfh (every operation,
+rounding mode and flag, NaN-boxed in the F registers), and the cache-block operations CBO.ZERO, CBO.CLEAN,
 CBO.FLUSH and CBO.INVAL with 64-byte blocks; there are no caches, so the
 last three only check privilege), in machine,
 supervisor and user mode. The program's ELF class picks the width: a 64-bit
@@ -80,9 +81,9 @@ The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
 interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
 (SEIP).
 
-The RISC-V architecture tests all pass, 793 programs: ui, um, ua, uc, uf,
-ud, uzba, uzbb, uzbc, uzbs, uzicond, uzbkb, uzbkx, uzabha, uzacas and
-uzabha_zacas for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
+The RISC-V architecture tests all pass, 837 programs: ui, um, ua, uc, uf,
+ud, uzba, uzbb, uzbc, uzbs, uzicond, uzbkb, uzbkx, uzabha, uzacas,
+uzabha_zacas and uzfh for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
 paging on (`v`, Sv32 and Sv39, and RV64's ui, um, ua and uc under Sv48
 too), mi and si for both, and RV64's mzicbo and ssvnapot. `tests/mvplat_isa.sh`
 runs them.

@@ -1676,18 +1676,18 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             }
             case 0x07:                                                 // FLW, FLD
             case 0x27: {                                               // FSW, FSD
-                if (!(h.mstatus & MSTATUS_FS) || (f3 != 2 && f3 != 3)) ILLEGAL();
-                unsigned n = f3 == 2 ? 4 : 8;
+                if (!(h.mstatus & MSTATUS_FS) || f3 < 1 || f3 > 3) ILLEGAL();  // FLH, FSH (Zfh) too
+                unsigned n = 1u << f3;
                 if (op == 0x07) {
                     uint64_t a = h.ax(x[rs1] + immI), v;
                     Acc r = load(h, a, n, v);
                     if (r != Acc::Ok) MEMFAIL(r, 5, a);
-                    FD(n == 4 ? fpu::box((uint32_t)v) : v);
+                    FD(n == 2 ? fpu::box16((uint16_t)v) : n == 4 ? fpu::box((uint32_t)v) : v);
                     cls = C_LOAD;
                     memAcc = true; memA = a; memN = n;
                 } else {
                     int64_t imm = (int32_t)(((insn >> 25) << 5) | ((insn >> 7) & 31)) << 20 >> 20;
-                    uint64_t a = h.ax(x[rs1] + imm), v = n == 4 ? (uint32_t)h.f[rs2] : h.f[rs2];
+                    uint64_t a = h.ax(x[rs1] + imm), v = n == 2 ? (uint16_t)h.f[rs2] : n == 4 ? (uint32_t)h.f[rs2] : h.f[rs2];
                     Acc r = store(h, a, n, v);
                     if (r != Acc::Ok) MEMFAIL(r, 7, a);
                     cls = C_STORE;
@@ -1699,7 +1699,70 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             case 0x53: {                                               // OP-FP
                 if (!(h.mstatus & MSTATUS_FS)) ILLEGAL();
                 const unsigned fmt = (insn >> 25) & 3;
-                if (fmt > 1) ILLEGAL();                                // H and Q: not here
+                if (fmt == 3) ILLEGAL();                               // Q: not here
+                if (fmt == 2) {                                        // Zfh
+                    const unsigned hrm = f3 == 7 ? (h.fcsr >> 5) & 7 : f3;
+                    const uint16_t ha = fpu::unbox16(h.f[rs1]), hb = fpu::unbox16(h.f[rs2]);
+                    uint32_t hfl = 0;
+                    cls = C_ALU;
+                    if (op != 0x53) {
+                        static const fpu::Op fused[4] = {fpu::Op::Madd, fpu::Op::Msub, fpu::Op::Nmsub, fpu::Op::Nmadd};
+                        if (hrm > 4) ILLEGAL();
+                        FD(fpu::box16(fpu::harith(fused[(op >> 2) & 3], ha, hb, fpu::unbox16(h.f[(insn >> 27) & 31]), hrm, hfl)));
+                    } else {
+                        const unsigned f5 = insn >> 27;
+                        static const fpu::Op ops[4] = {fpu::Op::Add, fpu::Op::Sub, fpu::Op::Mul, fpu::Op::Div};
+                        switch (f5) {
+                            case 0x00: case 0x01: case 0x02: case 0x03:
+                                if (hrm > 4) ILLEGAL();
+                                FD(fpu::box16(fpu::harith(ops[f5], ha, hb, 0, hrm, hfl)));
+                                break;
+                            case 0x0b:
+                                if (hrm > 4 || rs2) ILLEGAL();
+                                FD(fpu::box16(fpu::harith(fpu::Op::Sqrt, ha, 0, 0, hrm, hfl)));
+                                break;
+                            case 0x04:
+                                if (f3 > 2) ILLEGAL();
+                                FD(fpu::box16(fpu::sgnj<uint16_t>(ha, hb, f3)));
+                                break;
+                            case 0x05:
+                                if (f3 > 1) ILLEGAL();
+                                FD(fpu::box16(fpu::hminmax(ha, hb, f3, hfl)));
+                                break;
+                            case 0x08:                                 // FCVT.H.S, FCVT.H.D
+                                if (hrm > 4 || rs2 > 1) ILLEGAL();
+                                FD(fpu::box16(fpu::d2h(rs2 ? h.f[rs1] : fpu::sToD(fpu::unbox(h.f[rs1]), hfl), hrm, hfl)));
+                                break;
+                            case 0x14:
+                                if (f3 > 2) ILLEGAL();
+                                RD(fpu::compare<double>(fpu::h2d(ha), fpu::h2d(hb), f3, hfl));
+                                break;
+                            case 0x18: {                               // FCVT.W/WU/L/LU.H
+                                if (hrm > 4 || rs2 > 3 || (rs2 > 1 && !rv64)) ILLEGAL();
+                                RD(fpu::toInt<double>(fpu::h2d(ha), hrm, !(rs2 & 1), rs2 > 1 ? 64 : 32, hfl));
+                                break;
+                            }
+                            case 0x1a: {                               // FCVT.H.W/WU/L/LU
+                                if (hrm > 4 || rs2 > 3 || (rs2 > 1 && !rv64)) ILLEGAL();
+                                FD(fpu::box16(fpu::hFromInt(x[rs1], !(rs2 & 1), rs2 > 1 ? 64 : 32, hrm, hfl)));
+                                break;
+                            }
+                            case 0x1c:                                 // FMV.X.H, FCLASS.H
+                                if (rs2) ILLEGAL();
+                                if (f3 == 0) RD((uint64_t)(int64_t)(int16_t)(uint16_t)h.f[rs1]);
+                                else if (f3 == 1) RD(fpu::hclassify(ha));
+                                else ILLEGAL();
+                                break;
+                            case 0x1e:                                 // FMV.H.X
+                                if (rs2 || f3) ILLEGAL();
+                                FD(fpu::box16((uint16_t)x[rs1]));
+                                break;
+                            default: ILLEGAL();
+                        }
+                    }
+                    if (hfl) { h.fcsr |= hfl; h.mstatus |= MSTATUS_FS; }
+                    break;
+                }
                 const bool dbl = fmt == 1;
                 unsigned rm = f3 == 7 ? (h.fcsr >> 5) & 7 : f3;
                 uint32_t fl = 0;
@@ -1733,8 +1796,17 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                             if (dbl) FD(fpu::minmax<double>(ra, rb, f3, fl));
                             else FD(fpu::box(fpu::minmax<float>((uint32_t)sa, (uint32_t)sb, f3, fl)));
                             break;
-                        case 0x08:                                     // FCVT.S.D, FCVT.D.S
-                            if (rm > 4 || rs2 != (dbl ? 0u : 1u)) ILLEGAL();
+                        case 0x08:                                     // FCVT.S.D, FCVT.D.S, FCVT.S/D.H
+                            if (rm > 4) ILLEGAL();
+                            if (rs2 == 2) {                            // from half, exact
+                                uint64_t d = fpu::h2d(fpu::unbox16(ra));
+                                if (dbl) {
+                                    if (fpu::snan64(d)) fl |= fpu::NV;
+                                    FD(std::isnan(fpu::f64(d)) ? fpu::QNAN64 : d);
+                                } else FD(fpu::box(fpu::dToS(d, rm, fl)));
+                                break;
+                            }
+                            if (rs2 != (dbl ? 0u : 1u)) ILLEGAL();
                             if (dbl) FD(fpu::sToD((uint32_t)sa, fl));
                             else FD(fpu::box(fpu::dToS(ra, rm, fl)));
                             break;
