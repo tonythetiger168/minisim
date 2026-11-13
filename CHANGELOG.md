@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint`: `NAME018` (Verible dff-name-style: a register written in
+  `always_ff` whose name does not match `name.dff`, default
+  `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
+  declaration that hides one of the same name in an enclosing scope). Both
+  off by default.
 - `mlint`: four more rules after Verible's, off by default: `STY013`
   (explicit-begin: `if`/`else`/loop/`always` bodies without `begin`),
   `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
