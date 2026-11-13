@@ -226,7 +226,15 @@ the object was made of, its dynamic type: a `Base` variable holding a
 gives an extends object whose `vpiClassTypespec` names the base class;
 `vpiMethods` iterates the tasks and functions the class declares (each with
 `vpiVirtual`; a `pure virtual` prototype is one too), `vpiDerivedClasses`
-the classes that extend it, and `vpiVariables` its static properties.
+the classes that extend it, and `vpiVariables` its properties, static and
+automatic (37.31 detail 1), as declarations: each has its type, name,
+`vpiAutomatic` and `vpiParent` (the class), and `vpi_get_value` /
+`vpi_put_value` refuse them (detail 2; read a static property through its
+variable, a non-static one through an object). `vpiNamedEvent` gives its
+`event` properties, `vpiParameter` the parameters of its port list and body
+(`vpiLocalParam` 1 for a body one, detail 7), `vpiTypedef` its typedefs,
+`vpiInternalScope` its tasks and functions; `vpiAutomatic` of a class
+definition is 1.
 
 **Constraints (37.31).** `vpi_iterate(vpiConstraint, class definition)`
 gives its constraint blocks, each with `vpiName`, `vpiFullName`,
@@ -473,8 +481,7 @@ waveform tools (`mwave`, the FST and VCD readers).
 
 ## Not yet
 
-The non-static property
-declarations of a class definition, the value of a non-constant expression,
+The value of a non-constant expression,
 the connection list of an instance array (`vpiExpr`, a
 `vpiListOp` operation) and its `vpiParamAssign`, the per-source
 delay of an inter-module path on a net with several sources,
@@ -485,7 +492,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `37.18-vpi-nested-containers.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `37.18-vpi-nested-containers.sv`, `37.31-vpi-class-defn.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

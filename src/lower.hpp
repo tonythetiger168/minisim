@@ -3676,8 +3676,43 @@ struct Lowerer {
         const Symbol* b = selectBase(e);
         if (!b || b->kind != SymbolKind::Parameter || !b->as<ParameterSymbol>().getType().isUnpackedArray()) return nullptr;
         auto cv = tryConst(e, b);
-        if (!cv || !cv.isInteger()) unsupported("non-constant select of a parameter unpacked array");
+        if (!cv || !cv.isInteger()) {
+            if (E rom = paramRom(e, *b, ctx)) return rom;
+            unsupported("non-constant select of a parameter unpacked array");
+        }
         return svLit(cv.integer(), e.type->isSigned(), ctx);
+    }
+    // P[i] with i known only at run time, P a one-dimensional parameter array
+    // of integral elements (a ROM table): a balanced tree of muxes on the
+    // bits of the element position, so a read costs log2(N) steps.
+    E paramRom(const slang::ast::Expression& e, const slang::ast::Symbol& b, ExprCtx ctx) {
+        using namespace slang::ast;
+        if (e.kind != ExpressionKind::ElementSelect) return nullptr;
+        const auto& sel = e.as<ElementSelectExpression>();
+        if (!ValueExpressionBase::isKind(sel.value().kind) || &sel.value().as<ValueExpressionBase>().symbol != &b) return nullptr;
+        const Type& t = sel.value().type->getCanonicalType();
+        if (t.kind != SymbolKind::FixedSizeUnpackedArrayType || !e.type->isIntegral()) return nullptr;
+        auto pv = tryConst(sel.value(), &b);
+        if (!pv || !pv.isUnpacked()) return nullptr;
+        std::vector<E> elems;
+        constElems(t, pv, elems);
+        if (elems.empty()) return nullptr;
+        auto range = t.as<FixedSizeUnpackedArrayType>().range;
+        const Type& st = *sel.selector().type;
+        E idx = resize(expr(sel.selector()), 64, st.isSigned(), true);
+        E left = konst(make((uint64_t)(int64_t)range.left, 0, 64));
+        E pos = range.left <= range.right ? bin(Op::Sub, idx, left) : bin(Op::Sub, left, idx);
+        int bits = 0;
+        while (((size_t)1 << bits) < elems.size()) ++bits;
+        std::function<E(size_t, int)> tree = [&](size_t base, int bit) -> E {
+            if (bit < 0) return base < elems.size() ? elems[base] : elems.back();
+            size_t half = (size_t)1 << bit;
+            if (base + half >= elems.size()) return tree(base, bit - 1);   // the upper half is empty
+            auto b1 = node(Op::Slice, {pos});
+            b1->hi = b1->lo = bit;
+            return node(Op::Mux, {b1, tree(base + half, bit - 1), tree(base, bit - 1)});
+        };
+        return sized(tree(0, bits - 1), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
     }
     // a[i][j] on an unpacked array: the array and one index per dimension.
     // Fewer indices than dimensions (a slice) is not supported yet.

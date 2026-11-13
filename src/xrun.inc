@@ -273,10 +273,8 @@ inline bool translate(const std::vector<std::string>& in0, Opts& o, int depth = 
             flush();
             continue;
         }
-        if (ends(la, ".vhd") || ends(la, ".vhdl") || la == "-v93" || la == "-v200x_vhdl") {
-            std::cerr << o.tool << ": " << a << ": VHDL is not supported yet\n";
-            return false;
-        }
+        // VHDL: the files go to msim's VHDL front end (docs/VHDL.md); the language version options need nothing
+        if (la == "-v93" || la == "-v200x" || la == "-v200x_vhdl" || la == "-v2008" || la == "-v1993") continue;
         v.push_back(a);
     }
     return true;

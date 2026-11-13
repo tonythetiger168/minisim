@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI class definitions (37.31): `vpiVariables` of a class defn gives its
+  automatic properties too (before only static ones), as declarations
+  with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);
+  `vpiNamedEvent`, `vpiParameter` (with `vpiLocalParam`), `vpiTypedef` and
+  `vpiInternalScope` iterate its events, parameters, typedefs and methods.
+  `tests/spec/37.31-vpi-class-defn.sv`.
+- `mlint` CDC on generated register blocks: a register struct written field
+  by field through ports on fields or on concatenations of fields, copied
+  whole (`assign hw2reg_regtop = hw2reg`) and passed whole down a port, is
+  kept field by field, so one field's crossing no longer spreads to every
+  register. A clock behind a scan mux is the functional clock. `-static`
+  takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
 - `include/msim_upf.h`: C and C++ (SystemC, TLM) models called through
   DPI-C read the current power state and simstate of a power domain or
   supply set under `msim -upf` (IEEE 1801-2024 5.14).
@@ -24,6 +36,14 @@ Spec references are IEEE 1800-2023 clauses.
   element `vpiIndex` and its array. Array elements are now named `u[2]`, and
   `vpi_handle_by_name` picks the right element of a descending array
   (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
+- msim simulates VHDL and mixed VHDL/SystemVerilog designs (`docs/VHDL.md`):
+  `.vhd`/`.vhdl` files are translated in memory into SystemVerilog for the
+  same engine, so SV can instantiate VHDL entities and VHDL can instantiate
+  SV modules. Covers entities, packages, processes, generate, components,
+  numeric_std, std_logic_1164, textio, math_real, std.env and common
+  VHDL-2008 additions; results are checked against GHDL goldens
+  (`tests/vhdl`). `msim -xrun` passes VHDL files on; `vhdl2sv` and
+  `msim -vhdl-sv` print the translation.
 - `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
   flop, the nets and logic between it and the reader (a glitch source for
   CDC003), the synchronizer stages, and the qualifier of an enable-qualified
@@ -33,6 +53,11 @@ Spec references are IEEE 1800-2023 clauses.
   answers), and an acknowledge read back through logic (an FSM) counts.
   Checked by simulation on pulp common_cells `cdc_2phase`, `cdc_4phase`,
   `cdc_fifo_2phase` and `cdc_fifo_gray`: no assertion fails.
+- `mlint`: `NAME018` (Verible dff-name-style: a register written in
+  `always_ff` whose name does not match `name.dff`, default
+  `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
+  declaration that hides one of the same name in an enclosing scope). Both
+  off by default.
 
 ### Fixed
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
