@@ -502,6 +502,43 @@ transaction in flight; a click on a transaction shows its fields and
 parent and moves the cursor to its start. Times are the simulation's, the
 same as the waveform's. In `-script`: `trans [STREAM] [T]`.
 
+### Transactions without UVM
+
+A testbench without UVM can record transactions with Questa's recording
+API or Verdi's FSDB transaction tasks. msim writes them in the same text
+format as UVM's database, to `transactions.log` (or `msim -tr FILE`), and
+mdebug reads them with `-tr` as above:
+
+```systemverilog
+s = $create_transaction_stream("tb.bus.drive");   // or the stream's name in $begin_transaction
+t = $begin_transaction(s, "write");               // (stream, name, begin time, parent)
+$add_attribute(t, addr);                          // named after the variable
+$add_attribute(t, data, "wdata");
+$end_transaction(t);
+$free_transaction(t);
+
+p = $fsdbTrans_begin("tb.mon.seen", "burst");     // Verdi: a stream by its name
+v = $fsdbTrans_begin("tb.mon.seen", "beat", p);   // a child of p
+$fsdbTrans_add_attribute(v, 8'h5a, "byte");
+$fsdbTrans_set_label(v, "first");
+$fsdbTrans_end(v);
+```
+
+```
+msim tb.sv -tr bus.log
+mdebug tb.sv -tr bus.log -trans -at 60
+tb.mon.seen at 60:
+  #3 burst  @55 to 75
+  #4 beat  @55 to 65  byte='h5a  (in #3 burst on tb.mon.seen)
+```
+
+The stream's name up to its last dot is the scope it is listed under.
+Values are recorded in hex, strings as text. `$add_relation(a, b, "rel")` and
+`$fsdbTrans_add_relation` record a link. `$add_color` and
+`$fsdbTrans_add_tag` are accepted and ignored. An explicit begin or end
+time is not used: each record has the simulation time of the call.
+`-compile` writes the same records.
+
 ## Interactive simulation (msim -i)
 
 `msim -i` (also `-ucli`, and `xrun -tcl`) stops before time 0 and reads

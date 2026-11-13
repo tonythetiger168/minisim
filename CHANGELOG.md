@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Transaction recording without UVM: Questa's `$create_transaction_stream`,
+  `$begin_transaction`, `$add_attribute`, `$end_transaction` and Verdi's
+  `$fsdbTrans_begin`, `$fsdbTrans_add_attribute`, `$fsdbTrans_end` write
+  the text format of UVM's `uvm_text_tr_database` (`transactions.log`,
+  `msim -tr FILE`), which `mdebug -tr` reads. `tests/msim_tr.cmake`.
 - `msim -vcd-sva` and `-vcd-power`: assertions and power in the waveform.
   Each assertion and cover gets `.passes` and `.fails` counters; with `-upf`
   each power domain gets `upf.PD.simstate` and each supply net

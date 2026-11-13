@@ -6890,6 +6890,7 @@ struct Lowerer {
                     return seededCall(id, *args[0], more);
                 }
         }
+        if (E t = trCall(call, n)) return t;   // $begin_transaction, $fsdbTrans_begin, ... (expr.hpp trrec)
         if (n == "$system") return args.empty() ? sysFnNode(SF_SYSTEM, {}) : sysFnNode(SF_SYSTEM, {strOf(*args[0])});
         if (n.starts_with("$q_")) return queueCall(call, n);   // 20.15
         if (n == "$urandom") return args.empty() ? sysFnNode(SF_URANDOM, {}) : sysFnNode(SF_URANDOM_SEED, {a(0)});
@@ -8142,6 +8143,11 @@ struct Lowerer {
                 lowerDumpPorts(call, n);
                 return;
             }
+            if (E t = trCall(call, n)) {   // transaction recording as a statement
+                Instr i; i.k = IK::Assign; i.sig = fresh(64); i.e = resize(t, 64, false, false);
+                prog.emit(i);
+                return;
+            }
             if (n.starts_with("$fsdb") || n.starts_with("$vcdplus") || n.starts_with("$shm_") || n.starts_with("$record")) {
                 lowerVendorDump(call, n);
                 return;
@@ -8208,6 +8214,47 @@ struct Lowerer {
     // Options as strings: "+fsdbfile+NAME" names the file, "+mda" and "+all"
     // add memories; the rest ("+parameter", "+struct", ...) need nothing here.
     // Tasks with no counterpart ($fsdbSuppress, $fsdbLog, ...) do nothing.
+    // Transaction recording (expr.hpp trrec): Questa's and Verdi's tasks, as
+    // SF_TR with the arguments in one order: stream (handle or name), name,
+    // parent for a begin; transaction, value, name for an attribute.
+    E trCall(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        auto has = [&](size_t i) { return i < args.size() && args[i]->kind != ExpressionKind::EmptyArgument; };
+        auto num = [&](size_t i) { return has(i) ? resize(expr(*args[i]), 64, false, false) : konst(make(0, 0, 64)); };
+        auto str = [&](size_t i) { return has(i) ? strOf(*args[i]) : konst(mkstr("")); };
+        // A string, or a string literal (an integral value in SV, 5.9), is text.
+        auto isText = [&](const Expression& x) {
+            const Expression* e = &x;
+            while (e->kind == ExpressionKind::Conversion) e = &e->as<ConversionExpression>().operand();
+            return e->kind == ExpressionKind::StringLiteral || (x.type && x.type->isString());
+        };
+        auto strOrNum = [&](size_t i) { return has(i) && isText(*args[i]) ? str(i) : num(i); };
+        auto attr = [&](size_t h, size_t v, size_t nm) {
+            if (!has(v)) return E{};
+            std::string name;
+            if (!has(nm)) {   // Questa: the variable's own name
+                const Expression& x = *args[v];
+                if (x.kind == ExpressionKind::NamedValue || x.kind == ExpressionKind::HierarchicalValue)
+                    name = std::string(x.as<ValueExpressionBase>().symbol.name);
+                else name = "value";
+            }
+            const Expression& x = *args[v];
+            E val = isText(x) ? strOf(x) : x.type && x.type->isFloating() ? realOf(x) : expr(x);
+            return sysFnNode(SF_TR, {num(h), val, has(nm) ? str(nm) : konst(mkstr(name))}, TR_ATTR);
+        };
+        if (n == "$create_transaction_stream") return sysFnNode(SF_TR, {str(0), str(1)}, TR_STREAM);
+        if (n == "$begin_transaction") return sysFnNode(SF_TR, {strOrNum(0), str(1), num(3)}, TR_BEGIN);
+        if (n == "$fsdbTrans_begin") return sysFnNode(SF_TR, {strOrNum(0), str(1), num(2)}, TR_BEGIN);
+        if (n == "$add_attribute" || n == "$fsdbTrans_add_attribute") return attr(0, 1, 2);
+        if (n == "$fsdbTrans_set_label") return sysFnNode(SF_TR, {num(0), str(1)}, TR_LABEL);
+        if (n == "$end_transaction" || n == "$fsdbTrans_end") return sysFnNode(SF_TR, {num(0)}, TR_END);
+        if (n == "$free_transaction") return sysFnNode(SF_TR, {num(0)}, TR_FREE);
+        if (n == "$add_relation" || n == "$fsdbTrans_add_relation") return sysFnNode(SF_TR, {num(0), num(1), str(2)}, TR_LINK);
+        if (n == "$add_color" || n == "$fsdbTrans_add_tag") return konst(make(0, 0, 64));
+        return nullptr;
+    }
+
     void lowerVendorDump(const slang::ast::CallExpression& call, std::string_view n) {
         using namespace slang::ast;
         auto args = call.arguments();

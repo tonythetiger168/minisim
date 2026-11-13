@@ -1482,7 +1482,8 @@ enum SysFnId : int {
     SF_XPROP_EDGE,
     SF_ANNEXD,           // Annex D optional tasks and functions: lo is the AnnexOp, run by g_annexHook
     SF_VALUE_WIDTH,      // the width in bits of kid0's value, which may be known only at run time (a stream)
-    SF_TO_2STATE         // kid0 with every x and z bit made 0: a 4-state value converted to a 2-state type (6.11.2)
+    SF_TO_2STATE,        // kid0 with every x and z bit made 0: a 4-state value converted to a 2-state type (6.11.2)
+    SF_TR                // transaction recording (trrec): lo is the TrOp
 };
 // Annex D (annexd.inc): $countdrivers (kid0 the net signal, kid1 the bit;
 // AD_COUNT_GET k reads count k of the last call), $log / $nolog, $key /
@@ -1663,6 +1664,126 @@ inline uint64_t condCovFast(size_t base, int mode, std::initializer_list<int> te
 // Current simulation time, for $time / $stime / $realtime (IEEE 1800 20.3).
 // The kernel sets it when time advances.
 inline uint64_t g_simTime = 0;
+
+// ---- Transaction recording: Questa's $create_transaction_stream /
+// $begin_transaction / $add_attribute / $end_transaction and Verdi's
+// $fsdbTrans_begin / $fsdbTrans_add_attribute / $fsdbTrans_end, written in
+// the text format of UVM's uvm_text_tr_database (IEEE 1800.2 16.4.7), so
+// that mdebug -tr reads them as it reads UVM's tr_db.log. Handles are
+// numbers from 1 up; 0 is no handle. Times are the simulation's ticks, as
+// in the waveform.
+enum TrOp { TR_STREAM, TR_BEGIN, TR_ATTR, TR_END, TR_FREE, TR_LINK, TR_LABEL };
+namespace trrec {
+// msim -tr FILE sets MSIM_TR, so that a compiled simv it runs records there too.
+inline std::string& path() {
+    static std::string p = getenv("MSIM_TR") && *getenv("MSIM_TR") ? getenv("MSIM_TR") : "transactions.log";
+    return p;
+}
+struct St {
+    FILE* f = nullptr;
+    uint64_t next = 1;
+    std::unordered_map<std::string, uint64_t> streams;   // name -> handle (Verdi names a stream per call)
+    std::unordered_map<uint64_t, uint64_t> open;          // transaction -> its stream
+    ~St() { if (f) fclose(f); }
+};
+inline St& st() { static St s; return s; }
+inline FILE* out() {
+    St& s = st();
+    if (!s.f) {
+        s.f = fopen(path().c_str(), "w");
+        if (!s.f) { std::cerr << "msim: cannot write the transactions to " << path() << "\n"; s.f = stderr; }
+    }
+    return s.f;
+}
+inline std::string hexOf(const Val& a) {
+    std::string r;
+    int w = a.w < 1 ? 1 : a.w;
+    for (int n = (w + 3) / 4 - 1; n >= 0; n--) {
+        int d = 0;
+        bool x = false;
+        for (int b = 3; b >= 0; b--) {
+            int i = n * 4 + b;
+            if (i >= w) continue;
+            uint64_t v, xx;
+            if (i < 64) { v = a.v; xx = a.x; }
+            else if ((size_t)(i / 64 - 1) < a.hi.size()) { v = a.hi[(size_t)(i / 64 - 1)].v; xx = a.hi[(size_t)(i / 64 - 1)].x; }
+            else { v = 0; xx = 0; }
+            if ((xx >> (i % 64)) & 1) x = true;
+            d = d * 2 + (int)((v >> (i % 64)) & 1);
+        }
+        if (x) r += 'x';
+        else if (!r.empty() || d || n == 0) r += "0123456789abcdef"[d];
+    }
+    return r;
+}
+inline uint64_t stream(const std::string& name, const std::string& kind) {
+    St& s = st();
+    auto it = s.streams.find(name);
+    if (it != s.streams.end()) return it->second;
+    uint64_t h = s.next++;
+    s.streams.emplace(name, h);
+    std::string nm = name, scope;
+    if (size_t d = name.rfind('.'); d != std::string::npos) { nm = name.substr(d + 1); scope = name.substr(0, d); }
+    fprintf(out(), "  CREATE_STREAM @%llu {NAME:%s T:%s SCOPE:%s STREAM:%llu}\n", (unsigned long long)g_simTime, nm.c_str(),
+            kind.empty() ? "TVM" : kind.c_str(), scope.c_str(), (unsigned long long)h);
+    return h;
+}
+inline Val op(int o, const std::vector<Val>& a) {
+    St& s = st();
+    auto str = [&](size_t i) { if (i >= a.size()) return std::string(); Val c = a[i]; c.str = true; return v_str(c); };
+    auto num = [&](size_t i) -> uint64_t { return i < a.size() && !a[i].x ? a[i].v : 0; };
+    auto t = (unsigned long long)g_simTime;
+    switch (o) {
+        case TR_STREAM: return make(stream(str(0), str(1)), 0, 64, 0);
+        case TR_BEGIN: {   // (stream handle or name, transaction name[, parent])
+            uint64_t sh = a.size() && a[0].str ? stream(str(0), "") : num(0);
+            if (!sh) return make(0, 0, 64, 0);
+            uint64_t h = s.next++;
+            s.open[h] = sh;
+            uint64_t parent = num(2);
+            fprintf(out(), "    OPEN_RECORDER @%llu {TXH:%llu STREAM:%llu NAME:%s TIME:%llu TYPE=\"Begin_No_Parent, Link\"}\n", t,
+                    (unsigned long long)h, (unsigned long long)sh, str(1).c_str(), t);
+            if (parent && s.open.count(parent))
+                fprintf(out(), "  LINK @%llu {TXH1:%llu TXH2:%llu RELATION=child}\n", t, (unsigned long long)parent, (unsigned long long)h);
+            return make(h, 0, 64, 0);
+        }
+        case TR_ATTR:   // (transaction, value, name)
+        case TR_LABEL: {   // (transaction, label)
+            uint64_t h = num(0);
+            if (!s.open.count(h) || a.size() < 2) return make(0, 0, 1, 0);
+            const Val& v = a[1];
+            std::string name = o == TR_LABEL ? "label" : str(2);
+            std::string val, radix;
+            if (v.str || o == TR_LABEL) { Val c = v; c.str = true; val = v_str(c); radix = "UVM_STRING"; }
+            else if (v.real) { char b[64]; snprintf(b, sizeof b, "%g", v_real(v)); val = b; radix = "UVM_REAL"; }
+            else { val = hexOf(v); radix = "UVM_HEX"; }
+            fprintf(out(), "      SET_ATTR @%llu {TXH:%llu NAME:%s VALUE:%s   RADIX:%s BITS=%d}\n", t, (unsigned long long)h, name.c_str(),
+                    val.c_str(), radix.c_str(), v.str ? (int)val.size() * 8 : v.w);
+            return make(0, 0, 1, 0);
+        }
+        case TR_END: {
+            uint64_t h = num(0);
+            if (!s.open.count(h)) return make(0, 0, 1, 0);
+            fprintf(out(), "    CLOSE_RECORDER @%llu {TXH:%llu TIME=%llu}\n", t, (unsigned long long)h, t);
+            return make(0, 0, 1, 0);
+        }
+        case TR_FREE: {
+            uint64_t h = num(0);
+            if (s.open.erase(h)) fprintf(out(), "    FREE_RECORDER @%llu {TXH:%llu}\n", t, (unsigned long long)h);
+            return make(0, 0, 1, 0);
+        }
+        case TR_LINK: {   // (from, to[, relation])
+            uint64_t f = num(0), to = num(1);
+            if (!s.open.count(f) || !s.open.count(to)) return make(0, 0, 1, 0);
+            std::string r = str(2);
+            fprintf(out(), "  LINK @%llu {TXH1:%llu TXH2:%llu RELATION=%s}\n", t, (unsigned long long)f, (unsigned long long)to,
+                    r.empty() ? "child" : r.c_str());
+            return make(0, 0, 1, 0);
+        }
+    }
+    return make(0, 0, 1, 0);
+}
+}   // namespace trrec
 
 // a ** b (IEEE 1800 11.4.5, table 11-4). The result has a's width and sign.
 // Any X/Z operand gives X. A negative exponent gives 0 except for a base of
@@ -2143,6 +2264,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             }
             return sint(0);
         }
+        case SF_TR: return trrec::op(ctl, a);
         case SF_SYSTEM: {   // 20.17: run the command in a shell; the result is its exit status
             Val c = a.empty() ? mkstr("") : a[0];
             c.str = true;

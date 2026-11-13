@@ -2446,6 +2446,8 @@ static void usage() {
                  "  -vcd-class [N]  also write the properties of the object each class handle\n"
                  "                 variable points to, as h.addr (x while h is null); handle\n"
                  "                 properties are followed N levels (default 1)\n"
+                 "  -tr FILE       where $begin_transaction / $fsdbTrans_begin record their\n"
+                 "                 transactions (default transactions.log; read with mdebug -tr)\n"
                  "  -vcd-sva       also write how many times each assertion and cover has\n"
                  "                 passed and failed, as a.passes and a.fails\n"
                  "  -vcd-power     with -upf: also write each power domain's simstate and each\n"
@@ -2726,6 +2728,8 @@ int main(int argc, char** argv) {
                 vcdClass = std::max(1, std::atoi(argv[++i]));
             continue;
         }
+        // -tr FILE: where $begin_transaction / $fsdbTrans_begin record (default transactions.log).
+        if (a == "-tr" && i + 1 < argc) { trrec::path() = argv[++i]; setenv("MSIM_TR", argv[i], 1); continue; }
         // -vcd-sva / -vcd-power: assertion counts, power states and supplies as signals (statview.inc).
         if (a == "-vcd-sva" || a == "-fst-sva") { vcdSva = true; continue; }
         if (a == "-vcd-power" || a == "-fst-power") { vcdPower = true; continue; }
