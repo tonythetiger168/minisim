@@ -74,10 +74,18 @@ static const slang::ast::ClockingBlockSymbol* clockingRef(const slang::ast::Expr
     else if (ValueExpressionBase::isKind(e.kind)) sym = &e.as<ValueExpressionBase>().symbol;
     return sym ? sym->as_if<ClockingBlockSymbol>() : nullptr;
 }
-// A skew (14.4) as (kind, ticks): kind 0 is #1step, 1 is #0, 2 is #N.
+// A skew (14.4) as (kind, ticks): kind 0 is #1step, 1 is #0, 2 is #N, 3 an
+// edge of the clock signal (output negedge), then N ticks (14.3).
 std::pair<int, uint64_t> skewOf(const slang::ast::ClockingSkew& sk, int dflt) {
     using namespace slang::ast;
-    if (sk.edge != EdgeKind::None) unsupported("a clocking skew with an edge (14.4)");
+    if (sk.edge != EdgeKind::None) {
+        if (!sk.delay) return {3, 0};
+        if (sk.delay->kind != TimingControlKind::Delay) unsupported("this clocking skew");
+        Instr d;
+        delayInto(sk.delay->as<DelayControl>().expr, d);
+        if (d.de) unsupported("a clocking skew that is not a constant");
+        return {3, d.delay};
+    }
     if (!sk.delay) return {dflt, 0};
     if (sk.delay->kind == TimingControlKind::OneStepDelay) return {0, 0};
     if (sk.delay->kind != TimingControlKind::Delay) unsupported("this clocking skew");
@@ -121,6 +129,26 @@ void outPieces(const slang::ast::Expression& e, std::vector<ClockingRT::Piece>& 
     }
     out.push_back(p);
 }
+// An edge skew needs the clocking event to be one signal (@(posedge clk),
+// @(clk)): its edges are the ones the skew names (14.3).
+static int skewClock(const ClockingRT& r) {
+    if (r.ev.size() != 1) unsupported("an edge skew in a clocking block whose event is not one signal (14.3)");
+    return r.ev[0].first;
+}
+static void edgeIn(const ClockingRT& r, ClockingRT::In& x, int e, uint64_t t) {
+    if (t) unsupported("an input edge skew with a delay (14.3)");
+    x.edgeSig = skewClock(r);
+    x.edge = e;
+}
+static void edgeOut(const ClockingRT& r, ClockingRT::Out& o, int e) {
+    o.edgeSig = skewClock(r);
+    o.edge = e;
+}
+// The edge of an edge skew, as an Edge (posedge, negedge, edge).
+static int skewEdge(const slang::ast::ClockingSkew& sk) {
+    using namespace slang::ast;
+    return sk.edge == EdgeKind::PosEdge ? POS : sk.edge == EdgeKind::NegEdge ? NEG : ANY;
+}
 int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
     using namespace slang::ast;
     if (auto it = clockingIdxMap().find(&cb); it != clockingIdxMap().end()) return it->second;
@@ -154,6 +182,8 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
             auto [ik, it] = cv->inputSkew.hasValue() ? skewOf(cv->inputSkew, 0) : std::pair{dinK, dinT};
             auto [ok, ot] = cv->outputSkew.hasValue() ? skewOf(cv->outputSkew, 1) : std::pair{doutK, doutT};
             if (out && ok == 0) unsupported("#1step as an output skew (14.4)");
+            int iEdge = skewEdge(cv->inputSkew.hasValue() ? cv->inputSkew : cb.getDefaultInputSkew());
+            int oEdge = skewEdge(cv->outputSkew.hasValue() ? cv->outputSkew : cb.getDefaultOutputSkew());
             for (int n = 0; n < A.count; n++) {
                 if (in) {
                     ClockingRT::In x;
@@ -163,6 +193,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
                     E src = ref(T->base + n, T->sgn);
                     x.src = ik == 0 ? sampledE(src) : src;
                     if (ik == 2) collectRefs(src, x.refs);
+                    if (ik == 3) edgeIn(r, x, iEdge, it);
                     r.ins.push_back(std::move(x));
                 }
                 if (out) {
@@ -170,6 +201,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
                     o.cv = A.base + n;
                     o.w = A.elemW;
                     o.skew = ot;
+                    if (ok == 3) edgeOut(r, o, oEdge);
                     ClockingRT::Piece p{T->base + n, 0, A.elemW};
                     if (net && mkSig && (size_t)p.sig < sigInfo().size()) {   // driven through a hidden variable
                         p.net = p.sig;
@@ -192,6 +224,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
             E src = expr(*init);
             x.src = k == 0 ? sampledE(src) : src;
             if (k == 2) collectRefs(src, x.refs);
+            if (k == 3) edgeIn(r, x, skewEdge(cv->inputSkew.hasValue() ? cv->inputSkew : cb.getDefaultInputSkew()), t);
             r.ins.push_back(std::move(x));
         }
         if (out) {
@@ -201,6 +234,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
             auto [k, t] = cv->outputSkew.hasValue() ? skewOf(cv->outputSkew, 1) : std::pair{doutK, doutT};
             if (k == 0) unsupported("#1step as an output skew (14.4)");
             o.skew = t;
+            if (k == 3) edgeOut(r, o, skewEdge(cv->outputSkew.hasValue() ? cv->outputSkew : cb.getDefaultOutputSkew()));
             outPieces(*init, o.pieces);
             r.outs.push_back(std::move(o));
         }
