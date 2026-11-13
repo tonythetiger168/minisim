@@ -73,6 +73,10 @@ struct Platform {
     // at physical address `a`. False for a hole or a refusing device.
     virtual bool masterRead(uint64_t a, uint8_t& v, const Device* from) = 0;
     virtual bool masterWrite(uint64_t a, uint8_t v, const Device* from) = 0;
+    // DMA in bulk: where bytes [a, a+n) are in host memory, when they all lie
+    // in one plain memory (writable, for `write`); nullptr otherwise, and the
+    // caller goes byte by byte through masterRead/masterWrite.
+    virtual uint8_t* memSpan(uint64_t a, uint64_t n, bool write) = 0;
 };
 
 struct Device {

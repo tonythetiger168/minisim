@@ -8,12 +8,12 @@ cd "$(dirname "$0")"
 out=${1:-elf}
 mkdir -p "$out"
 CC="${CLANG:-clang} --target=riscv32-unknown-elf -march=rv32imac -mabi=ilp32 -O2 -g0 -nostdlib -ffreestanding -fuse-ld=lld -Wl,-T,link.ld -Wl,--build-id=none -static"
-for p in hello irq smp bench pmp; do
+for p in hello irq smp bench pmp virtio; do
   $CC crt0.S $p.c -o "$out/$p.elf"
 done
 # The same programs as RV64 (the ELF class makes mvplat's harts 64-bit).
 CC64="${CLANG:-clang} --target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 -mcmodel=medany -O2 -g0 -nostdlib -ffreestanding -fuse-ld=lld -Wl,-T,link.ld -Wl,--build-id=none -static"
-for p in hello irq smp; do
+for p in hello irq smp virtio; do
   $CC64 crt0.S $p.c -o "$out/${p}64.elf"
 done
 # A supervisor-mode payload for OpenSBI, at the address firmware starts the

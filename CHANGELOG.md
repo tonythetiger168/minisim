@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: virtio-blk over virtio-mmio (VIRTIO 1.2, 4.2 and 5.2). `-disk FILE`
+  puts a raw image on `/dev/vda` (repeat for more), `-disk-write` lets the
+  guest's writes reach the file; platform files take `"type": "virtio-blk"`.
+  Linux mounts an ext4 disk and boots with its root file system on it.
+  Extension ABI 7.
 - VPI parameters (37.28): type parameters (`vpiTypeParameter`) in
   `vpi_iterate(vpiParameter, module)`, a parameter's default through
   `vpiExpr`, param assigns (`vpiParamAssign`: the `#(...)` overrides with
