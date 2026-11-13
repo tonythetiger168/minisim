@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` CDC on generated register blocks: a register struct written field
+  by field through ports on fields or on concatenations of fields, copied
+  whole (`assign hw2reg_regtop = hw2reg`) and passed whole down a port, is
+  kept field by field, so one field's crossing no longer spreads to every
+  register. A clock behind a scan mux is the functional clock. `-static`
+  takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
 - `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
   flop, the nets and logic between it and the reader (a glitch source for
   CDC003), the synchronizer stages, and the qualifier of an enable-qualified

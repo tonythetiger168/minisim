@@ -81,7 +81,8 @@ crossings: 9
   and its divided clock, for example) and count as one domain. Repeatable.
 - `-static sig`: the signal does not change while it is read (a configuration
   register written before the other domain starts), so its crossings are not
-  reported. Repeatable.
+  reported. Repeatable. A pattern (`-static 'u_reg.u_*.q'`, `*` and `?`)
+  names every signal whose path matches, as SpyGlass `quasi_static` does.
 
 Names are hierarchical paths, with or without the top (`top.u.clk` or
 `u.clk`).
@@ -226,10 +227,17 @@ RDC analysis is 0.3 s.
 ## Limits
 
 - A vector or struct is tracked piece by piece when it is written piece by
-  piece (`r[0] <= a; r[1] <= b;`, or the fields of a struct one at a time)
-  and where ports are connected to single bits of a bus. A variable that is
-  only ever assigned whole, or that a port is connected to by name, is one
-  signal, whichever bits are read.
+  piece (`r[0] <= a; r[1] <= b;`, the fields of a struct one at a time, or
+  output ports on fields or on a concatenation of fields) and where ports are
+  connected to single bits of a bus. A whole copy (`assign b = a;`) or a port
+  of the same packed type connected by name keeps the pieces, so a register
+  struct passed down to the register block stays field by field. A variable
+  that is only ever assigned whole from other logic is one signal, whichever
+  bits are read.
+- A clock mux whose other input is a scan or test clock (`scan`, `test`,
+  `dft`, `bist` in its name) is the functional clock, and a scan bypass of an
+  inverter (`clk` or `~clk`) is that clock. Other clock muxes are a domain of
+  their own unless `-sdc` names the clocks behind them.
 - Reconvergence is followed through `-cdc-depth` flops (2 by default), not
   further.
 - Without `-sdc`, primary inputs and outputs have no domain: a crossing from
@@ -247,3 +255,13 @@ controller, the edge propagator) with `tech_cells_generic` synchronizers come
 out clean, with every crossing classified. The isochronous blocks, which rely
 on related clocks, are reported until `-clock-group` says the clocks are
 related. Ibex (one clock behind a clock gate) is one domain with no findings.
+
+OpenTitan IPs (`-only cdc,rdc`, under a second each): `usbdev` (system and
+always-on clocks, register CDC through `prim_reg_cdc`) gives 12 findings,
+the reconvergence of the register-CDC handshakes and resets into RAMs;
+`i2c` 10 and `uart` 2, all resets into flops without one. `spi_device`
+(system clock, SPI clock and its inverse behind scan muxes, chip select)
+reports the configuration registers read in the SPI clock; with
+`-static 'u_reg.u_*.q'` (they are written while SPI is idle) 16 CDC001
+remain, the TPM configuration, the dual-clock RAM and the chip-select
+toggles.
