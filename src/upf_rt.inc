@@ -776,6 +776,7 @@ struct Rt {
         double lastV = 0;            // hdl2upf: the voltage last driven (rows without a voltage keep it)
         bool hasV = false;
         bool warned = false;
+        int fOff = -1;               // -field: the field's lowest bit in the port (its width is w)
         int copyFrom = -1, target = -1;   // a function or model VCM (upf2hdl): its result, held on the port
         Val lastCopy;
         bool copied = false;
@@ -901,21 +902,28 @@ struct Rt {
         std::string name, keyword;   // the type's own name (an alias or enum), the predefined keyword
         bool sgn = false;
         std::map<int64_t, std::string> labels;
+        const slang::ast::Type* type = nullptr;   // the port's declared type
     };
     static std::string stateName(int st) {
         return st == S_OFF ? "OFF" : st == S_FULL_ON ? "FULL_ON" : st == S_PARTIAL_ON ? "PARTIAL_ON" : "UNDETERMINED";
     }
     static PortType portTypeOf(const slang::ast::Symbol* sym) {
         using namespace slang::ast;
+        if (!sym || !ValueSymbol::isKind(sym->kind)) return {};
+        return typeInfo(sym->as<ValueSymbol>().getType());
+    }
+    static PortType typeInfo(const slang::ast::Type& t) {
+        using namespace slang::ast;
         PortType pt;
-        if (!sym || !ValueSymbol::isKind(sym->kind)) return pt;
-        const Type& t = sym->as<ValueSymbol>().getType();
+        pt.type = &t;
         const Type& ct = t.getCanonicalType();
         if (t.isAlias()) pt.name = std::string(t.name);
-        if (ct.kind == SymbolKind::PackedStructType) {
+        if (ct.kind == SymbolKind::PackedStructType || ct.kind == SymbolKind::UnpackedStructType) {
             std::set<std::string> f;
             for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>()) f.insert(std::string(fs.name));
-            if (f == std::set<std::string>{"state", "voltage"}) pt.cat = 's';
+            if (ct.kind == SymbolKind::PackedStructType && f == std::set<std::string>{"state", "voltage"}) pt.cat = 's';
+            else pt.cat = 'u';   // a struct: a VCM converts one of its fields (-field)
+            if (pt.name.empty()) pt.name = std::string(ct.name);
             return pt;
         }
         if (ct.isFloating()) { pt.cat = 'r'; pt.keyword = ct.toString(); return pt; }
@@ -937,6 +945,58 @@ struct Rt {
             else pt.cat = ct.getBitWidth() == 1 ? 'b' : 'i';
         }
         return pt;
+    }
+    // A field of a struct port (-field of a table VCM, 6.30): its bits in the
+    // port's value, counted from bit 0, and its type. "a.b" names a field of
+    // a nested struct.
+    struct FieldLoc { bool ok = false; int off = 0, w = 0; PortType pt; std::string why; };
+    static FieldLoc fieldOf(const slang::ast::Type& t0, const std::string& path) {
+        using namespace slang::ast;
+        FieldLoc r;
+        const Type* cur = &t0;
+        size_t b = 0;
+        while (true) {
+            size_t e = path.find('.', b);
+            std::string nm = path.substr(b, e == std::string::npos ? std::string::npos : e - b);
+            const Type& ct = cur->getCanonicalType();
+            if (ct.kind != SymbolKind::PackedStructType && ct.kind != SymbolKind::UnpackedStructType) {
+                r.why = "it is not a struct where " + nm + " is looked up";
+                return r;
+            }
+            const FieldSymbol* f = nullptr;
+            for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>())
+                if (fs.name == nm) f = &fs;
+            if (!f) {
+                r.why = "it has no field " + nm;
+                return r;
+            }
+            if (ct.kind == SymbolKind::PackedStructType) r.off += (int)f->bitOffset;
+            else r.off += uField(ct, *f).first;
+            cur = &f->getType();
+            if (e == std::string::npos) break;
+            b = e + 1;
+        }
+        const Type& ft = cur->getCanonicalType();
+        r.w = ft.isFloating() ? 64 : ft.isIntegral() ? (int)ft.getBitWidth() : uWidth(ft);
+        r.pt = typeInfo(*cur);
+        if (r.pt.cat == 'b') r.pt.cat = 'i';   // a one-bit field: an integer table (0 and 1)
+        if (r.pt.cat == 'x' || r.pt.cat == 'u' || r.pt.cat == 's') {
+            r.why = "field " + path + " is not of a type a table converts (4.10.1)";
+            return r;
+        }
+        r.ok = true;
+        return r;
+    }
+    // Whether a table VCM converts this port: its type, or with -field the
+    // named field of a struct of the VCM's -hdl_type.
+    static bool tableFits(const Vcm& v, const PortType& pt) {
+        if (v.field.empty()) return v.cat == 'b' ? pt.cat == 'b' && (v.lang == "sv" || v.bits.lang == "sv") : vcmFits(v, pt);
+        if (pt.cat != 'u' || !pt.type || v.lang != "sv") return false;
+        std::string last = v.hdlType.substr(v.hdlType.rfind(':') == std::string::npos ? 0 : v.hdlType.rfind(':') + 1);
+        if (last != pt.name) return false;
+        FieldLoc fl = fieldOf(*pt.type, v.field);
+        if (!fl.ok) return false;
+        return fl.pt.cat == v.cat;   // the table's values say which kind of field it converts
     }
     // Whether a table VCM converts this port's type (6.14).
     static bool vcmFits(const Vcm& v, const PortType& pt) {
@@ -1023,34 +1083,62 @@ struct Rt {
                         if (v->kind == Vcm::Function || v->kind == Vcm::Model) continue;   // none fit this port (vcmSource)
                         bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
                         if (!dirOk) continue;
-                        bool typeOk = v->cat == 'b' ? (pt.cat == 'b' && (v->lang == "sv" || v->bits.lang == "sv")) : vcmFits(*v, pt);
-                        if (typeOk) fit.push_back(v);
+                        if (tableFits(*v, pt)) fit.push_back(v);
                     }
                     std::string tn = pt.cat == 'b' ? "a one-bit port" : pt.cat == 'r' ? "a real port" : pt.cat == 'e' ? "an enum port (" + pt.name + ")"
-                                   : pt.cat == 'i' ? "an integer port" : "a port of a type no VCM converts";
+                                   : pt.cat == 'i' ? "an integer port" : pt.cat == 'u' ? "a struct port (" + pt.name + ")"
+                                   : "a port of a type no VCM converts";
                     std::string dn = dir == 0 ? "input" : dir == 1 ? "output" : "inout";
+                    if (fit.empty() && pt.cat == 'u')   // say why no field fits (6.30)
+                        for (auto* v : all) {
+                            if (v->kind != Vcm::Table) continue;
+                            std::string last = v->hdlType.substr(v->hdlType.rfind(':') == std::string::npos ? 0 : v->hdlType.rfind(':') + 1);
+                            if (last != pt.name) continue;
+                            if (v->field.empty())
+                                fail(" is " + tn + ", and VCM " + v->name + " converts the whole struct " + v->hdlType +
+                                     "; a struct with several fields needs -field (6.30)");
+                            FieldLoc fl = fieldOf(*pt.type, v->field);
+                            if (!fl.ok) fail(": VCM " + v->name + " -field " + v->field + ": " + fl.why + " (6.30)");
+                        }
                     if (fit.empty())
                         fail(" is " + tn + " (" + dn + "), and VCM " + nvcm->second->name + " has no " +
                              (dir == 0 ? "upf2hdl " : dir == 1 ? "hdl2upf " : "") + "conversion for it (6.14, 4.10.2)");
-                    if (fit.size() > 1)
-                        fail(" is " + tn + " (" + dn + "), and VCMs " + fit[0]->name + " and " + fit[1]->name + " both fit it" +
-                             (dir == 2 ? "; a list for an inout port holds one direction per type (4.10.2)" : " (6.14)"));
-                    const Vcm* v = fit[0];
-                    if (!v->field.empty()) fail(": VCM " + v->name + " converts field " + v->field + " of a struct; msim does not convert struct fields yet");
-                    h.hdl2upf = v->hdl2upf;
-                    if (v->cat == 'b') h.vct = &v->bits;
-                    else {
-                        h.vcm = v;
-                        h.cat = pt.cat;
-                        h.sgn = pt.sgn;
-                        for (auto& [val, nm] : pt.labels) { h.labelOf[val] = nm; h.valueOf[nm] = val; }
-                        if (pt.cat == 'e')
-                            for (auto& r : v->rows)
-                                if (r.h == Vcm::Row::Label && !h.valueOf.count(r.label))
-                                    fail(": VCM " + v->name + " names " + r.label + ", which is not a value of " + pt.name + " (6.30.6)");
+                    // Fields of a struct input: one upf2hdl VCM for each field (6.30).
+                    bool perField = fit.size() > 1 && pt.cat == 'u';
+                    std::set<std::string> fieldsSeen;
+                    for (auto* v : fit) {
+                        if (!perField) break;
+                        if (v->hdl2upf || !fieldsSeen.insert(v->field).second) perField = false;
                     }
-                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " through " + v->name);
-                    hdlPorts.push_back(h);
+                    if (fit.size() > 1 && !perField)
+                        fail(" is " + tn + " (" + dn + "), and VCMs " + fit[0]->name + " and " + fit[1]->name + " both fit it" +
+                             (dir == 2 ? "; a list for an inout port holds one direction per type (4.10.2)"
+                              : pt.cat == 'u' ? "; only a struct input takes one upf2hdl VCM for each of its fields (6.30)" : " (6.14)"));
+                    for (const Vcm* v : fit) {
+                        HdlPort hf = h;
+                        PortType ft = pt;
+                        if (!v->field.empty()) {
+                            FieldLoc fl = fieldOf(*pt.type, v->field);
+                            hf.fOff = fl.off;
+                            hf.w = fl.w;
+                            ft = fl.pt;
+                        }
+                        hf.hdl2upf = v->hdl2upf;
+                        if (v->cat == 'b') hf.vct = &v->bits;
+                        else {
+                            hf.vcm = v;
+                            hf.cat = ft.cat;
+                            hf.sgn = ft.sgn;
+                            for (auto& [val, nm] : ft.labels) { hf.labelOf[val] = nm; hf.valueOf[nm] = val; }
+                            if (ft.cat == 'e')
+                                for (auto& r : v->rows)
+                                    if (r.h == Vcm::Row::Label && !hf.valueOf.count(r.label))
+                                        fail(": VCM " + v->name + " names " + r.label + ", which is not a value of " + ft.name + " (6.30.6)");
+                        }
+                        note(std::string("supply net ") + net + (hf.hdl2upf ? " is driven by " : " drives ") + m.design(p) +
+                             (v->field.empty() ? "" : "." + v->field) + " through " + v->name);
+                        hdlPorts.push_back(hf);
+                    }
                     continue;
                 }
                 if (named != m.connectVct.end()) {
@@ -1159,8 +1247,7 @@ struct Rt {
                 std::string inP, outP;
                 if (v->kind == Vcm::Table) {
                     bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
-                    bool typeOk = v->cat == 'b' ? ptc.cat == 'b' : vcmFits(*v, ptc);
-                    if (dirOk && typeOk) fits.push_back({v, v->hdl2upf, "", ""});
+                    if (dirOk && tableFits(*v, ptc)) fits.push_back({v, v->hdl2upf, "", ""});
                     continue;
                 }
                 if (v->kind == Vcm::Function) {   // 6.30.8
@@ -1246,6 +1333,7 @@ struct Rt {
         for (auto& h : hdlPorts) {
             if (!h.hdl2upf) continue;
             Val v = S.get(h.sig);
+            if (h.fOff >= 0) v = v_slice(v, h.fOff + h.w - 1, h.fOff);   // -field
             SupplyVal sv;
             if (h.supply) {   // {state, voltage in microvolts}, state in the upper word
                 if (v.x) sv.st = S_UNDETERMINED;
@@ -1320,18 +1408,38 @@ struct Rt {
                             out = h.cat == 'r' ? mkreal(r->num) : make((uint64_t)(int64_t)r->num & mask, 0, h.w, 0);
                     }
                 }
-                if (h.held && out == h.lastVal) continue;
-                h.held = true;
-                h.lastVal = out;
-                S.holdOn(h.sig, konst(out), true);
+                hold(h, out);
                 continue;
             }
             char c = h.vct->toHdl(sv.st);
-            if (c == h.last) continue;
+            if (h.fOff < 0 && c == h.last) continue;
             h.last = c;
             bool one = c == '1' || c == 'H', zero = c == '0' || c == 'L', z = c == 'Z';
-            S.holdOn(h.sig, konst(make(one ? 1 : 0, one || zero || z ? 0 : 1, 1, z ? 1 : 0)), true);
+            hold(h, make(one ? 1 : 0, one || zero || z ? 0 : 1, 1, z ? 1 : 0));
         }
+    }
+    // Holds an HDL port at a converted value. With -field the value goes into
+    // the field's bits; the other fields keep what the other VCMs of the
+    // port put there (x until then).
+    std::map<int, Val> fieldHeld;
+    void hold(HdlPort& h, Val out) {
+        if (h.fOff >= 0) {
+            int W = S.sigs[(size_t)h.sig].w;
+            auto it = fieldHeld.find(h.sig);
+            if (it == fieldHeld.end()) it = fieldHeld.emplace(h.sig, allx(W)).first;
+            Val f = make(out.v, out.x, h.w, out.z);
+            f.hi = out.hi;
+            std::vector<Val> parts;
+            if (h.fOff + h.w < W) parts.push_back(v_slice(it->second, W - 1, h.fOff + h.w));
+            parts.push_back(f);
+            if (h.fOff > 0) parts.push_back(v_slice(it->second, h.fOff - 1, 0));
+            it->second = v_concat(parts);
+            out = it->second;
+        }
+        if (h.held && out == h.lastVal) return;
+        h.held = true;
+        h.lastVal = out;
+        S.holdOn(h.sig, konst(out), true);
     }
 
     // Isolation and level-shifter cells on the port connections that cross
