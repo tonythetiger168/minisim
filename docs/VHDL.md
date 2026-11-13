@@ -14,6 +14,7 @@ msim adder.sv tb.vhd -top tb                    # a VHDL testbench around an SV 
 msim -xrun -v200x rtl.vhd tb.sv                 # the xrun front end passes VHDL files on
 msim a.vhd -vhdl-sv a.sv                        # also write the SystemVerilog msim simulates
 vhdl2sv a.vhd b.vhd > design.sv                 # the same translation, as a separate program
+mlint a.vhd b.vhd -top top                      # lint the VHDL (docs/LINT.md, "VHDL")
 ```
 
 Files ending in `.vhd`, `.vhdl`, `.vho` or `.vht` are VHDL. They are read in

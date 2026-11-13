@@ -8,6 +8,24 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI parameters (37.28): type parameters (`vpiTypeParameter`) in
+  `vpi_iterate(vpiParameter, module)`, a parameter's default through
+  `vpiExpr`, param assigns (`vpiParamAssign`: the `#(...)` overrides with
+  `vpiLhs`, `vpiRhs`, `vpiConnByName`) and def params (`vpiDefParam`).
+  An instance array's `vpiExpr` is its connection list (a `vpiListOp`,
+  37.11), and net declaration assignments are `vpiContAssign` objects with
+  `vpiNetDeclAssign` (37.40). `tests/spec/37.28-vpi-param-assign.sv`.
+- mvplat harts are RV32GC / RV64GC: the F and D extensions (IEEE 754 single
+  and double, every rounding mode, `fflags`/`frm`/`fcsr`, NaN boxing,
+  `mstatus.FS`/`SD`, the compressed FP loads and stores). 430 riscv-tests
+  pass (uf and ud added). Linux runs Ubuntu's rv64gc BusyBox; `-input`
+  reaches the shell once the kernel's UART driver is up. Extension ABI 5.
+- `mlint -cdc-formal`: formal proof that the source of each bus synchronized
+  bit by bit changes at most one bit per clock, by exhaustive search of its
+  reachable states (slang's evaluator, through assigns, ports, functions and
+  `always_comb`). A proved bus is not CDC002; a Gray-coded bus that can change
+  more bits is the new rule CDC010, with the step. Proves all eight async
+  FIFO pointers of OpenTitan `spi_device` and both of pulp `cdc_fifo_gray`.
 - VPI expression values (37.35, 38.15): `vpi_get_value` on an expression
   object gives its value now, not only for a constant expression. The nets
   and variables it reads (memories too) take their current values, so
@@ -72,6 +90,14 @@ Spec references are IEEE 1800-2023 clauses.
   `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
   declaration that hides one of the same name in an enclosing scope). Both
   off by default.
+- `mlint` reads VHDL (`.vhd`, `.vhdl`), alone or mixed with SystemVerilog,
+  through msim's VHDL front end: unused/undriven signals, CDC/RDC, latches,
+  sensitivity lists, multiple drivers, reset style, FSMs and formal checks
+  run on it, with findings at the VHDL line. Rules that would only describe
+  the translation are left out (docs/LINT.md, "VHDL"). The translation now
+  puts a `` `line `` before each port and signal declaration. The lint rules
+  read `always begin ... @(list); end` (how a VHDL process arrives) as a
+  combinational block, and a reset tested with `===`.
 
 ### Changed
 - `msim -compile` builds the kernel once into a cached object
@@ -81,6 +107,10 @@ Spec references are IEEE 1800-2023 clauses.
   off.
 
 ### Fixed
+- mvplat: a CSRRS/CSRRC on `mip` no longer latches the PLIC's SEIP into the
+  software-written bit (privileged ISA 3.1.9). OpenSBI's timer code does such
+  a read-modify-write, after which Linux took the same external interrupt
+  forever.
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
   the reader takes), which failed on correct FIFOs such as common_cells
   `cdc_fifo_gray`.

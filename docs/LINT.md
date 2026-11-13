@@ -11,6 +11,14 @@ mlint -list                                    # every rule: severity, on/off, g
 mlint -explain RST003                          # what a rule means, what to do
 ```
 
+VHDL files (`.vhd`, `.vhdl`, `.vho`, `.vht`) can be given too, alone or mixed
+with SystemVerilog (see [VHDL](#vhdl) below):
+
+```sh
+mlint rtl/*.vhd -top soc_top                   # VHDL only
+mlint core.vhd wrapper.sv -top wrapper         # mixed
+```
+
 A finding is one line, `file:line:col: severity: [RULE] text`, sorted by file
 and line. The last line counts them per rule. Findings can be filed as issues
 with `mbug lint`.
@@ -351,6 +359,7 @@ it. One-hot registers tested bit by bit are followed too.
 | `CDC007` | warning | on | A clock read as data by logic |
 | `CDC008` | warning | on | A clock made by combinational logic of a clock and other signals (glitch) |
 | `CDC009` | warning | on | A one-cycle pulse from a faster clock into a slower one through a plain synchronizer (SDC periods) |
+| `CDC010` | warning | on | A Gray-coded bus that a formal search finds changing more than one bit in one clock (`-cdc-formal`) |
 
 ### Reset-domain crossings (`rdc`)
 
@@ -393,6 +402,38 @@ Notes on a few rules:
 - **RST003** leaves memories (unpacked arrays) alone.
 - **CASE001** accepts a case that lists every value of its selector or every
   member of its enum, `unique` / `priority`, and `(* full_case *)`.
+
+## VHDL
+
+mlint reads VHDL through the front end msim simulates it with (`src/vhdl/`,
+[VHDL.md](VHDL.md)): each design unit is translated into SystemVerilog in
+memory, with `` `line `` directives, and the same rules run on the result.
+Findings name the VHDL file and line (the column is the translation's).
+What carries over:
+
+- unused, undriven and unread signals and ports (`UNU001`..`UNU005`);
+- clock- and reset-domain crossings (`CDC`, `RDC`), and `-cdc-sva`;
+- latches: a combinational process that does not assign a signal on every
+  path (`LAT001`), and signals missing from a sensitivity list (`COMB001`);
+- multiple drivers of an unresolved signal (`L004`), reset style (`RST`),
+  state machines, formal-assisted checks, naming;
+- `-json`, `-html`, waivers and the SoC flow work as for SystemVerilog.
+
+What is left out, because it would describe the translation and not the VHDL:
+
+- the source-text and syntax rules (`FMT`, `STY004`..`STY015`, `SUS`,
+  `NAME014`..`NAME019`) run on SystemVerilog text only;
+- `STY003` (use `always_ff`), `SEQ003` (non-blocking assignment in
+  combinational logic: VHDL signal assignment), `SYN003` and `SYN010`
+  (system functions and `===` the translation uses for `report` and
+  std_logic `=`), `TIDY006` (the integer cast of `to_integer`), and
+  `FSM003` (a VHDL `case` must list every value);
+- a resolved signal (std_logic, a tri-state bus) with several drivers is
+  legal VHDL and is not an `L004`.
+
+Checked on NEORV32 (50 files, its default configuration): no finding about
+the translation is left; what remains are inputs and signals that
+configuration does not use.
 
 ## Configuration
 
