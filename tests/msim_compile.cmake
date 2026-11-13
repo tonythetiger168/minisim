@@ -27,6 +27,7 @@ set(CASES
   "examples/seqtemp.sv"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
+  "examples/manygroups.sv"
   "examples/islands.sv"
   "examples/combbranch.sv"
   "examples/combcycle.sv"

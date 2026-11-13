@@ -256,6 +256,68 @@ inline AV aeval(const E& e, bool& exact) {
             if (a.w + sh > kMaxW) return full(a.w, a.sgn);
             return wrap(u.lo << sh, u.hi << sh, a.w, a.sgn);
         }
+        case Op::Slice: case Op::Index: {   // v[hi:lo], v[b] with b constant
+            int hi, lo;
+            if (e->op == Op::Slice) { hi = e->hi; lo = e->lo; }
+            else {
+                if (e->kids.size() < 2 || e->kids[1]->op != Op::Const || e->kids[1]->k.x) return concrete(e, exact);
+                hi = lo = (int)e->kids[1]->k.v;
+            }
+            bool ea;
+            AV a = aeval(e->kids[0], ea);
+            exact = ea;
+            if (ea) return concrete(e, exact);
+            int sw = hi - lo + 1;
+            if (a.w > 64 || lo < 0 || hi >= a.w || sw < 1 || isFull(a)) return full(std::max(sw, 1), false);
+            // While the bits above the slice are the same over the whole
+            // range, the slice moves with the value: the search fixes the top
+            // bits first, so a slice of them narrows early.
+            AV u = conv(a, a.w, false);
+            uint64_t l = (uint64_t)u.lo, h = (uint64_t)u.hi, m = mask(sw);
+            bool sameTop = hi + 1 >= 64 || (l >> (hi + 1)) == (h >> (hi + 1));
+            if (!sameTop) return full(sw, false);
+            return AV{(i128)((l >> lo) & m), (i128)((h >> lo) & m), sw, false};
+        }
+        case Op::Concat: {   // {a, b} up to 64 bits: grows with each part, the first on top
+            int tw = 0;
+            std::vector<AV> parts;
+            bool all = true;
+            for (const E& k : e->kids) {
+                bool ek;
+                AV p = aeval(k, ek);
+                all = all && ek;
+                tw += p.w;
+                parts.push_back(conv(p, p.w, false));
+            }
+            exact = all;
+            if (all || tw > 64) return concrete(e, exact);
+            i128 lo = 0, hi = 0;
+            for (const AV& p : parts) { lo = (lo << p.w) + p.lo; hi = (hi << p.w) + p.hi; }
+            return AV{lo, hi, tw, false};
+        }
+        case Op::SysFn: {
+            if (e->hi != SF_COUNTBITS || e->kids.empty()) return concrete(e, exact);
+            // $countones / $countbits (20.9) of a value in [lo, hi]: the bits
+            // above the highest one where lo and hi differ are fixed, the
+            // rest may be anything, so the count is bounded either way.
+            bool ea;
+            AV a = aeval(e->kids[0], ea);
+            exact = ea;
+            if (ea || a.w > 64 || isFull(a)) return concrete(e, exact);
+            AV u = conv(a, a.w, false);
+            uint64_t l = (uint64_t)u.lo, h = (uint64_t)u.hi;
+            int freeBits = l == h ? 0 : 64 - __builtin_clzll(l ^ h);
+            uint64_t fixedPart = freeBits >= 64 ? 0 : l >> freeBits;
+            int fixedW = a.w - freeBits;
+            int ones = __builtin_popcountll(fixedPart);
+            int zeros = fixedW - ones;
+            int c = e->lo;   // the bit values counted: 1 << {0, 1, x, z}
+            int mn = 0, mx = 0;
+            if (c & 2) { mn += ones; mx += ones + freeBits; }
+            if (c & 1) { mn += zeros; mx += zeros + freeBits; }
+            if ((c & 3) == 3) { mn = mx = a.w; }
+            return AV{(i128)mn, (i128)mx, 32, true};
+        }
         case Op::DynHas: {   // x inside {q} (11.4.13, 18.5.4): x equals some element of q
             bool ea;
             AV a = aeval(e->kids[0], ea);
@@ -849,6 +911,19 @@ struct RCont {
     int depth = 1;            // int m[][]: 2 until its size is fixed and its elements stand in for it
     bool sized = false;       // its size is fixed (an outer level was solved before)
 };
+// A rand variable wider than 64 bits is solved as 64-bit chunks, low first
+// (the top one narrower): one signal each.
+inline const FrameLayout* wideLayout(int w) {
+    static std::map<int, std::unique_ptr<FrameLayout>> m;
+    auto& l = m[w];
+    if (!l) {
+        l = std::make_unique<FrameLayout>();
+        l->name = "randomize wide chunks";
+        for (int lo = 0; lo < w; lo += 64) l->add(std::min(64, w - lo), make(0, 0, std::min(64, w - lo)));
+    }
+    return l.get();
+}
+struct WideVar { int base = 0, w = 0; };   // its chunks: signals base .. base + (w + 63) / 64 - 1
 constexpr int kSizeW = 17;    // a solved size is at most 2^17 - 1
 inline const FrameLayout* scratchLayout(int w, bool sgn, int64_t n) {
     static std::map<std::tuple<int, bool, int64_t>, std::unique_ptr<FrameLayout>> m;
@@ -869,6 +944,58 @@ struct Rewrite {
     bool dropped = false;                         // pass 1: reads an element
     std::vector<int>* sizeVars = nullptr;         // pass 1: containers whose size is read
     std::vector<const std::vector<std::pair<int, E>>*> refScope;   // RandItem::refs in force
+    const std::unordered_map<int, WideVar>* wide = nullptr;   // variables wider than 64 bits, by signal
+    // A wide variable read whole: its chunks, top first.
+    E wideRef(int addr, bool sgn) {
+        auto it = wide->find(addr);
+        const WideVar& v = it->second;
+        std::vector<E> parts;
+        for (int k = (v.w + 63) / 64; k-- > 0;) parts.push_back(ref(v.base + k, false));
+        auto c = node(Op::Concat, std::move(parts));
+        c->sgn = sgn;
+        return c;
+    }
+    bool isWide(int addr) const { return wide && wide->count(addr); }
+    // A constant select of a wide variable read as the chunks it covers, so
+    // the solver sees variables of at most 64 bits: x[127:120] is a slice of
+    // the top chunk.
+    E wideSel(const E& c) {
+        if ((c->op != Op::Slice && c->op != Op::Index) || c->kids.empty()) return c;
+        const E& w = c->kids[0];
+        if (w->op != Op::Concat || w->kids.empty()) return c;
+        int total = 0;
+        for (auto& k : w->kids) {
+            if (k->op != Op::Ref || k->at || !wideChunk.count(k->sig)) return c;
+            total += S.sigs[k->sig].w;
+        }
+        int hi, lo;
+        if (c->op == Op::Slice) { hi = c->hi; lo = c->lo; }
+        else {
+            if (c->kids.size() < 2 || c->kids[1]->op != Op::Const || c->kids[1]->k.x) return c;
+            hi = lo = (int)c->kids[1]->k.v;
+        }
+        if (lo < 0 || hi >= total || hi < lo || hi - lo >= 64) return c;
+        // the kids are top first: kid i holds bits [top - 1 : top - width]
+        std::vector<E> parts;
+        int top = total;
+        for (auto& k : w->kids) {
+            int cw = S.sigs[k->sig].w, bot = top - cw;
+            int h = std::min(hi, top - 1), l = std::max(lo, bot);
+            if (h >= l) {
+                if (h - bot == cw - 1 && l == bot) parts.push_back(k);
+                else {
+                    auto sl = node(Op::Slice, {k});
+                    sl->hi = h - bot; sl->lo = l - bot;
+                    parts.push_back(sl);
+                }
+            }
+            top = bot;
+        }
+        E r = parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+        r->sgn = c->sgn;
+        return r;
+    }
+    std::unordered_set<int> wideChunk;   // the chunk signals
     const E* refOf(int sig) {
         if (sig < kRel) return nullptr;
         for (size_t k = refScope.size(); k-- > 0;)
@@ -890,6 +1017,7 @@ struct Rewrite {
     }
     E elem(RCont& c, int64_t k) {
         if (k < 0 || k >= c.n) return konst(make(0, 0, c.w, 0, c.sgn));
+        if (isWide(c.elems->base + (int)k)) return wideRef(c.elems->base + (int)k, c.sgn);
         return ref(c.elems->base + (int)k, c.sgn);
     }
     E operator()(const E& e0) {
@@ -908,6 +1036,7 @@ struct Rewrite {
                 if (e->sig == lv) return konst(k);
             for (auto& [iv, x] : items)
                 if (e->sig == iv) return x;
+            if (wide && !wide->empty() && isWide(R(e->sig))) return wideRef(R(e->sig), e->sgn);
         }
         if (e->op == Op::DynReduce && !e->kids.empty()) {   // sum() with (...) in a constraint: folded
             RCont* c = contOf(e->sig);
@@ -986,6 +1115,7 @@ struct Rewrite {
         auto c = std::make_shared<Expr>(*e);
         c->kids = std::move(kids);
         c->at = at;
+        if (wide && !wide->empty()) return wideSel(c);
         return c;
     }
 };
@@ -1083,8 +1213,22 @@ static int doRandomize(int obj, const RandCall* rc) {
         Ctx* savedCtx = g_ctx;
         g_ctx = &ctx;
         std::deque<RandItem> owned;
-        auto addVar = [&](int addr, int w, bool sgn, bool randc, int owner) {
-            if (ctx.idx.count(addr) || w > 64) return;
+        std::unordered_map<int, WideVar> wides;
+        std::vector<FrameP> wideFrs;
+        std::unordered_set<int> wideChunks;
+        std::function<void(int, int, bool, bool, int)> addVar = [&](int addr, int w, bool sgn, bool randc, int owner) {
+            if (ctx.idx.count(addr) || wides.count(addr)) return;
+            if (w > 64) {   // solved as chunks of 64 bits (randc is 64 bits at most)
+                if (randc) return;
+                FrameP f = newFrame(wideLayout(w), nullptr, 0);
+                wides[addr] = WideVar{f->base, w};
+                for (int k = 0; k < (w + 63) / 64; k++) {
+                    wideChunks.insert(f->base + k);
+                    addVar(f->base + k, std::min(64, w - 64 * k), false, false, owner);
+                }
+                wideFrs.push_back(std::move(f));
+                return;
+            }
             ctx.idx[addr] = (int)ctx.vars.size();
             Var v;
             v.addr = addr; v.w = w; v.sgn = sgn; v.randc = randc; v.owner = owner;
@@ -1097,6 +1241,7 @@ static int doRandomize(int obj, const RandCall* rc) {
         int prio = 0;
         Rewrite rw;
         rw.conts = &conts; rw.contIdx = &contIdx; rw.pass = pass; rw.sizeVars = &sizeVars;
+        rw.wide = &wides; rw.wideChunk = wideChunks;
         std::function<void(const std::vector<RandItem>&, Frame*)> addItems = [&](const std::vector<RandItem>& its, Frame* fr) {
             for (const RandItem& it : its) {
                 g_fr = fr;
@@ -1317,6 +1462,14 @@ static int doRandomize(int obj, const RandCall* rc) {
                 }
                 S.set(v.addr, nv);
             }
+            if (pass != 1)
+                for (auto& [addr, wv] : wides) {   // the chunks put together
+                    std::vector<Val> parts;
+                    for (int k = (wv.w + 63) / 64; k-- > 0;) parts.push_back(S.get(wv.base + k));
+                    Val whole = v_concat(parts);
+                    whole.sgn = S.get(addr).sgn;
+                    S.set(addr, whole);
+                }
         }
         g_ctx = savedCtx;
         return ok;
