@@ -28,8 +28,11 @@ endforeach()
 # for real, enum, integer and upfSupplyTypeT ports (4.10, 5.11, 6.29, 6.30,
 # 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9); supply ports
 # connected by pg_type (4.5.4.6.2, 6.14, 6.15); table VCMs on fields of
-# packed and unpacked struct ports (6.30 -field).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield)
+# packed and unpacked struct ports (6.30 -field); a retention register
+# simulated by its verification model (6.39 -lib_model_name); isolation
+# cells simulated by their functional model (6.62 -force_function);
+# retention of flip-flops or latches only (6.54 -applies_to).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield retmodel isomodel retlatch)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -411,3 +414,26 @@ upf_error_in(gating e_ret2 "define_retention_cell -cells R -power P -ground G -h
 upf_error_in(vcmfield e_fld1 "create_vcm WHOLE -hdl_type {sv pw_pkg::stat_t} -conversion_direction hdl2upf -table {{{3} {FULL_ON}} {{0} {OFF}}}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm WHOLE" "converts the whole struct pw_pkg::stat_t; a struct with several fields needs -field (6.30)")
 upf_error_in(vcmfield e_fld2 "create_vcm NOPE -hdl_type {sv pw_pkg::stat_t} -field nope -conversion_direction hdl2upf -table {{{3} {FULL_ON}} {{0} {OFF}}}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm NOPE" "VCM IEEE::NOPE -field nope: it has no field nope (6.30)")
 upf_error_in(vcmfield e_fld3 "create_vcm K2U -hdl_type {sv pw_pkg::stat_t} -field ok -conversion_direction hdl2upf -table {{{1} {FULL_ON}} {{0} {OFF}}}\ncreate_vcm BOTH -vcms {M2U K2U}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm BOTH" "only a struct input takes one upf2hdl VCM for each of its fields (6.30)")
+upf_error_in(retmodel e_rm1 "map_retention_cell RET_A -domain PD_A -lib_model_name nomod -port_map {{CK UPF_GENERIC_CLOCK}}" "-lib_model_name nomod: no module nomod (6.39)")
+upf_error_in(retmodel e_rm2 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{CK UPF_GENERIC_CLOCK}}" "input port D of ret_ff is not connected by -port_map (6.39)")
+upf_error_in(retmodel e_rm3 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{XX UPF_GENERIC_CLOCK}}" "ret_ff has no port XX (6.39)")
+upf_error_in(retmodel e_rm4 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{CK UPF_GENERIC_CLOCK} {CK UPF_GENERIC_DATA}}" "-port_map maps model port CK twice (6.39)")
+set(uic "use_interface_cell X -strategy ISO_A -domain PD_A -force_function")
+upf_error_in(isomodel e_ifc1 "define_isolation_cell -cells ISO_HI -power VDD -enable EN -clamp_cell high\n${uic} -lib_cells ISO_HI" "the functional model ISO_HI clamps to 1 (")
+upf_error_in(isomodel e_ifc2 "${uic} -lib_cells iso_and -port_map {{VDD isolation_supply.power}}" "port EN is not connected: A is already the data input (6.62)")
+upf_error_in(isomodel e_ifc3 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal[1]}}" "strategy ISO_A has no isolation_signal[1] (6.62)")
+upf_error_in(isomodel e_ifc4 "${uic} -lib_cells iso_and -port_map {{EN ~iso}}" "~ is only for isolation_signal, not iso (6.62)")
+upf_error_in(isomodel e_ifc5 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal} {VDD isolation_supply.power} {Y isolation_signal}}" "-port_map connects output port Y; only the data output is an output (6.62)")
+upf_error_in(isomodel e_ifc6 "${uic} -lib_cells iso_and -port_map {{VDD input_supply.power}}" "input_supply.power needs a level-shifter strategy in -strategy (6.62)")
+upf_error_in(isomodel e_ifc7 "${uic} -lib_cells iso_and -port_map {{XX isolation_signal}}" "iso_and has no port XX (6.62)")
+upf_error_in(isomodel e_ifc8 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal} {EN isolation_signal}}" "-port_map maps model port EN twice (6.62)")
+upf_error_in(retlatch e_rl1 "set_retention RET_X -domain PD_A -applies_to flops -save_signal {sf high} -restore_signal {sf low}" "-applies_to flops is not flop, latch or any (6.54)")
+# Low-power coverage (msim -upf_cov): power states, named transitions,
+# isolation enables, retention saves and restores; bins not hit are marked.
+execute_process(COMMAND ${MSIM} ${D}/retlatch.sv -upf ${D}/lpcov.upf -upf_cov ${CMAKE_CURRENT_BINARY_DIR}/lpcov.cov
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ ${D}/lpcov.cov want)
+file(READ ${CMAKE_CURRENT_BINARY_DIR}/lpcov.cov got)
+if(NOT rc EQUAL 0 OR NOT got STREQUAL want)
+  message(FATAL_ERROR "lpcov: ${rc}\n--- got\n${got}${err}--- want\n${want}")
+endif()
