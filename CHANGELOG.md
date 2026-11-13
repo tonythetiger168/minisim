@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
+  acknowledge back gets an assertion that it changes only once the
+  acknowledge has caught up (two- and four-phase). The one-bit stability
+  check no longer counts the reset value as a change.
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
@@ -19,6 +23,8 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- The `minisimCore` package installs `compat.hpp`, so a tool built against the
+  installed kernel can register its vendor command-line rules too.
 - UPF `use_interface_cell -force_function` (IEEE 1801-2024 6.62) is
   simulated: each isolated port runs through the HDL model of the first
   library cell, wired by `-port_map` to the isolation signal (or its
@@ -40,6 +46,14 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
   object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
   `vpiRefObj` has `vpiName` and `vpiFullName`.
+- VPI threads and frames (38.36.1): `vpi_handle(vpiThread / vpiFrame, NULL)`
+  in a calltf, thread objects (`vpiParent`, `vpiFrame`, child threads) and
+  frame objects (`vpiScope`, `vpiParent`, `vpiThread`, `vpiAutomatic`), both
+  with `vpiValid`, and the callbacks `cbStartOfThread`, `cbEndOfThread`,
+  `cbEnterThread`, `cbStartOfFrame` and `cbEndOfFrame`. The value of a
+  system task argument that is an automatic variable no longer crashes.
+- VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
+  unknown system task or function name, which the callback may register.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -49,6 +63,12 @@ Spec references are IEEE 1800-2023 clauses.
   `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
   `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
   them against an exact rational reference (docs/DATAPATH.md).
+- `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
+  format): a database named `.xml` is UCIS. Each instance becomes an
+  instanceCoverages scope with its statements, branches, conditions,
+  toggles, FSMs, assertions and covergroups. It also reads what other tools
+  write, such as blocks, case statements with more than two arms and
+  SystemVerilog literal state values.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -98,6 +118,36 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- VIP library: `vip/` holds UVM verification IP that runs on `msim -uvm`:
+  AXI4, APB4 and a memory model (from SoC-tb-regress-builder) and a new
+  AXI4-Lite VIP, each with agents, monitor, coverage, protocol assertions
+  and sequences, and self-test benches in `tests/vip` (`ctest -L vip`).
+  `tools/mvip.py` runs the 146 VIPs of open-vip-portfolio on msim. See
+  `docs/VIP.md`.
+- A `tri0` / `tri1` / `wand` / `wor` net connected to an inout port
+  (23.3.3.7) read `x` as soon as either side drove it; the port's net is now
+  the same net, of the external kind, so the pull and the drivers resolve.
+- The implicit sensitivity of a continuous assignment, `always_comb` or `@*`
+  no longer holds the arguments, result and locals of the functions it calls
+  (9.2.2.2.1): two assignments calling one function that writes its result
+  bit by bit woke each other for ever, and the simulation hung at time 0.
+- `@(event iff expr)` in procedures (9.4.2.3): the condition was ignored, so
+  `@(posedge clk iff rst_n)` woke on the first edge.
+- A user function called in the boolean of a concurrent assertion (16.6) is
+  run at each clock tick on the sampled values of its arguments; its result
+  was garbage before.
+- An array declared with an initializer in a non-recursive function,
+  `bit [5:0] t[4] = '{...};` (6.21), was an unsupported reference.
+- A queue or dynamic array reached through handles in a coverpoint or its
+  `iff` guard, `coverpoint tr.txn.data[0] iff (tr.txn.data.size() > 0)`
+  (19.5): it was a null object access.
+- Constraints on part-selects (18.5): `addr[1:0] == 0; addr[31:12] == 0;`
+  with a range on `addr` failed nearly every `randomize()`; the solver now
+  narrows a variable's range through a part-select.
+- A parameter or localparam of a class read through a handle, `h.N` (8.25).
+- VPI: `vpi_get_vlog_info` gives a `-f` file's arguments as the nested
+  array 38.36 describes, so `msim -uvm -f files.f` no longer crashes in
+  UVM's command line reader.
 - UPF `find_objects` (IEEE 1801-2024 6.33): a UPF file can search the
   design for instances, instances of a module, ports by direction, nets and
   its own supply ports and nets (`-transitive`, `-regexp`, `-exact`,
@@ -207,6 +257,12 @@ Spec references are IEEE 1800-2023 clauses.
   `tb.p.addr` that follows the handle (x while it is null), with handle
   properties followed N levels. `mdebug` reads them back: script `value` and
   `changes`, `-signals`, and the page adds them when the handle is picked.
+- `mdebug` reads a waveform on demand: the signal list first, then each
+  signal's changes when a query or the page first needs it (the `-html`
+  page in blocks of 2048 signals). On a 1024-core generated SoC (23305
+  signals, 384 MB FST) a script query takes 1 s and 113 MB, `-serve` 157 MB,
+  `-html` 1.6 GB, where every one of them ran out of memory before.
+  `wave::Reader::lazy`, `fetch()` and `release()` give other tools the same.
 - `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
   uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
   parent sequence, those in progress at `-at T`, and stream rows in the
@@ -603,6 +659,11 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a branch that calls a task or function with a nonblocking
+  assignment is merged. The task's `<=` target becomes `x` when the branch
+  only might be taken (each process calls its own copy of the task that
+  tests its unknown flag); before, the whole block kept the standard
+  behavior.
 - `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
   `forever` loops are merged; once a break or the condition of an unbounded
   loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or
@@ -849,6 +910,17 @@ Spec references are IEEE 1800-2023 clauses.
   by default (`-threads N`) with the same report for every thread count. A
   35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
   is the shared GDSII reader and writer. See `docs/MPV.md`.
+- UVM (IEEE 1800.2-2020): three tests cover the classes that compiled but
+  had no check of their own: `tests/uvm/base_extras.sv` (`uvm_time`,
+  `uvm_heartbeat`, `uvm_sequence_library`, report macros,
+  `uvm_callback_iter`, `uvm_run_test_callback`, `uvm_root`),
+  `reg_extras.sv` (`uvm_reg_file`, `uvm_reg_indirect_data`, `uvm_reg_fifo`,
+  `uvm_vreg`, `uvm_vreg_field`, `uvm_mem_mam`, block lookups) and
+  `reg_sequences.sv` (the built-in register and memory test sequences of
+  Annex E, each also run against a faulty DUT). Two faults they found are
+  fixed: `c ? i++ : i` and `c ? (x = 1) : 0` ran the assignment in the arm
+  not picked (11.4.11), and a `randc` property named in `randomize(v)` lost
+  its cycle (18.11).
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
