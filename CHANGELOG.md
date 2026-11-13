@@ -1262,6 +1262,23 @@ Spec references are IEEE 1800-2023 clauses.
   comments, package file names, explicit lifetimes and parameter types,
   range direction, macro names, short binary literals. Off by default; one
   task per file, same output at any `-threads`.
+- `mlint`: eight more rules after Verible's: `NAME015`..`NAME017` (interface
+  and constraint names, parameters named for what they disable), `SUS002`
+  (`void'(x.randomize())`), `SUS003` (`$psprintf`, `$random`, `$dist_*`),
+  `STY010`..`STY012` (string line continuations, a semicolon after a UVM
+  macro, `disable` of something other than an enclosing block).
+- `mlint` formal-assisted checks (`FML001`..`FML003`, `src/lintformal.hpp`):
+  dead `if`/`case` branches, indexes and part selects that can fall out of
+  range, and registers that never leave their reset value, each proved by
+  enumerating the values of the signals involved through single-driver nets
+  and the reachable values of small registers. Multithreaded; settings
+  `formal.max_bits` and `formal.reg_bits`.
+- `mlint` SoC flow (`src/lintsoc.hpp`): `-abstract-out` writes a block
+  abstract (ports and what the block does with them, parameters, open
+  findings); `-abstract` checks the top against it without the block's RTL
+  (rules `ABS001`..`ABS004`); `-bbox` makes modules black boxes.
+- `mlint -html FILE`: a self-contained report page with counts by severity
+  and rule, the source around each finding, and filters.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
