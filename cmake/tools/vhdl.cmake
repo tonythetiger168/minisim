@@ -13,6 +13,7 @@ if(TARGET msim)
     "structure|structure.vhd|ghdl"
     "seq|seq.vhd|ghdl"
     "textio_math|textio_math.vhd|ghdl|textio_math.txt|1"
+    "rom_records|rom_records.vhd|ghdl"
     "mixed_sv_top|counter.vhd,mixed_sv_top.sv|"
     "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|")
   foreach(t ${VHDL_TESTS})

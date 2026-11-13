@@ -2997,6 +2997,7 @@ endpackage
             } else if (where == "process") kw = "static ";
             else if (d->k == DK::Variable && d->shared) kw = "";
             std::string dname = y.sv;
+            if (d->k == DK::Signal && cx->drvNames.count(dname) && !(isPackable(ot) && isFourState(ot))) cx->drvNames.erase(dname);
             if (d->k == DK::Signal && cx->drvNames.count(dname)) {
                 // resolved signal with several drivers: a wire, each driver is a variable
                 o << ind() << svDeclNet(ot, dname) << ";\n";
@@ -3010,8 +3011,7 @@ endpackage
     std::string svDeclNet(const TP& t, const std::string& name) {
         std::string pre, post;
         svParts(t, pre, post);
-        if (pre.rfind("logic", 0) == 0) pre = "wire " + pre;
-        else pre = "wire logic";
+        pre = "wire " + pre;
         return pre + " " + name + post;
     }
 
@@ -3147,12 +3147,17 @@ endpackage
         Spec spec;
         std::string key = s.sv + "|" + std::to_string((uintptr_t)s.sub.get());
         auto& pts = paramTypes[s.sub.get()];
+        TP rt0 = retType(&s);
+        bool retUnconstrained = rt0 && isUnconstrained(rt0) && !(rt0->elem && rt0->elem->k == Type::Char);
         for (size_t i = 0; i < sp.params.size(); ++i) {
             TP pt = pts[i];
             std::string act;
             if (sp.params[i]->cls == "signal" || sp.params[i]->cls == "file") {
                 act = av[i].s;
                 if (isUnconstrained(pt) || !pt) pt = av[i].t;
+            } else if (retUnconstrained && pt && pt->k != Type::Array && pt->k != Type::Record && isStatic(ord[i])) {
+                // the result's width may depend on this value: specialize on it
+                act = "(" + av[i].s + ")";
             } else if (isUnconstrained(pt) && !(pt->elem && pt->elem->k == Type::Char && pt->dims.size() == 1)) {
                 TP at = av[i].t;
                 if (!at || at->k != Type::Array || isUnconstrained(at)) {
@@ -3203,6 +3208,26 @@ endpackage
         return v;
     }
     std::map<std::string, std::string> specNames;
+    // an expression of literals, constants and generics (and attributes of them)
+    bool isStatic(const EP& e) {
+        if (!e) return true;
+        switch (e->k) {
+        case EK::Int: case EK::Real: case EK::Char: case EK::Str: case EK::BitStr: case EK::Phys: return true;
+        case EK::Un: case EK::Bin: return isStatic(e->a) && isStatic(e->b);
+        case EK::Name: {
+            const Sym* y = lookup(e->name);
+            return y && (y->k == Sym::Lit || (y->k == Sym::Obj && y->cls == "constant" && !y->decl) || (y->k == Sym::Obj && y->cls == "constant" && y->decl && y->decl->k == DK::Constant));
+        }
+        case EK::Sel: return lookupSel(e) != nullptr;
+        case EK::Attr: return e->name == "length" || e->name == "left" || e->name == "right" || e->name == "high" || e->name == "low";
+        case EK::Call: {
+            for (auto& a : e->args) if (!isStatic(a.actual)) return false;
+            const Sym* y = e->a->k == EK::Name ? lookup(e->a->name) : nullptr;
+            return y && (y->k == Sym::Sub || y->k == Sym::TypeK);
+        }
+        default: return false;
+        }
+    }
 
     // ===================================================================
     // Sequential statements
@@ -3475,7 +3500,7 @@ endpackage
             if (y && y->k == Sym::Obj && y->cls == "signal") {
                 Val v = ex(e, nullptr);
                 if (v.t && (isPackable(v.t) || v.t->k == Type::Real || v.t->k == Type::Time)) addUnique(out, v.s);
-                else if (v.t && v.t->k == Type::Array) addUnique(out, v.s);
+                else if (v.t) addEvent(out, v.s, v.t);
             } else if (y && y->k == Sym::Alias) {
                 addUnique(out, y->aliasSv);
             }
@@ -3493,7 +3518,7 @@ endpackage
                 if (y && y->k == Sym::Obj && y->cls == "signal" && y->type && y->type->k == Type::Array && !isScalarBit(y->type->elem)) {
                     for (auto& a : e->args) readSignals(a.actual, out);
                     Val v = exQuiet(e);
-                    if (!v.s.empty()) addUnique(out, v.s);
+                    if (!v.s.empty()) addEvent(out, v.s, v.t);
                     return;
                 }
             }
@@ -3501,10 +3526,12 @@ endpackage
             for (auto& a : e->args) readSignals(a.actual, out);
             return;
         }
-        case EK::Attr:
-            readSignals(e->a, out);
+        case EK::Attr: {
+            static const std::set<std::string> arrayAttrs = {"length", "left", "right", "high", "low", "range", "reverse_range", "ascending", "element", "subtype", "base"};
+            if (!arrayAttrs.count(e->name)) readSignals(e->a, out);   // 'length etc. do not read the value
             readSignals(e->b, out);
             return;
+        }
         case EK::Agg:
             for (auto& a : e->agg) { readSignals(a.value, out); for (auto& c : a.choices) readSignals(c, out); }
             return;
@@ -3514,6 +3541,24 @@ endpackage
             return;
         default: return;
         }
+    }
+    // an event control term for an object: unpacked arrays and records are expanded into their elements
+    void addEvent(std::vector<std::string>& out, const std::string& sv, const TP& t) {
+        if (t && t->k == Type::Array && !isScalarBit(t->elem)) {
+            const Rng& d = t->dims[0];
+            if (d.lv && d.rv && std::abs(*d.lv - *d.rv) < 256) {
+                TP sub = t->elem;
+                if (t->dims.size() > 1) { sub = std::make_shared<Type>(*t); sub->dims.erase(sub->dims.begin()); }
+                for (int64_t i = std::min(*d.lv, *d.rv); i <= std::max(*d.lv, *d.rv); ++i) addEvent(out, sv + "[" + std::to_string(i) + "]", sub);
+                return;
+            }
+        }
+        if (t && t->k == Type::Record && !isPackable(t)) {
+            for (size_t i = 0; i < t->fnames.size(); ++i) addEvent(out, sv + "." + svId(t->ftext[i]), t->ftypes[i]);
+            return;
+        }
+        if (t && (t->k == Type::String || t->k == Type::Line || t->k == Type::File)) return;
+        addUnique(out, sv);
     }
     static void addUnique(std::vector<std::string>& v, const std::string& s) {
         if (std::find(v.begin(), v.end(), s) == v.end()) v.push_back(s);
@@ -3561,7 +3606,7 @@ endpackage
         std::vector<std::string> sigs;
         for (auto& n : s.on) {
             Val v = ex(n, nullptr);
-            addUnique(sigs, v.s);
+            addEvent(sigs, v.s, v.t);
         }
         if (s.on.empty() && s.cond) readSignals(s.cond, sigs);
         std::string tm = s.forTime ? ex(s.forTime, bt["time"]).s : "";
@@ -3836,10 +3881,7 @@ endpackage
                 for (auto& d : arch->decls)
                     if (d->k == DK::Signal)
                         for (auto& n : d->names)
-                            if (di.needsNet(n)) {
-                                TP t = subtype(d->type);
-                                if (isPackable(t) && isFourState(t)) c.drvNames[svId(d->texts[std::find(d->names.begin(), d->names.end(), n) - d->names.begin()])] = n;
-                            }
+                            if (di.needsNet(n)) c.drvNames[svId(d->texts[std::find(d->names.begin(), d->names.end(), n) - d->names.begin()])] = n;
             }
             emitDecls(body, ent->decls, "module");
             if (arch) {
@@ -4174,7 +4216,7 @@ endpackage
                 std::string body = seqStmts(s.body);
                 std::vector<std::string> sens;
                 if (s.sensAll) readSignalsStmts(s.body, sens);
-                else for (auto& n : s.sens) addUnique(sens, ex(n, nullptr).s);
+                else for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); }
                 if (s.hasSens && containsWait(s.body)) fail(s.line, "a process with a sensitivity list cannot contain wait");
                 // previous values for 'event / rising_edge
                 std::string prevDecl, prevUpd;
@@ -4228,7 +4270,7 @@ endpackage
         if (!s.hasSens || s.sensAll || s.body.size() != 1 || s.body[0]->k != SK::If) return "";
         const Stmt& iff = *s.body[0];
         std::vector<std::string> sens;
-        for (auto& n : s.sens) addUnique(sens, ex(n, nullptr).s);
+        for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); }
         auto edgeSig = [&](const EP& c) -> std::string {
             std::string e = edgeOf(c);
             return e;
