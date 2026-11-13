@@ -349,7 +349,10 @@ inline int uWidth(const slang::ast::Type& t0) {
         int w = 0;
         bool u = t.isUnpackedUnion();
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
-            int fw = uWidth(f.getType());
+            const Type& ft = f.getType().getCanonicalType();
+            // A queue, dynamic or associative array member: its container id (7.2)
+            bool cont = !u && (ft.isQueue() || ft.isAssociativeArray() || ft.kind == SymbolKind::DynamicArrayType);
+            int fw = cont ? 64 : uWidth(f.getType());
             if (fw <= 0) return -1;
             w = u ? std::max(w, fw) : w + fw;
         }
@@ -370,15 +373,22 @@ inline int bitsOf(const slang::ast::Type& t) {
     return t.getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType ? uWidth(t) : storeW(t);
 }
 // Offset and width of field f inside unpacked struct or union t.
+// The bits of a member of unpacked struct type: a container member holds
+// its container's id (7.2).
+inline int uMemberW(const slang::ast::Type& ft0) {
+    const auto& ft = ft0.getCanonicalType();
+    if (ft.isQueue() || ft.isAssociativeArray() || ft.kind == slang::ast::SymbolKind::DynamicArrayType) return 64;
+    return uWidth(ft);
+}
 inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::FieldSymbol& f) {
     using namespace slang::ast;
     const auto& t = t0.getCanonicalType();
-    int fw = uWidth(f.getType());
-    if (t.isUnpackedUnion()) return {0, fw};
+    if (t.isUnpackedUnion()) return {0, uWidth(f.getType())};
+    int fw = uMemberW(f.getType());
     int after = 0;
     bool seen = false;
     for (const auto& g : t.as<Scope>().membersOfType<FieldSymbol>()) {
-        if (seen) after += uWidth(g.getType());
+        if (seen) after += uMemberW(g.getType());
         if (&g == &f) seen = true;
     }
     return {after, fw};
@@ -1841,7 +1851,7 @@ struct Lowerer {
             const Expression& a = *args[n];
             if (staged && !formal.arr && formal.dir == ArgumentDirection::In && a.kind != ExpressionKind::EmptyArgument) {
                 int tmp = fresh(formal.w);
-                Instr i; i.k = IK::Assign; i.sig = tmp; i.e = expr(a);
+                Instr i; i.k = IK::Assign; i.sig = tmp; i.e = cloneConts(*a.type, expr(a));
                 prog.emit(i);
                 stagedSet.push_back({formal.sig, tmp});
                 continue;
@@ -1862,14 +1872,15 @@ struct Lowerer {
                 Instr i;
                 i.k = IK::Assign;
                 i.sig = formal.sig;
-                i.e = expr(a);
+                i.e = cloneConts(*a.type, expr(a));
                 prog.emit(i);
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
                 Instr i;
                 i.k = IK::Assign;
                 i.sig = formal.sig;
-                i.e = expr(a.as<AssignmentExpression>().left());
+                const Expression& l = a.as<AssignmentExpression>().left();
+                i.e = cloneConts(*l.type, expr(l));
                 prog.emit(i);
             } else if (a.kind != ExpressionKind::Assignment &&
                        a.kind != ExpressionKind::EmptyArgument) {
@@ -1905,7 +1916,7 @@ struct Lowerer {
             OutSlot slot{formal.sig, formal.w, formal.sgn};
             const OutSlot* saved = outSlot;
             outSlot = &slot;
-            i.e = expr(as.right());
+            i.e = cloneConts(*as.left().type, expr(as.right()));
             outSlot = saved;
             prog.emit(i);
         }
@@ -2178,10 +2189,11 @@ struct Lowerer {
                     defaultSelf = saved;
                     continue;
                 }
-                c.init.push_back({formal.sig, expr(a)});
+                c.init.push_back({formal.sig, cloneConts(*a.type, expr(a))});
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
-                c.init.push_back({formal.sig, expr(a.as<AssignmentExpression>().left())});
+                const Expression& l = a.as<AssignmentExpression>().left();
+                c.init.push_back({formal.sig, cloneConts(*l.type, expr(l))});
             } else if (a.kind != ExpressionKind::Assignment && a.kind != ExpressionKind::EmptyArgument) {
                 unsupported("output argument");
             }
@@ -3885,9 +3897,79 @@ struct Lowerer {
     // A container is a hidden 64-bit handle signal whose value counts its
     // changes; the elements live in dynStore()[handle].
     int dollarQ = -1;   // the queue whose `$` (last index) the selector being lowered uses
+    // The containers inside a value of type t (7.2), at bit offset base:
+    // members of unpacked structs, also inside nested structs and arrays.
+    static void structConts(const slang::ast::Type& t0, int base, std::vector<std::pair<int, DynObj>>& out) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        if (t.isUnpackedStruct()) {
+            for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+                const Type& ft = f.getType().getCanonicalType();
+                int off = base + uField(t, f).first;
+                if (isDynType(ft)) out.push_back({off, dynShapeOf(ft)});
+                else structConts(ft, off, out);
+            }
+        } else if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            const auto& a = t.as<FixedSizeUnpackedArrayType>();
+            std::vector<std::pair<int, DynObj>> one;
+            structConts(a.elementType, 0, one);
+            if (one.empty()) return;
+            int ew = uWidth(a.elementType), n = (int)a.range.width();
+            for (int k = 0; k < n; k++)
+                for (auto& [o, sh] : one) out.push_back({base + k * ew + o, sh});
+        }
+    }
+    static bool hasStructConts(const slang::ast::Type& t) {
+        std::vector<std::pair<int, DynObj>> v;
+        structConts(t, 0, v);
+        return !v.empty();
+    }
+    // A value of type t that is about to be stored: its containers copied,
+    // so the copy does not share them with where it came from (7.2).
+    E cloneConts(const slang::ast::Type& t, E v) {
+        auto c = std::make_shared<std::vector<std::pair<int, DynObj>>>();
+        structConts(t, 0, *c);
+        if (c->empty()) return v;
+        auto n = node(Op::StructClone, {std::move(v)});
+        n->conts = std::move(c);
+        return n;
+    }
+    // A container id slot that names no container yet: 0, or X in a
+    // variable that never got its struct default (an output formal).
+    E noCont(E id) {
+        return bin(Op::LogOr, bin(Op::CaseEq, id, konst(make(0, 0, 64))),
+                   bin(Op::CaseEq, node(Op::RedXor, {id}), konst(xfill(1))));
+    }
+    // s.q, a container member of an unpacked struct (7.2): the container its
+    // id names, made (and its id written into s) on first use.
+    int structMemberDyn(const slang::ast::MemberAccessExpression& m) {
+        using namespace slang::ast;
+        if (consDepth) unsupported("a container member of a struct in a constraint");
+        DynObj shape = dynShapeOf(*m.type);
+        int tmp = fresh(64);
+        { Instr r; r.k = IK::Assign; r.sig = tmp; r.e = readPSel(expr(m.value()), memberPSel(m)); prog.emit(r); }
+        Instr j; j.k = IK::JmpIfNot; j.e = noCont(ref(tmp));
+        size_t jf = prog.emit(j);
+        {
+            auto a = node(Op::DynAlloc);
+            a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, shape}});
+            Instr i; i.k = IK::Assign; i.sig = tmp; i.e = a; prog.emit(i);
+            Instr w; w.k = IK::Assign; lhs(m, w); w.e = ref(tmp); prog.emit(w);
+        }
+        prog.code[jf].target = prog.here();
+        int p1 = fresh(64);
+        { Instr i; i.k = IK::Assign; i.sig = p1; i.e = bin(Op::Add, ref(tmp), konst(make(1, 0, 64))); prog.emit(i); }
+        int d = indThrough(p1);
+        indShape[d] = std::move(shape);
+        return d;
+    }
     int dynSig(const slang::ast::Expression& e0) {
         using namespace slang::ast;
         const Expression& e = peel(e0);
+        if (e.kind == ExpressionKind::MemberAccess && isDynType(*e.type)) {
+            const auto& m = e.as<MemberAccessExpression>();
+            if (m.value().type->getCanonicalType().isUnpackedStruct()) return structMemberDyn(m);
+        }
         if (classMember(e)) {   // h.q (8.4): the container slot through the handle
             const auto& m = e.as<MemberAccessExpression>();
             const PropSlot* ps = memberSlot(m);
@@ -4118,7 +4200,7 @@ struct Lowerer {
             }
         }
         if (x.type->isUnpackedArray()) unsupported("container value");
-        Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(x); prog.emit(i);
+        Instr i = dynCmd(t, D_PUSH_BACK); i.e = cloneConts(*x.type, expr(x)); prog.emit(i);
     }
     // An array argument (7.7): the formal gets a copy of the actual.
     void copyArrayArg(const slang::ast::FormalArgumentSymbol& f, const slang::ast::Expression& a) {
@@ -4627,8 +4709,8 @@ struct Lowerer {
             pushContainer(d, i.dcmd, i.dcmd == D_INSERT ? *args[2] : *args[1], i.dcmd == D_INSERT ? args[1] : nullptr);
             return nullptr;
         }
-        if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = expr(*args[1]);
-        if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = expr(*args[2]); }
+        if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = cloneConts(*args[1]->type, expr(*args[1]));
+        if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = cloneConts(*args[2]->type, expr(*args[2])); }
         prog.emit(i);
         return nullptr;
     }
@@ -5111,6 +5193,10 @@ struct Lowerer {
                     if (b.op == BinaryOperator::Inequality || b.op == BinaryOperator::CaseInequality) acc = un(Op::LogNot, acc);
                     return sized(acc, 1, false, ctx);
                 }
+                if ((hasStructConts(*b.left().type) || hasStructConts(*b.right().type)) &&
+                    (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
+                     b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality))
+                    unsupported("== on structs that hold containers");
                 if (b.left().type->isUnpackedArray() &&
                     (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
                      b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
@@ -6055,6 +6141,18 @@ struct Lowerer {
         const auto& t = t0.getCanonicalType();
         if (t.isFloating()) { auto b = node(Op::Resize, {realOf(x)}); b->hi = 64; return b; }
         if (t.isString()) return resize(strOf(x), 64, false, false);
+        if (isDynType(t)) {   // a container member (7.2): a new container holding x, by its id
+            if (!stmtDepth) unsupported("a struct pattern with a container member outside a procedural statement");
+            auto a = node(Op::DynAlloc);
+            a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, dynShapeOf(t)}});
+            int id = fresh(64), p1 = fresh(64);
+            { Instr i; i.k = IK::Assign; i.sig = id; i.e = a; prog.emit(i); }
+            { Instr i; i.k = IK::Assign; i.sig = p1; i.e = bin(Op::Add, ref(id), konst(make(1, 0, 64))); prog.emit(i); }
+            int d = indThrough(p1);
+            indShape[d] = dynShapeOf(t);
+            assignContainer(d, x);
+            return ref(id);
+        }
         int w = bitsOf(t);
         if (t.isIntegral()) return resize(expr(x), w, x.type->isSigned(), false);
         return resize(expr(x), w, false, false);
@@ -6107,7 +6205,7 @@ struct Lowerer {
         std::vector<E> parts;
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
             const Type& ft = f.getType().getCanonicalType();
-            int w = uWidth(ft);
+            int w = t.isUnpackedUnion() ? uWidth(ft) : uMemberW(ft);
             if (ft.isUnpackedStruct() || ft.kind == SymbolKind::FixedSizeUnpackedArrayType) parts.push_back(structDefault(ft));
             else if (ft.isIntegral() && ft.isFourState()) parts.push_back(konst(xfill(w)));
             else if (ft.isString()) parts.push_back(konst(make(mkstr("").v, 0, 64, 0)));
@@ -6644,6 +6742,7 @@ struct Lowerer {
         if (ec.isIntegral() && ec.kind != slang::ast::SymbolKind::EnumType && !ec.isStruct()) { fmt += 'd'; out.push_back(h); return; }
         int w = bitsOf(ec);
         if (w <= 0) unsupported("%p of a container of this element type");
+        if (hasStructConts(ec)) unsupported("%p of a container of structs that hold containers");
         int tmp = fresh(w);
         std::string sub;
         std::vector<E> subArgs;
@@ -6661,6 +6760,20 @@ struct Lowerer {
     void pfmtBits(const slang::ast::Type& t0, E part, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
         const Type& ft = t0.getCanonicalType();
+        if (isDynType(ft)) {   // a container member of a struct (7.2): the container its id names
+            auto a = node(Op::DynAlloc);
+            a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, dynShapeOf(ft)}});
+            int tmp = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = tmp;
+            i.e = bin(Op::Add, node(Op::Mux, {noCont(part), a, part}), konst(make(1, 0, 64)));
+            prog.emit(i);
+            int d = indThrough(tmp);
+            indShape[d] = dynShapeOf(ft);
+            const Type* et = ft.getArrayElementType();
+            while (isDynType(*et)) et = et->getCanonicalType().getArrayElementType();
+            pfmtCont(et->getCanonicalType(), ref(d), fmt, out);
+            return;
+        }
         int w = uWidth(ft);
         if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // '{e0, e1, ...}, the left element first
             const auto& a = ft.as<FixedSizeUnpackedArrayType>();
@@ -8566,6 +8679,7 @@ struct Lowerer {
             if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
             lvalue = saved;
+            if (!a.isCompound()) i.e = cloneConts(*a.left().type, i.e);   // a struct's containers are copied (7.2)
             if (const TimingControl* tc = a.timingControl; tc && tc->kind != TimingControlKind::Delay) {
                 // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
                 // written after the event (n events for repeat).
@@ -9030,7 +9144,9 @@ struct Lowerer {
                 if (localMap().count(&vd.symbol)) {   // an automatic variable starts over at each entry (6.21)
                     if (vd.symbol.getType().isEvent()) break;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol);
-                    i.e = init ? expr(*init) : konst(initOf(vd.symbol.getType()));
+                    const Type& vt = vd.symbol.getType().getCanonicalType();
+                    i.e = init ? cloneConts(vt, expr(*init))
+                        : konst(vt.isUnpackedStruct() || vt.isUnpackedUnion() ? structDefaultVal(vt) : initOf(vt));
                     prog.emit(i);
                     break;
                 }
@@ -9052,6 +9168,10 @@ struct Lowerer {
                         !vt.isEvent() && (vt.isIntegral() || vt.isFloating() || vt.isString())) {
                         Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = konst(initOf(vt));
                         prog.emit(i);
+                    } else if (vd.symbol.lifetime == VariableLifetime::Automatic && current &&
+                               (vt.isUnpackedStruct() || vt.isUnpackedUnion()) && uWidth(vt) > 0) {
+                        Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = konst(structDefaultVal(vt));
+                        prog.emit(i);
                     }
                     break;
                 }
@@ -9063,7 +9183,7 @@ struct Lowerer {
                 bool once = vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
                 auto initVar = [&] {   // a fixed-size array takes its value element by element
                     if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
-                    Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
+                    Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = cloneConts(vd.symbol.getType(), expr(*init));
                     prog.emit(i);
                 };
                 if (!once) {
@@ -9090,7 +9210,7 @@ struct Lowerer {
                     i.k = IK::Assign;
                     i.sig = retSig;
                     i.e = r.expr->type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType
-                        ? packedValue(*r.expr->type, *r.expr) : expr(*r.expr);
+                        ? packedValue(*r.expr->type, *r.expr) : cloneConts(*r.expr->type, expr(*r.expr));
                     prog.emit(i);
                 }
                 Instr ret;
@@ -9640,7 +9760,7 @@ inline Val structDefaultVal(const slang::ast::Type& t0) {
     int top = W;
     for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
         const Type& ft = f.getType().getCanonicalType();
-        int w = uWidth(ft);
+        int w = uMemberW(ft);
         top -= w;
         Val p;
         if (ft.isUnpackedStruct() || ft.isUnpackedUnion() || ft.kind == SymbolKind::FixedSizeUnpackedArrayType) p = structDefaultVal(ft);
