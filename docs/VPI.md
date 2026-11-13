@@ -144,8 +144,12 @@ concurrent assertion makes every clock step of each of its attempts call
 attempt, numbered per assertion in the order they are first seen (two
 attempts in the same state have the same number). `vpiAssertionDisableStep`
 turns it off. Not supported: `vpiAssertionClockSteps`, the matched
-expressions of a step (`matched_expression_count` is 0), and `failExpr` of
-a failure is NULL.
+expressions of a step (`matched_expression_count` is 0). On
+`cbAssertionFailure`, `info->detail.failExpr` is the failing expression: an
+immediate assertion's condition, or the boolean of a concurrent property
+that is a single expression (under its clock and `disable iff`); it is NULL
+for a property with sequence or property operators, because msim's engine
+does not keep which part of such a property failed.
 
 **Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
 instance)` gives the covered items of that instance: `vpiStatementCoverage`
@@ -154,7 +158,8 @@ rose and fell), `vpiFsmStateCoverage` (FSM states entered) and
 `vpiAssertCoverage` (assertions that succeeded, or covers that matched;
 counted with or without `-cov`). Items in instances below it are not
 included. `vpiCovered`, `vpiCoveredCount` and `vpiCoveredMax` read an
-assertion (succeeded, successes, 1), an FSM (states entered, entries, states),
+assertion (attempted, succeeded at least once and never failed, as 40.5.2
+says, a cover only the first two; successes; 1), an FSM (states entered, entries, states),
 an FSM state, or a net, variable, word or bit (bits toggled both ways, bits
 toggled, width). An assertion also gives `vpiAssertAttemptCovered`,
 `vpiAssertSuccessCovered`, `vpiAssertFailureCovered`,
@@ -165,17 +170,25 @@ found (`vpiFsm` objects with `vpiName`, `vpiFullName`, `vpiFile`,
 `vpi_iterate(vpiFsmStates, fsm)` its states (`vpiFsmHandle` objects whose
 `vpi_get_value` is the state's value and `vpiName` its name).
 `vpi_control(op, type, handle)` takes `vpiCoverageStart`, `vpiCoverageStop`,
-`vpiCoverageReset` and `vpiCoverageCheck` (1 when every item of the type is
-covered) with an instance, an assertion (for `vpiAssertCoverage`) or NULL
+`vpiCoverageReset` and `vpiCoverageCheck` with an instance, an assertion (for `vpiAssertCoverage`) or NULL
 (the whole design); `vpi_control(vpiCoverageSave, type, name)` writes the
 coverage database (the `-cov` JSON) to `name` now, and
 `vpi_control(vpiCoverageMerge, type, name)` reads such a database and adds
 its counts of that type to the current ones: statement hits by source line,
 toggled bits by signal name and width, FSM state and transition counts by
 instance and register, assertion attempts, successes and failures by
-assertion name (items the design does not have are skipped). Not
-supported: starting or stopping statement, toggle or FSM coverage for an
-instance below the top (it is for the whole design).
+assertion name (items the design does not have are skipped).
+`vpiCoverageStop` of statement, toggle or FSM coverage on an instance below
+the top freezes that instance's counts (only its own items, not those of
+the instances inside it) until `vpiCoverageStart`; other instances keep
+counting. A `vpiCoverageReset` of a stopped instance zeroes it and leaves
+it stopped. On a top instance or NULL the stop is for the whole design.
+The results are those of the system functions (40.5.3, 40.3.2):
+`SV_COV_OK` (1), `SV_COV_NOCOV` (0) and `SV_COV_ERROR` (-1). Check and
+start give 1 when there is coverage of that type there (whether or not it
+is all covered) and 0 when there is none (statement, toggle and FSM
+coverage without `msim -cov`); save gives 0 when there is nothing to save;
+merge gives -1 when the database is missing or not msim's.
 
 **Structs, containers and classes (37.17, 37.18, 37.29).** An unpacked
 struct or union variable is a `vpiStructVar` / `vpiUnionVar` (its value is
@@ -408,6 +421,12 @@ that signal (not `SIGKILL` or `SIGSTOP`). The handler only notes it; the
 callbacks run at the next safe point, the start of the next time slot (or
 the end of the run), with the signal in `index`.
 
+**Data read API (41).** The clause is deprecated: 1800-2023 says only
+"This clause has been deprecated. See IEEE Std 1800-2005 for the contents of
+this clause." Annex M declares no data read routines or
+constants, so there is nothing to implement; recorded data is read with the
+waveform tools (`mwave`, the FST and VCD readers).
+
 ## Not yet
 
 The non-static property
@@ -424,7 +443,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

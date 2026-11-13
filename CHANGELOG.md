@@ -12,6 +12,24 @@ Spec references are IEEE 1800-2023 clauses.
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
   check no longer counts the reset value as a change.
+- `msim -upf` plans the logic power cannot gate (testbench, always-on
+  logic) as without `-upf`: static schedules, partitions and `-threads`.
+  Processes in power domains, UPF cells and writers of UPF controls stay on
+  the interpreter. A testbench-heavy power-aware run is about 1.7 times
+  faster; `MSIM_UPF_SERIAL=1` restores the old serial mode.
+- The Tcl interpreter of the tool line (`src/tcl.hpp`, used by UPF, SDC and
+  the tool shells) has `upvar`, `uplevel`, `namespace eval` with `variable`
+  and namespace procs, `namespace current / exists / qualifiers / tail /
+  which / delete`, `regexp` and `regsub` (ECMAScript syntax), and
+  `info level / procs`. `tests/test_tcl.cpp` now runs in ctest.
+- `msim -upf_cov <file>`: a low-power coverage report of power states,
+  named state transitions, isolation enables and retention saves and
+  restores, with the bins not hit marked.
+- UPF `set_retention -applies_to flop | latch` (IEEE 1801-2024 6.54) selects
+  flip-flops or latches: `always_latch` and latches inferred from a
+  level-sensitive `always` that leaves a variable unassigned on some path.
+  Level-sensitive logic of a domain now re-evaluates at power-up (9.5.3)
+  even when no input changed while the domain was off.
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
@@ -25,6 +43,10 @@ Spec references are IEEE 1800-2023 clauses.
   profile, model libraries and RTL co-simulation.
 - The `minisimCore` package installs `compat.hpp`, so a tool built against the
   installed kernel can register its vendor command-line rules too.
+- UPF `use_interface_cell -force_function` (IEEE 1801-2024 6.62) is
+  simulated: each isolated port runs through the HDL model of the first
+  library cell, wired by `-port_map` to the isolation signal (or its
+  inverse) and supplies, in place of the strategy's clamp and sense.
 - UPF `map_retention_cell -lib_model_name` (IEEE 1801-2024 6.39) is
   simulated: the mapped register runs as the verification model, wired to
   the clock, data and async set/reset inferred from its always block, the
@@ -55,6 +77,14 @@ Spec references are IEEE 1800-2023 clauses.
   and `cbStartOfReset` / `cbEndOfReset` now run around `$save`,
   `$restart` and `$reset`; `cbSignal` runs at the next time slot after the
   signal. `cbUnresolvedSystf` now also passes the name in `user_data`.
+- VPI coverage stop and start on one instance below the top (40.5.1):
+  its statement, toggle or FSM counts freeze until `vpiCoverageStart`.
+- VPI coverage control as 40.5 reads: `vpi_control` returns the
+  `SV_COV_*` codes of the system functions (`vpiCoverageCheck` is 1 when
+  coverage is available, not when all is covered; errors are -1), and
+  `vpiCovered` of an assertion needs an attempt, a success and no failure.
+- VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
+  immediate assertion, or the boolean of a single-expression property.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
