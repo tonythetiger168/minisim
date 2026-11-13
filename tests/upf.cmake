@@ -28,8 +28,9 @@ endforeach()
 # for real, enum, integer and upfSupplyTypeT ports (4.10, 5.11, 6.29, 6.30,
 # 6.36, 6.63); function and model VCMs (6.30.8, 6.30.9); supply ports
 # connected by pg_type (4.5.4.6.2, 6.14, 6.15); table VCMs on fields of
-# packed and unpacked struct ports (6.30 -field).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield)
+# packed and unpacked struct ports (6.30 -field); a retention register
+# simulated by its verification model (6.39 -lib_model_name).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield retmodel)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -395,3 +396,7 @@ upf_error_in(gating e_ret2 "define_retention_cell -cells R -power P -ground G -h
 upf_error_in(vcmfield e_fld1 "create_vcm WHOLE -hdl_type {sv pw_pkg::stat_t} -conversion_direction hdl2upf -table {{{3} {FULL_ON}} {{0} {OFF}}}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm WHOLE" "converts the whole struct pw_pkg::stat_t; a struct with several fields needs -field (6.30)")
 upf_error_in(vcmfield e_fld2 "create_vcm NOPE -hdl_type {sv pw_pkg::stat_t} -field nope -conversion_direction hdl2upf -table {{{3} {FULL_ON}} {{0} {OFF}}}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm NOPE" "VCM IEEE::NOPE -field nope: it has no field nope (6.30)")
 upf_error_in(vcmfield e_fld3 "create_vcm K2U -hdl_type {sv pw_pkg::stat_t} -field ok -conversion_direction hdl2upf -table {{{1} {FULL_ON}} {{0} {OFF}}}\ncreate_vcm BOTH -vcms {M2U K2U}\ncreate_supply_net VX\nconnect_supply_net VX -ports {u_spare/s2} -vcm BOTH" "only a struct input takes one upf2hdl VCM for each of its fields (6.30)")
+upf_error_in(retmodel e_rm1 "map_retention_cell RET_A -domain PD_A -lib_model_name nomod -port_map {{CK UPF_GENERIC_CLOCK}}" "-lib_model_name nomod: no module nomod (6.39)")
+upf_error_in(retmodel e_rm2 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{CK UPF_GENERIC_CLOCK}}" "input port D of ret_ff is not connected by -port_map (6.39)")
+upf_error_in(retmodel e_rm3 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{XX UPF_GENERIC_CLOCK}}" "ret_ff has no port XX (6.39)")
+upf_error_in(retmodel e_rm4 "map_retention_cell RET_A -domain PD_A -lib_model_name ret_ff -port_map {{CK UPF_GENERIC_CLOCK} {CK UPF_GENERIC_DATA}}" "-port_map maps model port CK twice (6.39)")
