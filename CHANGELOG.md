@@ -25,6 +25,10 @@ Spec references are IEEE 1800-2023 clauses.
   profile, model libraries and RTL co-simulation.
 - The `minisimCore` package installs `compat.hpp`, so a tool built against the
   installed kernel can register its vendor command-line rules too.
+- UPF `map_retention_cell -lib_model_name` (IEEE 1801-2024 6.39) is
+  simulated: the mapped register runs as the verification model, wired to
+  the clock, data and async set/reset inferred from its always block, the
+  strategy's save and restore signals and its supplies.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
@@ -63,6 +67,14 @@ Spec references are IEEE 1800-2023 clauses.
   toggles, FSMs, assertions and covergroups. It also reads what other tools
   write, such as blocks, case statements with more than two arms and
   SystemVerilog literal state values.
+- `mcov` takes other vendors' coverage command lines:
+  - URG options with `--compat=synopsys`
+  - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
+  - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
+  - the same through a symlink named `urg`, `imc` or `vcover`
+
+  The engine is mcov's own, and it reads mcov's own databases.
+  A database that does not exist is now a one-line error instead of a traceback.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -84,6 +96,11 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- The interpreter finds the matching item of a case statement with constant
+  labels through a table instead of comparing label by label, and a `unique
+  case` whose labels are enum names is no longer treated as possibly
+  overlapping. OpenTitan Ibex runs in 15.7 s instead of 20.8 s on one thread
+  (`tests/spec/12.5-case-many-items.sv`).
 - VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
   `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
   one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and
@@ -161,6 +178,10 @@ Spec references are IEEE 1800-2023 clauses.
   clock domain (virtual clocks included), so an input read without a
   synchronizer, or an output launched on another clock, is a crossing.
   `set_case_analysis 0/1` makes a signal static.
+- UPF table VCMs convert a field of a struct port (`create_vcm -field`,
+  IEEE 1801-2024 6.30): packed and unpacked structs, nested fields, and one
+  upf2hdl VCM per field of a struct input.
+
 - `msim -upf` and `mlint -upf` check the implementation commands of IEEE
   1801-2024 instead of ignoring them: `map_power_switch`, `map_repeater_cell`,
   `map_retention_cell`, `map_retention_clamp_cell`, `name_format`,
@@ -247,6 +268,12 @@ Spec references are IEEE 1800-2023 clauses.
   `tb.p.addr` that follows the handle (x while it is null), with handle
   properties followed N levels. `mdebug` reads them back: script `value` and
   `changes`, `-signals`, and the page adds them when the handle is picked.
+- `mdebug` reads a waveform on demand: the signal list first, then each
+  signal's changes when a query or the page first needs it (the `-html`
+  page in blocks of 2048 signals). On a 1024-core generated SoC (23305
+  signals, 384 MB FST) a script query takes 1 s and 113 MB, `-serve` 157 MB,
+  `-html` 1.6 GB, where every one of them ran out of memory before.
+  `wave::Reader::lazy`, `fetch()` and `release()` give other tools the same.
 - `mdebug -tr FILE -trans [STREAM]`: UVM transactions from the recording
   uvm-core writes (`tr_db.log`): streams, each item's begin, end, fields and
   parent sequence, those in progress at `-at T`, and stream rows in the
@@ -255,6 +282,11 @@ Spec references are IEEE 1800-2023 clauses.
   `run [T]`, `step`, stops on a signal change, edge or value, `print` of
   signals and class objects (properties, inherited ones, paths through
   handles), `force`, `release`, `deposit` and `signals`.
+- `mdebug` waves: a marker with the time to the cursor (shift+click or `m`),
+  a radix per row (`r`: hex, decimal, signed, binary), find value
+  (next/previous time the selected signal takes it), Del to remove a row,
+  Ctrl+arrows to step changes; the view lives in the page address, so a
+  reload or a copied link opens on it.
 - `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
   signal's waves are sent when the page first shows it, so large waveforms
   are not cut to the one-file page's budget.
@@ -894,6 +926,17 @@ Spec references are IEEE 1800-2023 clauses.
   by default (`-threads N`) with the same report for every thread count. A
   35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
   is the shared GDSII reader and writer. See `docs/MPV.md`.
+- UVM (IEEE 1800.2-2020): three tests cover the classes that compiled but
+  had no check of their own: `tests/uvm/base_extras.sv` (`uvm_time`,
+  `uvm_heartbeat`, `uvm_sequence_library`, report macros,
+  `uvm_callback_iter`, `uvm_run_test_callback`, `uvm_root`),
+  `reg_extras.sv` (`uvm_reg_file`, `uvm_reg_indirect_data`, `uvm_reg_fifo`,
+  `uvm_vreg`, `uvm_vreg_field`, `uvm_mem_mam`, block lookups) and
+  `reg_sequences.sv` (the built-in register and memory test sequences of
+  Annex E, each also run against a faulty DUT). Two faults they found are
+  fixed: `c ? i++ : i` and `c ? (x = 1) : 0` ran the assignment in the arm
+  not picked (11.4.11), and a `randc` property named in `randomize(v)` lost
+  its cycle (18.11).
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
@@ -1056,6 +1099,8 @@ Spec references are IEEE 1800-2023 clauses.
   caller's variable in `randomize() with`, or a class property), no longer
   makes randomize() fail: the solver narrows x to the container's elements
   (11.4.13, 18.5.4). Found by the CCIX VIP's data sequence.
+- A port of an unpacked struct type is one vector, as a variable of that
+  type is; it was "unsupported port width".
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and

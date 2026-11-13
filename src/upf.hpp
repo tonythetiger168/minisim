@@ -889,6 +889,14 @@ struct Model {
         std::multimap<std::string, std::string> opts;
     };
     std::vector<ImplCmd> implCmds;
+    // map_retention_cell -lib_model_name (6.39): the model simulates the
+    // mapped registers in place of the strategy's retention semantics.
+    struct RetModel {
+        std::vector<std::string> strategies, elements;   // elements: rooted; empty = the strategies' own
+        std::string domain, scope, where, model;
+        std::vector<std::pair<std::string, std::string>> portMap;   // model port -> net_ref (a leading ~ inverts)
+    };
+    std::vector<RetModel> retModels;
     std::map<std::string, std::string> nameFormat;                  // name_format affix -> pattern
     struct Variation { double lo = 1, hi = 1; std::string where; };
     std::map<std::string, Variation> variations;                    // set_variation: supply -> range
