@@ -60,6 +60,7 @@ set(MINISIM_CORE_HEADERS
     vpi_covmerge.inc
     vpi_data.inc
     vpi_prim.inc
+    vpi_iarr.inc
     vpi_constr.inc
     vpi_svcb.inc
     vpi_thread.inc
