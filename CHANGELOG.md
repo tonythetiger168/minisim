@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat boots Linux: `-bios`, `-kernel`, `-initrd`, `-append`, `-dtb` as on
+  QEMU's virt board, a device tree made from the platform (`-dump-dtb`), and
+  OpenSBI's `fw_dynamic` hand-off. OpenSBI 1.7 and Ubuntu 24.04's stock
+  riscv64 kernel boot to user space on 1 to 4 harts. Instruction fetch with
+  paging on keeps the last page translated: 25 to 43 MIPS under Linux.
+  Extension ABI 4.
 - VPI class definitions (37.31): `vpiVariables` of a class defn gives its
   automatic properties too (before only static ones), as declarations
   with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);
@@ -20,6 +26,9 @@ Spec references are IEEE 1800-2023 clauses.
   kept field by field, so one field's crossing no longer spreads to every
   register. A clock behind a scan mux is the functional clock. `-static`
   takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
+- `include/msim_upf.h`: C and C++ (SystemC, TLM) models called through
+  DPI-C read the current power state and simstate of a power domain or
+  supply set under `msim -upf` (IEEE 1801-2024 5.14).
 - VPI containers of structs, classes and containers (37.18): an element of
   a queue, dynamic or associative array of unpacked structs is a
   `vpiStructVar` whose members read and write the element; one of class

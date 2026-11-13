@@ -24,6 +24,7 @@
 #include "parallel.hpp"
 #include "version.hpp"
 #include "vp/ext.hpp"
+#include "vp/fdt.hpp"
 #include "vp/json.hpp"
 #include "vp/machine.hpp"
 
@@ -63,6 +64,13 @@ void usage() {
         "  -max-cycles N      stop after N cycles (exit code 4)\n"
         "  -input TEXT        characters the first UART receives\n"
         "  -trace FILE        commit log, one line per instruction (spike's format)\n"
+        "Booting an operating system (as QEMU's -bios, -kernel, -initrd, -append, -dtb):\n"
+        "  -bios FILE         firmware run first, in machine mode (OpenSBI fw_dynamic)\n"
+        "  -kernel FILE       kernel (a raw Image or an ELF) the firmware starts in supervisor mode\n"
+        "  -initrd FILE       initial RAM disk\n"
+        "  -append TEXT       kernel command line\n"
+        "  -dtb FILE          device tree blob to pass instead of the one made from the platform\n"
+        "  -dump-dtb FILE     write the platform's device tree blob and exit\n"
         "  -map               print the memory map\n"
         "  -q                 no summary line on stderr\n"
         "  -version           print the version\n"
@@ -73,6 +81,8 @@ void usage() {
 
 struct Options {
     std::string platform, elf, trace, input;
+    std::string bios, kernel, initrd, append, dtb, dumpDtb;
+    bool haveAppend = false;
     int harts = -1;
     unsigned threads = par::defaultThreads();
     long long quantum = -1, maxCycles = 0;
@@ -127,7 +137,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : 1000;
     if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
     if (!m.quantum) throw std::runtime_error("the quantum must be at least one cycle");
-    uint32_t reset = pl.get("reset") ? (uint32_t)pl.get("reset")->u64() : 0x80000000u;
+    uint64_t reset = pl.get("reset") ? pl.get("reset")->u64() : 0x80000000u;
     m.addHarts(nh, reset);
 
     const json::Value* devs = pl.get("devices");
@@ -191,6 +201,134 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     }
 }
 
+std::vector<uint8_t> readFile(const std::string& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) throw std::runtime_error("cannot read " + path);
+    std::vector<uint8_t> b((size_t)in.tellg());
+    in.seekg(0);
+    in.read((char*)b.data(), (std::streamsize)b.size());
+    if (!in) throw std::runtime_error("cannot read " + path);
+    return b;
+}
+
+// Where OpenSBI is when -kernel is given with no -bios: $MVPLAT_BIOS, then
+// the places distributions install the generic platform's fw_dynamic.
+std::string defaultBios(bool rv64) {
+    if (const char* e = std::getenv("MVPLAT_BIOS")) return e;
+    std::vector<std::string> c = rv64
+        ? std::vector<std::string>{"/usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.elf",
+                                   "/usr/share/opensbi/lp64/generic/firmware/fw_dynamic.elf"}
+        : std::vector<std::string>{"/usr/share/opensbi/ilp32/generic/firmware/fw_dynamic.elf"};
+    std::error_code ec;
+    for (auto& p : c) if (fs::exists(p, ec)) return p;
+    return "";
+}
+
+// Boot an operating system the way QEMU's virt board does: the firmware
+// (OpenSBI fw_dynamic) runs from the start of RAM in machine mode with
+//   a0 = hart id, a1 = device tree, a2 = struct fw_dynamic_info
+// and starts the kernel in supervisor mode at RAM + 2 MiB (4 MiB on RV32).
+// The device tree goes at the top of the first RAM on a 2 MiB boundary, the
+// initrd just below it. Returns true when only -dump-dtb was asked for.
+bool bootOs(Machine& m, const Options& o) {
+    Device* ram = nullptr;
+    for (auto& d : m.bus.devices())
+        if (d->type == "ram" && (!ram || d->base < ram->base)) ram = d.get();
+    if (!ram) throw std::runtime_error("the platform has no RAM to boot from");
+    auto isElf = [](const std::vector<uint8_t>& b) { return b.size() >= 4 && !memcmp(b.data(), "\x7f" "ELF", 4); };
+
+    bool rv64 = m.haveElf ? m.harts[0]->rv64 : true;  // -dump-dtb with a program: that program's width
+    std::vector<uint8_t> kern;
+    Elf kelf;
+    bool kernElf = false;
+    if (!o.kernel.empty()) {
+        kern = readFile(o.kernel);
+        if (isElf(kern)) { kelf = readElf(o.kernel); kernElf = true; rv64 = kelf.is64; }
+    }
+    std::string bios = o.bios;
+    if (bios.empty() && !o.kernel.empty()) {
+        bios = defaultBios(rv64);
+        if (bios.empty())
+            throw std::runtime_error("-kernel needs firmware: give -bios (OpenSBI's fw_dynamic.elf) or install opensbi");
+    }
+    uint64_t entry = ram->base;
+    if (!bios.empty()) {
+        std::vector<uint8_t> b = readFile(bios);
+        if (isElf(b)) {
+            Elf e = readElf(bios);
+            // Position-independent firmware (OpenSBI's generic platform is
+            // linked at 0) runs from the start of RAM.
+            uint64_t lo = UINT64_MAX;
+            for (auto& s : e.segs) lo = std::min(lo, s.addr);
+            uint64_t off = lo != UINT64_MAX && !m.bus.find(lo) ? ram->base - lo : 0;
+            for (auto& s : e.segs) m.poke(s.addr + off, s.data.data(), s.data.size());
+            entry = e.entry + off;
+            rv64 = e.is64;
+        } else {
+            m.poke(ram->base, b.data(), b.size());
+        }
+    }
+    uint64_t kaddr = ram->base + (rv64 ? 0x200000 : 0x400000);
+    if (kernElf) {
+        for (auto& s : kelf.segs) m.poke(s.addr, s.data.data(), s.data.size());
+        kaddr = kelf.entry;
+    } else if (!kern.empty()) {
+        m.poke(kaddr, kern.data(), kern.size());
+    }
+
+    BootArgs args;
+    args.bootargs = o.append;
+    std::vector<uint8_t> initrd;
+    if (!o.initrd.empty()) {
+        initrd = readFile(o.initrd);
+        args.initrdEnd = 1;  // placeholders, so the tree has its final size
+    }
+    uint64_t hz = (uint64_t)(1e12 / (double)m.cycle_ps + 0.5), tb = (uint64_t)(1e12 / (double)m.tick_ps + 0.5);
+    unsigned nh = (unsigned)m.harts.size();
+    auto make = [&] { return makeDeviceTree(m.bus, nh, rv64, hz, tb, args); };
+    std::vector<uint8_t> dtb = o.dtb.empty() ? make() : readFile(o.dtb);
+    if (!o.dumpDtb.empty()) {
+        std::ofstream out(o.dumpDtb, std::ios::binary);
+        out.write((const char*)dtb.data(), (std::streamsize)dtb.size());
+        if (!out) throw std::runtime_error("cannot write " + o.dumpDtb);
+        if (o.kernel.empty() && o.bios.empty()) return true;
+    }
+    const uint64_t infoSize = 6 * 8;
+    uint64_t end = ram->base + ram->size;
+    if (dtb.size() + infoSize + 64 > (2u << 20) || ram->size < (8u << 20))
+        throw std::runtime_error("RAM '" + ram->name + "' is too small to boot from");
+    uint64_t dtbAddr = (end - dtb.size() - infoSize - 64) & ~(uint64_t)0x1fffff;
+    uint64_t infoAddr = (dtbAddr + dtb.size() + 7) & ~(uint64_t)7;
+    if (!initrd.empty()) {
+        uint64_t start = (dtbAddr - initrd.size()) & ~(uint64_t)0xfff;
+        if (dtbAddr < initrd.size() || start < kaddr + kern.size())
+            throw std::runtime_error("the initrd does not fit in RAM '" + ram->name + "' above the kernel");
+        m.poke(start, initrd.data(), initrd.size());
+        args.initrdStart = start;
+        args.initrdEnd = start + initrd.size();
+        if (o.dtb.empty()) dtb = make();  // same size: the initrd properties are always there
+        else throw std::runtime_error("-initrd with -dtb: put the initrd in the given device tree instead");
+    }
+    if (kaddr + kern.size() > dtbAddr) throw std::runtime_error("the kernel does not fit in RAM '" + ram->name + "'");
+    m.poke(dtbAddr, dtb.data(), dtb.size());
+
+    // struct fw_dynamic_info (OpenSBI include/sbi/fw_dynamic.h), version 2:
+    // magic, version, next_addr, next_mode (1 = supervisor), options, boot_hart (-1: any).
+    uint64_t info[6] = {0x4942534f, 2, kaddr, 1, 0, ~0ull};
+    uint8_t ib[48];
+    unsigned w = rv64 ? 8 : 4;
+    for (unsigned i = 0; i < 6; i++) wrLE(ib + i * w, w, info[i]);
+    m.poke(infoAddr, ib, 6 * w);
+    for (auto& h : m.harts) {
+        h->rv64 = rv64;
+        h->pc = entry;
+        h->x[10] = h->id;
+        h->x[11] = dtbAddr;
+        h->x[12] = bios.empty() ? 0 : infoAddr;
+    }
+    return false;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -229,6 +367,12 @@ int main(int argc, char** argv) {
         else if (s == "-max-cycles") o.maxCycles = integer("a number of cycles");
         else if (s == "-input") { o.input = next("text"); o.haveInput = true; }
         else if (s == "-trace") o.trace = next("a file");
+        else if (s == "-bios") o.bios = next("a firmware file");
+        else if (s == "-kernel") o.kernel = next("a kernel file");
+        else if (s == "-initrd") o.initrd = next("a file");
+        else if (s == "-append") { o.append = next("a command line"); o.haveAppend = true; }
+        else if (s == "-dtb") o.dtb = next("a device tree blob");
+        else if (s == "-dump-dtb") o.dumpDtb = next("a file");
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
         else if (!s.empty() && s[0] == '-') {
@@ -247,7 +391,13 @@ int main(int argc, char** argv) {
         else if (o.elf.empty()) o.elf = s;
         else { std::cerr << "mvplat: two programs: " << o.elf << " and " << s << "\n"; return 2; }
     }
-    if (o.elf.empty() && !(g_ext && g_ext->needsNoProgram())) { usage(); return 2; }
+    bool booting = !o.bios.empty() || !o.kernel.empty();
+    if (booting && !o.elf.empty()) { std::cerr << "mvplat: give a program or -bios/-kernel, not both\n"; return 2; }
+    if ((!o.initrd.empty() || o.haveAppend || !o.dtb.empty()) && !booting) {
+        std::cerr << "mvplat: -initrd, -append and -dtb need -kernel or -bios\n";
+        return 2;
+    }
+    if (o.elf.empty() && !booting && o.dumpDtb.empty() && !(g_ext && g_ext->needsNoProgram())) { usage(); return 2; }
 
     Machine m;
     FILE* trace = nullptr;
@@ -269,6 +419,9 @@ int main(int argc, char** argv) {
         m.threads = o.threads;
         m.maxCycles = (uint64_t)o.maxCycles;
         if (!o.elf.empty()) m.loadElf(o.elf);
+        if (booting || !o.dumpDtb.empty()) {
+            if (bootOs(m, o)) return 0;
+        }
         if (o.map) {
             std::cout << "mvplat: " << m.harts.size() << " hart" << (m.harts.size() == 1 ? "" : "s") << ", "
                       << 1e6 / (double)m.cycle_ps << " MHz\n";

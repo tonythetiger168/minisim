@@ -454,6 +454,7 @@ public:
     static uint8_t pmpCfg(const Hart& h, unsigned i) { return h.pmpcfg[i]; }
     static void pmpDecode(Hart& h) {
         h.pmpN = 0;
+        h.fpVpn = ~0ull;
         h.pmpLock = false;
         for (unsigned i = 0; i < 16; i++) {
             uint8_t c = pmpCfg(h, i);
@@ -788,10 +789,22 @@ public:
     // (cause and tval; cause 0 = none).
     uint32_t fetchXlat(Hart& h, uint64_t pc, uint32_t& raw, uint64_t& tval, bool readBits, unsigned knownLen) {
         uint64_t pa;
-        Acc r = translate(h, pc, 2, h.priv, pa);
         tval = pc;
-        if (r == Acc::PageFault) return 12;
-        if (r != Acc::Ok || !pmpAllows(h, pa, 2, PMP_X, h.priv)) return 1;
+        const bool samePage = (pc >> 12) == h.fpVpn && h.priv == h.fpPriv;
+        if (samePage) {
+            pa = h.fpPa | (pc & 0xfff);
+            if (!readBits && (knownLen == 2 || (pc & 0xfff) <= 0xffc)) return 0;
+        } else {
+            Acc r = translate(h, pc, 2, h.priv, pa);
+            if (r == Acc::PageFault) return 12;
+            if (r != Acc::Ok || !pmpAllows(h, pa, 2, PMP_X, h.priv)) return 1;
+            if (pmpAllows(h, pa & ~0xfffull, 4096, PMP_X, h.priv)) {
+                h.fpVpn = pc >> 12;
+                h.fpPa = pa & ~0xfffull;
+                h.fpPriv = h.priv;
+            }
+        }
+        Acc r;
         uint64_t lo = 0;
         if (readBits) {
             Device* d = bus.find(pa);
@@ -1011,7 +1024,9 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
         const bool fx = h.priv != 3 && h.paging();
         if (dce.pc == pc && dce.xlat == fx) {
             insn = dce.insn; raw = dce.raw; len = dce.len;
-            if (fx) {
+            if (fx && (pc >> 12) == h.fpVpn && h.priv == h.fpPriv && (len == 2 || (pc & 0xfff) <= 0xffc)) {
+                // the page fetched from last: translated and executable
+            } else if (fx) {
                 uint64_t tv;
                 uint32_t dummy = 0;
                 if (uint32_t c = fetchXlat(h, pc, dummy, tv, false, len)) { trap(h, c, tv, false); h.cycle++; continue; }
