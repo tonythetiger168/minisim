@@ -485,7 +485,9 @@ struct Sim {
     // pool runs here and is not measured.
     template <class F>
     void parallelTuned(Tuner& t, size_t n, F&& f) {
-        if (threads <= 1 || n < kMinParallel || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
+        static const char* dbgSerial = std::getenv("MSIM_SERIAL");   // debug: c, p, s = comb, partitions, clocked
+        const char which = &t == &combTune ? 'c' : &t == &partTune ? 'p' : 's';
+        if (threads <= 1 || n < kMinParallel || tlInPar || (dbgSerial && std::strchr(dbgSerial, which))) { for (size_t i = 0; i < n; i++) f(i); return; }
         int use = t.pick(threads);
         parallelFor(n, std::forward<F>(f), use);
         t.done(threads);
@@ -776,6 +778,11 @@ struct Sim {
     void runSeqs() {
         if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
+        // The compiled cycle domain's clock groups (one dseq each) share the
+        // NBA slots and their list: those run one after another, here.
+        auto dom = [&](size_t k) { return fastSeqId >= 0 && seqs[seqq[k]].fn == seqs[fastSeqId].fn; };
+        bool anyDom = false;
+        for (size_t k = 0; k < seqq.size() && !anyDom; k++) anyDom = dom(k);
         if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
             for (size_t k = 0; k < seqq.size(); k++) {
                 uint64_t t = prof::Profiler::nowNs();
@@ -783,11 +790,19 @@ struct Sim {
                 seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
                 prof::P().charge(prof::P().seqEnt[seqq[k]], prof::Profiler::nowNs() - t);
             }
-        } else
-        parallelTuned(seqTune, seqq.size(), [&](size_t k) {
-            seqBufs[k].clear();
-            seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
-        });
+        } else {
+            parallelTuned(seqTune, seqq.size(), [&](size_t k) {
+                if (anyDom && dom(k)) return;
+                seqBufs[k].clear();
+                seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+            });
+            if (anyDom)
+                for (size_t k = 0; k < seqq.size(); k++)
+                    if (dom(k)) {
+                        seqBufs[k].clear();
+                        seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+                    }
+        }
         for (size_t k = 0; k < seqq.size(); k++) {
             seqPend[seqq[k]] = 0;
             nbaq.insert(nbaq.end(), seqBufs[k].begin(), seqBufs[k].end());
