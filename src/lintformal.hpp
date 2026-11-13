@@ -293,6 +293,7 @@ struct Found {
     const char* rule;
     SourceLocation loc;
     std::string text;
+    std::string signal;
 };
 
 inline std::string valueText(const ConstantValue& v) {
@@ -533,7 +534,8 @@ struct Walk {
                                : "the selected value";
         out->push_back({"FML002", index.sourceRange.start(),
                         std::string(part ? "part select can start at " : "index can be ") + found + ", outside the range of " +
-                            what + ", " + std::to_string(r.lower()) + " to " + std::to_string(r.upper())});
+                            what + ", " + std::to_string(r.lower()) + " to " + std::to_string(r.upper()),
+                        value.kind == ExpressionKind::NamedValue ? lintir::path(value.as<NamedValueExpression>().symbol) : ""});
         (void)whole;
     }
 
@@ -919,7 +921,8 @@ inline void run(Compilation& comp, Report& rep, const Options& opt, unsigned thr
             found.back().push_back({"FML003", v->location,
                                     "register '" + std::string(v->name) + "' never leaves its reset value " +
                                         std::to_string(d->second[0]) +
-                                        ": no assignment after reset can give it another value"});
+                                        ": no assignment after reset can give it another value",
+                                    lintir::path(*v)});
         }
 
     par::parallelFor(procs.size() + assigns.size(), threads, [&](size_t i) {
@@ -935,7 +938,7 @@ inline void run(Compilation& comp, Report& rep, const Options& opt, unsigned thr
         }
     });
     for (auto& v : found)
-        for (Found& f : v) rep.add(f.rule, f.loc, std::move(f.text));
+        for (Found& f : v) rep.add(f.rule, f.loc, std::move(f.text), std::move(f.signal));
 }
 
 }  // namespace lintformal

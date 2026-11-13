@@ -479,6 +479,11 @@ A waiver that matches nothing is reported, so stale waivers do not pile up.
  "summary": {"error": 0, "warning": 1, "info": 0, "waived": 0}}
 ```
 
+Where mlint knows the signal a finding is about, the finding also has
+`"signal"`, its hierarchical path. `mdebug -lint FILE` reads this file and
+shows the findings in its viewer, cross-probing to the source line and the
+signal's drivers, loads and schematic (docs/DEBUG.md, "Lint findings").
+
 `-html FILE` writes one self-contained page (no server, no network) to
 read or pass on: counts by severity and by rule, each finding with the
 source lines around it, a filter box, and clicks on a severity or a rule

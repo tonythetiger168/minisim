@@ -344,6 +344,7 @@ bool writeJson(const std::string& path, const std::vector<Final>& fs) {
            << ", \"col\": " << x.f.col << ", \"rule\": " << jsonStr(x.f.rule) << ", \"group\": "
            << jsonStr(lintcfg::groupOf(x.f.rule)) << ", \"severity\": " << jsonStr(lintcfg::sevName(x.sev))
            << ", \"text\": " << jsonStr(x.f.text) << ", \"waived\": " << (x.waived ? "true" : "false");
+        if (!x.f.signal.empty()) os << ", \"signal\": " << jsonStr(x.f.signal);
         if (x.waived) os << ", \"reason\": " << jsonStr(x.reason);
         os << "}";
         first = false;

@@ -381,16 +381,20 @@ inline void checkTop(Compilation& comp, const std::vector<BlockFact>& blocks, Re
                 bool open = !e || e->kind == ExpressionKind::EmptyArgument;
                 SourceLocation loc = e ? e->sourceRange.start() : inst.location;
                 std::string where = std::string(inst.name) + "." + p.name;
+                // For mdebug: the net at the top, else the instance's port.
+                std::string sig = e && e->kind == ExpressionKind::NamedValue
+                                      ? path(e->as<NamedValueExpression>().symbol)
+                                      : inst.getHierarchicalPath() + "." + p.name;
                 if (p.dir == "out" && !p.driven && !open)
                     rep.add("ABS001", loc,
-                            "output '" + where + "' is connected, but block '" + b.name + "' never drives it");
+                            "output '" + where + "' is connected, but block '" + b.name + "' never drives it", sig);
                 if (p.dir == "in" && !p.used && !open && !constant(*e))
                     rep.add("ABS002", loc,
-                            "input '" + where + "' is driven here, but block '" + b.name + "' never reads it");
+                            "input '" + where + "' is driven here, but block '" + b.name + "' never reads it", sig);
                 if (p.dir == "in" && p.clock && (open || constant(*e)))
                     rep.add("ABS003", loc,
                             "clock input '" + where + "' of block '" + b.name + "' is " +
-                                (open ? "left open" : "tied to a constant"));
+                                (open ? "left open" : "tied to a constant"), sig);
             }
         }));
 }
