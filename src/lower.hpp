@@ -8142,9 +8142,11 @@ struct Lowerer {
                 lowerDumpPorts(call, n);
                 return;
             }
-            static const std::set<std::string_view> harmless = {
-                "$set_coverage_db_name", "$load_coverage_db", "$fsdbDumpfile", "$fsdbDumpvars", "$fsdbDumpon", "$fsdbDumpoff",
-                "$vcdpluson", "$vcdplusoff", "$vcdplusfile", "$shm_open", "$shm_probe", "$recordvars"};
+            if (n.starts_with("$fsdb") || n.starts_with("$vcdplus") || n.starts_with("$shm_") || n.starts_with("$record")) {
+                lowerVendorDump(call, n);
+                return;
+            }
+            static const std::set<std::string_view> harmless = {"$set_coverage_db_name", "$load_coverage_db"};
             if (!harmless.count(n)) unsupported(("system task " + std::string(n)).c_str());
             std::cerr << "lower: ignoring system call " << n << "\n";
             return;
@@ -8196,6 +8198,102 @@ struct Lowerer {
             if (i.dcmd == DC_LIMIT && !args.empty()) i.args.push_back(expr(*args[0]));
         }
         prog.emit(i);
+    }
+
+    // The waveform tasks of Verdi (FSDB), VCS (VPD) and Xcelium (SHM)
+    // (vendor_tasks.hpp) as msim's own dump: the file is written as FST (or
+    // VCD), $fsdbDumpvars / $vcdpluson / $shm_probe select like $dumpvars
+    // (a depth, then instances, signals or their names as strings), and
+    // on / off / flush / finish map to $dumpon / $dumpoff / $dumpflush.
+    // Options as strings: "+fsdbfile+NAME" names the file, "+mda" and "+all"
+    // add memories; the rest ("+parameter", "+struct", ...) need nothing here.
+    // Tasks with no counterpart ($fsdbSuppress, $fsdbLog, ...) do nothing.
+    void lowerVendorDump(const slang::ast::CallExpression& call, std::string_view n) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        auto emit = [&](DumpCmd c, E arg = nullptr, std::vector<std::pair<std::string, bool>> sel = {}) {
+            Instr i;
+            i.k = IK::Dump;
+            i.dcmd = c;
+            if (arg) i.args.push_back(arg);
+            i.dsel = std::move(sel);
+            prog.emit(i);
+        };
+        auto isEmpty = [](const Expression& x) { return x.kind == ExpressionKind::EmptyArgument; };
+        auto strLit = [](const Expression& x) -> std::optional<std::string> {
+            const Expression* e = &x;
+            while (e->kind == ExpressionKind::Conversion) e = &e->as<ConversionExpression>().operand();
+            if (e->kind == ExpressionKind::StringLiteral) return std::string(e->as<StringLiteral>().getValue());
+            return std::nullopt;
+        };
+        // An instance, signal or name -> a dsel entry (as lowerDump).
+        auto selOf = [&](const Symbol* sym, std::vector<std::pair<std::string, bool>>& sel) {
+            std::string path = sym->getHierarchicalPath();
+            size_t d = path.find('.');
+            std::string rel = path.find("::") != std::string::npos ? path : d == std::string::npos ? std::string() : path.substr(d + 1);
+            bool var = sym->isValue();
+            if (sym->kind == SymbolKind::Definition) rel.clear();   // the top module by its name: everything
+            if (!var && !rel.empty()) rel.push_back('.');
+            sel.push_back({rel, var});
+        };
+        bool file = n == "$fsdbDumpfile" || n == "$vcdplusfile" || n == "$shm_open" || n == "$recordfile" ||
+                    n == "$fsdbAutoSwitchDumpfile" || n == "$fsdbSwitchDumpfile";
+        bool vars = n == "$fsdbDumpvars" || n == "$fsdbDumpvarsES" || n == "$fsdbDumpSingle" || n == "$vcdpluson" ||
+                    n == "$shm_probe" || n == "$recordvars" || n == "$fsdbDumpMDA" || n == "$vcdplusmemon" || n == "$fsdbDumpMem";
+        if (file) {
+            // $fsdbAutoSwitchDumpfile(size, "name", n): the name is the second argument.
+            size_t k = n == "$fsdbAutoSwitchDumpfile" ? 1 : 0;
+            if (k < args.size() && !isEmpty(*args[k])) emit(DC_VFILE, strOf(*args[k]));
+            if (n == "$shm_open" && args.empty()) emit(DC_VFILE, konst(mkstr("waves.shm")));
+            return;
+        }
+        if (vars) {
+            E depth;
+            std::vector<std::pair<std::string, bool>> sel;
+            bool arrays = n == "$fsdbDumpMDA" || n == "$vcdplusmemon" || n == "$fsdbDumpMem";
+            for (size_t a = 0; a < args.size(); a++) {
+                const Expression* x = args[a];
+                if (isEmpty(*x)) continue;
+                if (auto s = strLit(*x)) {
+                    std::string t = *s;
+                    if (t.rfind("+fsdbfile+", 0) == 0) { emit(DC_VFILE, konst(mkstr(t.substr(10)))); continue; }
+                    if (t == "+mda" || t == "+all") { arrays = true; continue; }
+                    if (!t.empty() && t[0] == '+') continue;                         // +parameter, +struct, ...
+                    if (n == "$shm_probe" && t.find_first_not_of("ACDFMSTaecdfmst") == std::string::npos) continue;   // "AS", "ACM"
+                    // A scope or signal by name: tb.dut, or below the call's scope.
+                    const Symbol* sym = scope ? scope->lookupName(t) : nullptr;
+                    if (!sym && scope) sym = scope->getCompilation().getRoot().lookupName(t);
+                    if (!sym) { std::cerr << "lower: " << n << ": no scope or signal '" << t << "'; ignored\n"; continue; }
+                    selOf(sym, sel);
+                    continue;
+                }
+                const Symbol* sym = nullptr;
+                if (x->kind == ExpressionKind::ArbitrarySymbol) sym = x->as<ArbitrarySymbolExpression>().symbol.get();
+                else if (x->kind == ExpressionKind::NamedValue || x->kind == ExpressionKind::HierarchicalValue)
+                    sym = &x->as<ValueExpressionBase>().symbol;
+                if (sym) { selOf(sym, sel); continue; }
+                if (a == 0 && x->type && x->type->isIntegral()) { depth = expr(*x); continue; }   // the levels, as $dumpvars
+                std::cerr << "lower: " << n << ": argument " << a + 1 << " ignored\n";
+            }
+            // The tool's default file when none was named ('?': only then).
+            emit(DC_VFILE, konst(mkstr(n.starts_with("$fsdb") ? "?novas.fsdb" : n.starts_with("$vcdplus") ? "?vcdplus.vpd" : "?waves.shm")));
+            if (arrays) emit(DC_ARRAYS);
+            // $fsdbDumpMDA() / $vcdplusmemon() alone: memories in what is dumped, not a dump of everything.
+            bool onlyArrays = n == "$fsdbDumpMDA" || n == "$vcdplusmemon" || n == "$fsdbDumpMem";
+            if (onlyArrays && sel.empty()) return;
+            if (n == "$shm_probe" && !depth && !sel.empty()) depth = konst(make(1, 0, 32));   // $shm_probe(scope): that level
+            emit(DC_VVARS, depth ? depth : konst(make(0, 0, 32)), std::move(sel));
+            return;
+        }
+        if (n == "$fsdbDumpon" || n == "$vcdpluson" || n == "$recordon") { emit(DC_ON); return; }
+        if (n == "$fsdbDumpoff" || n == "$vcdplusoff" || n == "$recordoff") { emit(DC_OFF); return; }
+        if (n == "$fsdbDumpflush" || n == "$vcdplusflush") { emit(DC_FLUSH); return; }
+        if (n == "$fsdbDumpFinish" || n == "$vcdplusclose" || n == "$shm_close" || n == "$recordclose") {
+            emit(DC_FLUSH);
+            emit(DC_OFF);
+            return;
+        }
+        // $fsdbDumpSVA (assertions), $fsdbSuppress, $fsdbLog, $vcdplusautoflushon, ...: nothing to do here.
     }
 
     // Extended VCD tasks (21.7.3). $dumpports names module instances; each

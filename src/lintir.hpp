@@ -51,6 +51,7 @@
 #include "slang/driver/Driver.h"
 #include "slang/text/SourceManager.h"
 #include "protect_front.hpp"
+#include "vendor_tasks.hpp"
 
 using namespace slang;
 using namespace slang::ast;
@@ -507,6 +508,7 @@ struct FrontEnd {
         protfront::redact(driver, pc);
         if (!driver.parseAllSources()) return 1;
         comp = driver.createCompilation();
+        vendor::declare(*comp);  // $fsdbDumpvars, $vcdpluson, $shm_probe, ... compile as in msim
         driver.reportCompilation(*comp, /*quiet*/ true);
         if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
         return 0;

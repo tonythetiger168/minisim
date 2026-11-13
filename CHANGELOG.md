@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Verdi, VCS and Xcelium waveform tasks: `$fsdbDumpfile`, `$fsdbDumpvars`,
+  `$fsdbDumpon` / `off`, `$fsdbDumpMDA`, `$vcdpluson`, `$vcdplusfile`,
+  `$vcdplusmemon`, `$shm_open`, `$shm_probe`, `$recordvars` and the rest
+  compile on msim and write FST under the same name (the vendor formats are
+  closed); msim, mdebug and mlint all accept them, and `msim -i` takes the
+  UCLI commands `fsdbDumpfile` / `fsdbDumpvars` / `fsdbDumpoff`.
+  `docs/DEBUG.md`, `tests/msim_vendor_dump.cmake`.
 - `mlint -cdc-formal`: formal proof that the source of each bus synchronized
   bit by bit changes at most one bit per clock, by exhaustive search of its
   reachable states (slang's evaluator, through assigns, ports, functions and

@@ -344,6 +344,12 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DCHK=$<TARGET_FILE:test_fst>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
+    # $fsdbDumpvars, $vcdpluson, $shm_probe, ... write FST (vendor_tasks.hpp).
+    add_test(NAME msim_vendor_dump
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug>
+                     -DCHK=$<TARGET_FILE:test_fst> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vendor_dump
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_vendor_dump.cmake)
   endif()
   # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
   add_test(NAME msim_dpi

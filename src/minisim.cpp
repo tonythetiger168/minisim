@@ -422,6 +422,7 @@ struct Sim {
     // $dumplimit work on either.
     bool dumpCli = false, dumpPend = false, dumpOff = false, dumpStopped = false;
     string dumpFile = "dump.vcd";
+    bool dumpNamed = false, vendorNoted = false, vendorLate = false;   // a file was named; the FSDB / VPD note was printed
     vector<char> dumpSel;                            // empty: every signal
     uint64_t dumpLimit = 0;                          // bytes; 0: no limit
     bool dumped(size_t i) const {
@@ -2068,8 +2069,42 @@ struct Sim {
         switch (cmd) {
             case DC_FILE:
                 if (dumpCli || waving() || dumpPend) return;
-                if (!str.empty()) dumpFile = str;
+                if (!str.empty()) { dumpFile = str; dumpNamed = true; }
                 return;
+            case DC_VFILE: {   // $fsdbDumpfile, $vcdplusfile, $shm_open (vendor_tasks.hpp)
+                if (dumpCli || waving() || dumpPend) return;
+                string f = str;
+                bool dflt = !f.empty() && f[0] == '?';
+                if (dflt) { if (dumpNamed) return; f = f.substr(1); }
+                if (f.empty()) return;
+                size_t dot = f.rfind('.'), slash = f.rfind('/');
+                if (dot != string::npos && (slash == string::npos || dot > slash)) f.resize(dot);
+#ifdef MINISIM_FST
+                f += ".fst";
+#else
+                f += ".vcd";
+#endif
+                if (!vendorNoted) {
+                    cerr << "msim: " << str.substr(dflt ? 1 : 0) << ": FSDB, VPD and SHM are the vendors' own formats; writing " << f
+                         << " (open it with mdebug, GTKWave or Surfer)\n";
+                    vendorNoted = true;
+                }
+                dumpFile = f;
+                dumpNamed = !dflt;
+                return;
+            }
+            case DC_ARRAYS:   // $fsdbDumpMDA, "+mda": memory elements too, as msim -vcd-arrays
+                if (!dumpArrays && !waving()) dumpArrays = 1024;
+                return;
+            case DC_VVARS:   // $fsdbDumpvars, $vcdpluson, $shm_probe: once dumping, a resume (or more scopes, not kept)
+                if (dumpCli) return;
+                if (waving()) {
+                    if (sel.empty()) { dumpTask(DC_ON, str, num, sel); return; }
+                    if (!vendorLate) cerr << "msim: scopes added after the waveform has started are not dumped (the FST holds what the first call chose)\n";
+                    vendorLate = true;
+                    return;
+                }
+                [[fallthrough]];
             case DC_VARS:
                 if (dumpCli) return;
                 if (waving()) { cerr << "msim: $dumpvars after the dump has started is ignored (21.7.1.2)\n"; return; }
