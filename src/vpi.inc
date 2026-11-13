@@ -3439,10 +3439,10 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
         vpi::getValueOf(o, val, v);
         return;
     }
-    if (vpi::isCode(o)) {   // a constant expression (37.35)
+    if (vpi::isCode(o)) {   // an expression: its value now (37.35, 38.15)
         Val val;
         if (o->kind != Obj::Expr || !vpi::codeValue(o, val)) {
-            vpi::error(vpiError, "vpi_get_value: only a constant expression has a value here");
+            vpi::error(vpiError, "vpi_get_value: the expression has no value here (it reads an automatic variable, a class property or a hierarchical name)");
             return;
         }
         o->w = val.w;

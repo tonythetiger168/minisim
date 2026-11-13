@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-formal`: formal proof that the source of each bus synchronized
+  bit by bit changes at most one bit per clock, by exhaustive search of its
+  reachable states (slang's evaluator, through assigns, ports, functions and
+  `always_comb`). A proved bus is not CDC002; a Gray-coded bus that can change
+  more bits is the new rule CDC010, with the step. Proves all eight async
+  FIFO pointers of OpenTitan `spi_device` and both of pulp `cdc_fifo_gray`.
+- VPI expression values (37.35, 38.15): `vpi_get_value` on an expression
+  object gives its value now, not only for a constant expression. The nets
+  and variables it reads (memories too) take their current values, so
+  operations, variable selects, conditionals, concatenations and calls of
+  the design's functions have a value. `tests/spec/37.35-vpi-expr-values.sv`.
 - `msim -upf` with VHDL: the VHDL value conversion tables of IEEE 1801-2024
   Annex B (`VHDL_SL2UPF`, `UPF2VHDL_SL`, the `_GNDZERO` ones, `VHDL_TIED_HI`,
   `VHDL_TIED_LO`) connect `std_logic` ports of VHDL entities to supply nets.
@@ -67,6 +78,14 @@ Spec references are IEEE 1800-2023 clauses.
   `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
   declaration that hides one of the same name in an enclosing scope). Both
   off by default.
+- `mlint` reads VHDL (`.vhd`, `.vhdl`), alone or mixed with SystemVerilog,
+  through msim's VHDL front end: unused/undriven signals, CDC/RDC, latches,
+  sensitivity lists, multiple drivers, reset style, FSMs and formal checks
+  run on it, with findings at the VHDL line. Rules that would only describe
+  the translation are left out (docs/LINT.md, "VHDL"). The translation now
+  puts a `` `line `` before each port and signal declaration. The lint rules
+  read `always begin ... @(list); end` (how a VHDL process arrives) as a
+  combinational block, and a reset tested with `===`.
 
 ### Changed
 - `msim -compile` builds the kernel once into a cached object

@@ -57,6 +57,7 @@
 #include <deque>
 #include <fstream>
 #include <sstream>
+#include "cdc_formal.hpp"
 #include "cdc_sdc.hpp"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -78,6 +79,7 @@ struct Options {
     std::string abstractOut;                            // -cdc-abstract FILE
     std::vector<std::string> models;                    // -cdc-model FILE
     std::string html;                                   // -cdc-html FILE
+    bool formal = false;                                // -cdc-formal
     int threads = 1;                                    // -threads N
 
     // Takes one command-line option if it is one of these. `next` returns the
@@ -85,6 +87,7 @@ struct Options {
     template<typename Next>
     bool take(const std::string& a, Next&& next) {
         if (a == "-cdc-report") { report = true; return true; }
+        if (a == "-cdc-formal") { formal = true; return true; }
         if (a == "-static") { statics.push_back(next("a signal")); return true; }
         if (a == "-sdc") { sdcFiles.push_back(next("an SDC file")); return true; }
         if (a == "-cdc-sva") { sva = next("an output file"); return true; }
@@ -122,6 +125,7 @@ inline const char* usage() {
            "  -cdc-abstract FILE  write the top's CDC model (the clock of each port) for -cdc-model\n"
            "  -cdc-model FILE  use these block models instead of the blocks' RTL (repeatable)\n"
            "  -cdc-sva FILE  write SVA for every crossing to FILE, as module mlint_cdc_sva (compile it with the design)\n"
+           "  -cdc-formal    prove that every bus synchronized bit by bit changes one bit per clock (CDC010)\n"
            "  -cdc-depth N   CDC004 follows synchronized signals through N more flops to where they meet (2)\n"
            "  -sdc FILE      clocks, generated clocks, clock groups and clock-to-clock false paths from an SDC file\n"
            "  -clock-group a,b  these clocks are synchronous to each other: one domain (repeatable)\n"
@@ -1551,7 +1555,31 @@ struct Checker {
     };
     std::vector<Crossing> crossings;
 
+    Compilation* comp = nullptr;  // for -cdc-formal
+    std::unique_ptr<cdcformal::Prover> prover;
+
     Checker(Model& mm, Report& r, const Options& o) : m(mm), rep(r), opt(o) {}
+
+    // -cdc-formal on the source of a bus: does it change one bit per clock?
+    cdcformal::Result proveOneBit(const Flop& s) {
+        if (!comp || !s.sym || (s.sym->kind != SymbolKind::Variable && s.sym->kind != SymbolKind::Net))
+            return {};
+        if (!prover) return {};
+        std::unordered_set<Sym> ports;
+        for (auto& p : m.topPorts) ports.insert(m.canon(p.sym));
+        return prover->prove(s.sym->as<ValueSymbol>(), [&](const ValueSymbol* v) {
+            Sym c = m.canon(v);
+            if (const Flop* f = m.flopOf(c)) {
+                // A synchronizer stage carries the other domain's value: any
+                // value, as far as this search knows.
+                int i = (int)(f - m.flops.data());
+                if (i >= 0 && (size_t)i < member.size() && member[i].pos >= 1) return cdcformal::Leaf::Unmodeled;
+                return f->dom == s.dom ? cdcformal::Leaf::Register : cdcformal::Leaf::Free;
+            }
+            if (ports.count(c) || m.statics.count(c)) return cdcformal::Leaf::Free;
+            return cdcformal::Leaf::Unmodeled;
+        });
+    }
 
     // Findings wait here and go to the report in one order, whatever order
     // the maps (keyed by address) produced them in.
@@ -1849,6 +1877,30 @@ struct Checker {
         prof.lap("  emit");
         // The synchronizers of one signal into one domain, together: a bus
         // may be synchronized bit by bit, which is one crossing of the bus.
+        // -cdc-formal: the sources of buses, searched in parallel.
+        std::unordered_map<Sym, cdcformal::Result> proofs;
+        if (opt.formal) {
+            std::vector<Sym> srcs;
+            for (auto& [key, list] : syncs) {
+                const Flop& s = *m.flopOf(key.first);
+                uint64_t total = 0;
+                for (const Stage& st : list) total += m.flops[st.flop].fromBits;
+                if (total > 1 && !proofs.count(key.first)) {
+                    proofs[key.first];
+                    srcs.push_back(key.first);
+                }
+                (void)s;
+            }
+            if (!srcs.empty() && comp && !prover) {
+                prover = std::make_unique<cdcformal::Prover>(*comp, rep.rules);
+                prover->prepare();
+            }
+            std::vector<cdcformal::Result> out(srcs.size());
+            par::parallelFor(srcs.size(), (unsigned)std::max(1, opt.threads),
+                             [&](size_t i) { out[i] = proveOneBit(*m.flopOf(srcs[i])); });
+            for (size_t i = 0; i < srcs.size(); i++) proofs[srcs[i]] = std::move(out[i]);
+            prof.lap("  formal");
+        }
         for (auto& [key, list] : syncs) {
             const Flop& s = *m.flopOf(key.first);
             uint64_t total = 0, widest = 0;
@@ -1859,6 +1911,33 @@ struct Checker {
             bool fanout = list.size() > 1 && total > s.bits;
             bool gray = m.gray(s);
             bool bus = !gray && (widest > 1 || (total > 1 && !fanout));
+            // -cdc-formal: a bus whose source changes one bit per clock is
+            // safe however it is coded; a Gray-looking one that does not is
+            // CDC010.
+            std::string proof;
+            if (opt.formal && total > 1 && (gray || bus)) {
+                const cdcformal::Result& r = proofs[key.first];
+                if (r.kind == cdcformal::Result::Proved) {
+                    proof = ", one bit per clock (proved, " + std::to_string(r.states) + " states)";
+                    if (bus) {
+                        bus = false;
+                        gray = true;
+                    }
+                } else if (r.kind == cdcformal::Result::Violated) {
+                    proof = ", " + std::to_string(r.changed) + " bits change from " + std::to_string(r.from) +
+                            " to " + std::to_string(r.to) + " (CDC010)";
+                    if (gray)
+                        add("CDC010", s.loc,
+                            "'" + m.name(s) + "' (clocked by " + m.name(s.dom) +
+                                ") is synchronized bit by bit as a Gray code, but " + std::to_string(r.changed) +
+                                " bits change in one clock, from " + std::to_string(r.from) + " to " +
+                                std::to_string(r.to) +
+                                " (reachable from reset): the reader can see a value that was never there, so "
+                                "change one bit per clock or use a handshake or a FIFO");
+                } else {
+                    proof = ", not proved: " + r.why;
+                }
+            }
             bool busSaid = false;
             for (const Stage& st : list) {
                 const Flop& f = m.flops[st.flop];
@@ -1879,7 +1958,7 @@ struct Checker {
                     busSaid = true;
                     sync += ", multi-bit (CDC002)";
                 } else if (total > 1 && gray) {
-                    sync += ", Gray coded";
+                    sync += proof.empty() || proof.find("proved,") == std::string::npos ? ", Gray coded" : "";
                 } else if (total == 1 && s.bits == 1 && !s.shifts && !s.reads) {
                     // CDC009: a value that can last one cycle, from a faster
                     // clock into a slower one.
@@ -1894,6 +1973,7 @@ struct Checker {
                         sync += ", fast to slow (CDC009)";
                     }
                 }
+                sync += proof;
                 Check check = st.logic ? NoCheck : total > 1 || s.bits > 1 ? OneBit : Stable;
                 crossings.push_back({st.flop, key.first, sync, check});
             }
@@ -3167,6 +3247,7 @@ inline void check(Compilation& comp, Report& rep, const Options& opt) {
     m.finish();
     lap("model");
     Checker c(m, rep, opt);
+    c.comp = &comp;
     c.run();
 }
 
