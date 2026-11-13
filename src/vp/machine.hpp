@@ -468,6 +468,7 @@ public:
     static void pmpDecode(Hart& h) {
         h.pmpN = 0;
         h.fpVpn = ~0ull;
+        h.flushDataPages();
         h.pmpLock = false;
         for (unsigned i = 0; i < 16; i++) {
             uint8_t c = pmpCfg(h, i);
@@ -759,8 +760,45 @@ public:
         }
         return storeSlow(h, a, n, v);
     }
+    // The key a data page was checked under: privilege, SUM, MXR.
+    static uint32_t dataCtx(const Hart& h) {
+        return dataPriv(h) | (h.mstatus & MSTATUS_SUM ? 4 : 0) | (h.mstatus & MSTATUS_MXR ? 8 : 0);
+    }
+    // With paging on: an access within one page through the data page cache,
+    // or a translation that fills it when the page is plain memory that PMP
+    // allows as a whole. Returns false when the access has to take the
+    // general path (a device, part of a page allowed, a write buffer).
+    bool dataPage(Hart& h, uint64_t a, bool st, uint8_t*& p, Acc& r) {
+        uint32_t ctx = dataCtx(h);
+        Hart::DataPage& e = (st ? h.ds : h.dl)[(a >> 12) & (Hart::DP_SIZE - 1)];
+        if (e.vpn == (a >> 12) && e.ctx == ctx) { p = e.host + (a & 0xfff); return true; }
+        uint64_t pa;
+        r = translate(h, a, st ? 1 : 0, dataPriv(h), pa);
+        if (r != Acc::Ok) { p = nullptr; return true; }
+        uint64_t pg = pa & ~0xfffull;
+        Device* d = bus.find(pg);
+        if (!d || !d->memory() || pg + 4096 > d->base + d->size || (st && !d->writable()) ||
+            (tohost && (tohost >> 12) == (pa >> 12)) || !pmpAllows(h, pg, 4096, st ? PMP_W : PMP_R, dataPriv(h)))
+            return false;
+        e.vpn = a >> 12;
+        e.ctx = ctx;
+        e.host = d->memory() + (pg - d->base);
+        p = e.host + (a & 0xfff);
+        return true;
+    }
     __attribute__((noinline)) Acc loadSlow(Hart& h, uint64_t a, unsigned n, uint64_t& v) {
         if (!watches.empty()) watchCheck(h, a, n, 3);
+        if (watches.empty() && (!h.par || h.ov.empty()) && ((a & 0xfff) + n) <= 4096 && dataXlat(h)) {
+            uint8_t* p;
+            Acc r = Acc::Ok;
+            if (dataPage(h, a, false, p, r)) {
+                if (!p) return r;
+                uint64_t t = 0;
+                memcpy(&t, p, n);
+                v = t;
+                return Acc::Ok;
+            }
+        }
         if (dataXlat(h)) {
             uint64_t out = 0;
             Acc r = xlatData(h, a, n, 0, [&](uint64_t pa, unsigned at, unsigned k) {
@@ -776,6 +814,15 @@ public:
     }
     __attribute__((noinline)) Acc storeSlow(Hart& h, uint64_t a, unsigned n, uint64_t v) {
         if (!watches.empty()) watchCheck(h, a, n, 2);
+        if (watches.empty() && !h.par && ((a & 0xfff) + n) <= 4096 && dataXlat(h)) {
+            uint8_t* p;
+            Acc r = Acc::Ok;
+            if (dataPage(h, a, true, p, r)) {
+                if (!p) return r;
+                memcpy(p, &v, n);
+                return Acc::Ok;
+            }
+        }
         if (dataXlat(h))
             return xlatData(h, a, n, 1, [&](uint64_t pa, unsigned at, unsigned k) {
                 return physStore(h, pa, k, at < 8 ? v >> (8 * at) : 0);
