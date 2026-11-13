@@ -129,6 +129,13 @@ jobs:
         continue-on-error: true   # optional: a mirror problem must not fail CI
         run: sudo timeout 420 apt-get install -y yosys nextpnr-ice40 nextpnr-ecp5
 
+      # mvplat boots OpenSBI (the distribution's fw_dynamic) and checks the
+      # device tree with dtc (tests/mvplat.sh skips both when not installed).
+      - name: Install OpenSBI and dtc (mvplat boot tests)
+        if: env.APT_OK == '1'
+        continue-on-error: true   # optional: a mirror problem must not fail CI
+        run: sudo timeout 300 apt-get install -y opensbi device-tree-compiler
+
       # The UVM tests (tests/uvm) run against the Accellera UVM library.
       - name: Fetch Accellera UVM (uvm-core 2020.3.1)
         run: git clone --depth 1 --branch 2020.3.1 https://github.com/accellera-official/uvm-core $HOME/uvm-core
