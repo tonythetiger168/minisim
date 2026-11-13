@@ -134,16 +134,22 @@ pass, fail and vacuous action ones; `vpi_remove_cb` removes it.
 `SysKill`, `SysLock`, `SysUnlock`, `SysReset`, `SysEnd` (also at the end of
 simulation) and the action ones. `vpi_control` (39.5) takes every assertion
 operation of annex M, on one assertion (`vpi_control(vpiAssertionDisable,
-h)`) or the system (`vpi_control(vpiAssertionSysOff)`). The system tasks of
+h)`) or the system (`vpi_control(vpiAssertionSysOff, scope)`: the
+assertions in that scope and below, or all of them with NULL, 39.5.1).
+`vpiAssertionSysReset` also removes the step callbacks, and
+`vpiAssertionSysEnd` every assertion callback. `vpiAssertionKill` takes the
+attempt's start time and discards that attempt only: it has no outcome,
+`cbAssertionKill` runs, and the assertion stays enabled. The system tasks of
 20.11 (`$assertoff`, `$assertcontrol`, ...) call the same callbacks.
-Stepping (39.5.2): `vpi_control(vpiAssertionEnableStep, h)` on a
-concurrent assertion makes every clock step of each of its attempts call
+Stepping (39.5.2): `vpi_control(vpiAssertionEnableStep, h, start,
+vpiAssertionClockSteps)` on a concurrent assertion makes every clock step
+of the attempt that starts at `start` (it may not have started yet) call
 `cbAssertionStepSuccess` (the attempt goes on or matches) or
 `cbAssertionStepFailure` (it fails), with the attempt's start time and
 `detail.step` giving `stateFrom` and `stateTo`: the engine's states for the
 attempt, numbered per assertion in the order they are first seen (two
-attempts in the same state have the same number). `vpiAssertionDisableStep`
-turns it off. Not supported: `vpiAssertionClockSteps`, the matched
+attempts in the same state have the same number).
+`vpiAssertionDisableStep` (h, start) turns it off. Not supported: the matched
 expressions of a step (`matched_expression_count` is 0), and `failExpr` of
 a failure is NULL.
 

@@ -1157,6 +1157,15 @@ static void runAtomCall(const Prog* p) {
 }
 static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
+    if (!a.killAt.empty()) {   // vpi_control(vpiAssertionKill, h, start) (39.5.2): those attempts only
+        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
+            if (!a.killAt.count(t.start)) return false;
+            if (!a.hidden) for (uint64_t n = 0; n < t.count; n++) assertEvent(c.id, AE_KILLED, t.start);
+            expectDone(t.wait, 2);
+            return true;
+        });
+        a.killAt.clear();
+    }
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
         std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
             if (t.killGen == a.killGen) return false;
@@ -1231,7 +1240,7 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
         const sva::Node* t = dv.d(at.t);
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
-        if (a.step && assertHook() && !a.hidden) {   // VPI stepping (39.5.2): this attempt's step
+        if (!a.stepAt.empty() && a.stepAt.count(at.start) && assertHook() && !a.hidden) {   // VPI stepping (39.5.2): this attempt's step
             assertStep() = {at.t, t};
             for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, t->k == sva::PFALSE ? AE_STEP_FAIL : AE_STEP_OK, at.start);
         }

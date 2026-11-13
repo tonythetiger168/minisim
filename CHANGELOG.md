@@ -50,6 +50,12 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI assertion control as 39.5 reads: `vpiAssertionEnableStep` /
+  `DisableStep` and `vpiAssertionKill` act on one attempt, named by its
+  start time (`vpiAssertionClockSteps` accepted); kill no longer disables
+  the assertion. System control takes a scope handle (NULL: all);
+  `vpiAssertionSysReset` removes the step callbacks, `vpiAssertionSysEnd`
+  every assertion callback.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction

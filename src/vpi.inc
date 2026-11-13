@@ -1346,7 +1346,6 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         case vpiAssertionUnlock: ctl = AC_UNLOCK; break;
         case vpiAssertionDisable: ctl = AC_OFF; break;
         case vpiAssertionEnable: ctl = AC_ON; break;
-        case vpiAssertionKill: ctl = AC_KILL; break;
         case vpiAssertionReset: ctl = -1; break;
         case vpiAssertionDisablePassAction: ctl = AC_PASSOFF; break;
         case vpiAssertionEnablePassAction: ctl = AC_PASSON; break;
@@ -1367,33 +1366,70 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         case vpiAssertionSysDisableFailAction: ctl = AC_FAILOFF; sys = true; break;
         case vpiAssertionSysEnableNonvacuousAction: ctl = AC_NONVACON; sys = true; break;
         case vpiAssertionSysDisableVacuousAction: ctl = AC_VACOFF; sys = true; break;
+        case vpiAssertionKill:
         case vpiAssertionEnableStep:
-        case vpiAssertionDisableStep: {   // 39.5.2: report each clock step of the assertion's attempts
+        case vpiAssertionDisableStep: {   // 39.5.2: on one attempt, named by its start time
             Obj* o = O(va_arg(ap, vpiHandle));
+            p_vpi_time when = va_arg(ap, p_vpi_time);
+            const char* what = op == vpiAssertionKill ? "vpiAssertionKill" : "assertion stepping";
             if (!o || o->kind != Obj::Assertion) {
-                error(vpiError, "vpi_control: assertion stepping needs an assertion handle");
+                error(vpiError, std::string("vpi_control: ") + what + " needs an assertion handle");
+                return 0;
+            }
+            if (!when || (when->type != vpiSimTime && when->type != vpiScaledRealTime)) {
+                error(vpiError, std::string("vpi_control: ") + what + " needs the attempt start time (vpiSimTime or vpiScaledRealTime)");
                 return 0;
             }
             if (denied(o, "vpi_control")) return 0;
+            uint64_t start = (uint64_t)sigTicks(when, o);
             AssertInfo& a = asserts()[(size_t)o->idx];
+            if (op == vpiAssertionKill) {   // that attempt goes; the assertion stays enabled
+                if (a.locked) return 1;
+                assertEvent(o->idx, AE_CTL + AC_KILL);
+                if (a.type == AT_CONCURRENT) a.killAt.insert(start);
+                else a.killGen++;   // a deferred assertion: its pending reports (39.5.3)
+                return 1;
+            }
             if (a.type != AT_CONCURRENT) {   // a concurrent assertion: immediate ones have no steps
                 error(vpiError, "vpi_control: only a concurrent assertion has clock steps");
                 return 0;
             }
-            a.step = op == vpiAssertionEnableStep;
+            if (op == vpiAssertionDisableStep) {
+                a.stepAt.erase(start);
+                return 1;
+            }
+            if (va_arg(ap, PLI_INT32) != vpiAssertionClockSteps) {   // the only step control constant
+                error(vpiError, "vpi_control: vpiAssertionEnableStep needs vpiAssertionClockSteps");
+                return 0;
+            }
+            a.stepAt.insert(start);
             return 1;
         }
         case vpiAssertionClockSteps:
-            error(vpiError, "vpi_control: vpiAssertionClockSteps is not supported");
+            error(vpiError, "vpi_control: vpiAssertionClockSteps is a step control of vpiAssertionEnableStep, not an operation");
             return 0;
         default: return -1;   // not an assertion operation
     }
+    // The assertions: one (a handle), or (system control, 39.5.1) the ones
+    // in a scope and below it, or all of them (NULL).
     std::vector<int> ids;
+    std::vector<std::string> targets;
+    Obj* o = O(va_arg(ap, vpiHandle));
     if (sys) {
+        if (o && o->kind != Obj::Module && o->kind != Obj::Scope) {
+            error(vpiError, "vpi_control: assertion system control takes a scope handle or NULL");
+            return 0;
+        }
+        if (o) targets.push_back(fullName(*o->sym));
+        auto in = [&](const AssertInfo& a) {
+            if (targets.empty()) return true;
+            const std::string& t = targets[0];
+            auto under = [&](const std::string& x) { return x == t || (x.size() > t.size() && x.compare(0, t.size(), t) == 0 && x[t.size()] == '.'); };
+            return under(a.inst) || under(a.name);
+        };
         for (size_t k = 0; k < asserts().size(); k++)
-            if (!asserts()[k].hidden) ids.push_back((int)k);
+            if (!asserts()[k].hidden && in(asserts()[k])) ids.push_back((int)k);
     } else {
-        Obj* o = O(va_arg(ap, vpiHandle));
         if (!o || o->kind != Obj::Assertion) {
             error(vpiError, "vpi_control: an assertion operation needs an assertion handle");
             return 0;
@@ -1401,23 +1437,34 @@ inline PLI_INT32 assertControlOp(PLI_INT32 op, va_list ap) {
         ids.push_back(o->idx);
     }
     if (ctl > 0) {
-        if (sys) assertControl(ctl, 15, 7, 0, {});
+        if (sys) assertControl(ctl, 15, 7, 0, targets);
         else assertControl(ctl, 255, 7, 0, {asserts()[(size_t)ids[0]].name});
-    } else {
-        // Reset: the attempts in flight are dropped and the assertion goes
-        // back to its state at the start (enabled, actions on, unlocked).
-        // SysEnd: the attempts are dropped and no more start.
-        for (int id : ids) {
-            AssertInfo& a = asserts()[(size_t)id];
-            a.killGen++;
-            if (ctl == -1) {
-                a.on = a.passOn = a.failOn = a.vacOn = true;
-                a.locked = false;
-                if (!sys) onAssert(id, AE_RESET, 0);
-            } else a.on = false;
-        }
-        if (sys) fireSys(ctl == -1 ? cbAssertionSysReset : cbAssertionSysEnd);
-        if (sys && ctl == -2) st().assertEnded = true;
+        return 1;
+    }
+    // Reset: the attempts in flight are dropped and the assertion goes
+    // back to its state at the start (enabled, actions on, unlocked, no
+    // stepping). SysEnd: the attempts are dropped and no more start.
+    auto& s = st();
+    for (int id : ids) {
+        AssertInfo& a = asserts()[(size_t)id];
+        a.killGen++;
+        a.stepAt.clear();
+        a.killAt.clear();
+        if (ctl == -1) {
+            a.on = a.passOn = a.failOn = a.vacOn = true;
+            a.locked = false;
+            if (!sys) onAssert(id, AE_RESET, 0);
+        } else a.on = false;
+        // SysReset removes the step callbacks, SysEnd every callback (39.5.1).
+        if (sys)
+            if (auto it = s.assertCbs.find(id); it != s.assertCbs.end())
+                for (Cb* c : it->second)
+                    if (ctl == -2 || c->d.reason == cbAssertionStepSuccess || c->d.reason == cbAssertionStepFailure) c->live = false;
+    }
+    if (sys) fireSys(ctl == -1 ? cbAssertionSysReset : cbAssertionSysEnd);
+    if (sys && ctl == -2) {
+        for (Cb* c : s.assertSys) c->live = false;
+        if (targets.empty()) s.assertEnded = true;
     }
     return 1;
 }
