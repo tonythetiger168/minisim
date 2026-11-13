@@ -1,3 +1,5 @@
+#include <condition_variable>
+#include <mutex>
 #include <csignal>
 #include <unistd.h>
 // msim.cpp - one-step compile, elaborate and simulate, in the style of
@@ -470,6 +472,7 @@ static void unrollSeqLoops(LowerResult& lowered) {
                     Instr x = code[b];
                     x.e = sub(x.e, var, v);
                     for (auto& ai : x.aidx) ai = sub(ai, var, v);
+                    x.bidx = sub(x.bidx, var, v);   // v[i*8 +: 8] <= ...: the bit index too
                     if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
                         if (x.target == E) breaks.push_back(out.size());
                         else x.target = base + (x.target - (top + 1));   // the step: the end of this copy
@@ -1500,6 +1503,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
         std::filesystem::remove(dir + "/simv.stamp", ec);
         std::vector<std::string> jobs, objs;
+        std::vector<double> jobMB;   // the compiler's estimated memory for each job
         for (auto& [name, text] : files) {
             std::string path = dir + "/" + name;
             bool same = slurp(path) == text;
@@ -1514,6 +1518,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             if (same && hdrSame && sameFlags && std::filesystem::exists(obj, ec)) continue;
             std::filesystem::remove(obj, ec);
             jobs.push_back(shq(cc) + cflags + " -c " + shq(path) + " -o " + shq(obj));
+            jobMB.push_back(300 + 600.0 * (text.size() + files[0].second.size()) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
         }
         // Remove parts left from an earlier, larger split.
         for (int k = (int)files.size() - 2;; k++) {
@@ -1522,13 +1527,43 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             std::filesystem::remove(old + ".cpp", ec);
             std::filesystem::remove(old + ".o", ec);
         }
+        // The compiler takes about 0.6 GB per MB of a large generated file:
+        // four of them at once ran a 16 GB machine out of memory (16 Ibex
+        // cores). Jobs start while their estimates fit in the memory free
+        // now; one always runs.
+        double budget = 0;
+        {
+            std::ifstream mi("/proc/meminfo");
+            std::string k;
+            double kb;
+            std::string unit;
+            while (mi >> k >> kb >> unit)
+                if (k == "MemAvailable:") { budget = kb / 1024 * 0.85; break; }
+        }
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::vector<std::thread> pool;
+        std::mutex memMu;
+        std::condition_variable memCv;
+        double inUse = 0;
+        int running = 0;
         for (int t = 0; t < std::min<int>(maxThreads(), (int)jobs.size()); t++)
             pool.emplace_back([&] {
-                for (size_t j; (j = next++) < jobs.size();)
+                for (size_t j; (j = next++) < jobs.size();) {
+                    {
+                        std::unique_lock<std::mutex> lk(memMu);
+                        memCv.wait(lk, [&] { return budget <= 0 || running == 0 || inUse + jobMB[j] <= budget; });
+                        inUse += jobMB[j];
+                        running++;
+                    }
                     if (std::system(jobs[j].c_str()) != 0) { failed = true; std::cerr << "msim: -compile: C++ build failed: " << jobs[j] << "\n"; }
+                    {
+                        std::lock_guard<std::mutex> lk(memMu);
+                        inUse -= jobMB[j];
+                        running--;
+                    }
+                    memCv.notify_all();
+                }
             });
         for (auto& t : pool) t.join();
         if (failed) return 1;

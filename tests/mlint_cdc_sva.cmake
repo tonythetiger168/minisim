@@ -5,15 +5,17 @@ file(MAKE_DIRECTORY ${OUT})
 set(sva ${OUT}/cdc_sva_props.sv)
 execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/cdc_sva.sv -top cdc_sva_tb -only cdc -cdc-sva ${sva}
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
-if(NOT rc EQUAL 0 OR NOT err MATCHES "3 assertions")
+if(NOT rc EQUAL 0 OR NOT err MATCHES "9 assertions")
   message(FATAL_ERROR "mlint -cdc-sva exited ${rc}:\n${out}${err}")
 endif()
 file(READ ${sva} text)
 foreach(want
     "module mlint_cdc_sva;"
     "cdc_onebit_cdc_sva_tb_dut_gray: assert property (@(posedge cdc_sva_tb.fclk) disable iff (!cdc_sva_tb.rst_n) $countones(cdc_sva_tb.dut.gray ^ $past(cdc_sva_tb.dut.gray)) <= 1)"
-    "always @(cdc_sva_tb.dut.tog) begin"
-    "cdc_stable_cdc_sva_tb_dut_req_to_cdc_sva_tb_sclk: assert")
+    "always @(cdc_sva_tb.dut.tog) if (cdc_sva_tb.rst_n) begin"
+    "cdc_stable_cdc_sva_tb_dut_req_to_cdc_sva_tb_sclk: assert"
+    "always @(cdc_sva_tb.dut.req) if (cdc_sva_tb.rst_n) begin"
+    "cdc_handshake_cdc_sva_tb_dut_hreq: assert property (@(posedge cdc_sva_tb.fclk) disable iff (!cdc_sva_tb.rst_n) $changed(cdc_sva_tb.dut.hreq) |-> $past(cdc_sva_tb.dut.ha2) == $past(cdc_sva_tb.dut.hreq))")
   string(FIND "${text}" "${want}" pos)
   if(pos EQUAL -1)
     message(FATAL_ERROR "-cdc-sva output missing: ${want}\n${text}")
@@ -25,6 +27,9 @@ set(all "${out}${err}")
 if(NOT all MATCHES "cdc_sva_tb.dut.tog changed again before two cdc_sva_tb.sclk edges")
   message(FATAL_ERROR "the fast toggle did not fail its assertion (msim exited ${rc}):\n${all}")
 endif()
-if(all MATCHES "dut.gray changed|dut.req changed")
+if(NOT all MATCHES "cdc_sva_tb.dut.breq changed before cdc_sva_tb.dut.ba2 acknowledged its last change")
+  message(FATAL_ERROR "the impatient handshake did not fail its assertion:\n${all}")
+endif()
+if(all MATCHES "dut.gray changed|dut.req changed|dut.hreq changed|dut.hack changed")
   message(FATAL_ERROR "a safe crossing failed its assertion:\n${all}")
 endif()

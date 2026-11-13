@@ -303,6 +303,18 @@ mcov exclude all.json -formal formal.json -o unreachable.el      # finds tb.dut 
 mcov report all.json -elfile unreachable.el -el-review
 ```
 
+**UCIS XML.** A database whose name ends in `.xml` is UCIS XML (Accellera
+UCIS 1.0, its XML interchange format), the open format other simulators'
+coverage tools import and export. `mcov merge` writes one, and every `mcov`
+command reads one, with JSON databases mixed in. Proprietary binary
+databases are not read.
+
+```sh
+mcov merge all.json -o all.xml                 # for another tool
+mcov report other.xml -detail                  # another tool's coverage, with mcov
+mcov merge other.xml cov/*.json -o all.json    # both together
+```
+
 **Which test covers what.** With one database per test, `mcov rank` orders
 the tests so that each next one adds the most items not yet covered, and
 shows what only one test covers and which tests add nothing:

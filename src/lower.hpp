@@ -12369,6 +12369,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             if (sub->cls->builtin) lw.builtinMethod(*sub->cls, *sub);
             else lw.ctorBody(*sub->cls, sub->sym ? &sub->sym->getBody() : nullptr);
             *sub->prog = std::move(lw.prog);
+            sub->prog->sub = sub->sym;
             continue;
         }
         g_covInst = 0;
@@ -12388,6 +12389,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);
+        sub->prog->sub = sub->sym;   // VPI frames (38.36.1)
         if (!sub->lay) {   // its static variables: callers are not sensitive to them
             struct Walk {
                 const std::unordered_map<const slang::ast::Symbol*, int>& sm;
@@ -12514,7 +12516,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
-                            if (rv.w > 64 && (rv.dyn || rv.randc)) Lowerer::unsupported(rv.randc ? "randc variable wider than 64 bits" : "rand container of elements wider than 64 bits");
+                            if (rv.w > 64 && rv.randc) Lowerer::unsupported("randc variable wider than 64 bits");
                         } else Lowerer::unsupported("rand property of this type");
                         if (et->isEnum() && rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // each element: one of the named values
                             RandItem loop;
