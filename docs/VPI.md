@@ -341,9 +341,11 @@ inout) port of another that are connected to the same net, in either order,
 and gives the same path object each time. `vpi_iterate(vpiPort, path)` gives
 the two ports. `vpi_get_delays` / `vpi_put_delays` read and write its delay
 (1, 2, 3, 6 or 12 values, with `pulsere_flag` pulse limits and
-`append_flag`), which is the interconnect delay of the load port from every
-source on the net, the same as an SDF `PORT` or `INTERCONNECT` delay
-(32.4.4). The load port has to be a net.
+`append_flag`). On a net with one source it is the interconnect delay of the
+load port, as an SDF `PORT` delay; on a net with several sources it is the
+delay from that path's source alone, as an SDF `INTERCONNECT` delay
+(32.4.4), so each source port can have its own. The load port has to be a
+net.
 
 **Timing checks (37, 38.10, 38.36.1).** `vpi_iterate(vpiTchk, module)`
 gives the timing checks of a module instance's specify blocks
@@ -490,8 +492,14 @@ start of simulation callbacks and before any procedure, and
 `cbEndOfRestart` once the run is back at the checkpoint. They run each
 time, with only `reason`, `cb_rtn` and `user_data` set.
 `vpi_control(vpiReset, stop_value, reset_value, diagnostics_value)` runs
-`$reset` when the calling routine returns (stop_value is ignored: msim has
-no interactive mode).
+`$reset` when the calling routine returns (stop_value is ignored).
+
+**Interactive mode (38.36.3).** With `msim -i` or `-do FILE`,
+`cbEnterInteractive` runs when msim starts reading commands: at time 0, at
+each stop, and when a statement stop or step pauses a process.
+`cbExitInteractive` runs when a `run`, `step` or `next` goes on and when the
+commands end. `cbInteractiveScopeChange` runs after the `scope` command
+changes the scope, with `obj` the new scope. Each has `time` set.
 
 **Signals (38.36.3).** `cbSignal` with the signal number in `index` traps
 that signal (not `SIGKILL` or `SIGSTOP`). The handler only notes it; the
@@ -506,10 +514,7 @@ waveform tools (`mwave`, the FST and VCD readers).
 
 ## Not yet
 
-The per-source
-delay of an inter-module path on a net with several sources,
-interactive mode
-callbacks. A call to something not
+Nothing in clauses 36 to 41 or annexes K, L and M. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
