@@ -397,6 +397,12 @@ struct Sim {
     // null, and is refreshed at the end of each time slot (viewTail).
     struct ObjView { int sig, handle; vector<int> offs; };
     vector<ObjView> objViews;
+    // msim -vcd-sva / -vcd-power (statview.inc): a count or state of the
+    // simulator itself (an assertion's failures, a power domain's simstate)
+    // as a signal, refreshed with the object views at the end of each slot.
+    struct StatView { int sig; std::function<uint64_t()> get; };
+    vector<StatView> statViews;
+    bool hasViews() const { return !objViews.empty() || !statViews.empty(); }
     string timescale = "1ns";                        // one tick, for the VCD header
     ofstream vcd;
     // VCD text is built here and written in large blocks (an ostream insert
@@ -941,7 +947,7 @@ struct Sim {
         closeWaves();
     }
     void closeWaves() {
-        if (!objViews.empty()) viewTail();   // the slot $finish ended
+        if (hasViews()) viewTail();   // the slot $finish ended
         evcdClose();
 #ifdef MINISIM_FST
         if (fst) { fstWriterClose((fstWriterContext*)fst); fst = nullptr; }
@@ -2287,6 +2293,12 @@ struct Sim {
             sigs[o.sig].val = nv;
             dump(o.sig);
         }
+        for (const StatView& v : statViews) {
+            Val nv = make(v.get(), 0, sigs[v.sig].w);
+            if (sameBits(nv, sigs[v.sig].val)) continue;
+            sigs[v.sig].val = nv;
+            dump(v.sig);
+        }
     }
     // The end of a time slot: the first values, then the ports that changed.
     void evcdTail() {
@@ -2751,7 +2763,7 @@ struct Sim {
         if (dumpPend) { startDump(); return true; }        // $dumpvars in this slot: the values it ends with
         if (vpiRegion && vpiRegion(VR_RO)) return true;   // cbReadOnlySynch
         if (!ticked.empty()) { shiftSampled(); return true; }   // end of slot: $past lines shift
-        if (!objViews.empty()) { viewTail(); if (evcds.empty()) return false; }   // msim -vcd-class: as $dumpports
+        if (hasViews()) { viewTail(); if (evcds.empty()) return false; }   // msim -vcd-class / -vcd-sva: as $dumpports
         if (!evcds.empty()) { evcdTail(); return false; }   // $dumpports: rare stays set, every slot ends here
         rare = false;
         return false;
@@ -2890,7 +2902,7 @@ struct Sim {
 // ---- kernel-object members (out of the class: built once in the kernel object, msim -compile) ----
 #ifndef MINISIM_CLIENT
 MSIM_KDEF void Sim::run(uint64_t end, bool start) {
-    if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); if (!objViews.empty()) rare = true; }
+    if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); if (hasViews()) rare = true; }
     if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
     while (!wheel.empty() && !finished) {
         auto it = wheel.begin();

@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -vcd-sva` and `-vcd-power`: assertions and power in the waveform.
+  Each assertion and cover gets `.passes` and `.fails` counters; with `-upf`
+  each power domain gets `upf.PD.simstate` and each supply net
+  `upf.NET.state` and `upf.NET.mV`. `$fsdbDumpSVA` and `"+power"` in
+  `$fsdbDumpvars` turn them on too. `docs/DEBUG.md`.
 - Verdi, VCS and Xcelium waveform tasks: `$fsdbDumpfile`, `$fsdbDumpvars`,
   `$fsdbDumpon` / `off`, `$fsdbDumpMDA`, `$vcdpluson`, `$vcdplusfile`,
   `$vcdplusmemon`, `$shm_open`, `$shm_probe`, `$recordvars` and the rest

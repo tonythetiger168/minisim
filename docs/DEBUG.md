@@ -220,6 +220,18 @@ trace of each signal. The log's time and the waveform's must be in the same
 unit. `-json` and the page's database carry the assertions and their failure
 times (`asserts`).
 
+### Assertions in the waveform
+
+    msim design.sv -top tb -fst run.fst -vcd-sva
+
+writes two counters for each assertion, assume and cover: `tb.u.a_gnt.passes`
+and `tb.u.a_gnt.fails` (32 bits), how many attempts have passed (a cover:
+matched) and failed so far. Each failure is a step in `.fails` at the time it
+is reported, so the wave shows where to look and `-active` / `-assert` say
+why. `$fsdbDumpSVA` in the testbench (or `"+sva"` in `$fsdbDumpvars`) turns
+it on as well. Assertions in protected code are left out. The counters are
+written at the end of each time slot; `-compile` runs the interpreter.
+
 ## Coverage
 
     msim design.sv -top tb -cov cov.json
@@ -272,6 +284,23 @@ value and the enable:
     tb.u_dut.u_core.cnt = 8'bxxxxxxxx @60  (since 45)
       power domain PD_CORE is CORRUPT since 45 (power switch SW_CORE state off; supply VDD_CORE = OFF); isolation ISO_0 on this port, clamp 0, enabled by iso_en (high)
       x because the domain has no power: no assignment made this value
+
+### Power in the waveform
+
+    msim tb.sv dut.sv -top tb -upf dut.upf -fst run.fst -vcd-power
+
+adds, under a scope `upf`, each power domain's simstate (9.6) and each supply
+net's state and voltage:
+
+| Signal | Value |
+|---|---|
+| `upf.PD_CORE.simstate` | 0 NORMAL, 1 CORRUPT_STATE_ON_CHANGE, 2 CORRUPT_STATE_ON_ACTIVITY, 3 CORRUPT_ON_CHANGE, 4 CORRUPT_ON_ACTIVITY, 5 CORRUPT |
+| `upf.VDD_CORE.state` | 0 OFF, 1 FULL_ON, 2 PARTIAL_ON, 3 UNDETERMINED |
+| `upf.VDD_CORE.mV` | the voltage in millivolts (0 while OFF) |
+
+so a switch-off is visible next to the signals it corrupts. `"+power"` in
+`$fsdbDumpvars` turns it on as well. A supply net is listed by the net that
+drives its subnet (a switch output, a supply port).
 
 ## Large designs: the served viewer
 

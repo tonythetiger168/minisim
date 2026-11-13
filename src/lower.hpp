@@ -8258,6 +8258,8 @@ struct Lowerer {
                     std::string t = *s;
                     if (t.rfind("+fsdbfile+", 0) == 0) { emit(DC_VFILE, konst(mkstr(t.substr(10)))); continue; }
                     if (t == "+mda" || t == "+all") { arrays = true; continue; }
+                    if (t == "+sva") { g_vendorWave() |= 1; continue; }
+                    if (t == "+power") { g_vendorWave() |= 2; continue; }
                     if (!t.empty() && t[0] == '+') continue;                         // +parameter, +struct, ...
                     if (n == "$shm_probe" && t.find_first_not_of("ACDFMSTaecdfmst") == std::string::npos) continue;   // "AS", "ACM"
                     // A scope or signal by name: tb.dut, or below the call's scope.
@@ -8293,7 +8295,8 @@ struct Lowerer {
             emit(DC_OFF);
             return;
         }
-        // $fsdbDumpSVA (assertions), $fsdbSuppress, $fsdbLog, $vcdplusautoflushon, ...: nothing to do here.
+        if (n == "$fsdbDumpSVA") { g_vendorWave() |= 1; return; }   // assertions as signals (statview.inc)
+        // $fsdbSuppress, $fsdbLog, $vcdplusautoflushon, ...: nothing to do here.
     }
 
     // Extended VCD tasks (21.7.3). $dumpports names module instances; each
