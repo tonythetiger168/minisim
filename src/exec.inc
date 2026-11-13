@@ -1507,7 +1507,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Assign:
             case IK::Nba: {
                 Val v = eval(i.e, rd);
-                if (i.tmp) { S.poke(i.sig, v, i.hi, i.lo); pc++; break; }   // a temporary of its own (msim -xprop)
+                if (i.tmp || i.xq) { S.poke(i.sig, v, i.hi, i.lo); pc++; break; }   // a temporary of its own (msim -xprop)
                 if (__builtin_expect(g_upf, 0) && entry->pd >= 0 && g_pdMode[(size_t)entry->pd] > 0 && i.sig >= 0 && !isRel(i.sig) && !i.arr)
                     v = upfWrite(entry, i.sig, i.hi, i.lo, v);
                 if (i.drv >= 0) {
@@ -1970,7 +1970,7 @@ static void execComb(const void* ctx) {
         pc++;
         if (g_cov) covHit(i.hits);
         Val v = eval(i.e, rd);
-        if (i.tmp) { S.poke(i.sig, v, i.hi, i.lo); continue; }   // a temporary of its own
+        if (i.tmp || i.xq) { S.poke(i.sig, v, i.hi, i.lo); continue; }   // a temporary of its own
         if (i.bidx) {   // v[i] = ...: the bits are chosen now; an invalid index writes nothing
             int sg = i.sig, hi = i.hi, lo = i.lo;
             if (target(i, sg, hi, lo, v)) S.set(sg, hi >= 0 ? v_insert(S.get(sg), v, hi, lo) : v);
@@ -2067,13 +2067,19 @@ inline Task cbHist(int k, int j, shared_ptr<vector<pair<int, Edge>>> ev) {
         else in.hist.push_back({S.now, v});
     }
 }
+// An input with an edge skew: its value at such an edge now, or N ticks
+// before it (input negedge #N).
+static Val cbEdgeValue(ClockingRT::In& in) {
+    if (!in.skew) return eval(in.src, rd);
+    return S.now >= in.skew ? cbHistAt(in, S.now - in.skew) : in.hist.front().second;
+}
 // An input with an edge skew keeps its value at each such edge of the clock.
 inline Task cbEdgeSample(int k, int j) {
     for (;;) {
         auto& in0 = clockings()[k].ins[j];
         co_await Wait{in0.edgeSig, (Edge)in0.edge};
         auto& in = clockings()[k].ins[j];
-        in.last = eval(in.src, rd);
+        in.last = cbEdgeValue(in);
         in.lastAt = S.now;
     }
 }
@@ -2106,7 +2112,7 @@ inline Task cbProc(int k) {
                 int cur = (cv.x & 1) ? 2 : (int)(cv.v & 1);
                 bool now = in.lastAt == S.now || in.edge == ANY || in.edge == c.ev[0].second ||
                            (c.ev[0].second == ANY && ((in.edge == POS && cur == 1) || (in.edge == NEG && cur == 0)));
-                if (now) S.set(in.cv, eval(in.src, rd));
+                if (now) S.set(in.cv, cbEdgeValue(in));
                 else if (in.lastAt != ~0ull) S.set(in.cv, in.last);
             }
         }
@@ -2137,8 +2143,8 @@ inline void startClockings() {
         S.set(c.evSig + 1, mk(0, 64));
         for (size_t j = 0; j < c.ins.size(); j++) {
             auto& in = c.ins[j];
-            if (in.kind == 3) { S.spawn(cbEdgeSample((int)k, (int)j)); continue; }
-            if (in.kind != 2) continue;
+            if (in.kind == 3) S.spawn(cbEdgeSample((int)k, (int)j));
+            if (in.kind != 2 && !(in.kind == 3 && in.skew)) continue;
             in.hist.push_back({0, eval(in.src, rd)});   // cbHist updates it once the initializers have run
             if (in.refs.empty()) continue;
             auto ev = make_shared<vector<pair<int, Edge>>>();

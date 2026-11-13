@@ -71,6 +71,10 @@ struct CgCpDef {
     std::vector<std::pair<std::string, uint64_t>> enumVals;   // an enum coverpoint's values
     bool isEnum = false;
     bool isReal = false;        // a real coverpoint: keys order the doubles (19.5.1)
+    // Wider than 64 bits: explicit value bins only. A key is the value's
+    // place among the sorted bin bounds of the instance (CgCpInst::wb):
+    // 2i+1 on bound i, 2i between bounds i-1 and i.
+    bool wide = false;
     E realInterval;             // type_option.real_interval; null: the group's, else 1.0
     std::vector<CgBinDef> bins;
     std::vector<CgOptSet> opts;
@@ -78,10 +82,11 @@ struct CgCpDef {
 // A cross bin's select expression (19.6.1), as a tree.
 struct CgSel {
     int kind = 0;   // 0 binsof(cp[.bin]) [intersect items], 1 !, 2 &&, 3 ||, 4 every tuple (the cross's name),
-                    // 5 kids[0] with (expr) [matches n] (19.6.1.2)
+                    // 5 kids[0] with (expr) [matches n] (19.6.1.2), 6 a set of value tuples [matches n] (19.6.1.3)
     E with, matches;          // kind 5: matches null is 1; a matches of $ sets all
     bool all = false;
     std::vector<int> valSigs;   // kind 5: each coverpoint's value, as the with expression reads it
+    std::vector<std::vector<Val>> tuples;   // kind 6: a cross set expression's value tuples (19.6.1.3)
     int cp = -1;    // the index in the cross's coverpoint list
     std::string bin;   // empty: any bin of cp
     std::vector<CgItem> isect;
@@ -129,6 +134,9 @@ struct CgBin {
     std::vector<std::pair<uint64_t, uint64_t>> ranges;   // keys, inclusive
     std::vector<std::pair<uint64_t, uint64_t>> wild;     // (care mask, value): wildcard bins
     std::vector<Val> xvals;          // values with x/z, matched with === (19.5.4)
+    // A wildcard bin of a coverpoint wider than 64 bits: (care, value) per
+    // 64-bit limb, on the value itself (not on keys).
+    std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>> wwild;
     const sva::Node* trans = nullptr;   // a transition bin
     E iff;
     bool empty = false;              // no value left: not counted (19.11.1)
@@ -138,6 +146,7 @@ struct CgBin {
 };
 struct CgCpInst {
     std::vector<CgBin> bins;
+    std::vector<Val> wb;             // a wide coverpoint: its bin bounds, sorted and distinct
     bool autoBins = false;
     std::vector<std::vector<std::pair<uint64_t, uint64_t>>> atoms;   // transition step value sets
     std::vector<int> hit;            // the bins this sample hit (for crosses)

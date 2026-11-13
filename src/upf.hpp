@@ -249,9 +249,16 @@ struct Ex {
     double real = 0;        // Num: as a voltage
     bool isReal = false;
     std::vector<ExP> kids;
+    std::string text;       // the root of a parsed expression: its source text (upf_expr_string, 10.6.3.4)
 };
 
+inline ExP parseExprTree(const std::string& text, const std::string& where);
 inline ExP parseExpr(const std::string& text, const std::string& where) {
+    ExP e = parseExprTree(text, where);
+    if (e) e->text = text;
+    return e;
+}
+inline ExP parseExprTree(const std::string& text, const std::string& where) {
     struct P {
         const std::string& t;
         const std::string& where;
@@ -507,6 +514,78 @@ inline EVal evalEx(const ExP& e, const EvalCtx& c, const std::string& where) {
         }
     }
     return logicV(2);
+}
+
+// The pattern matching of find_objects and query_upf (1801-2024 6.33.2):
+// Tcl glob style against names, not file names. * any sequence, ? one
+// character, [chars] one of chars with a-b ranges, \x the character x, and
+// {a,b,c} any of the alternatives a, b or c.
+inline bool upfGlobAt(const std::string& p, size_t pi, const std::string& s, size_t si) {
+    for (; pi < p.size(); pi++, si++) {
+        char c = p[pi];
+        if (c == '*') {
+            while (pi < p.size() && p[pi] == '*') pi++;
+            for (size_t t = si; t <= s.size(); t++)
+                if (upfGlobAt(p, pi, s, t)) return true;
+            return false;
+        }
+        if (si >= s.size()) return false;
+        if (c == '?') continue;
+        if (c == '[') {
+            size_t e = pi + 1;
+            bool hit = false;
+            while (e < p.size() && p[e] != ']') {
+                char lo = p[e];
+                if (lo == '\\' && e + 1 < p.size()) lo = p[++e];
+                char hi = lo;
+                if (e + 2 < p.size() && p[e + 1] == '-' && p[e + 2] != ']') {
+                    hi = p[e + 2];
+                    e += 2;
+                    if (hi == '\\' && e + 1 < p.size()) hi = p[++e];
+                }
+                if (lo > hi) std::swap(lo, hi);
+                if (s[si] >= lo && s[si] <= hi) hit = true;
+                e++;
+            }
+            if (e >= p.size()) {   // no closing bracket: a literal [
+                if (s[si] != '[') return false;
+                continue;
+            }
+            if (!hit) return false;
+            pi = e;
+            continue;
+        }
+        if (c == '\\' && pi + 1 < p.size()) c = p[++pi];
+        if (c != s[si]) return false;
+    }
+    return si == s.size();
+}
+inline bool upfGlob(const std::string& p, const std::string& s) {
+    // {a,b,c}: try each alternative in place of the first unescaped brace group
+    for (size_t i = 0; i < p.size(); i++) {
+        if (p[i] == '\\') { i++; continue; }
+        if (p[i] == '[') {   // a bracket expression keeps its braces
+            size_t e = p.find(']', i + 1);
+            if (e != std::string::npos) i = e;
+            continue;
+        }
+        if (p[i] != '{') continue;
+        int depth = 0;
+        size_t start = i + 1, j = i;
+        std::vector<std::string> alts;
+        for (; j < p.size(); j++) {
+            if (p[j] == '\\') { j++; continue; }
+            if (p[j] == '{') depth++;
+            else if (p[j] == '}' && --depth == 0) break;
+            else if (p[j] == ',' && depth == 1) { alts.push_back(p.substr(start, j - start)); start = j + 1; }
+        }
+        if (j >= p.size()) break;   // no closing brace: literal
+        alts.push_back(p.substr(start, j - start));
+        for (auto& a : alts)
+            if (upfGlob(p.substr(0, i) + a + p.substr(j + 1), s)) return true;
+        return false;
+    }
+    return upfGlobAt(p, 0, s, 0);
 }
 
 // ------------------------------------------------------------------ model
@@ -923,6 +1002,11 @@ struct Model {
     std::string loadStart;
     std::map<std::string, std::string> topSeen;
     std::string result;   // the Tcl result of the UPF command just run
+    std::map<std::string, std::string> supplyWhere;   // "net:" / "port:" + supply name -> file:line
+    // The information model (clause 10), built at the first query command
+    // (11.1): from then on only the commands of phase 5 may follow (11.1.1).
+    std::shared_ptr<struct InfoModel> im;
+    bool phase5 = false;
 
     // ---- names ----
     static std::string join(const std::string& scope, const std::string& n) {
@@ -1326,6 +1410,10 @@ struct Model {
     void resolveApplies(const std::function<std::vector<std::string>(const std::string&)>& instancesOf) {
         auto pend = std::move(pendingApplies);
         pendingApplies.clear();
+        // these are phase-4 commands replayed once the design is known: a query
+        // read since then (11.1.1) does not forbid them
+        struct Phase5 { bool& f; bool saved; ~Phase5() { f = saved; } } p5{phase5, phase5};
+        phase5 = false;
         for (auto& pa : pend) {
             const PowerModel& pm = powerModels.at(pa.c.w[1]);
             std::vector<std::string> mods = pm.fors.empty() ? std::vector<std::string>{pm.name} : pm.fors;
@@ -1423,6 +1511,11 @@ struct Model {
 
     void run(const std::vector<Cmd>& cmds, std::string& scope, Reader& r, const std::string& file);
     std::string findObjects(const Cmd& c, const std::string& scope) const;
+    std::string query(const Cmd& c, const std::string& scope);   // upf_query_* and query_upf (upf_query.hpp)
+    static bool isQuery(const std::string& n) {
+        return n == "upf_query_object_properties" || n == "upf_query_object_type" || n == "upf_object_in_class" ||
+               n == "upf_query_object_pathname" || n == "query_upf";
+    }
 };
 
 #include "upf_impl.inc"
@@ -1431,6 +1524,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
     for (const Cmd& c : cmds) {
         const std::string& n = c.w[0];
         if (!recording.empty() && n != "end_power_model") {   // inside begin_power_model (6.11)
+            if (isQuery(n)) throw Error(c.where() + ": " + n + " inside power model " + recording + ": a query may not be used in a power model (11.1)");
             if (n == "begin_power_model" || n == "define_power_model")
                 throw Error(c.where() + ": " + n + " inside power model " + recording + "; power models do not nest (6.31)");
             powerModels[recording].cmds.push_back(c);
@@ -1440,6 +1534,13 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
         if (!curLib.empty() && n != "create_vcm" && n != "use_upf_library")
             throw Error(c.where() + ": " + n + " inside create_upf_library " + curLib +
                         "; a UPF library holds only create_vcm and use_upf_library (6.29)");
+        if (isQuery(n)) {   // 11.1
+            result = query(c, scope);
+            continue;
+        }
+        if (phase5 && n != "set_scope" && n != "bind_checker" && n != "find_objects" && n != "load_upf")
+            throw Error(c.where() + ": " + n + " after a UPF query command: only set_scope, bind_checker, find_objects and "
+                        "load_upf may follow one (11.1.1)");
         if (!noLog && pmStack.empty() && curLib.empty() && n != "save_upf" && n != "load_upf" && n != "set_scope" &&
             n != "load_simstate_behavior")
             history.push_back({scope, c});
@@ -1531,6 +1632,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                                                     : scope;
                 std::string name = join(base, p);
                 ports.insert(name);
+                if (!supplyWhere.count("port:" + name)) supplyWhere["port:" + name] = c.where();
                 portDir[name] = o.get("-direction", "in");
             }
             continue;
@@ -1547,6 +1649,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 }
                 std::string name = join(base, p);
                 nets.insert(name);
+                if (!supplyWhere.count("net:" + name)) supplyWhere["net:" + name] = c.where();
                 if (o.has("-resolve")) resolve[name] = o.get("-resolve");
             }
             continue;
@@ -3077,7 +3180,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
         // Accepted and not needed for simulation.
         static const std::set<std::string> ignored = {
             "map_isolation_cell", "map_level_shifter_cell", "set_retention_control", "set_pin_related_supply",
-            "set_related_supply_net", "query_upf", "add_parameter"};
+            "set_related_supply_net", "add_parameter"};
         if (ignored.count(n)) {
             warnings.push_back(c.where() + ": " + n + " is accepted and has no effect in simulation");
             continue;
@@ -3286,6 +3389,8 @@ struct DesignView {
     std::vector<PortSite> ports;
     std::map<std::string, std::string> model;   // instance path ("" the top) -> its module; none for a generate block
     std::map<std::string, std::vector<std::pair<std::string, int>>> portsOf;   // instance path -> its ports, 0 in 1 out 2 inout
+    std::map<std::string, int> width;   // signal -> bits
+    std::map<std::string, std::pair<int, int>> range;   // a packed signal of more than one bit -> [left:right]
 };
 
 // find_objects (6.33): HDL objects of the design below a scope whose names
@@ -3294,29 +3399,38 @@ struct DesignView {
 //       [-direction in|out|inout] [-transitive [TRUE|FALSE]] [-regexp | -exact] [-ignore_case]
 //       [-leaf_only | -non_leaf]
 inline std::string Model::findObjects(const Cmd& c, const std::string& scope) const {
-    static const std::set<std::string> flags = {"-regexp", "-exact", "-ignore_case", "-leaf_only", "-non_leaf"};
-    static const std::set<std::string> known = {"-pattern", "-object_type", "-direction", "-transitive", "-regexp",
-                                                "-exact", "-ignore_case", "-leaf_only", "-non_leaf"};
+    static const std::set<std::string> flags = {"-regexp", "-exact", "-ignore_case", "-leaf_only", "-non_leaf",
+                                                "-traverse_macros", "-expand_to_bits"};
+    static const std::set<std::string> known = {"-pattern", "-object_type", "-direction", "-transitive", "-regexp", "-exact",
+                                                "-ignore_case", "-leaf_only", "-non_leaf", "-traverse_macros", "-expand_to_bits"};
     Opts o = opts(c, flags, {"-transitive"});
+    auto err = [&](const std::string& t) { return Error(c.where() + ": find_objects" + t); };
     for (auto& [k, v] : o.v)
-        if (!known.count(k)) throw Error(c.where() + ": find_objects: unknown option " + k);
-    if (o.pos.size() != 1) throw Error(c.where() + ": find_objects needs one scope");
-    if (!o.has("-pattern")) throw Error(c.where() + ": find_objects needs -pattern");
-    if (o.has("-regexp") && o.has("-exact")) throw Error(c.where() + ": find_objects: -regexp and -exact exclude each other");
-    if (o.has("-leaf_only") && o.has("-non_leaf")) throw Error(c.where() + ": find_objects: -leaf_only and -non_leaf exclude each other");
-    std::string type = o.get("-object_type", "inst");
+        if (!known.count(k)) throw err(": unknown option " + k);
+    if (o.pos.size() != 1) throw err(" needs one scope");
+    if (!o.has("-pattern")) throw err(" needs -pattern");
+    if (o.has("-regexp") && o.has("-exact")) throw err(": -regexp and -exact exclude each other");
+    if (o.has("-leaf_only") && o.has("-non_leaf")) throw err(": -leaf_only and -non_leaf exclude each other");
+    bool traverse = o.has("-traverse_macros");
+    if (traverse && (o.has("-leaf_only") || o.has("-non_leaf")))
+        throw err(": -traverse_macros cannot be given with -leaf_only or -non_leaf (6.33)");
+    if (traverse && o.has("-transitive") && o.get("-transitive") == "FALSE")
+        throw err(": -traverse_macros cannot be given with -transitive FALSE (6.33)");
+    const std::string& scopeArg = o.pos[0];
+    if (scopeArg.rfind("..", 0) == 0 || (!scopeArg.empty() && scopeArg[0] == '/'))
+        throw err(": the scope must be the current scope or below it, not '" + scopeArg + "' (6.33)");
+    // by default instances, named processes, logic ports and nets (6.33)
+    std::string type = o.get("-object_type");
     static const std::set<std::string> types = {"model", "inst", "port", "net", "supply_port", "supply_net", "process"};
-    if (!types.count(type))
-        throw Error(c.where() + ": find_objects -object_type " + type +
-                    ": one of model, inst, port, net, supply_port, supply_net, process");
+    if (!type.empty() && !types.count(type))
+        throw err(" -object_type " + type + ": one of model, inst, port, net, supply_port, supply_net, process");
     std::string dirS = o.get("-direction");
     int dir = dirS.empty() ? -1 : dirS == "in" ? 0 : dirS == "out" ? 1 : dirS == "inout" ? 2 : -2;
-    if (dir == -2) throw Error(c.where() + ": find_objects -direction " + dirS + ": in, out or inout");
-    if (dir >= 0 && type != "port" && type != "supply_port")
-        throw Error(c.where() + ": find_objects -direction applies to ports only");
-    if ((o.has("-leaf_only") || o.has("-non_leaf")) && type != "inst" && type != "model")
-        throw Error(c.where() + ": find_objects -leaf_only / -non_leaf apply to instances only");
-    bool transitive = o.get("-transitive", "FALSE") == "TRUE";
+    if (dir == -2) throw err(" -direction " + dirS + ": in, out or inout");
+    if (dir >= 0 && type != "port" && type != "supply_port") throw err(" -direction applies to -object_type port or supply_port only");
+    bool leafOnly = o.has("-leaf_only"), nonLeaf = o.has("-non_leaf");
+    bool transitive = traverse || o.get("-transitive", "FALSE") == "TRUE";
+    bool bits = o.has("-expand_to_bits");
     bool icase = o.has("-ignore_case");
     std::string pat = o.get("-pattern");
     auto lower = [](std::string t) { for (char& ch : t) ch = (char)std::tolower((unsigned char)ch); return t; };
@@ -3324,15 +3438,14 @@ inline std::string Model::findObjects(const Cmd& c, const std::string& scope) co
     if (o.has("-regexp")) {
         try {
             re = std::regex(pat, icase ? std::regex::extended | std::regex::icase : std::regex::extended);
-        } catch (const std::regex_error&) { throw Error(c.where() + ": find_objects: bad -regexp pattern '" + pat + "'"); }
+        } catch (const std::regex_error&) { throw err(": bad -regexp pattern '" + pat + "'"); }
     }
     auto match = [&](const std::string& name) {
         if (o.has("-regexp")) return std::regex_search(name, re);
         if (o.has("-exact")) return icase ? lower(name) == lower(pat) : name == pat;
-        std::string p = icase ? lower(pat) : pat, n = icase ? lower(name) : name;
-        return tcl::globMatch(p.c_str(), n.c_str(), true);
+        return icase ? upfGlob(lower(pat), lower(name)) : upfGlob(pat, name);
     };
-    std::string root = join(scope, o.pos[0]);   // the scope searched, a UPF name
+    std::string root = join(scope, scopeArg);   // the scope searched, a UPF name
     std::vector<std::string> out;
     // UPF supply objects: by UPF name, below the scope searched
     if (type == "supply_port" || type == "supply_net") {
@@ -3351,10 +3464,10 @@ inline std::string Model::findObjects(const Cmd& c, const std::string& scope) co
         }
         return tcl::joinList(out);
     }
-    if (type == "process") throw Error(c.where() + ": find_objects -object_type process: processes are not named in msim's design view");
-    if (!dv) throw Error(c.where() + ": find_objects needs the design; it is not available here");
+    if (type == "process") throw err(" -object_type process: processes are not named in msim's design view");
+    if (!dv) throw err(" needs the design; it is not available here");
     std::string base = design(scope), start = design(root);
-    if (!start.empty() && !dv->instances.count(start)) throw Error(c.where() + ": find_objects: no scope '" + start + "' in the design");
+    if (!start.empty() && !dv->instances.count(start)) throw err(": no scope '" + start + "' in the design");
     // a simulator path below the current scope, as a UPF name relative to it
     auto rel = [&](const std::string& p) {
         std::string r = base.empty() ? p : p.substr(std::min(p.size(), base.size() + 1));
@@ -3367,38 +3480,81 @@ inline std::string Model::findObjects(const Cmd& c, const std::string& scope) co
                p.find('.', parent.size() + 1) == std::string::npos;
     };
     auto isInst = [&](const std::string& p) { return dv->model.count(p) != 0; };   // not a generate block
-    std::function<bool(const std::string&)> hasInst = [&](const std::string& p) {
+    auto hasInst = [&](const std::string& p) {
         for (auto it = dv->instances.upper_bound(p + "."); it != dv->instances.end() && it->rfind(p + ".", 0) == 0; ++it)
             if (isInst(*it)) return true;
         return false;
+    };
+    // a hard, soft or refinable macro is a leaf cell (4.9.2.5) unless -traverse_macros
+    auto isMacro = [&](const std::string& p) {
+        auto mi = dv->model.find(p);
+        if (mi == dv->model.end() || p.empty()) return false;
+        for (const char* a : {"UPF_is_hard_macro", "UPF_is_soft_macro", "UPF_is_refinable_macro"})
+            if (designAttr(p, mi->second, a) == "TRUE") return true;
+        return false;
+    };
+    auto leafCell = [&](const std::string& p) { return !hasInst(p) || (!traverse && isMacro(p)); };
+    // inside a leaf cell: below a macro instance the search does not enter
+    auto insideLeaf = [&](const std::string& p) {
+        for (size_t d = p.find('.'); d != std::string::npos; d = p.find('.', d + 1)) {
+            std::string up = p.substr(0, d);
+            if ((start.empty() || up.size() > start.size()) && isInst(up) && !traverse && isMacro(up)) return true;
+        }
+        return false;
+    };
+    if (!start.empty() && !traverse && isMacro(start) && start != base)
+        throw err(": the search cannot start in leaf cell '" + scopeArg + "' (6.33)");
+    auto leafOk = [&](bool leaf) { return !((leafOnly && !leaf) || (nonLeaf && leaf)); };
+    // a signal's name, or with -expand_to_bits the names of its bits
+    auto named = [&](const std::string& p) {
+        auto r = bits ? dv->range.find(p) : dv->range.end();
+        if (r == dv->range.end()) { out.push_back(rel(p)); return; }
+        auto [l, rt] = r->second;
+        for (int i = l;; i += l > rt ? -1 : 1) {
+            out.push_back(rel(p) + "[" + std::to_string(i) + "]");
+            if (i == rt) break;
+        }
     };
     // the scopes searched: the scope, and with -transitive everything below it
     std::vector<std::string> scopes{start};
     if (transitive)
         for (auto& p : dv->instances)
-            if (start.empty() || p.rfind(start + ".", 0) == 0) scopes.push_back(p);
-    for (auto& sc : scopes) {
-        if (type == "inst" || type == "model") {
-            for (auto it = dv->instances.begin(); it != dv->instances.end(); ++it) {
-                const std::string& p = *it;
-                if (!childOf(p, sc) || !isInst(p)) continue;
-                std::string leaf = p.substr(sc.empty() ? 0 : sc.size() + 1);
-                if (!match(type == "model" ? dv->model.at(p) : leaf)) continue;
-                bool leafInst = !hasInst(p);
-                if ((o.has("-leaf_only") && !leafInst) || (o.has("-non_leaf") && leafInst)) continue;
-                out.push_back(rel(p));
+            if ((start.empty() || p.rfind(start + ".", 0) == 0) && !insideLeaf(p + ".x")) scopes.push_back(p);
+    std::vector<std::string> want = type.empty() ? std::vector<std::string>{"inst", "port", "net"} : std::vector<std::string>{type};
+    for (auto& t : want)
+        for (auto& sc : scopes) {
+            bool scLeaf = isInst(sc) ? leafCell(sc) : false;
+            if (t == "inst" || t == "model") {
+                for (const std::string& p : dv->instances) {
+                    if (!childOf(p, sc) || !isInst(p)) continue;
+                    std::string leaf = p.substr(sc.empty() ? 0 : sc.size() + 1);
+                    if (!match(t == "model" ? dv->model.at(p) : leaf)) continue;
+                    if (!leafOk(leafCell(p))) continue;
+                    out.push_back(rel(p));
+                }
+            } else if (t == "port") {
+                // the ports of the scope; with -leaf_only / -non_leaf, by the scope's own kind
+                auto own = [&](const std::string& inst, bool leaf) {
+                    auto it = dv->portsOf.find(inst);
+                    if (it == dv->portsOf.end() || !leafOk(leaf)) return;
+                    for (auto& [pn, pd] : it->second)
+                        if (match(pn) && (dir < 0 || pd == dir)) named(inst.empty() ? pn : inst + "." + pn);
+                };
+                own(sc, scLeaf);
+                // a macro the search does not enter still shows its HighConn pins (6.33)
+                if (transitive && !traverse)
+                    for (const std::string& p : dv->instances)
+                        if (childOf(p, sc) && isInst(p) && isMacro(p)) own(p, true);
+            } else {   // net
+                if (!leafOk(scLeaf)) continue;
+                for (auto& sg : dv->signals)
+                    if (childOf(sg, sc) && match(sg.substr(sc.empty() ? 0 : sc.size() + 1))) named(sg);
             }
-        } else if (type == "port") {
-            auto it = dv->portsOf.find(sc);
-            if (it == dv->portsOf.end()) continue;
-            for (auto& [pn, pd] : it->second)
-                if (match(pn) && (dir < 0 || pd == dir)) out.push_back(rel(sc.empty() ? pn : sc + "." + pn));
-        } else {   // net
-            for (auto& sg : dv->signals)
-                if (childOf(sg, sc) && match(sg.substr(sc.empty() ? 0 : sc.size() + 1))) out.push_back(rel(sg));
         }
-    }
-    return tcl::joinList(out);
+    std::set<std::string> seen;
+    std::vector<std::string> uniq;
+    for (auto& e : out) if (seen.insert(e).second) uniq.push_back(e);
+    return tcl::joinList(uniq);
 }
 
 // The supply net a supply set function reaches, followed through
@@ -3650,3 +3806,5 @@ endpackage
 }
 
 }  // namespace upf
+
+#include "upf_query.hpp"

@@ -54,6 +54,7 @@ set(MINISIM_CORE_HEADERS
     upf.hpp
     upf_impl.inc
     upf_vct.hpp
+    upf_query.hpp
     upf_rt.inc
     vpi.inc
     vpi_code.inc
