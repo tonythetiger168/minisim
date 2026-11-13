@@ -1272,8 +1272,83 @@ struct Sim {
     }
     // The value net n sees: the drivers of every net it reaches through
     // switches that are on (and, when unkOn, those with an unknown control).
-    Val tranValue(int n, bool unkOn, vector<int>& seen);   // kernel object (MSIM_KDEF below)
-    void tranResolve(int s);   // kernel object (MSIM_KDEF below)
+    Val tranValue(int n, bool unkOn, vector<int>& seen) {
+        // Best path to each net: the fewest resistive steps, then any switch
+        // at all. Bit b of n is bit b + delta of the net reached, for b in [lo, hi).
+        // A net can be reached more than once, each time for a different
+        // range of n's bits (an inout port on {p[0], p[1]}), so a path is
+        // keyed by the net, the shift and the first bit.
+        struct Reach { int k; bool crossed; int delta, lo, hi; };
+        const Sig& g = sigs[(size_t)n];
+        map<std::tuple<int, int, int>, Reach> best;
+        deque<std::tuple<int, int, int>> q{{n, 0, 0}};
+        best[{n, 0, 0}] = {0, false, 0, 0, g.w};
+        while (!q.empty()) {
+            auto key = q.front(); q.pop_front();
+            int m = std::get<0>(key);
+            Reach r = best[key];
+            for (int id : tranOf[(size_t)m]) {
+                const TranSw& t = trans[(size_t)id];
+                if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
+                int o = t.a == m ? t.b : t.a;
+                Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi};
+                if (t.w >= 0) {   // only the joined bits, moved to o's place
+                    int mLo = t.a == m ? t.aLo : t.bLo, oLo = t.a == m ? t.bLo : t.aLo;
+                    nb.lo = std::max(r.lo, mLo - r.delta);
+                    nb.hi = std::min(r.hi, mLo + t.w - r.delta);
+                    nb.delta = r.delta + oLo - mLo;
+                    if (nb.lo >= nb.hi) continue;
+                }
+                std::tuple<int, int, int> ok{o, nb.delta, nb.lo};
+                auto it = best.find(ok);
+                if (it != best.end() && it->second.k <= nb.k) continue;
+                best[ok] = nb;
+                q.push_back(ok);
+            }
+        }
+        vector<Drv> all;
+        uint8_t kind = g.kind;
+        for (auto& [key, r] : best) {
+            int m = std::get<0>(key);
+            if (seen.empty() || seen.back() != m) seen.push_back(m);   // keys of one net are neighbours
+            const Sig& sm = sigs[(size_t)m];
+            if (kind == NR_WIRE && sm.kind != NR_WIRE && r.lo == 0 && r.hi == g.w) kind = sm.kind;   // a wire joined to a tri1 is pulled too
+            bool same = r.delta == 0 && r.lo == 0 && r.hi == g.w && sm.w == g.w;
+            for (Drv d : sm.drv) {
+                if (r.crossed) {
+                    d.s0 = tranReduce(d.s0, false);
+                    d.s1 = tranReduce(d.s1, false);
+                }
+                for (int k = 0; k < r.k; k++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                if (!same) {   // as n's bits: those outside the joined range are Z
+                    Val v = make(0, 0, g.w);
+                    for (int b = 0; b < g.w; b++) setBit(v, b, b >= r.lo && b < r.hi ? bitAt(d.v, b + r.delta) : 3);
+                    d.v = v;
+                }
+                all.push_back(d);
+            }
+        }
+        return kind != NR_WIRE ? resolveNet(kind, all.data(), all.size(), g.w, g.val)
+                               : resolveDrives(all.data(), all.size(), g.w);
+    }
+    void tranResolve(int s) {
+        vector<int> group, scratch;
+        Val v = tranValue(s, true, group);
+        bool unknown = false;
+        for (int m : group)
+            for (int id : tranOf[(size_t)m]) if (trans[(size_t)id].state == 2) unknown = true;
+        vector<pair<int, Val>> vals;
+        for (int m : group) {
+            Val on = m == s ? v : tranValue(m, true, scratch);
+            if (unknown) {
+                Val off = tranValue(m, false, scratch);
+                for (int b = 0; b < sigs[(size_t)m].w; b++)
+                    if (bitAt(on, b) != bitAt(off, b)) setBit(on, b, 2);
+            }
+            vals.push_back({m, on});
+        }
+        for (auto& [m, val] : vals) set(m, val);
+    }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
                                : clipRead(sigs[s].val, sigs[s].w);
@@ -2859,79 +2934,6 @@ MSIM_KDEF void Sim::applyHold(int s) {
     set(s, v);
     sigs[s].fl = fl;
 }
-MSIM_KDEF Val Sim::tranValue(int n, bool unkOn, vector<int>& seen) {
-    // Best path to each net: the fewest resistive steps, then any switch
-    // at all. Bit b of n is bit b + delta of the net reached, for b in [lo, hi).
-    struct Reach { int k; bool crossed; int delta, lo, hi; };
-    const Sig& g = sigs[(size_t)n];
-    map<int, Reach> best;
-    deque<int> q{n};
-    best[n] = {0, false, 0, 0, g.w};
-    while (!q.empty()) {
-        int m = q.front(); q.pop_front();
-        Reach r = best[m];
-        for (int id : tranOf[(size_t)m]) {
-            const TranSw& t = trans[(size_t)id];
-            if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
-            int o = t.a == m ? t.b : t.a;
-            Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi};
-            if (t.w >= 0) {   // only the joined bits, moved to o's place
-                int mLo = t.a == m ? t.aLo : t.bLo, oLo = t.a == m ? t.bLo : t.aLo;
-                nb.lo = std::max(r.lo, mLo - r.delta);
-                nb.hi = std::min(r.hi, mLo + t.w - r.delta);
-                nb.delta = r.delta + oLo - mLo;
-                if (nb.lo >= nb.hi) continue;
-            }
-            auto it = best.find(o);
-            if (it != best.end() && it->second.k <= nb.k) continue;
-            best[o] = nb;
-            q.push_back(o);
-        }
-    }
-    vector<Drv> all;
-    uint8_t kind = g.kind;
-    for (auto& [m, r] : best) {
-        seen.push_back(m);
-        const Sig& sm = sigs[(size_t)m];
-        if (kind == NR_WIRE && sm.kind != NR_WIRE && r.lo == 0 && r.hi == g.w) kind = sm.kind;   // a wire joined to a tri1 is pulled too
-        bool same = r.delta == 0 && r.lo == 0 && r.hi == g.w && sm.w == g.w;
-        for (Drv d : sm.drv) {
-            if (r.crossed) {
-                d.s0 = tranReduce(d.s0, false);
-                d.s1 = tranReduce(d.s1, false);
-            }
-            for (int k = 0; k < r.k; k++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
-            if (!same) {   // as n's bits: those outside the joined range are Z
-                Val v = make(0, 0, g.w);
-                for (int b = 0; b < g.w; b++) setBit(v, b, b >= r.lo && b < r.hi ? bitAt(d.v, b + r.delta) : 3);
-                d.v = v;
-            }
-            all.push_back(d);
-        }
-    }
-    return kind != NR_WIRE ? resolveNet(kind, all.data(), all.size(), g.w, g.val)
-                           : resolveDrives(all.data(), all.size(), g.w);
-}
-
-MSIM_KDEF void Sim::tranResolve(int s) {
-    vector<int> group, scratch;
-    Val v = tranValue(s, true, group);
-    bool unknown = false;
-    for (int m : group)
-        for (int id : tranOf[(size_t)m]) if (trans[(size_t)id].state == 2) unknown = true;
-    vector<pair<int, Val>> vals;
-    for (int m : group) {
-        Val on = m == s ? v : tranValue(m, true, scratch);
-        if (unknown) {
-            Val off = tranValue(m, false, scratch);
-            for (int b = 0; b < sigs[(size_t)m].w; b++)
-                if (bitAt(on, b) != bitAt(off, b)) setBit(on, b, 2);
-        }
-        vals.push_back({m, on});
-    }
-    for (auto& [m, val] : vals) set(m, val);
-}
-
 MSIM_KDEF void Sim::buildPartitions(const vector<vector<int>>& combOuts, const vector<vector<int>>& combIns,
                      const vector<int>& seqTargets) {
     size_t ns = sigs.size();

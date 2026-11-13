@@ -3371,6 +3371,7 @@ int main(int argc, char** argv) {
         ses.comp = comp.get();
         ses.maxTime = maxTime;
         ses.lr = &lowered;
+        ses.doPath = doPath;
         if (doPath.empty()) { ses.prompt = isatty(0); ses.loop(std::cin); }
         else {
             std::ifstream df(doPath);

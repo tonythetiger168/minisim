@@ -8,6 +8,25 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` CDC on generated register blocks: a register struct written field
+  by field through ports on fields or on concatenations of fields, copied
+  whole (`assign hw2reg_regtop = hw2reg`) and passed whole down a port, is
+  kept field by field, so one field's crossing no longer spreads to every
+  register. A clock behind a scan mux is the functional clock. `-static`
+  takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
+- VPI containers of structs, classes and containers (37.18): an element of
+  a queue, dynamic or associative array of unpacked structs is a
+  `vpiStructVar` whose members read and write the element; one of class
+  handles gives its object through `vpiClassObj`; one that is itself a
+  container is a `vpiArrayVar` with its own size and elements.
+  `tests/spec/37.18-vpi-nested-containers.sv`.
+- VPI instance arrays (37.11): `vpi_iterate(vpiModuleArray /
+  vpiInterfaceArray / vpiProgramArray / vpiPrimitiveArray /
+  vpiInstanceArray, module)`, an array's name, size, ranges and elements,
+  `vpi_handle_by_index` / `vpi_handle_by_multi_index` on it, and from an
+  element `vpiIndex` and its array. Array elements are now named `u[2]`, and
+  `vpi_handle_by_name` picks the right element of a descending array
+  (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
 - `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
   flop, the nets and logic between it and the reader (a glitch source for
   CDC003), the synchronizer stages, and the qualifier of an enable-qualified
@@ -34,6 +53,15 @@ Spec references are IEEE 1800-2023 clauses.
   `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
   `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
   (plusarg-assignment: `$test$plusargs`).
+- UPF language rules of IEEE 1801-2024 clause 5 and 8.3 in `msim -upf` and
+  `mlint -upf`: identifier and name-conflict checks, references to objects
+  that do not exist, `-update` refinement of strategies and switches,
+  conflicting port attributes, `{.}` with `-models`, `-instance` cells that
+  are not in the design, and supply ports named like HDL logic ports are
+  errors. Expressions gain `<`, `<=`, `>`, `>=`, `.voltage` and `.state`;
+  Tcl `catch` sets `errorInfo` and `errorCode`. Strategies are chosen by the
+  precedence of 5.7.3 and 5.7.4 (port, instance, domain; then options),
+  not by the order they were written; a tie is an error.
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their
@@ -77,6 +105,10 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` runs RV64: RV64IMAC harts (chosen by the program's ELF class),
+  the W instructions, LD/SD/LWU, 64-bit atomics, RV64C and Sv39 paging. The
+  riscv-tests run grows to 342 programs, RV32 and RV64, all passing. The
+  extension ABI is 3.
 - `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
   `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
   TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
@@ -396,6 +428,10 @@ Spec references are IEEE 1800-2023 clauses.
   (next/previous time the selected signal takes it), Del to remove a row,
   Ctrl+arrows to step changes; the view lives in the page address, so a
   reload or a copied link opens on it.
+- `msim -i`: `drivers` / `loads` of a signal, `call` of a task or function
+  (static or automatic, with its return value and outputs), `save` /
+  `restore` checkpoints by replay of the run and its commands (also read by
+  `msim -restore`), and `restart` from time 0.
 - `msim -i` / `-do` is a UCLI on the shared Tcl interpreter: `set`, `if`,
   `foreach`, `proc`, `source` around the commands; stops at a line
   (`stop -line N -file F`), at a time, on a condition, with `-command`,
@@ -796,6 +832,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `disable` of a named block from inside it is merged: it sets
+  a flag (and the break flags of the loops between) instead of jumping, and
+  the rest of the block runs under the flag, so an unknown condition around
+  it merges the rest with not running it.
 - `-xprop`: blocking writes to an element of an array of 64 elements or
   fewer chosen at run time merge exactly: the branch saves, puts back and
   merges the array's elements like variables, so two branches that write

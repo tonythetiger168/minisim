@@ -209,11 +209,16 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_vcdtasks
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcdtasks.cmake)
-  # Compiled mode: generated C++ prints the same as the interpreter.
-  add_test(NAME msim_compile
-           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
-                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile
-                   -P ${CMAKE_SOURCE_DIR}/tests/msim_compile.cmake)
+  # Compiled mode: generated C++ prints the same as the interpreter. Each
+  # case is a C++ build of about 20 s, so the cases are split over eight
+  # tests that ctest -j runs side by side (one test took 20 minutes).
+  foreach(k RANGE 7)
+    add_test(NAME msim_compile_${k}
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile -DSHARD=${k} -DSHARDS=8
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_compile.cmake)
+    set_tests_properties(msim_compile_${k} PROPERTIES LABELS "compile" TIMEOUT 1500)
+  endforeach()
   # X-propagation (msim -xprop): tests/xprop in every execution mode.
   add_test(NAME msim_xprop
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}

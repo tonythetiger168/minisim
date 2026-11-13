@@ -702,6 +702,7 @@ struct LowerResult {
     std::unordered_map<const slang::ast::Symbol*, int> sigOf;   // variable / net -> signal (VPI, 37)
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
+    std::vector<std::unique_ptr<Subr>> subrs;   // every task and function with its arguments (msim -i call)
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
     int programs = 0;                 // program instances (24.3)
     LayoutList layouts;   // frame shapes of automatic subroutines and fork branches
@@ -9279,7 +9280,7 @@ struct Lowerer {
         switch (s.kind) {
             case StatementKind::Empty: break;
             case StatementKind::List:
-                if (!loops.empty() && loops.back().xpBrk >= 0) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
+                if ((!loops.empty() && loops.back().xpBrk >= 0) || (!xp.dis.empty() && !xp.clean)) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
                 break;
             case StatementKind::Block: {
@@ -9293,7 +9294,9 @@ struct Lowerer {
                     labelOf = &b.body;
                     size_t s0 = prog.here();
                     blockEventSample(b.blockSymbol, true);   // @@(begin blk) (19.3)
+                    bool xpd = !current && !forkyBlocks.count(b.blockSymbol) && xpBlockStart(b.blockSymbol, b.body);   // -xprop
                     stmt(b.body);
+                    if (xpd) xpBlockEnd();
                     blockEventSample(b.blockSymbol, false);
                     if (blockIds().targets.count(b.blockSymbol))   // another process may disable it (9.6.2)
                     { prog.spans.push_back({blockIds().of(b.blockSymbol), s0, prog.here()}); anySpans() = true; }
@@ -10043,7 +10046,11 @@ struct Lowerer {
                 // forked in it: no other process can be inside it, so a jump
                 // past it is the whole disable.
                 for (size_t k = named.size(); k-- > 0;)
-                    if (named[k].first == sym && !current && !forkyBlocks.count(sym)) { named[k].second.push_back(emitJmp()); return; }
+                    if (named[k].first == sym && !current && !forkyBlocks.count(sym)) {
+                        if (xpDisable(sym)) return;   // -xprop: flags (xpBlockStart)
+                        named[k].second.push_back(emitJmp());
+                        return;
+                    }
                 // A block or task some process is running: a process it is
                 // the whole of ends; any other process inside it resumes
                 // after it, this one included (a task disabling itself).
@@ -11614,6 +11621,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     bool inoutTran(const slang::ast::PortSymbol& ps, const slang::ast::Expression& act0, const Formal& f) {
         using namespace slang::ast;
         const Expression& act = Lowerer::peel(act0);
+        if (act.kind == ExpressionKind::Concatenation) return inoutTranConcat(ps, act.as<ConcatenationExpression>(), f);
         if (act.kind != ExpressionKind::ElementSelect && act.kind != ExpressionKind::RangeSelect &&
             act.kind != ExpressionKind::NamedValue && act.kind != ExpressionKind::HierarchicalValue)
             return false;
@@ -11643,6 +11651,63 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         t.k = IK::Tran;
         t.sig = id;
         lw.prog.emit(t);
+        out.procs.push_back({std::move(lw.prog), false, "tran"});
+        return true;
+    }
+    // An inout port on a concatenation of net bits (`.pad({p[1], p[0]})`, as
+    // gate netlists write it): one switch per run of operands that are
+    // neighbouring bits of the same net, formal bits to those bits. A net
+    // bit used twice, or a non-constant select, is left to the plain
+    // continuous assignments.
+    bool inoutTranConcat(const slang::ast::PortSymbol& ps, const slang::ast::ConcatenationExpression& cat, const Formal& f) {
+        using namespace slang::ast;
+        auto simple = [](const Symbol& s) {
+            if (s.kind != SymbolKind::Net) return false;
+            const auto& n = s.as<NetSymbol>();
+            auto k = n.netType.netKind;
+            return n.getType().isIntegral() && !n.getDelay() && k != NetType::UserDefined && k != NetType::Interconnect &&
+                   k != NetType::TriReg && k != NetType::Unknown;
+        };
+        if (!ps.internalSymbol || !simple(*ps.internalSymbol)) return false;
+        struct Run { int sig, fLo, aLo, w; };
+        std::vector<Run> runs;
+        int off = f.w;
+        for (const Expression* op0 : cat.operands()) {
+            const Expression& op = Lowerer::peel(*op0);
+            int w = (int)op.type->getBitWidth();
+            if (w <= 0) continue;   // a replication of zero
+            const Expression* root = &op;
+            while (root->kind == ExpressionKind::ElementSelect || root->kind == ExpressionKind::RangeSelect)
+                root = root->kind == ExpressionKind::ElementSelect ? &root->as<ElementSelectExpression>().value()
+                                                                   : &root->as<RangeSelectExpression>().value();
+            if (root->kind != ExpressionKind::NamedValue && root->kind != ExpressionKind::HierarchicalValue) return false;
+            if (!simple(root->as<ValueExpressionBase>().symbol)) return false;
+            Lowerer lw(sigmap);
+            prep(lw);
+            Instr i;
+            lw.lhs(op, i);
+            if (i.arr || i.bidx || i.dyn >= 0 || !lw.prog.code.empty()) return false;
+            off -= w;
+            int lo = i.hi >= 0 ? i.lo : 0;
+            if (!runs.empty() && runs.back().sig == i.sig && runs.back().fLo == off + w && runs.back().aLo == lo + w) {
+                runs.back().fLo = off; runs.back().aLo = lo; runs.back().w += w;   // the next lower bits of the same net
+            } else runs.push_back({i.sig, off, lo, w});
+        }
+        if (off != 0 || runs.empty()) return false;
+        for (size_t a = 0; a < runs.size(); a++)   // the same net bit twice ({p[0], p[0]}) would short two port bits
+            for (size_t b = a + 1; b < runs.size(); b++)
+                if (runs[a].sig == runs[b].sig && runs[a].aLo < runs[b].aLo + runs[b].w && runs[b].aLo < runs[a].aLo + runs[a].w)
+                    return false;
+        Lowerer lw(sigmap);
+        prep(lw);
+        for (const Run& r : runs) {
+            int id = (int)out.trans.size();
+            out.trans.push_back({f.sig, r.sig, false, r.fLo, r.aLo, r.w});
+            Instr t;
+            t.k = IK::Tran;
+            t.sig = id;
+            lw.prog.emit(t);
+        }
         out.procs.push_back({std::move(lw.prog), false, "tran"});
         return true;
     }
@@ -13243,5 +13308,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         }
     }
     out.sigOf = sigmap;
+    out.subrs = std::move(owned);
     return out;
 }

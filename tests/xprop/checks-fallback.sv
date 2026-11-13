@@ -1,7 +1,7 @@
 // msim -xprop: unique / priority if, casex, nested case, negedge, a for loop
-// with break, a while loop with break, a task call; constructs that are not
-// merged (disable of an outer block, a task with an intra-assignment delay)
-// keep the standard behavior.
+// with break, a while loop with break, a task call, disable of an outer
+// block; a construct that is not merged (a task with an intra-assignment
+// delay) keeps the standard behavior.
 //! args: -xprop
 module top;
   logic a, b; logic [3:0] y, z, w, u, k, s; logic [2:0] sel; logic [3:0] idx;
@@ -59,7 +59,7 @@ module top;
       m = m + 4'd1;
     end
   end
-  always_comb begin   // disable of a block outside the branch is not merged
+  always_comb begin   // disable of a block outside the branch
     m2 = 4'd0;
     begin : scan
       for (int i = 0; i < 8; i++) begin
