@@ -13,6 +13,8 @@
 // calltf routines may read or write any signal at any time.
 
 #include <dlfcn.h>
+#include <atomic>
+#include <csignal>
 
 #include <deque>
 #include <fstream>
@@ -135,6 +137,10 @@ struct State {
     std::map<std::pair<const ProcCtl*, size_t>, Obj*> frameObjs;      // live frames with a handle
     std::unordered_set<const Obj*> softObjs;   // constraint items that are soft (vpiSoft, 37.31)
     std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
+    std::vector<Cb*> featCbs;             // save, restart and reset callbacks (38.36.3)
+    std::map<int, std::vector<Cb*>> sigCbs;   // cbSignal, by signal number (38.36.3)
+    bool resetDue = false;                // vpi_control(vpiReset) in a calltf: on its return (38.6)
+    long resetValue = 0, resetDiag = 0;
     bool inErrCb = false;
     std::vector<Cb*> nbaCbs, endSlot;     // cbNBASynch, cbAtEndOfSimTime of this time slot (38.36.2)
     int mode = vpiMode1800v2009;          // the compatibility mode of the running call (36.12)
@@ -1083,6 +1089,54 @@ inline void fireList(std::vector<Cb*>& l) {
     now.swap(l);
     for (Cb* c : now) fire(c);
 }
+// Save, restart and reset callbacks (38.36.3) fire each time, with only
+// reason, cb_rtn and user_data set.
+inline void fireFeature(int reason) {
+    auto due = st().featCbs;
+    for (Cb* c : due) {
+        if (!c->live || c->d.reason != reason) continue;
+        s_cb_data d = c->d;
+        d.obj = nullptr;
+        d.time = nullptr;
+        d.value = nullptr;
+        d.cb_rtn(&d);
+    }
+}
+inline void onFeature(annexd::Feature f) {
+    static const int reason[] = {cbStartOfSave, cbEndOfSave, cbStartOfRestart, cbEndOfRestart, cbStartOfReset};
+    fireFeature(reason[f]);
+}
+// cbSignal (38.36.3): the handler only notes the signal; its callbacks run
+// at the next safe point, the start of a time slot (or the end of the run).
+inline std::atomic<uint64_t> sigSeen{0};
+inline void sigNote(int n) { sigSeen.fetch_or(uint64_t(1) << n); }
+inline void trapSignal(int n) {
+    struct sigaction a {};
+    a.sa_handler = sigNote;
+    sigemptyset(&a.sa_mask);
+    a.sa_flags = SA_RESTART;
+    sigaction(n, &a, nullptr);
+}
+inline void pollSignals() {
+    uint64_t m = sigSeen.exchange(0);
+    if (!m) return;
+    auto& s = st();
+    for (int n = 1; n < 64; ++n) {
+        if (!(m & (uint64_t(1) << n))) continue;
+        auto it = s.sigCbs.find(n);
+        if (it == s.sigCbs.end()) continue;
+        auto due = it->second;
+        for (Cb* c : due) {
+            if (!c->live) continue;
+            s_cb_data d = c->d;
+            d.obj = nullptr;
+            d.time = nullptr;
+            d.value = nullptr;
+            d.index = n;
+            d.cb_rtn(&d);
+        }
+    }
+}
 inline void onChange(int s) {
     auto it = st().change.find(s);
     if (it == st().change.end()) return;
@@ -1092,6 +1146,7 @@ inline void onChange(int s) {
 inline bool onRegion(int r) {
     auto& s = st();
     if (r == Sim::VR_START) {
+        pollSignals();
         auto [a, b] = s.timed.equal_range(S.now);
         std::vector<Cb*> due;
         for (auto it = a; it != b; ++it) due.push_back(it->second);
@@ -1152,6 +1207,10 @@ inline void callSite(const Instr& ins) {
     s.cur = site;
     f.d.calltf(f.d.user_data);
     s.cur = saved;
+    if (s.resetDue) {
+        s.resetDue = false;
+        annexd::reset(s.resetValue, s.resetDiag);
+    }
 }
 
 // The slang side of a user system task or function: any arguments (a
@@ -1722,6 +1781,7 @@ inline void fireUnresolved(Compilation& comp) {
             d.obj = nullptr;
             d.time = nullptr;
             d.value = &val;
+            d.user_data = val.value.str;   // 38.36.3: user_data points to the name
             d.cb_rtn(&d);
         }
     }
@@ -1749,10 +1809,12 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
     assertHook() = onAssert;
     fireList(s.endCompile);
     fireList(s.start);
+    if (annexd::envLong("MSIM_RESET_COUNT") > 0 && !getenv("MSIM_RESTORE_AT")) fireFeature(cbEndOfReset);   // 38.36.3
     fireSys(cbAssertionSysInitialized);   // 39.4.1
     if (!s.rw.empty() || !s.ro.empty()) S.rare = true;
 }
 inline void end() {
+    pollSignals();
     if (!st().assertEnded) fireSys(cbAssertionSysEnd);
     fireList(st().endSim);
 }
@@ -1938,7 +2000,18 @@ vpiHandle vpi_register_cb(p_cb_data d) {
         case cbStartOfRestart:
         case cbEndOfRestart:
         case cbStartOfReset:
-        case cbEndOfReset:   // 38.36.2: msim has no save, restart or reset, so these never fire
+        case cbEndOfReset:   // 38.36.3: around $save / $incsave, $restart and $reset (annex D.8, D.9)
+            s.featCbs.push_back(c);
+            annexd::featureHook = vpi::onFeature;
+            break;
+        case cbSignal:   // 38.36.3: index is the operating system's signal number
+            if (d->index <= 0 || d->index >= 64 || d->index == SIGKILL || d->index == SIGSTOP) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbSignal needs a signal number in index (not SIGKILL or SIGSTOP)");
+                return nullptr;
+            }
+            vpi::trapSignal(d->index);
+            s.sigCbs[d->index].push_back(c);
             break;
         case cbError:
         case cbPLIError:   // 38.36.3
@@ -3598,6 +3671,16 @@ inline PLI_INT32 control(PLI_INT32 op, va_list ap) {
     if (PLI_INT32 r = covControlOp(op, ap); r >= 0) return r;
     if (op == vpiFinish || op == vpiStop) {
         S.finished = true;
+        return 1;
+    }
+    if (op == vpiReset) {   // 38.6: $reset(stop_value, reset_value, diagnostics_value) on return of the routine
+        (void)va_arg(ap, PLI_INT32);   // stop_value: msim has no interactive mode (annex D.8)
+        long value = va_arg(ap, PLI_INT32), diag = va_arg(ap, PLI_INT32);
+        auto& s = st();
+        if (!s.cur) annexd::reset(value, diag);   // from a callback: it has returned once vpi_control does
+        s.resetDue = true;
+        s.resetValue = value;
+        s.resetDiag = diag;
         return 1;
     }
     error(vpiWarning, "vpi_control: operation " + std::to_string(op) + " is not supported");

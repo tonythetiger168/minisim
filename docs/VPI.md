@@ -387,12 +387,26 @@ callback or handle was asked for are not reported as starting.
 **Unresolved system tasks and functions (38.36.3).** A `cbUnresolvedSystf`
 callback registered at startup runs before elaboration, once for each
 system task or function name in the source that is neither built in nor
-registered, with the name in `cb_data->value` (`vpiStringVal`). It may
+registered. `user_data` points to the name (as 38.36.3 says), which is
+also in `cb_data->value` (`vpiStringVal`). It may
 register the name with `vpi_register_systf`; the calls then run as usual.
 
-**Save, restart and reset (38.36.2).** msim has no save, restart or reset,
-so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
-`cbStartOfReset` and `cbEndOfReset` register (with a handle) and never run.
+**Save, restart and reset (38.6, 38.36.3).** `cbStartOfSave` and
+`cbEndOfSave` run around each `$save` / `$incsave`, `cbStartOfRestart`
+before `$restart`, `cbStartOfReset` before `$reset` (annex D.8, D.9). msim
+does a reset or restart by running the simulation again, so the VPI
+library starts again too: `cbEndOfReset` runs in the new run after the
+start of simulation callbacks and before any procedure, and
+`cbEndOfRestart` once the run is back at the checkpoint. They run each
+time, with only `reason`, `cb_rtn` and `user_data` set.
+`vpi_control(vpiReset, stop_value, reset_value, diagnostics_value)` runs
+`$reset` when the calling routine returns (stop_value is ignored: msim has
+no interactive mode).
+
+**Signals (38.36.3).** `cbSignal` with the signal number in `index` traps
+that signal (not `SIGKILL` or `SIGSTOP`). The handler only notes it; the
+callbacks run at the next safe point, the start of the next time slot (or
+the end of the run), with the signal in `index`.
 
 ## Not yet
 
@@ -404,7 +418,7 @@ instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
 callbacks, `cbReclaimObj` /
-`cbEndOfObject` (msim does not reclaim objects), `cbSignal` and `vpi_control(vpiReset)`. A call to something not
+`cbEndOfObject` (msim does not reclaim objects). A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 

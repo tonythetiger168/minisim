@@ -50,6 +50,11 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI save, restart and reset (38.6, 38.36.3): `vpi_control(vpiReset)`;
+  `cbStartOfSave` / `cbEndOfSave`, `cbStartOfRestart` / `cbEndOfRestart`
+  and `cbStartOfReset` / `cbEndOfReset` now run around `$save`,
+  `$restart` and `$reset`; `cbSignal` runs at the next time slot after the
+  signal. `cbUnresolvedSystf` now also passes the name in `user_data`.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
