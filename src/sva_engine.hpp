@@ -76,7 +76,8 @@ enum K : uint8_t {
     // local variables (16.10)
     ENV,     // kids[0] read in environment lo
     MATCH,   // kids[0], running match items lo at the end of each match (never nullable)
-    INIT     // kids[0], running initializers lo when it starts
+    INIT,    // kids[0], running initializers lo when it starts
+    REC      // a recursive property instance (16.12.17): the term recBody[lo]
 };
 enum Flag : uint8_t { STRONG = 1, NONOVERLAP = 2, WITH = 4, NEG = 8, LOCAL = 16 /* the atom reads a local variable */ };
 
@@ -152,14 +153,19 @@ public:
         for (const Node* k : n.kids) n.isect |= k->isect;
         n.envDep = (n.flags & LOCAL) || n.k == ENV || n.k == MATCH || n.k == INIT;
         for (const Node* k : n.kids) n.envDep |= k->envDep;
-        n.prop = (n.k >= PTRUE && n.k <= COVSEQ) || ((n.k == ENV || n.k == INIT) && n.kids[0]->prop);
-        n.mask = clocked(n.k) ? 1u << (n.clk & 31) : 0;
+        n.prop = (n.k >= PTRUE && n.k <= COVSEQ) || n.k == REC || ((n.k == ENV || n.k == INIT) && n.kids[0]->prop);
+        n.mask = n.k == REC ? ~0u : clocked(n.k) ? 1u << (n.clk & 31) : 0;
         for (const Node* k : n.kids) n.mask |= k->mask;
         arena.push_back(std::move(n));
         set.insert(&arena.back());
         return &arena.back();
     }
-    void clear() { set.clear(); arena.clear(); }
+    void clear() { set.clear(); arena.clear(); recBody.clear(); }
+    // Recursive property instances (16.12.17): REC(k) stands for recBody[k],
+    // set once the body (which holds REC(k) after a time advance) is built.
+    std::vector<const Node*> recBody;
+    int recNew() { recBody.push_back(nullptr); return (int)recBody.size() - 1; }
+    const Node* rec(int k) { Node n; n.k = REC; n.lo = k; return mk(n); }
     size_t size() const { return arena.size(); }
 
     // ---- sequence builders, with the simplifications that keep the set of
@@ -566,6 +572,7 @@ struct Deriv {
                 if (r->nullable) matches++;
                 return st.covseq(r);
             }
+            case REC: return d(st.recBody[(size_t)n->lo]);
             default: return st.nul();
         }
     }
@@ -633,6 +640,14 @@ inline bool endValue(const Node* n) {
         case POR: for (auto* k : n->kids) if (endValue(k)) return true; return false;
         case IMPL: return true;
         case ACCEPT: case REJECT: case ENV: case INIT: return endValue(n->kids[0]);
+        case REC: {   // a recursive instance only recurs after a time advance (16.12.17), so this ends
+            static int depth = 0;
+            if (depth > 64) return true;
+            depth++;
+            bool r = endValue(store().recBody[(size_t)n->lo]);
+            depth--;
+            return r;
+        }
         default: return true;
     }
 }

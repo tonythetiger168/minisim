@@ -442,7 +442,6 @@ int svaAtomE(E e) {
 // (declaration initializers and local input arguments, 16.8.2); -1: none.
 int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
     using namespace slang::ast;
-    if (ai.isRecursiveProperty) unsupported("recursive property (16.12.17)");
     if (ai.localVars.empty()) return -1;
     std::vector<ConcAssert::Item> init;
     for (const LocalAssertionVarSymbol* lv : ai.localVars) {
@@ -704,12 +703,90 @@ bool isSeq(const slang::ast::AssertionExpr& a) {
     }
 }
 // A property (16.12). `strong`: how a bare sequence is read (16.12.2).
+// Recursive properties (16.12.17): the property instances being built, and
+// the REC term each one became the target of (-1: none).
+struct RecEnt { const slang::ast::AssertionInstanceExpression* ai; int idx; };
+std::vector<RecEnt> recStack;
+// Whether two expressions are the same, as far as can be told without
+// evaluating them (false when unsure).
+static bool sameExpr(const slang::ast::Expression& a, const slang::ast::Expression& b) {
+    using namespace slang::ast;
+    if (&a == &b) return true;
+    if (a.kind != b.kind || !a.type->isMatching(*b.type)) return false;
+    switch (a.kind) {
+        case ExpressionKind::NamedValue: case ExpressionKind::HierarchicalValue:
+            return &a.as<ValueExpressionBase>().symbol == &b.as<ValueExpressionBase>().symbol;
+        case ExpressionKind::IntegerLiteral:
+            return exactlyEqual(a.as<IntegerLiteral>().getValue(), b.as<IntegerLiteral>().getValue());
+        case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+            return exactlyEqual(a.as<UnbasedUnsizedIntegerLiteral>().getValue(), b.as<UnbasedUnsizedIntegerLiteral>().getValue());
+        case ExpressionKind::UnaryOp:
+            return a.as<UnaryExpression>().op == b.as<UnaryExpression>().op &&
+                   sameExpr(a.as<UnaryExpression>().operand(), b.as<UnaryExpression>().operand());
+        case ExpressionKind::BinaryOp: {
+            const auto &x = a.as<BinaryExpression>(), &y = b.as<BinaryExpression>();
+            return x.op == y.op && sameExpr(x.left(), y.left()) && sameExpr(x.right(), y.right());
+        }
+        case ExpressionKind::Conversion:
+            return sameExpr(a.as<ConversionExpression>().operand(), b.as<ConversionExpression>().operand());
+        case ExpressionKind::ElementSelect:
+            return sameExpr(a.as<ElementSelectExpression>().value(), b.as<ElementSelectExpression>().value()) &&
+                   sameExpr(a.as<ElementSelectExpression>().selector(), b.as<ElementSelectExpression>().selector());
+        case ExpressionKind::MemberAccess:
+            return &a.as<MemberAccessExpression>().member == &b.as<MemberAccessExpression>().member &&
+                   sameExpr(a.as<MemberAccessExpression>().value(), b.as<MemberAccessExpression>().value());
+        default: return false;
+    }
+}
+static bool sameArgs(const slang::ast::AssertionInstanceExpression& a, const slang::ast::AssertionInstanceExpression& b) {
+    using namespace slang::ast;
+    if (a.arguments.size() != b.arguments.size()) return false;
+    for (size_t k = 0; k < a.arguments.size(); k++) {
+        const auto& [fa, va] = a.arguments[k];
+        const auto& [fb, vb] = b.arguments[k];
+        if (fa != fb || va.index() != vb.index()) return false;
+        if (auto* x = std::get_if<const Expression*>(&va)) {
+            if (!sameExpr(**x, *std::get<const Expression*>(vb))) return false;
+        } else if (auto* x = std::get_if<const AssertionExpr*>(&va)) {
+            const AssertionExpr* y = std::get<const AssertionExpr*>(vb);
+            if (*x == y) continue;
+            if ((*x)->kind != AssertionExprKind::Simple || y->kind != AssertionExprKind::Simple) return false;
+            const auto &sx = (*x)->as<SimpleAssertionExpr>(), &sy = y->as<SimpleAssertionExpr>();
+            if (sx.repetition || sy.repetition || !sameExpr(sx.expr, sy.expr)) return false;
+        } else if (va != vb) return false;
+    }
+    return true;
+}
 const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
     using namespace slang::ast;
     auto& st = sva::store();
     if (const auto* ai = instanceOf(a); ai && ai->symbol.kind == SymbolKind::Property) {
+        if (ai->isRecursiveProperty) {
+            // slang expands a recursive property twice and leaves a placeholder
+            // for the instance inside the second expansion. With the same
+            // arguments at both levels, the placeholder is the second
+            // expansion again: a REC term for it.
+            std::vector<size_t> same;
+            for (size_t k = recStack.size(); k-- > 0 && same.size() < 2;)
+                if (&recStack[k].ai->symbol == &ai->symbol) same.push_back(k);
+            if (same.size() < 2) unsupported("recursive property (16.12.17)");
+            if (!sameArgs(*recStack[same[0]].ai, *recStack[same[1]].ai))
+                unsupported("a recursive property whose arguments change from one level to the next (16.12.17)");
+            if (svb && !svb->more.empty()) unsupported("a recursive property in a multiclock assertion (16.12.17)");
+            RecEnt& e = recStack[same[0]];
+            if (e.idx < 0) e.idx = st.recNew();
+            return st.rec(e.idx);
+        }
+        recStack.push_back({ai, -1});
         int init = instLocals(*ai);
-        return st.init(init, propTerm(ai->body, strong));
+        const sva::Node* r = st.init(init, propTerm(ai->body, strong));
+        RecEnt e = recStack.back();
+        recStack.pop_back();
+        if (e.idx >= 0) {
+            if (init >= 0) unsupported("a recursive property with local variables (16.12.17)");
+            st.recBody[(size_t)e.idx] = r;
+        }
+        return r;
     }
     if (isSeq(a)) return st.pseq(seqTerm(a), strong);
     switch (a.kind) {
@@ -944,6 +1021,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     struct Reset { ~Reset() { sva::store().localAtoms = nullptr; sva::store().clk = 0; } } reset;
     for (;;) {
         if (const auto* ai = instanceOf(*a); ai && ai->symbol.kind == SymbolKind::Property) {
+            recStack.push_back({ai, -1});
             inits.push_back(instLocals(*ai));
             a = &ai->body;
         } else if (a->kind == AssertionExprKind::Clocking) {
@@ -974,7 +1052,15 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         c.root = sva::store().covseq(seqTerm(*a));
     } else
         c.root = propTerm(*a, dir == AD_COVER);
-    for (size_t k = inits.size(); k-- > 0;) c.root = sva::store().init(inits[k], c.root);
+    for (size_t k = inits.size(); k-- > 0;) {
+        c.root = sva::store().init(inits[k], c.root);
+        RecEnt e = recStack.back();   // a leading instance that recurs (16.12.17)
+        recStack.pop_back();
+        if (e.idx >= 0) {
+            if (inits[k] >= 0) unsupported("a recursive property with local variables (16.12.17)");
+            sva::store().recBody[(size_t)e.idx] = c.root;
+        }
+    }
     sva::store().localAtoms = nullptr;
     if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
     std::string name = asserts()[c.id].name;
