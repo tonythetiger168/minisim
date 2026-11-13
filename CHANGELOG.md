@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
+  flop, the nets and logic between it and the reader (a glitch source for
+  CDC003), the synchronizer stages, and the qualifier of an enable-qualified
+  bus.
 - `mlint -cdc-sva`: handshake checks are now an alternation check that
   holds on both sides (the side that starts a transfer and the side that
   answers), and an acknowledge read back through logic (an FSM) counts.
