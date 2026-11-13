@@ -47,6 +47,11 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
+  `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
+  TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
+  context per hart. The riscv-tests run grows to 144 programs (rv32si, and
+  the `v` environment with paging on), all passing.
 - The `minisimCore` package installs `compat.hpp`, so a tool built against the
   installed kernel can register its vendor command-line rules too.
 - UPF `use_interface_cell -force_function` (IEEE 1801-2024 6.62) is
