@@ -1404,6 +1404,7 @@ enum class Op {
     // a new empty container shaped like conts[0].
     StructClone, DynAlloc,
     DynById,   // %p only: the container whose id kids[0] is (0 or X: an empty one)
+    Future,    // kids[0] read at the next global clock tick (16.9.4); gone once the assertion is built
     ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
@@ -2770,6 +2771,7 @@ inline Val eval(const E& e, const Reader& rd) {
             parent.elem = std::make_shared<DynObj>((*e->conts)[0].second);
             return dynNewElem(parent);
         }
+        case Op::Future: return k(0);
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {
             auto& d = dynStore()[R(e->sig)];

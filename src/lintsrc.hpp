@@ -42,7 +42,8 @@ inline const std::vector<const char*>& textRules() {
 inline const std::vector<const char*>& syntaxRules() {
     static const std::vector<const char*> r = {"SUS001", "STY005", "STY006", "STY007",
                                                "STY008", "STY009", "W009", "NAME015", "NAME016", "NAME017",
-                                               "SUS002", "SUS003", "STY010", "STY012"};
+                                               "SUS002", "SUS003", "STY010", "STY012",
+                                               "STY013", "STY014", "STY015", "SUS004"};
     return r;
 }
 inline bool any(const Rules& rules, const std::vector<const char*>& ids) {
@@ -187,6 +188,10 @@ struct Walk : SyntaxVisitor<Walk> {
                               : nullptr;
         if (instead)
             add("SUS003", s.systemIdentifier.location(), std::string(n) + ": use " + instead);
+        // $test$plusargs("x") says only whether +x was given; +x=0 reads as on.
+        if (n == "$test$plusargs")
+            add("SUS004", s.systemIdentifier.location(),
+                "$test$plusargs: +NAME=0 still counts as given; read the value with $value$plusargs");
     }
     void handle(const LiteralExpressionSyntax& s) {
         if (s.kind == SyntaxKind::StringLiteralExpression && rules.enabled("STY010")) {
@@ -195,6 +200,37 @@ struct Walk : SyntaxVisitor<Walk> {
             if (at == std::string_view::npos) at = raw.find("\\\r\n");
             if (at != std::string_view::npos)
                 add("STY010", s.literal.location() + at, "a string carried over the line with a backslash; join two strings with {}");
+        }
+        if (s.kind == SyntaxKind::StringLiteralExpression && rules.enabled("STY015")) formats(s.literal);
+    }
+    // "%h" should read "0x%h", "%b" "0b%b", and "%d" carries no radix prefix.
+    void formats(Token lit) {
+        std::string_view raw = lit.rawText();
+        for (size_t i = 0; i + 1 < raw.size(); i++) {
+            if (raw[i] != '%') continue;
+            if (raw[i + 1] == '%') { i++; continue; }
+            size_t j = i + 1;
+            while (j < raw.size() && (std::isdigit((unsigned char)raw[j]) || raw[j] == '-')) j++;
+            if (j >= raw.size()) break;
+            char c = (char)std::tolower((unsigned char)raw[j]);
+            auto before = [&](std::string_view a, std::string_view b) {
+                std::string_view pre = raw.substr(0, i);
+                auto ends = [&](std::string_view x) {
+                    if (pre.size() < x.size()) return false;
+                    for (size_t k = 0; k < x.size(); k++)
+                        if (std::tolower((unsigned char)pre[pre.size() - x.size() + k]) != x[k]) return false;
+                    return true;
+                };
+                return ends(a) || ends(b);
+            };
+            std::string spec(raw.substr(i, j - i + 1));
+            if ((c == 'h' || c == 'x') && !before("0x", "'h"))
+                add("STY015", lit.location() + i, "\"" + spec + "\" prints hex with no prefix; write 0x" + spec);
+            else if (c == 'b' && !before("0b", "'b"))
+                add("STY015", lit.location() + i, "\"" + spec + "\" prints binary with no prefix; write 0b" + spec);
+            else if (c == 'd' && (before("0x", "'h") || before("0b", "'b")))
+                add("STY015", lit.location() + i, "\"" + spec + "\" prints decimal after a hex or binary prefix");
+            i = j;
         }
     }
     void handle(const ConstraintDeclarationSyntax& s) {
@@ -252,6 +288,37 @@ struct Walk : SyntaxVisitor<Walk> {
         }
         visitDefault(s);
     }
+    // parameter in a module body, package or class body: overridable only by defparam (or not at all).
+    void handle(const ParameterDeclarationStatementSyntax& s) {
+        if (s.parameter->keyword.kind == TokenKind::ParameterKeyword)
+            add("STY014", s.parameter->keyword.location(),
+                "parameter outside a #(...) parameter list; use localparam for a constant, or move it into #(...)");
+        visitDefault(s);
+    }
+
+    // if, else, loops and always/initial bodies without begin ... end.
+    void body(const SyntaxNode& st, Token kw) {
+        if (!rules.enabled("STY013")) return;
+        const SyntaxNode* n = &st;
+        if (n->kind == SyntaxKind::TimingControlStatement) n = n->as<TimingControlStatementSyntax>().statement.get();
+        if (n->kind == SyntaxKind::SequentialBlockStatement || n->kind == SyntaxKind::ParallelBlockStatement ||
+            n->kind == SyntaxKind::EmptyStatement)
+            return;
+        add("STY013", kw.location(), std::string(kw.valueText()) + " body with no begin ... end");
+    }
+    void handle(const ConditionalStatementSyntax& s) {
+        body(*s.statement, s.ifKeyword);
+        if (s.elseClause && s.elseClause->clause->kind != SyntaxKind::ConditionalStatement)
+            body(*s.elseClause->clause, s.elseClause->elseKeyword);
+        visitDefault(s);
+    }
+    void handle(const ForLoopStatementSyntax& s) { body(*s.statement, s.forKeyword); visitDefault(s); }
+    void handle(const ForeachLoopStatementSyntax& s) { body(*s.statement, s.keyword); visitDefault(s); }
+    void handle(const LoopStatementSyntax& s) { body(*s.statement, s.repeatOrWhile); visitDefault(s); }
+    void handle(const ForeverStatementSyntax& s) { body(*s.statement, s.foreverKeyword); visitDefault(s); }
+    void handle(const DoWhileStatementSyntax& s) { body(*s.statement, s.doKeyword); visitDefault(s); }
+    void handle(const ProceduralBlockSyntax& s) { body(*s.statement, s.keyword); visitDefault(s); }
+
     void handle(const ParameterDeclarationSyntax& s) {
         // parameter DisableFoo = 0: "not disabled" is a double negative at every use.
         if (rules.enabled("NAME017"))

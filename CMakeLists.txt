@@ -256,6 +256,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_threads
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_threads.cmake)
+  # Blocking temporaries of clocked blocks: index writes and $urandom stimulus.
+  add_test(NAME msim_seqtmp
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_seqtmp.cmake)
   # 2-state fast path vs 4-state on random expressions.
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)

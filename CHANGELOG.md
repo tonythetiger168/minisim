@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint`: four more rules after Verible's, off by default: `STY013`
+  (explicit-begin: `if`/`else`/loop/`always` bodies without `begin`),
+  `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
+  `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
+  (plusarg-assignment: `$test$plusargs`).
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their
@@ -110,6 +115,17 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiCovered` of an assertion needs an attempt, a success and no failure.
 - VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
   immediate assertion, or the boolean of a single-expression property.
+- UPF information model and Tcl queries (IEEE 1801-2024 clause 10, 11.1):
+  `upf_query_object_properties`, `upf_query_object_type`,
+  `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
+  phase 5 enforced after the first query (docs/LOWPOWER.md).
+- The UPF information model also holds abstract power sources, composite
+  domains, power state groups, state transitions, repeater strategies, power
+  models and attributes (IEEE 1801-2024 10.6.1, 10.6.3).
+- `find_objects` follows 1801-2024 6.33 in full: instances, ports and nets
+  by default, `-traverse_macros`, `-expand_to_bits`, transitive searches that
+  stop at leaf cells and macros, `-leaf_only` / `-non_leaf` for every object
+  type, and the glob forms of 6.33.2 (`[a-z]`, `\x`, `{a,b,c}`).
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -133,6 +149,10 @@ Spec references are IEEE 1800-2023 clauses.
 
   The engine is mcov's own, and it reads mcov's own databases.
   A database that does not exist is now a one-line error instead of a traceback.
+
+### Fixed
+- The `SV_TIED_HI`, `SV_TIED_LO`, `VHDL_TIED_HI` and `VHDL_TIED_LO` value
+  conversion tables are upf2hdl tables, as in IEEE 1801-2024 Annex B.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,

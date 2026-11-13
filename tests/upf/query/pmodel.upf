@@ -1,0 +1,7 @@
+# Appended to pmodel.upf: power models in the information model (10.6.1).
+proc expect {what got want} { if {$got ne $want} { error "query $what: got {$got}, want {$want}" } }
+proc prop {h p} { return [upf_query_object_properties $h -property $p] }
+expect type   [upf_query_object_type MAC_PM]  upfPowerModelT
+expect for    [prop MAC_PM upf_for_models]    mac
+expect ext    [prop [prop MAC_PM upf_effective_extents] upf_hdl_element] /u_dut/u_mac1
+expect rom    [prop ROM_PM upf_for_models]    rom
