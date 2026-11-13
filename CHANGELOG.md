@@ -154,6 +154,12 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- A for loop with a constant trip count in an always_comb or always @* block
+  is unrolled, as loops in clocked blocks already were, so the block runs as
+  straight code and can be split per output. On OpenTitan Ibex this saves 8%
+  of the instructions executed (`tests/spec/12.7.1-comb-loop-unroll.sv`).
+  The unroller also substitutes the loop variable into an indexed
+  part-select's base (`v[i*8 +: 8] = ...`).
 - The interpreter finds the matching item of a case statement with constant
   labels through a table instead of comparing label by label, and a `unique
   case` whose labels are enum names is no longer treated as possibly
