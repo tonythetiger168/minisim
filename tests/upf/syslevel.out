@@ -1,0 +1,4 @@
+1 on: energy=1 simstate=0
+2 on: energy=2 simstate=0
+3 off: energy=2 simstate=5
+4 on again: energy=3 simstate=0

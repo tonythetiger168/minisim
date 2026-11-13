@@ -1,0 +1,2 @@
+counter_tb.vhd:28:5:@206ns:(report note): count=4 n=20 st=running
+counter_tb.vhd:32:5:@207ns:(report note): done 0100 4

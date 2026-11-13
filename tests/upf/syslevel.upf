@@ -1,0 +1,17 @@
+# Power intent for syslevel.sv.
+upf_version 4.0
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_SYS -elements {u_m}
+create_supply_port VDD
+create_supply_port VSS
+create_supply_port VDD_SYS
+create_supply_net VDD
+create_supply_net VSS
+create_supply_net VDD_SYS
+connect_supply_net VDD -ports {VDD}
+connect_supply_net VSS -ports {VSS}
+connect_supply_net VDD_SYS -ports {VDD_SYS}
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+create_supply_set SS_SYS -function {power VDD_SYS} -function {ground VSS}
+associate_supply_set SS_AON -handle PD_TOP.primary
+associate_supply_set SS_SYS -handle PD_SYS.primary

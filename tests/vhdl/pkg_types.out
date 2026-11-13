@@ -1,0 +1,10 @@
+pkg_types.vhd:81:5:@1ns:(report note): add=35 tag=3
+pkg_types.vhd:85:7:@2ns:(report note): op_add -> 35
+pkg_types.vhd:85:7:@3ns:(report note): op_sub -> EB
+pkg_types.vhd:85:7:@4ns:(report note): op_and -> 00
+pkg_types.vhd:85:7:@5ns:(report note): op_or -> 35
+pkg_types.vhd:85:7:@6ns:(report note): op_xor -> 35
+pkg_types.vhd:90:5:@6ns:(report note): sum=88 max=9
+pkg_types.vhd:91:5:@6ns:(report note): parity='1' '0'
+pkg_types.vhd:92:5:@6ns:(report note): rev=11110000 3A5
+pkg_types.vhd:95:5:@7ns:(report note): mem3=FF high=15 len=8

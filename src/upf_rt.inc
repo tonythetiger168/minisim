@@ -3278,3 +3278,27 @@ struct Rt {
 inline Rt& rt() { return Rt::rt(); }
 
 }  // namespace upfrt
+
+// C and C++ models called through DPI-C (a SystemC or TLM model, 1801-2024
+// 5.14) read the power intent's state here: include/msim_upf.h.
+extern "C" {
+const char* msim_upf_power_state(const char* name) {
+    if (!g_upf || !name) return nullptr;
+    static thread_local std::string out;
+    upfrt::Rt& r = upfrt::rt();
+    std::string n = name;
+    if (auto d = r.domIdx.find(n); d != r.domIdx.end()) out = r.doms[(size_t)d->second].state;
+    else if (auto s = r.sets.find(r.m.setOf(n)); s != r.sets.end()) out = s->second.state;
+    else if (auto g = r.groupIdx.find(n); g != r.groupIdx.end()) out = r.groups[(size_t)g->second].state;
+    else out.clear();
+    return out.c_str();
+}
+int msim_upf_simstate(const char* name) {
+    if (!g_upf || !name) return -1;
+    upfrt::Rt& r = upfrt::rt();
+    std::string n = name;
+    if (auto d = r.domIdx.find(n); d != r.domIdx.end()) return r.doms[(size_t)d->second].mode;
+    if (auto s = r.sets.find(r.m.setOf(n)); s != r.sets.end()) return s->second.sim;
+    return -1;
+}
+}
