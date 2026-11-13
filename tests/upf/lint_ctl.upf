@@ -1,0 +1,23 @@
+# retlatch.sv with controls driven from the domain they control, for mlint's
+# UPF008 (isolation control), UPF009 (isolation supply), UPF010 (retention
+# control and supply) and UPF011 (power switch control).
+create_supply_port VDD
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSS
+connect_supply_net VDD -ports VDD
+connect_supply_net VSS -ports VSS
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+
+create_power_domain PD_A -elements {u_a}
+create_supply_net VA
+create_power_switch SW_A -output_supply_port {o VA} -input_supply_port {i VDD} -control_port {c u_a/en} -on_state {on i {c}}
+create_supply_set SS_A -function {power VA} -function {ground VSS}
+associate_supply_set SS_A -handle PD_A.primary
+
+set_isolation ISO_C -domain PD_A -applies_to outputs -elements {u_a/c} -isolation_supply SS_AON \
+    -clamp_value 0 -isolation_signal u_a/en -isolation_sense low
+set_isolation ISO_F -domain PD_A -applies_to outputs -elements {u_a/f} -isolation_supply SS_A \
+    -clamp_value 0 -isolation_signal sl -isolation_sense high
+set_retention RET_F -domain PD_A -retention_supply SS_AON -save_signal {u_a/en high} -restore_signal {u_a/en low}
+set_retention RET_L -domain PD_A -retention_supply SS_A -save_signal {sl high} -restore_signal {sl low}

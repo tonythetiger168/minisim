@@ -179,11 +179,14 @@ make their target `x` instead of merging values.
 - every nonblocking assignment of a block that calls a task that is not
   merged (above), or has a `fork`.
 
-An array element merges with its present value, which is exact for one
-write such as `if (we) mem[addr] <= d;`. When several possible branches
-write the same element, or a branch reads back an element it wrote, the
-result has `x` where the present value differs, even if every branch
-agrees.
+A blocking write to an element of an array of 64 elements or fewer is
+exact: the branch saves, puts back and merges every element of the array
+like a variable, so branches that write the same element, or read back what
+they wrote, merge only the values they wrote. In a larger array, and for a
+nonblocking write, the element merges with its present value, which is exact
+for one write such as `if (we) mem[addr] <= d;`. When several possible
+branches write the same element of such an array, the result has `x` where
+the present value differs, even if every branch agrees.
 
 Known limit: two signals of one event list that change in the same time
 step but in different delta cycles, the first with a clean edge and the
