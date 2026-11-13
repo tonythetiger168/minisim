@@ -503,7 +503,13 @@ void run(Compilation& comp, Report& rep, const lintrules::Params& P, unsigned th
     std::sort(bufs.begin(), bufs.end(), [&](BufferID a, BufferID b) {
         return std::make_pair(sm.getRawFileName(a), a.getId()) < std::make_pair(sm.getRawFileName(b), b.getId());
     });
-    auto trees = comp.getSyntaxTrees();
+    std::vector<std::shared_ptr<SyntaxTree>> trees;
+    for (auto& t : comp.getSyntaxTrees()) {
+        SourceLocation at = t->root().getFirstToken().location();
+        std::string_view name = at.buffer() ? sm.getRawFileName(at.buffer()) : std::string_view{};
+        if (!name.empty() && (name.front() == '<' || skip(name))) continue;   // generated text
+        trees.push_back(t);
+    }
     size_t nt = any(rep.rules, syntaxRules()) ? trees.size() : 0;
     std::vector<std::vector<Found>> found(bufs.size() + nt);
     par::parallelFor(found.size(), threads, [&](size_t i) {

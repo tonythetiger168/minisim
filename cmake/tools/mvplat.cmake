@@ -23,7 +23,7 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS mvplat RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES src/vp/bus.hpp src/vp/devices.hpp src/vp/elf.hpp src/vp/ext.hpp src/vp/fdt.hpp src/vp/json.hpp
+install(FILES src/vp/bus.hpp src/vp/devices.hpp src/vp/elf.hpp src/vp/ext.hpp src/vp/fdt.hpp src/vp/fpu.hpp src/vp/json.hpp
               src/vp/machine.hpp src/vp/rv32.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/minisim/vp)
 install(FILES docs/VPLAT.md DESTINATION ${CMAKE_INSTALL_DOCDIR})

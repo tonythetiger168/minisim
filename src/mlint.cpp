@@ -31,6 +31,7 @@
 #include "lintformal.hpp"
 #include "lintsoc.hpp"
 #include "lintsrc.hpp"
+#include "vhdl/front.hpp"
 #ifdef MINISIM_TIDY
 #include "linttidy.hpp"
 #endif
@@ -75,6 +76,19 @@ void checkDrivers(const std::map<const Symbol*, std::vector<SourceLocation>>& dr
                     " processes; in simulation the last write wins and in synthesis this is a "
                     "multiple-driver error");
     }
+}
+
+// --------------------------------------------------------------------- VHDL
+// VHDL is linted through its SystemVerilog translation (src/vhdl/sv.hpp).
+// Findings in the translator's own runtime package, and rules that only see
+// how the translation is written (=== for std_logic '=', a process as
+// "always begin ... @(list); end", always rather than always_ff), say
+// nothing about the VHDL.
+inline bool vhdlNoise(const Finding& f) {
+    if (f.file.empty() || f.file == "vhdl_design.sv" || f.file.front() == '<') return true;
+    if (!vhdl::isVhdlFile(f.file)) return false;
+    static const std::set<std::string> rules = {"STY003", "SYN003", "SYN010", "SEQ003", "TIDY006", "FSM003"};
+    return rules.count(f.rule) > 0;
 }
 
 // ------------------------------------------------------------- UPF (1801)
@@ -363,6 +377,7 @@ int main(int argc, char** argv) {
     bool werror = false, quiet = false, powerTopSet = false, showWaived = false, list = false, stats = false;
     std::string upfPath, powerTop, jsonPath, explainRule;
     std::vector<std::string> bboxPats, abstractIn;  // the SoC flow (lintsoc.hpp)
+    std::vector<std::string> vhdlFiles;            // VHDL sources (src/vhdl/)
     std::string abstractOut, htmlPath;
     unsigned threads = par::defaultThreads();
     FrontEnd fe;
@@ -433,6 +448,8 @@ int main(int argc, char** argv) {
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
         if (fe.prot.take(argc, argv, i)) continue;
+        if (a == "-v93" || a == "-v2008" || a == "-vhdl2008" || a == "-v200x" || a == "-vhdl93" || a == "-vhdl87") continue;
+        if (a.size() && a[0] != '-' && vhdl::isVhdlFile(a)) { vhdlFiles.push_back(a); continue; }
         fwd.push_back(a);
     }
     lintrules::Params params = lintrules::Params::from(cfg, cfg.errors);
@@ -492,6 +509,27 @@ int main(int argc, char** argv) {
         fwd.insert(fwd.begin() + 1, stubFile);
     }
     RmPkg rmStub{stubFile};
+
+    // VHDL (src/vhdl/, the front end msim uses): translated to SystemVerilog
+    // with `line directives, so findings point at the VHDL source. slang wants
+    // at least one SystemVerilog file; an empty one stands in.
+    std::string vhdlStub;
+    if (!vhdlFiles.empty()) {
+        char tmpl[] = "/tmp/mlint_vhdlXXXXXX.sv";
+        int fd = mkstemps(tmpl, 3);
+        if (fd < 0) {
+            std::cerr << "mlint: cannot write a temporary file\n";
+            return 2;
+        }
+        close(fd);
+        vhdlStub = tmpl;
+        fwd.push_back(vhdlStub);
+        fe.afterParse = [&](driver::Driver& drv) {
+            vhdl::Translator tr;
+            return vhdl::addVhdl(drv, vhdlFiles, "", "mlint", tr);
+        };
+    }
+    RmPkg rmVhdl{vhdlStub};
 
     // Where the time goes, for -stats.
     using Clock = std::chrono::steady_clock;
@@ -610,7 +648,9 @@ int main(int argc, char** argv) {
     }
     lap("formal-assisted checks");
     // The source text and the syntax trees (lintsrc.hpp).
-    lintsrc::run(*fe.comp, rep, params, threads, [&](std::string_view f) { return !pkgFile.empty() && f == pkgFile; });
+    // The translated VHDL is not the user's text: only the semantic rules see it.
+    lintsrc::run(*fe.comp, rep, params, threads,
+                 [&](std::string_view f) { return (!pkgFile.empty() && f == pkgFile) || f == "vhdl_design.sv"; });
     lap("text and syntax rules");
 #ifdef MINISIM_TIDY
     if (tidy) linttidy::run(*fe.comp, *am, fe.driver.diagEngine, rep, threads);
@@ -623,6 +663,7 @@ int main(int argc, char** argv) {
         boxes.add(*fe.comp, bboxPats);
         // The stub file may be named relative to the working directory.
         std::erase_if(rep.out, [&](const Finding& f) {
+            if (!vhdlFiles.empty() && vhdlNoise(f)) return true;
             return (!stubFile.empty() && f.file.ends_with(stubFile.substr(stubFile.rfind('/') + 1))) || boxes.inside(f);
         });
     }

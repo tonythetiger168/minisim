@@ -2944,6 +2944,8 @@ endpackage
     std::set<std::string> litNames;   // enumeration literal SV names used in the current container
 
     void emitObject(std::ostringstream& o, const DP& d, const std::string& where) {
+        // Diagnostics about a signal (mlint's unused-signal rules) point at its declaration.
+        if (where == "module" && d->line > 0) o << lineDir(d->line);
         TP t = subtype(d->type);
         for (size_t k = 0; k < d->names.size(); ++k) {
             Sym y;
@@ -3839,6 +3841,7 @@ endpackage
             }
             // ports
             std::vector<std::string> portList;
+            std::vector<int> portLines;   // each port's VHDL line, for diagnostics about it
             std::vector<std::pair<std::string, TP>> portSigs;
             for (auto& p : ent->ports) {
                 TP t = subtype(p->type);
@@ -3868,6 +3871,7 @@ endpackage
                     else decl = dir + " " + svDecl(t, sv);
                     if (p->mode == "in" && p->init) decl += " = " + ex(p->init, t).s;
                     portList.push_back(decl);
+                    portLines.push_back(p->line);
                     if (net) c.drvNames[sv] = sv;
                 }
             }
@@ -3882,7 +3886,8 @@ endpackage
                 o << ")";
             }
             o << " (";
-            for (size_t i = 0; i < portList.size(); ++i) o << (i ? ",\n    " : "\n    ") << portList[i];
+            for (size_t i = 0; i < portList.size(); ++i)
+                o << (i ? ",\n" : "\n") << (portLines[i] > 0 ? lineDir(portLines[i]) : std::string()) << "    " << portList[i];
             o << ");\n";
             o << "  timeunit " << timeUnit << "; timeprecision " << timePrec << ";\n";
             // signals with several drivers are wires

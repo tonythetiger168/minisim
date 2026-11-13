@@ -6,7 +6,7 @@
 //   mvplat prog.elf -harts 4                four harts, on every core
 //   mvplat prog.elf -trace commits.log      a commit log, in spike's format
 //
-// The platform is RV32IMAC or RV64IMAC harts (machine, supervisor and user mode, PMP, Sv32 or Sv39) on a bus of
+// The platform is RV32GC or RV64GC harts (machine, supervisor and user mode, PMP, Sv32 or Sv39) on a bus of
 // RAM, ROM, a 16550 UART, a CLINT, a PLIC and a test finisher. Several harts
 // run on several threads with the same result as on one (vp/machine.hpp says
 // how). Options and device types this file does not know go to an extension
@@ -319,6 +319,14 @@ bool bootOs(Machine& m, const Options& o) {
     unsigned w = rv64 ? 8 : 4;
     for (unsigned i = 0; i < 6; i++) wrLE(ib + i * w, w, info[i]);
     m.poke(infoAddr, ib, 6 * w);
+    // What -input types reaches the console once the kernel's driver is up.
+    for (auto& d : m.bus.devices())
+        if (d->type == "uart16550") {
+            auto* u = static_cast<Uart16550*>(d.get());
+            u->held.insert(u->held.end(), u->rx.begin(), u->rx.end());
+            u->rx.clear();
+            break;
+        }
     for (auto& h : m.harts) {
         h->rv64 = rv64;
         h->pc = entry;
