@@ -1,6 +1,7 @@
 // IEEE 1800-2023 6.5 Nets and variables: a variable may be written by a
 // continuous assignment to some of its bits (or members) and by procedures
 // to the others. The procedural bits keep their values; they do not become z.
+//! icarus-skip: Icarus rejects a variable written by both a continuous assignment and procedures
 module drv(input logic clk, output logic a, output logic [3:0] d);
   always @(posedge clk) begin a <= 1'b1; d <= 4'b0101; end
 endmodule
