@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI parameters (37.28): type parameters (`vpiTypeParameter`) in
+  `vpi_iterate(vpiParameter, module)`, a parameter's default through
+  `vpiExpr`, param assigns (`vpiParamAssign`: the `#(...)` overrides with
+  `vpiLhs`, `vpiRhs`, `vpiConnByName`) and def params (`vpiDefParam`).
+  An instance array's `vpiExpr` is its connection list (a `vpiListOp`,
+  37.11), and net declaration assignments are `vpiContAssign` objects with
+  `vpiNetDeclAssign` (37.40). `tests/spec/37.28-vpi-param-assign.sv`.
 - mvplat harts are RV32GC / RV64GC: the F and D extensions (IEEE 754 single
   and double, every rounding mode, `fflags`/`frm`/`fcsr`, NaN boxing,
   `mstatus.FS`/`SD`, the compressed FP loads and stores). 430 riscv-tests
