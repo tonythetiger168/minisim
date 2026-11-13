@@ -48,6 +48,12 @@ Spec references are IEEE 1800-2023 clauses.
   riscv64 kernel boot to user space on 1 to 4 harts. Instruction fetch with
   paging on keeps the last page translated, and loads and stores keep the
   last 64 pages each: 25 to 50 MIPS under Linux. Extension ABI 6.
+- msim VHDL: protected types (classes), access types (`new`, `null`,
+  `.all`, `deallocate`, linked lists through incomplete types, growable
+  arrays), generic packages and package instantiation, VHDL-2019
+  `std.env` queries, enumeration literals overloaded with functions, and
+  procedures as void functions so VHDL functions can call them.
+  `tests/vhdl/protected.vhd`, `access.vhd`, `generic_pkg.vhd` (GHDL goldens).
 - VPI class definitions (37.31): `vpiVariables` of a class defn gives its
   automatic properties too (before only static ones), as declarations
   with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);

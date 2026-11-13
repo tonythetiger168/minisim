@@ -37,7 +37,11 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | component / entity / SV module instance | a module instance; a VHDL component binds to the VHDL entity or SV module with its name, matched case-insensitively |
 | for / if / case generate, block | generate blocks |
 | a resolved signal with several drivers (tri-state buses) | a wire; every driving process drives its own variable |
-| function, procedure | `function automatic` / `task automatic`; ones with unconstrained array parameters or results, or signal parameters, are specialized per call so the widths are known |
+| function, procedure | `function automatic`; a procedure is a `function automatic void` unless it waits or assigns a signal (then a `task automatic`), so VHDL functions can call it. Ones with unconstrained array parameters or results, or signal parameters, are specialized per call so the widths are known |
+| protected type (5.6) | a class; `shared variable` and protected variables hold an object made at elaboration; methods are class methods (a method that needs a per-call specialization is a function taking the object) |
+| access type (5.4) | a class handle: `new`, `null`, `.all`, implicit dereference, `deallocate`. A designated record's elements are the class's own members (so a list node may hold the access type); an array is a dynamic array with its left bound and direction |
+| incomplete type | a forward `typedef class`, completed by the full declaration |
+| generic package, package instantiation (4.7, 4.9) | one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals |
 | `report`, `assert` | a message in GHDL's format (`file:line:col:@time:(report note): text`); severity failure stops the run with a non-zero exit |
 | `std.env.stop` / `finish` | `$stop` / `$finish` |
 | enumerations, records, arrays | enum, packed or unpacked struct, packed (bit-like elements) or unpacked arrays |
@@ -52,7 +56,10 @@ declared name.
 Design units: entity, architecture, package, package body, context clauses
 (`library`, `use`). Types: enumeration, integer and real ranges, physical
 types, constrained and unconstrained arrays (multi-dimensional too), records,
-subtypes, `line`/`text`, access to string. Statements: all sequential
+subtypes, `line`/`text`, access types (to scalars, records, arrays and
+string), incomplete types, protected types and their bodies. Generic
+packages and package instantiation with type, constant and subprogram
+generics. Statements: all sequential
 statements (if, case, case?, loops with labels and `next`/`exit` to outer
 loops, `wait on/until/for` and combinations, signal and variable assignment
 including VHDL-2008 conditional and selected forms, force/release), process
@@ -66,7 +73,9 @@ readline/writeline, files), `std.env`, `ieee.std_logic_1164`,
 `uniform`), `ieee.std_logic_unsigned` / `std_logic_signed` /
 `std_logic_arith` (the Synopsys packages), and VHDL-2008's `to_string`,
 `to_hstring`, `to_ostring`, `minimum`, `maximum`, reduction operators,
-matching relational operators and `??`. Attributes: `'event`,
+matching relational operators and `??`, `justify`, and VHDL-2019's
+`std.env` tool and source queries (`tool_name`, `vhdl_version`,
+`file_name`, `file_path`, `file_line`). Attributes: `'event`,
 `'last_value`, `'stable`, `'length`, `'range`, `'reverse_range`, `'left`,
 `'right`, `'high`, `'low`, `'ascending`, `'image`, `'value`, `'pos`, `'val`,
 `'succ`, `'pred`, `'subtype`, `'element`.
@@ -87,9 +96,13 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
 - Configurations (choosing an architecture other than the last analyzed),
   configuration instances, and conversion functions in port maps.
 - Unconstrained ports (an entity port without a range).
-- Generic types, generic subprograms, generic packages and package
-  instantiation (VHDL-2008), protected types, guarded signals and blocks
-  with ports.
+- Guarded signals and blocks with ports; package generics (a generic
+  package passed to another); generic types and subprograms on entities and
+  subprograms (generic packages have them); package instantiation inside a
+  declarative region (library-level instances work).
+- Access types: to a bit vector or a multidimensional array; a slice
+  through an access value read as a whole array starts at index 0 inside a
+  specialized subprogram (`'left` reads 0).
 - `'delayed`, `'transaction`, `'last_event`, `'stable(T)`, `'quiet(T)`.
 - Integer range checks: an out-of-range value is not an error.
 - `'image` of a real prints `%g`-style text, not exactly GHDL's.
