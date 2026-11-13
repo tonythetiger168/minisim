@@ -6,7 +6,7 @@
 //               tb.u.a_gnt.passes and tb.u.a_gnt.fails (32 bits): how many
 //               attempts have passed (a cover: matched) and failed so far.
 //               A failure is a step in .fails at the time it is reported.
-//   -vcd-power  each power domain PD (msim -upf) gets upf.PD.simstate
+//   -vcd-power  each power domain PD (msim -upf) gets TOP.upf.PD.simstate
 //               (0 NORMAL, 1 CORRUPT_STATE_ON_CHANGE, 2 CORRUPT_STATE_ON_ACTIVITY,
 //               3 CORRUPT_ON_CHANGE, 4 CORRUPT_ON_ACTIVITY, 5 CORRUPT; 9.6),
 //               each supply net upf.NET.state (0 OFF, 1 FULL_ON, 2 PARTIAL_ON,
@@ -31,8 +31,14 @@ inline int mk(const std::string& n, int w) {
     return s;
 }
 
+// Each view starts at its value now, so the first slot has no step.
+inline void prime(size_t from) {
+    for (size_t k = from; k < S.statViews.size(); k++)
+        S.sigs[(size_t)S.statViews[k].sig].val = make(S.statViews[k].get(), 0, S.sigs[(size_t)S.statViews[k].sig].w);
+}
+
 inline size_t sva() {
-    size_t made = 0;
+    size_t made = 0, from = S.statViews.size();
     for (size_t i = 0; i < asserts().size(); i++) {
         const AssertInfo& a = asserts()[i];
         if (a.hidden || a.prot || a.name.empty()) continue;
@@ -41,6 +47,7 @@ inline size_t sva() {
         S.statViews.push_back({mk(n + ".fails", 32), [i] { return asserts()[i].fails; }});
         made++;
     }
+    prime(from);
     return made;
 }
 
@@ -54,7 +61,7 @@ inline std::string dotted(std::string n) {
 inline size_t power() {
     auto& rt = upfrt::rt();
     if (!rt.on) return 0;
-    size_t made = 0;
+    size_t made = 0, from = S.statViews.size();
     for (size_t i = 0; i < rt.doms.size(); i++) {
         if (rt.doms[i].region) continue;
         S.statViews.push_back({mk("upf." + dotted(rt.doms[i].name) + ".simstate", 3),
@@ -70,11 +77,12 @@ inline size_t power() {
                                }});
         S.statViews.push_back({mk(n + ".mV", 32), [key] {
                                    auto it = upfrt::rt().val.find(key);
-                                   if (it == upfrt::rt().val.end() || !it->second.hasV || it->second.st == S_OFF) return (uint64_t)0;
+                                   if (it == upfrt::rt().val.end() || !it->second.hasV || it->second.st == upf::S_OFF) return (uint64_t)0;
                                    return (uint64_t)std::llround(it->second.v * 1000.0);
                                }});
         made++;
     }
+    prime(from);
     return made;
 }
 
