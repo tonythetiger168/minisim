@@ -115,6 +115,10 @@ class Uart16550 : public Device {
 public:
     unsigned shift = 0, irq = 0;
     std::deque<uint8_t> rx;
+    // Input held back until the software turns the receive interrupt on, as
+    // an operating system's driver does once it has set the port up (and
+    // cleared its FIFO): what a user types after the system is up.
+    std::deque<uint8_t> held;
 
     Uart16550() { type = "uart16550"; }
     Acc read(uint64_t off, unsigned, uint64_t& v, const Who& w) override {
@@ -153,9 +157,17 @@ public:
                 break;
             case 1:
                 if (lcr_ & 0x80) dlm_ = b;
-                else { bool was = ier_ & 2; ier_ = b & 0x0f; if (!was && (ier_ & 2)) thri_ = true; update(); }
+                else {
+                    bool was = ier_ & 2;
+                    ier_ = b & 0x0f;
+                    if (!was && (ier_ & 2)) thri_ = true;
+                    if ((ier_ & 1) && !held.empty()) { rx.insert(rx.end(), held.begin(), held.end()); held.clear(); }
+                    update();
+                }
                 break;
-            case 2: break;  // FCR: FIFOs are always on
+            case 2:  // FCR: FIFOs are always on; bit 1 empties the receive FIFO
+                if (b & 2) { rx.clear(); update(); }
+                break;
             case 3: lcr_ = b; break;
             case 4: mcr_ = b; break;
             case 7: scr_ = b; break;
@@ -168,6 +180,8 @@ public:
         w.u32(dll_ | dlm_ << 8 | (thri_ ? 1u << 16 : 0));
         w.u64(rx.size());
         for (uint8_t c : rx) w.bytes(&c, 1);
+        w.u64(held.size());
+        for (uint8_t c : held) w.bytes(&c, 1);
     }
     void load(Reader& r) override {
         uint32_t a = r.u32(), b = r.u32();
@@ -175,6 +189,8 @@ public:
         dll_ = b & 0xff; dlm_ = (b >> 8) & 0xff; thri_ = (b >> 16) & 1;
         rx.clear();
         for (uint64_t n = r.u64(); n; n--) { uint8_t c; r.read(&c, 1); rx.push_back(c); }
+        held.clear();
+        for (uint64_t n = r.u64(); n; n--) { uint8_t c; r.read(&c, 1); held.push_back(c); }
         update();
     }
     uint64_t transmitted() const { return tx_; }
