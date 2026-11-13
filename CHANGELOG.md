@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint`: four more rules after Verible's, off by default: `STY013`
+  (explicit-begin: `if`/`else`/loop/`always` bodies without `begin`),
+  `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
+  `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
+  (plusarg-assignment: `$test$plusargs`).
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their
