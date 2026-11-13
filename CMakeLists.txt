@@ -267,7 +267,7 @@ if(MINISIM_WITH_SLANG)
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_partcomp.cmake)
   # Siemens vlib/vlog/vcom/vsim and Synopsys vlogan/vhdlan/vcs/simv flows.
   add_test(NAME msim_mstep
-           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR} "-DUVM_HOME=${UVM_HOME}"
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mstep
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_mstep.cmake)
   # Simulation profile (msim -profile): processes, instances, kinds.

@@ -10,8 +10,10 @@
 //   vlogan -sverilog -work work dut.sv tb.sv; vhdlan ctr.vhd
 //   vcs -debug_access+all tb -o simv; ./simv +ntb_random_seed=5 -l run.log
 //
+// vopt checks a design and records it under a name that vsim then runs.
+//
 // msim takes this front end when it is invoked under one of these names
-// (a link or copy of the binary; minisim ships none), or with -vlog, -vcom,
+// (a link or copy of the binary; minisim ships none), or with -vlog, -vcom, -vopt,
 // -vsim, -vlib, -vmap, -vlogan, -vhdlan or -vcs as the first option.
 //
 // A library is a directory (./work by default). It holds one text file,
@@ -46,7 +48,7 @@ namespace mstep {
 
 namespace fs = std::filesystem;
 
-enum class Tool { None, Vlib, Vmap, Vlog, Vcom, Vsim, Vlogan, Vhdlan, Vcs, Simv };
+enum class Tool { None, Vlib, Vmap, Vlog, Vcom, Vopt, Vsim, Vlogan, Vhdlan, Vcs, Simv };
 
 struct Opts {
     Tool tool = Tool::None;
@@ -335,6 +337,25 @@ inline int analyse(const Opts& o, const std::vector<std::string>& args) {
     if (files.empty()) { std::cerr << o.name << ": no source files\n"; return 2; }
     LibMap m = readMap(snps(o.tool), ini);
     std::string dir = libDir(m, work);
+    // vlog finds Questa's precompiled UVM by itself: a file that imports
+    // uvm_pkg or includes uvm_macros.svh gets msim's UVM (-uvm), unless the
+    // UVM sources are analysed here.
+    if (o.tool == Tool::Vlog && std::find(opts.begin(), opts.end(), "-uvm") == opts.end()) {
+        bool own = false, uses = false;
+        auto isPkg = [](const std::string& f) { return fs::path(f).filename() == "uvm_pkg.sv"; };
+        for (auto& f : files) own |= isPkg(f);
+        for (auto& e : readLib(dir)) own |= isPkg(e.file);
+        if (!own)
+            for (auto& f : files) {
+                if (vhdl::isVhdlFile(f)) continue;
+                std::ifstream in(f);
+                std::stringstream ss;
+                ss << in.rdbuf();
+                std::string t = ss.str();
+                uses |= t.find("uvm_pkg") != std::string::npos || t.find("uvm_macros.svh") != std::string::npos;
+            }
+        if (uses) opts.push_back("-uvm");
+    }
     if (!isLib(dir)) {
         if (snps(o.tool)) {   // vlogan / vhdlan create the library directory
             if (!makeLib(dir)) { std::cerr << o.name << ": cannot create library " << dir << "\n"; return 2; }
@@ -450,24 +471,101 @@ inline int vmap(const Opts& o, const std::vector<std::string>& args) {
 
 // ---- elaboration: the libraries' sources as one msim command line ----
 
+// The macro definitions of a +define+A=1+B token, as `define lines.
+inline std::string defineLines(const std::string& tok) {
+    std::string r;
+    std::stringstream ss(tok.substr(8));
+    for (std::string d; std::getline(ss, d, '+');) {
+        if (d.empty()) continue;
+        size_t eq = d.find('=');
+        r += "`define " + (eq == std::string::npos ? d + " 1" : d.substr(0, eq) + " " + d.substr(eq + 1)) + "\n";
+    }
+    return r;
+}
+
+// Libraries a Questa install provides precompiled: here, msim's own UVM.
+inline bool builtinUvm(const std::string& l) {
+    std::string n = lower(l);
+    return n == "uvm" || n == "mtiuvm" || n == "uvm_1_2" || n == "uvm-1.2" || n == "uvm_ieee" || n == "mtiuvm_ieee";
+}
+
 // Appends the sources of the libraries in `libs`, in order, each once, with
 // their options (each option once) in front of the files.
+//
+// Each analysis step is its own compilation unit (like vlog without -mfcu):
+// a +define+ given to one step applies to its files only. When the SV files
+// do not all share one set of +define+s, each file with its own goes to msim
+// through a small generated file in the library (_msim/units) that defines
+// them and includes it.
 inline bool collect(const LibMap& m, const std::vector<std::string>& libs, std::vector<std::string>& out,
                     const std::string& tool) {
     std::set<std::string> seenLib, seenFile, seenOpt;
-    std::vector<std::string> opts, files;
+    struct Item { Entry e; std::string dir; };
+    std::vector<Item> items;
+    std::vector<std::string> opts;
     for (auto& l : libs) {
         std::string dir = absPath(libDir(m, l));
         if (!seenLib.insert(dir).second) continue;
-        if (!isLib(dir)) { std::cerr << tool << ": library " << l << " (" << dir << ") not found\n"; return false; }
-        for (auto& e : readLib(dir)) {
-            if (!seenFile.insert(e.file).second) continue;
-            for (auto& op : e.opts)
-                if (seenOpt.insert(op).second) opts.push_back(op);
-            files.push_back(e.file);
+        if (!isLib(dir)) {
+            if (builtinUvm(l)) {   // -L uvm of a Questa install
+                if (seenOpt.insert("-uvm").second) opts.push_back("-uvm");
+                continue;
+            }
+            std::cerr << tool << ": library " << l << " (" << dir << ") not found\n";
+            return false;
+        }
+        for (auto& e : readLib(dir))
+            if (seenFile.insert(e.file).second) items.push_back({e, dir});
+    }
+    if (items.empty()) { std::cerr << tool << ": the libraries hold no sources; analyse some first\n"; return false; }
+    auto defs = [](const Entry& e) {
+        std::vector<std::string> d;
+        for (auto& op : e.opts)
+            if (starts(op, "+define+")) d.push_back(op);
+        return d;
+    };
+    bool perFile = false;
+    {
+        const std::vector<std::string>* first = nullptr;
+        std::vector<std::string> keep;
+        for (auto& it : items) {
+            if (vhdl::isVhdlFile(it.e.file)) continue;
+            auto d = defs(it.e);
+            if (!first) { keep = d; first = &keep; }
+            else if (d != keep) perFile = true;
         }
     }
-    if (files.empty()) { std::cerr << tool << ": the libraries hold no sources; analyse some first\n"; return false; }
+    std::vector<std::string> files;
+    for (auto& it : items) {
+        std::string f = it.e.file;
+        auto d = defs(it.e);
+        if (perFile && !d.empty() && !vhdl::isVhdlFile(f)) {
+            std::string text = "// generated by msim (mstep.inc): " + f + " with the +define+s it was analysed with\n";
+            for (auto& t : d) text += defineLines(t);
+            text += "`include \"" + f + "\"\n";
+            std::string ext = fs::path(f).extension().string();
+            std::string w = it.dir + "/_msim/units/" + fs::path(f).stem().string() + "_" +
+                            std::to_string(std::hash<std::string>{}(f + text) % 1000000007ULL) + (ext.empty() ? ".sv" : ext);
+            std::error_code ec;
+            fs::create_directories(it.dir + "/_msim/units", ec);
+            std::string old;
+            {
+                std::ifstream in(w);
+                std::stringstream ss;
+                ss << in.rdbuf();
+                old = ss.str();
+            }
+            if (old != text) {
+                std::ofstream wf(w);
+                wf << text;
+                if (!wf) { std::cerr << tool << ": cannot write " << w << "\n"; return false; }
+            }
+            f = w;
+        }
+        for (auto& op : it.e.opts)
+            if (!(perFile && starts(op, "+define+")) && seenOpt.insert(op).second) opts.push_back(op);
+        files.push_back(f);
+    }
     out.insert(out.end(), opts.begin(), opts.end());
     out.insert(out.end(), files.begin(), files.end());
     return true;
@@ -529,6 +627,7 @@ inline bool vsim(Opts& o, const std::vector<std::string>& args) {
     std::vector<std::string> libs, tops, rest;
     std::string ini, workLib, script;
     bool batch = false, doGiven = false, compiled = false, dirGiven = false;
+    std::string optName;   // vopt -o
     auto need = [&](size_t& i, const char* what) -> std::string {
         if (i + 1 >= in.size()) { std::cerr << o.name << ": " << in[i] << " needs " << what << "\n"; std::exit(2); }
         return in[++i];
@@ -563,6 +662,7 @@ inline bool vsim(Opts& o, const std::vector<std::string>& args) {
         }
         if (a == "-coverage") { rest.push_back("-cov"); continue; }
         if (a == "-compile") { compiled = true; rest.push_back(a); continue; }
+        if (a == "-o" && o.tool == Tool::Vopt) { optName = need(i, "a name"); continue; }
         if (a == "-o" || starts(a, "-partcomp_dir=") || starts(a, "-Mdir=")) dirGiven = true;
         if (quietDrop(a)) continue;
         if (quietDropValue(a)) { need(i, "a value"); continue; }
@@ -575,20 +675,8 @@ inline bool vsim(Opts& o, const std::vector<std::string>& args) {
         tops.push_back(a);
     }
     if (tops.empty()) { std::cerr << o.name << ": no design unit to simulate\n"; return false; }
+    if (o.tool == Tool::Vopt && optName.empty()) { std::cerr << o.name << ": -o <name> is required\n"; return false; }
     LibMap m = readMap(false, ini);
-    std::vector<std::string> order = libs;   // -L libraries first, then those of the tops
-    for (auto& t : tops) {
-        std::string l, n;
-        splitTop(t, l, n);
-        order.push_back(l.empty() ? workLib : l);
-    }
-    if (!collect(m, order, o.out, o.name)) return false;
-    for (auto& t : tops) {
-        std::string l, n;
-        splitTop(t, l, n);
-        o.out.push_back("-top");
-        o.out.push_back(n);
-    }
     std::string lib0 = absPath(libDir(m, workLib));
     std::string first;
     {
@@ -596,8 +684,57 @@ inline bool vsim(Opts& o, const std::vector<std::string>& args) {
         splitTop(tops[0], l, first);
         if (!l.empty()) lib0 = absPath(libDir(m, l));
     }
-    if (compiled && !dirGiven) { o.out.push_back("-o"); o.out.push_back(lib0 + "/_msim/" + first); }
+    // vsim of a vopt result: the design it recorded in the library.
+    std::string optFile = lib0 + "/_msim/opt/" + first + ".args";
+    if (o.tool == Tool::Vsim && tops.size() == 1 && fs::is_regular_file(optFile)) {
+        std::ifstream f(optFile);
+        for (std::string ln; std::getline(f, ln);) o.out.push_back(ln);
+    } else {
+        std::vector<std::string> order = libs;   // -L libraries first, then those of the tops
+        for (auto& t : tops) {
+            std::string l, n;
+            splitTop(t, l, n);
+            order.push_back(l.empty() ? workLib : l);
+        }
+        if (!collect(m, order, o.out, o.name)) return false;
+        for (auto& t : tops) {
+            std::string l, n;
+            splitTop(t, l, n);
+            o.out.push_back("-top");
+            o.out.push_back(n);
+        }
+        std::string unit = o.tool == Tool::Vopt ? optName : first;
+        if (compiled && !dirGiven) { o.out.push_back("-o"); o.out.push_back(lib0 + "/_msim/" + unit); }
+    }
     o.out.insert(o.out.end(), rest.begin(), rest.end());
+    if (o.tool == Tool::Vopt) {   // check the design now, then record it under its name
+        std::string c = shq(self()) + " -elab";
+        for (size_t k = 1; k < o.out.size(); k++) c += " " + shq(o.out[k]);
+        c += " 2>&1";
+        std::cout.flush();
+        FILE* p = popen(c.c_str(), "r");
+        std::string text;
+        char buf[8192];
+        size_t n;
+        while (p && (n = std::fread(buf, 1, sizeof buf, p)) > 0) text.append(buf, n);
+        int st = p ? pclose(p) : 2 << 8;
+        FILE* log = o.log.empty() ? nullptr : std::fopen(o.log.c_str(), "w");
+        std::stringstream ss(text);
+        for (std::string ln; std::getline(ss, ln);) {
+            if (ln.find("not run") != std::string::npos) continue;
+            std::cout << ln << "\n";
+            if (log) std::fprintf(log, "%s\n", ln.c_str());
+        }
+        if (log) std::fclose(log);
+        o.log.clear();
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) { std::cerr << o.name << ": errors; " << optName << " not written\n"; return false; }
+        std::error_code ec;
+        fs::create_directories(lib0 + "/_msim/opt", ec);
+        std::ofstream f(lib0 + "/_msim/opt/" + optName + ".args");
+        for (size_t k = 1; k < o.out.size(); k++) f << o.out[k] << "\n";
+        if (!f) { std::cerr << o.name << ": cannot write " << optName << "\n"; return false; }
+        return true;
+    }
     if (doGiven && !justRun(script)) {
         std::string p = doFile(script, lib0 + "/_msim/" + first);
         if (p.empty()) { std::cerr << o.name << ": cannot write the -do script\n"; return false; }
@@ -786,7 +923,7 @@ inline bool simvRun(Opts& o, const std::string& argsFile, const std::vector<std:
 // o.out is the msim command line to run (with o.log to copy the output to).
 inline bool wanted(int argc, char** argv, Opts& o) {
     static const std::pair<const char*, Tool> names[] = {
-        {"vlib", Tool::Vlib}, {"vmap", Tool::Vmap}, {"vlog", Tool::Vlog}, {"vcom", Tool::Vcom}, {"vsim", Tool::Vsim},
+        {"vlib", Tool::Vlib}, {"vmap", Tool::Vmap}, {"vlog", Tool::Vlog}, {"vcom", Tool::Vcom}, {"vopt", Tool::Vopt}, {"vsim", Tool::Vsim},
         {"vlogan", Tool::Vlogan}, {"vhdlan", Tool::Vhdlan}, {"vcs", Tool::Vcs}};
     std::string me = compat::basename(argv[0]);
     int skip = 1;
@@ -806,6 +943,7 @@ inline bool wanted(int argc, char** argv, Opts& o) {
         case Tool::Vlog: case Tool::Vcom: case Tool::Vlogan: case Tool::Vhdlan: o.exitNow = analyse(o, args); break;
         case Tool::Vcs: o.exitNow = vcs(o, args); break;
         case Tool::Vsim: if (!vsim(o, args)) o.exitNow = 2; break;
+        case Tool::Vopt: o.exitNow = vsim(o, args) ? 0 : 2; break;
         case Tool::Simv: if (!simvRun(o, argv[2], args)) o.exitNow = 2; break;
         default: break;
     }
