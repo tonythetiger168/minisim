@@ -147,6 +147,17 @@ Spec references are IEEE 1800-2023 clauses.
   puts a `` `line `` before each port and signal declaration. The lint rules
   read `always begin ... @(list); end` (how a VHDL process arrives) as a
   combinational block, and a reset tested with `===`.
+- `mlint -goal NAME`: methodology goals like SpyGlass's (`lint_rtl`,
+  `lint_synth`, `lint_style`, `starc`, `openmore`, `verible`, `cdc`,
+  `formal`, `signoff`; `-list-goals`), and twelve more rules: `CASE005`
+  (non-constant case item), `CASE006` (`full_case`/`parallel_case`
+  pragmas), `CASE007` (case on a constant), `SYN018` (while loops),
+  `SYN019` (tasks in design code), `SYN020` (integer signals), `W010`
+  (shift out of every bit), `EXP003` (reduction of one bit), `EXP005`
+  (unsigned comparison with one answer), `EXP006` (if on a literal),
+  `CLK004` (divided/ripple clocks), and `L005` (a VHDL std_logic driven by
+  several processes that do not all release it with 'Z'). docs/LINT.md maps
+  the STARC guide's topics to rules. `-list` no longer shows `ABS001`..`ABS004` twice.
 
 ### Changed
 - `msim -compile` builds the kernel once into a cached object

@@ -36,6 +36,7 @@ architecture rtl of vhdl is
   signal state   : state_t;
   signal ctrl    : ctrl_t;
   signal bus_l   : std_logic_vector(3 downto 0);
+  signal fight   : std_logic; --~ L005
 begin
   -- the asynchronous reset form, compared with '1'
   process (clk_a, rst)
@@ -78,9 +79,13 @@ begin
   bus_l <= x"5" when en1 = '1' else (others => 'Z');
   bus_l <= x"A" when en2 = '1' else (others => 'Z');
 
+  -- two drivers of a std_logic, neither ever 'Z'
+  fight <= din(2);
+  fight <= din(3);
+
   lonely <= din(1);
   dout <= b_reg;
-  flag <= never and lat and ctrl.run and ctrl.halt;
+  flag <= never and lat and ctrl.run and ctrl.halt and fight;
   bus_o <= bus_l;
   st_o <= '1' when state = DONE else '0';
   assert din /= x"FF" report "din is " & to_hstring(din) severity note;

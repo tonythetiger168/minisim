@@ -63,6 +63,8 @@ inline const std::vector<RuleInfo>& table() {
          "The block's later statements read the old value, so simulation and synthesis disagree. Use =."},
         {"L004", "driver", Sev::Warning, true, "one value is assigned by more than one process",
          "Synthesis reports a multiple-driver error; simulation keeps the last write."},
+        {"L005", "driver", Sev::Warning, true, "a resolved (VHDL std_logic) signal driven by several processes, not all of them tri-state",
+         "Several drivers are legal on a resolved signal, but unless all but one drive 'Z' at a time the values fight."},
         {"SEQ001", "assign", Sev::Warning, true, "a variable has both blocking and non-blocking assignments",
          "Mixing = and <= on one variable makes its update time depend on which statement ran. Pick one."},
         {"SEQ002", "assign", Sev::Warning, true, "a blocking assignment in an edge-triggered always, to a variable read elsewhere",
@@ -97,6 +99,12 @@ inline const std::vector<RuleInfo>& table() {
          "A plain case compares 4-state values exactly, so the item never matches in hardware. Use casez with ?."},
         {"CASE004", "case", Sev::Warning, true, "the same value appears in two items of one case",
          "The second item never runs."},
+        {"CASE005", "case", Sev::Warning, false, "a case item that is not a constant",
+         "Items are compared in order: priority logic, and more than one item can match. Use if ... else if to say so."},
+        {"CASE006", "case", Sev::Warning, false, "a full_case or parallel_case pragma",
+         "Synthesis trusts the pragma, simulation ignores it: the netlist can behave differently. Use unique or priority."},
+        {"CASE007", "case", Sev::Info, false, "a case on a constant selector (case (1'b1))",
+         "The reverse case: the items are tested in order like an if ... else if chain. Fine when meant; unique says it is one-hot."},
 
         // ------------------------------------------------------------------- width
         {"W001", "width", Sev::Warning, true, "an assignment truncates its right-hand side",
@@ -156,6 +164,12 @@ inline const std::vector<RuleInfo>& table() {
          "Internal tri-state buses are not available in most ASIC and FPGA fabrics. Use a mux."},
         {"SYN017", "synth", Sev::Warning, true, "a hierarchical reference in design code",
          "a.b.c reaches into another module; synthesis works on one module at a time."},
+        {"SYN018", "synth", Sev::Warning, false, "a while or do ... while loop in design code",
+         "Synthesis unrolls loops and needs the count: a for loop with constant bounds."},
+        {"SYN019", "synth", Sev::Info, false, "a task called in design code",
+         "STARC and most RTL guides keep tasks for testbenches; a function says what it returns."},
+        {"SYN020", "synth", Sev::Info, false, "an integer or int signal (not only a loop index)",
+         "32 signed bits whether the value needs them or not; give the signal its real width."},
 
         // ----------------------------------------------------------------- unused
         {"UNU001", "unused", Sev::Warning, true, "a signal is declared but never used",
@@ -182,6 +196,8 @@ inline const std::vector<RuleInfo>& table() {
          "treats specially. Clock gates and muxes belong in dedicated cells; waive this there."},
         {"CLK002", "clock", Sev::Info, false, "a flop on the falling edge of its clock", "Off by default."},
         {"CLK003", "clock", Sev::Warning, true, "one signal is used both as a clock and as a reset", ""},
+        {"CLK004", "clock", Sev::Warning, false, "a flop clocked by the output of another flop (a divided or ripple clock)",
+         "An internally generated clock: timing, CDC and test tools treat it as a new clock. Prefer a clock enable."},
         {"RST001", "reset", Sev::Warning, true, "one reset is used with both polarities",
          "Active high in one block and active low in another."},
         {"RST002", "reset", Sev::Warning, true, "one reset is used both asynchronously and synchronously", ""},
@@ -282,6 +298,13 @@ inline const std::vector<RuleInfo>& table() {
         {"SUS004", "suspicious", Sev::Info, false, "$test$plusargs: +NAME=0 still reads as given",
          "Verible rule plusarg-assignment: read the value with $value$plusargs."},
         {"W009", "width", Sev::Info, false, "a sized binary literal with fewer digits than its width (8'b101)", "Verible rule undersized-binary-literal."},
+        {"W010", "width", Sev::Warning, false, "a shift by a constant at least as wide as the value",
+         "Every bit is shifted out: the result is 0 (or the sign)."},
+        {"EXP003", "width", Sev::Info, false, "a reduction operator on a 1-bit value", "&x, |x, ^x of one bit is x."},
+        {"EXP005", "width", Sev::Warning, false, "a comparison of an unsigned value that is always true or false",
+         "x < 0, x >= 0, or a bound past the largest value x can hold."},
+        {"EXP006", "width", Sev::Info, false, "an if on a literal constant in procedural code",
+         "One branch never runs. A parameter says why; otherwise remove the dead branch."},
         // ------------------------------------------------------------------ formal
         // lintformal.hpp: answered by enumerating the values the logic can take.
         {"FML001", "formal", Sev::Warning, true, "an if condition or case item that can never be true where it stands",
@@ -294,16 +317,6 @@ inline const std::vector<RuleInfo>& table() {
         {"FML003", "formal", Sev::Warning, true, "a register that never leaves its reset value",
          "Every assignment after reset gives it the value it already has: a constant, so the logic it feeds is "
          "fixed too."},
-        // ---------------------------------------------------------------- soc flow
-        // lintsoc.hpp: the top checked against block abstracts (-abstract).
-        {"ABS001", "soc", Sev::Warning, true, "a block output the block never drives is connected at the top",
-         "The block's abstract says nothing inside drives the output, so whatever reads it at the top floats."},
-        {"ABS002", "soc", Sev::Info, true, "the top drives a block input the block never reads",
-         "Logic at the top feeds an input the block ignores. Tie it off, or check the block uses it."},
-        {"ABS003", "soc", Sev::Warning, true, "a block clock input is left open or tied to a constant",
-         "The block clocks registers on this input."},
-        {"ABS004", "soc", Sev::Warning, true, "a block was signed off with errors or warnings not waived",
-         "From the counts in its abstract (-abstract-out at block level)."},
         // ---------------------------------------------------------------- soc flow
         // lintsoc.hpp: the top checked against block abstracts (-abstract).
         {"ABS001", "soc", Sev::Warning, true, "a block output the block never drives is connected at the top",
@@ -431,6 +444,42 @@ struct Waiver {
     mutable size_t hits = 0;
 };
 
+// Methodology goals, like SpyGlass's lint goals: a named set of rules for one
+// purpose. "goal NAME" (or -goal NAME) is "only" with that set; later enable,
+// disable and severity directives adjust it.
+struct Goal {
+    const char* name;
+    const char* rules;   // rules and groups, as for only
+    const char* what;
+};
+inline const std::vector<Goal>& goals() {
+    static const std::vector<Goal> g = {
+        {"lint_rtl", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth",
+         "RTL correctness before simulation and synthesis (SpyGlass lint_rtl)"},
+        {"lint_synth", "latch,comb,case,driver,synth,SEQ001,SEQ002,W001,RST006,RST007",
+         "what synthesis rejects or builds differently from simulation"},
+        {"lint_style", "naming,style,format,suspicious", "naming, layout and coding style"},
+        {"starc", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,naming,style",
+         "rules in the spirit of the STARC RTL design style guide (docs/LINT.md has the mapping)"},
+        {"openmore", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,synth,naming,style,format",
+         "rules in the spirit of the OpenMORE / Reuse Methodology Manual checklist"},
+        {"verible", "FMT001,FMT002,FMT003,FMT004,STY004,STY005,STY006,STY007,STY008,STY009,STY010,STY011,STY012,"
+                    "STY013,STY014,STY015,SUS001,SUS002,SUS003,SUS004,NAME014,NAME015,NAME016,NAME017,NAME018,"
+                    "NAME019,W009,TIDY009",
+         "the rules after Verible's lint rules (docs/LINT.md lists which)"},
+        {"cdc", "cdc,rdc", "clock- and reset-domain crossings (docs/CDC.md)"},
+        {"formal", "formal", "formal-assisted checks: dead branches, out-of-range indexes, stuck registers"},
+        {"signoff", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,formal,cdc,rdc,soc",
+         "everything that can break hardware, before handing a block off"},
+    };
+    return g;
+}
+inline const Goal* findGoal(std::string_view n) {
+    for (auto& g : goals())
+        if (n == g.name) return &g;
+    return nullptr;
+}
+
 struct Config {
     // enable / disable / only, in the order given: the last word wins.
     struct Op {
@@ -526,6 +575,11 @@ struct Config {
             for (auto& x : splitList(all))
                 if (!known(x)) bad("unknown rule or group '" + x + "'");
             only(all);
+        } else if (cmd == "goal") {
+            if (w.size() != 2) return bad("goal NAME (mlint -list-goals)");
+            const Goal* g = findGoal(w[1]);
+            if (!g) return bad("unknown goal '" + w[1] + "' (mlint -list-goals)");
+            only(g->rules);
         } else if (cmd == "severity") {
             Sev s;
             if (w.size() != 3 || !parseSev(w[2], s)) return bad("severity RULE error|warning|info");
