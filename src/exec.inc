@@ -1194,17 +1194,22 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     }
     if (!(ticked & 1)) {
     } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait, S.now}); a.evals++; assertEvent(c.id, AE_START, S.now); }
+        vector<ConcAssert::Attempt> starting;
+        for (auto& p : c.matured) starting.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait, S.now});
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) {
-                c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, nullptr, S.now});
-                a.evals++;
-                assertEvent(c.id, AE_START, S.now);
-            }
+            if (!pc->killed && pc->epoch == p.epoch) starting.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, nullptr, S.now});
         }
         c.pending.clear();
+        if (c.future) std::swap(starting, c.delayed);   // the ones of the tick before start now (16.9.4)
+        for (auto& at : starting) {
+            if (at.killGen != a.killGen) continue;   // killed while it waited
+            at.killGen = a.killGen;
+            c.att.push_back(std::move(at));
+            a.evals++;
+            assertEvent(c.id, AE_START, c.att.back().start);
+        }
     } else if (a.on) {
         c.att.push_back({c.root, false, 1, a.killGen, nullptr, nullptr, nullptr, S.now});
         a.evals++;
