@@ -2687,6 +2687,7 @@ struct Sim {
     void (*vpiChange)(int) = nullptr;
     bool (*vpiRegion)(int) = nullptr;
     void (*vpiHoldCb)(int s, bool force, bool on, int hi, int lo) = nullptr;
+    SrcLoc holdSrc;   // the force / assign statement running holdOn (VPI drivers and loads, 37.16)
     bool vpiNbaPend = false;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {

@@ -127,6 +127,9 @@ struct State {
     struct Put { const Obj* o; Val v; Obj* ev; };
     std::multimap<uint64_t, Put> puts;
     std::vector<Cb*> holdCbs;             // cbForce, cbRelease, cbAssign, cbDeassign (38.36.1)
+    // The force and assign statements in effect (37.16 details 14, 15): by
+    // signal, force or assign, bits (hi -1: all), the statement's source.
+    std::map<std::tuple<int, bool, int, int>, std::pair<uint32_t, uint32_t>> holdSrcs;
     std::map<std::pair<uint32_t, uint32_t>, std::vector<Cb*>> stmtCbs;   // cbStmt: by source file id and line
     std::vector<Cb*> tchkCbs;             // cbTchkViolation (38.36.1)
     std::vector<Cb*> createCbs, sizeCbs;  // cbCreateObj, cbSizeChange (38.36.1)
@@ -1053,6 +1056,12 @@ inline void fire(Cb* c) {
 // unless vpiSuppressVal, its value after the change.
 inline void onHold(int sg, bool force, bool on, int hi, int lo) {
     auto& s = st();
+    if (on) {
+        if (S.holdSrc.line) s.holdSrcs[{sg, force, hi, lo}] = {S.holdSrc.file, S.holdSrc.line};
+        else s.holdSrcs.erase({sg, force, hi, lo});
+    } else
+        for (auto it = s.holdSrcs.lower_bound({sg, force, INT32_MIN, INT32_MIN}); it != s.holdSrcs.end() && std::get<0>(it->first) == sg && std::get<1>(it->first) == force;)
+            it = hi < 0 || (std::get<2>(it->first) == hi && std::get<3>(it->first) == lo) ? s.holdSrcs.erase(it) : std::next(it);
     int reason = force ? (on ? cbForce : cbRelease) : (on ? cbAssign : cbDeassign);
     auto list = s.holdCbs;
     for (Cb* c : list) {
@@ -1738,6 +1747,7 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
     vpiCallHook() = callSite;
     S.vpiChange = onChange;
     S.vpiRegion = onRegion;
+    S.vpiHoldCb = onHold;   // which force / assign statements are in effect (37.16)
     // compiletf runs once per call site, before the simulation (38.37.1).
     for (const auto& site : Lowerer::vpiSites()) {
         const Systf& f = s.systfs[(size_t)site->systf];
