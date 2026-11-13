@@ -78,6 +78,14 @@ Spec references are IEEE 1800-2023 clauses.
   `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
   declaration that hides one of the same name in an enclosing scope). Both
   off by default.
+- `mlint` reads VHDL (`.vhd`, `.vhdl`), alone or mixed with SystemVerilog,
+  through msim's VHDL front end: unused/undriven signals, CDC/RDC, latches,
+  sensitivity lists, multiple drivers, reset style, FSMs and formal checks
+  run on it, with findings at the VHDL line. Rules that would only describe
+  the translation are left out (docs/LINT.md, "VHDL"). The translation now
+  puts a `` `line `` before each port and signal declaration. The lint rules
+  read `always begin ... @(list); end` (how a VHDL process arrives) as a
+  combinational block, and a reset tested with `===`.
 
 ### Changed
 - `msim -compile` builds the kernel once into a cached object
