@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <deque>
 #include <functional>
 #include <set>
 #include <sstream>
@@ -77,6 +78,7 @@ struct Val {
     TP t;
     bool isConst = false;
     std::optional<int64_t> iv;   // folded integer value
+    std::string accObj;          // p.all of an access-to-array object: p (the elements are p.a)
 };
 
 class Translator {
@@ -90,6 +92,11 @@ public:
     std::map<std::string, SvModule> svModules;   // lower-case name -> module
     std::string timeUnit = "1ns", timePrec = "1fs";
     std::vector<std::string> warnings;
+    // For synthesis tools: a combinational process (a sensitivity list or an
+    // equivalent process of a concurrent assignment, no wait inside, no
+    // 'event history) becomes `always @*` instead of a loop that waits on its
+    // signals, which simulates the same but is not a synthesizable form.
+    bool synth = false;
 
     void add(const std::vector<UP>& units) {
         for (auto& u : units) {
@@ -126,19 +133,22 @@ public:
         std::function<void(const UP&)> emitPkg = [&](const UP& u) {
             if (done.count(u->name)) return;
             done.insert(u->name);
-            for (auto& d : allCtx(*u))
-                for (auto& n : d->uses) {
-                    std::string pn = usePackage(n);
-                    auto it = packages.find(pn);
-                    if (it != packages.end() && it->second != u) emitPkg(it->second);
+            auto deps = [&](const UP& x) {
+                std::vector<DP> uses = allCtx(*x);
+                if (auto b = bodies.find(x->name); b != bodies.end()) {
+                    auto bu = allCtx(*b->second);
+                    uses.insert(uses.end(), bu.begin(), bu.end());
                 }
-            if (auto b = bodies.find(u->name); b != bodies.end())
-                for (auto& d : allCtx(*b->second))
+                for (auto& d : uses)
                     for (auto& n : d->uses) {
                         std::string pn = usePackage(n);
                         auto it = packages.find(pn);
-                        if (it != packages.end() && it->second != u) emitPkg(it->second);
+                        if (it != packages.end() && it->second != u && it->second != x) emitPkg(it->second);
                     }
+            };
+            deps(u);
+            if (u->k == Unit::PackageInst)
+                if (auto it = packages.find(u->of); it != packages.end()) deps(it->second);
             o << emitPackage(u);
         };
         for (auto& u : order)
@@ -177,6 +187,8 @@ private:
         std::map<std::string, std::pair<std::string, std::string>> useItems;   // name -> (package, name)
         std::ostringstream* extra = nullptr;  // specializations / hoisted items of the container
         std::set<std::string>* specDone = nullptr;
+        std::vector<Sym>* deferSubs = nullptr;   // package: bodies emitted after the package body's declarations
+        std::string self;   // a protected type's method emitted as a free function: the object's name
         Proc* proc = nullptr;
         std::vector<Loop>* loops = nullptr;
         bool inFunc = false;
@@ -350,6 +362,15 @@ private:
         for (size_t i = 0; i < fos->lits.size(); ++i) lit(fos->lits[i], fos, fos->litSv[i]);
         lit("right", side, "0");
         lit("left", side, "1");
+        // the named (non-graphic) literals of CHARACTER (16.3)
+        {
+            static const char* ctl[] = {"nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel", "bs", "ht", "lf", "vt",
+                                        "ff", "cr", "so", "si", "dle", "dc1", "dc2", "dc3", "dc4", "nak", "syn", "etb",
+                                        "can", "em", "sub", "esc", "fsp", "gsp", "rsp", "usp"};
+            for (int i = 0; i < 32; ++i) lit(ctl[i], chr, "8'd" + std::to_string(i));
+            lit("del", chr, "8'd127");
+            for (int i = 128; i < 160; ++i) lit("c" + std::to_string(i), chr, "8'd" + std::to_string(i));
+        }
         // physical units of time
         auto unit = [&](const std::string& n, int64_t fs) {
             Sym y;
@@ -399,15 +420,40 @@ private:
                        "arctan", "sign", "realmax", "realmin", "uniform", "now", "write", "writeline", "read", "readline", "hwrite", "hread", "owrite",
                        "oread", "bwrite", "bread", "swrite", "sread", "endfile", "file_open", "file_close", "flush", "deallocate", "stop", "finish",
                        "resolution_limit", "find_leftmost", "find_rightmost", "and_reduce", "or_reduce", "xor_reduce", "nand_reduce",
-                       "nor_reduce", "xnor_reduce", "to_real", "justify", "abs", "std_logic_vector", "tee", "fwrite", "unsigned_num_bits", "signed_num_bits"})
+                       "nor_reduce", "xnor_reduce", "to_real", "justify", "abs", "std_logic_vector", "tee", "fwrite", "unsigned_num_bits", "signed_num_bits",
+                       "vhdl_version", "tool_type", "tool_vendor", "tool_name", "tool_edition", "tool_version", "file_name", "file_path",
+                       "file_line"})
             addBuiltinFn(n);
     }
 
     // ------------------------------------------------------------- lookups
     const std::vector<Sym>* lookupAll(const std::string& n) {
+        static std::deque<std::vector<Sym>> keep;   // merged overload sets (stable addresses)
+        auto allSubs = [](const std::vector<Sym>& v) {   // overloadable: subprograms and enumeration literals
+            for (auto& y : v)
+                if (y.k != Sym::Sub && y.k != Sym::Lit) return false;
+            return true;
+        };
         for (auto it = cx->scopes.rbegin(); it != cx->scopes.rend(); ++it) {
             auto f = it->find(n);
-            if (f != it->end() && !f->second.empty()) return &f->second;
+            if (f != it->end() && !f->second.empty()) {
+                if (!allSubs(f->second)) return &f->second;
+                // subprograms: overloads declared further out stay visible (12.3)
+                std::vector<Sym> m = f->second;
+                for (auto jt = std::next(it); jt != cx->scopes.rend(); ++jt) {
+                    auto g = jt->find(n);
+                    if (g != jt->end() && allSubs(g->second)) m.insert(m.end(), g->second.begin(), g->second.end());
+                }
+                for (auto& p : cx->usePkgs) {
+                    auto g = pkgScope[p].find(n);
+                    if (g != pkgScope[p].end() && allSubs(g->second)) m.insert(m.end(), g->second.begin(), g->second.end());
+                }
+                auto b = builtinScope.find(n);
+                if (b != builtinScope.end() && allSubs(b->second)) m.insert(m.end(), b->second.begin(), b->second.end());
+                if (m.size() == f->second.size()) return &f->second;
+                keep.push_back(std::move(m));
+                return &keep.back();
+            }
         }
         if (auto ui = cx->useItems.find(n); ui != cx->useItems.end()) {
             auto& ps = pkgScope[ui->second.first];
@@ -425,8 +471,16 @@ private:
                 ++count;
             }
         }
+        if (found && count == 1 && allSubs(*found)) {
+            auto b = builtinScope.find(n);
+            if (b != builtinScope.end() && allSubs(b->second)) {
+                std::vector<Sym> m = *found;
+                m.insert(m.end(), b->second.begin(), b->second.end());
+                keep.push_back(std::move(m));
+                return &keep.back();
+            }
+        }
         if (count > 1) {   // overloads from several packages
-            static std::vector<std::vector<Sym>> keep;
             keep.emplace_back();
             for (auto& p : cx->usePkgs) {
                 auto& ps = pkgScope[p];
@@ -623,7 +677,8 @@ private:
         case Type::Record: return typeName(t);
         case Type::String: case Type::Line: return "string";
         case Type::File: return "int";
-        case Type::Access: return t->target && t->target->k == Type::String ? "string" : "int";
+        case Type::Access: return t->target && t->target->k == Type::String ? "string" : typeName(t);
+        case Type::Protected: return typeName(t);
         default: return "logic";
         }
     }
@@ -728,7 +783,8 @@ private:
             else if (t && t->k == Type::Array) {
                 // unconstrained object (e.g. a string): use SystemVerilog queries
                 Val v = ex(r->a, nullptr);
-                g = mkRng("$left(" + v.s + ")", "$right(" + v.s + ")", true);
+                // packed vectors are declared [hi:lo]; unpacked dynamic arrays count up from 0
+                g = mkRng("$left(" + v.s + ")", "$right(" + v.s + ")", isScalarBit(t->elem));
                 if (t->elem && t->elem->k == Type::Char) g = mkRng("1", v.s + ".len()", false);
             } else if (t && t->range) g = *t->range;
             else if (t && t->k == Type::Enum) g = mkRng(t->litSv.front(), t->litSv.back(), false);
@@ -763,7 +819,9 @@ private:
             const Sym* y = e->k == EK::Name ? lookup(e->name) : lookupSel(e);
             if (y && y->k == Sym::TypeK) return y->type;
         }
-        return ex(e, nullptr).t;
+        Val v = ex(e, nullptr);
+        if (accArray(v.t)) return derefArray(v).t;
+        return v.t;
     }
 
     TP subtype(const SubInd& si, const EP& initForWidth = nullptr) {
@@ -940,7 +998,9 @@ private:
             v.isConst = true;
             return v;
         }
-        case EK::Null: v.s = "\"\""; v.t = want ? want : bt["line"]; return v;
+        case EK::Null:
+            if (want && want->k == Type::Access) { v.s = "null"; v.t = want; return v; }
+            v.s = "\"\""; v.t = want ? want : bt["line"]; return v;
         case EK::Agg: return aggregate(e, want);
         case EK::Qual: {
             TP t = typeOfMark(e->a);
@@ -955,6 +1015,7 @@ private:
         case EK::Others: fail(e->line, "'others' outside an aggregate");
         case EK::Open: v.s = ""; v.t = want; return v;
         case EK::New: {
+            if (want && want->k == Type::Access) return allocator(e, want);
             // new T'(x) / new string'(...) on access types: line is a string
             if (e->a && e->a->k == EK::Qual) return ex(e->a->b, bt["string"]);
             v.s = "\"\"";
@@ -1040,6 +1101,9 @@ private:
                 first = false;
             }
             v.s = typeName(rt) + "'(" + s + "})";
+            // a record holding class handles: a plain assignment pattern (its context gives the type)
+            for (auto& ft : rt->ftypes)
+                if (ft && (ft->k == Type::Access || ft->k == Type::Protected)) { v.s = s + "}"; break; }
             v.t = rt;
             return v;
         }
@@ -1071,7 +1135,9 @@ private:
                 else if (x.s == "1'bz") v.s = "'z";
                 else if (x.s == "1'bx") v.s = "'x";
                 else v.s = known ? "{" + lenOf(want->dims[0]) + "{" + x.s + "}}" : "'{default: " + x.s + "}";
-                if (v.s[0] == '\'' && known && v.s.size() == 2) v.s = "{" + lenOf(want->dims[0]) + "{" + x.s + "}}";
+                // a sized fill where the width is a constant; a range that depends on generics may be
+                // null in a branch that is never taken, where a zero replication would not compile
+                if (v.s[0] == '\'' && known && v.s.size() == 2 && want->dims[0].lv && want->dims[0].rv) v.s = "{" + lenOf(want->dims[0]) + "{" + x.s + "}}";
             } else
                 v.s = "'{default: " + x.s + "}";
             v.t = want;
@@ -1350,7 +1416,7 @@ private:
                 // the other operand decides (e.g. 1 + unsigned)
                 b = ex(e->b, nullptr);
                 if (b.t && b.t->k == Type::Real && e->a->k == EK::Int) a = ex(e->a, b.t);
-            } else b = ex(e->b, a.t && a.t->k == Type::Array && ambiguous(e->b) ? a.t : (a.t && (a.t->k == Type::Real || a.t->k == Type::Time || a.t->k == Type::Enum || isScalarBit(a.t) || a.t->k == Type::Char) ? a.t : nullptr));
+            } else b = ex(e->b, a.t && a.t->k == Type::Array && ambiguous(e->b) ? a.t : (a.t && (a.t->k == Type::Real || a.t->k == Type::Time || a.t->k == Type::Enum || isScalarBit(a.t) || a.t->k == Type::Char || a.t->k == Type::Access) ? a.t : nullptr));
         }
         return {a, b};
     }
@@ -1494,9 +1560,19 @@ private:
             }
             // enumeration literal: pick by expected type
             const Sym* y = &syms->front();
-            if (y->k == Sym::Lit && syms->size() > 1 && want) {
+            if (syms->size() > 1 && want && (y->k == Sym::Lit || y->k == Sym::Sub)) {
+                // overloaded enumeration literals and functions: the expected type decides
                 for (auto& s : *syms)
                     if (s.k == Sym::Lit && sameBase(s.type, want)) { y = &s; break; }
+            }
+            if (y->k == Sym::Sub && syms->size() > 1) {
+                // a literal when no function can be called without arguments
+                bool callable = false;
+                for (auto& s : *syms)
+                    if (s.k == Sym::Sub && (!s.sub || std::all_of(s.sub->params.begin(), s.sub->params.end(), [](const DP& p) { return (bool)p->init; }))) callable = true;
+                if (!callable)
+                    for (auto& s : *syms)
+                        if (s.k == Sym::Lit) { y = &s; break; }
             }
             if (y->k == Sym::Sub) {
                 // function call without arguments; pick the overload with no parameters
@@ -1515,11 +1591,27 @@ private:
                 }
                 return symVal(*y, e);
             }
+            // method of a protected-type object, without arguments
+            {
+                std::string recv;
+                if (auto ms = methodOf(e, recv)) return callSub(e, *ms, {}, want, recv);
+            }
             // record element
             Val p = ex(e->a, nullptr);
             TP t = baseOf(p.t);
             if (t && t->k == Type::Line && e->name == "all") { v.s = p.s; v.t = bt["string"]; return v; }
+            if (e->name == "all" && p.t && p.t->k == Type::Access) return deref(p);
             if (e->name == "all") { v.s = p.s; v.t = p.t && p.t->target ? p.t->target : p.t; return v; }
+            if (e->a->k == EK::Sel && e->a->name == "all") {
+                // p.all.f: the element of the designated record
+                Val q = ex(e->a->a, nullptr);
+                if (q.t && q.t->k == Type::Access && q.t->target && baseOf(q.t->target)->k == Type::Record) p = q;
+            }
+            if (p.t && p.t->k == Type::Access && p.t->target && baseOf(p.t->target)->k == Type::Record) {
+                // implicit dereference: the class holds the record's elements
+                t = baseOf(p.t->target);
+                p.t = t;
+            }
             TP rt = p.t && p.t->k == Type::Record ? p.t : t;
             if (!rt || rt->k != Type::Record) fail(e->line, "'" + e->text + "': prefix is not a record");
             for (size_t i = 0; i < rt->fnames.size(); ++i)
@@ -1543,9 +1635,14 @@ private:
                 (void)y;
             }
         }
+        std::string recv;
+        if (!syms && pre->k == EK::Sel) syms = methodOf(pre, recv);
         if (syms && !syms->empty()) {
             const Sym& y = syms->front();
-            if (y.k == Sym::Sub) return callSub(pre, *syms, e->args, want);
+            if (y.k == Sym::Lit)
+                for (auto& z : *syms)
+                    if (z.k == Sym::Sub) return callSub(pre, *syms, e->args, want, recv);   // a function named like a literal
+            if (y.k == Sym::Sub) return callSub(pre, *syms, e->args, want, recv);
             if (y.k == Sym::TypeK) return conversion(y.type, e, want);
         }
         // indexed or sliced object (or a function result)
@@ -1558,6 +1655,7 @@ private:
         switch (y.k) {
         case Sym::Obj:
             v.s = y.home == "*" ? y.sv : qual(y);
+            if (y.member && !cx->self.empty()) v.s = cx->self + "." + v.s;
             v.t = y.type;
             if (y.cls == "constant" && y.decl && y.decl->init) {
                 auto f = fold(y.decl->init);
@@ -1575,10 +1673,29 @@ private:
         }
     }
 
-    Val indexOrSlice(const Val& p, const EP& e) {
+    Val indexOrSlice(const Val& p0, const EP& e) {
         Val v;
+        Val p = accArray(p0.t) ? derefArray(p0) : p0;
         TP t = p.t;
         if (!t) fail(e->line, "cannot index this expression");
+        if (!p.accObj.empty()) {
+            if (e->args.size() != 1) fail(e->line, "too many indices");
+            if (e->args[0].actual->k == EK::Range) {
+                Rng r = rangeOf(e->args[0].actual);
+                std::string lo = r.downto ? r.l : r.l;
+                v.s = p.accObj + ".slice(" + p.accObj + ".idx(" + r.l + "), " + p.accObj + ".idx(" + r.r + "))";
+                TP st = std::make_shared<Type>(*t);
+                st->name = st->text = "";
+                r.idx = t->dims[0].idx;
+                st->dims[0] = r;
+                v.t = st;
+                return v;
+            }
+            Val i = ex(e->args[0].actual, t->dims[0].idx ? t->dims[0].idx : bt["integer"]);
+            v.s = p.s + "[" + p.accObj + ".idx(" + i.s + ")]";
+            v.t = t->elem;
+            return v;
+        }
         if (t->k == Type::String || t->k == Type::Line || (t->k == Type::Array && t->elem && t->elem->k == Type::Char && t->dims.size() <= 1)) {
             // SV strings are 0-based; VHDL strings start at 'left (1 for literals)
             if (e->args.size() == 1 && e->args[0].actual->k == EK::Range) {
@@ -1608,6 +1725,7 @@ private:
                 // a part-select of variable position: indexed form with a constant width when one exists
                 auto w = constDiff(e->args[0].actual->a, e->args[0].actual->b);
                 if (w) {
+                    st->dims[0].len = *w + 1;
                     std::string lo = r.downto ? r.r : r.l;
                     std::string base = (!t->dims[0].box && t->dims[0].downto == r.downto) ? lo : lo;
                     v.s = p.s + "[" + base + (r.downto ? " +: " : " +: ") + std::to_string(*w + 1) + "]";
@@ -1715,7 +1833,18 @@ private:
         }
         if (!isType) {
             p = ex(e->a, nullptr);
+            if (accArray(p.t)) p = derefArray(p);
             pt = p.t;
+            if (!p.accObj.empty()) {
+                const std::string& o = p.accObj;
+                v.t = bt["integer"];
+                if (a == "length") { v.s = o + ".a.size()"; return v; }
+                if (a == "left") { v.s = o + ".l"; return v; }
+                if (a == "right") { v.s = o + ".right()"; return v; }
+                if (a == "high") { v.s = "(" + o + ".dn ? " + o + ".l : " + o + ".right())"; return v; }
+                if (a == "low") { v.s = "(" + o + ".dn ? " + o + ".right() : " + o + ".l)"; return v; }
+                if (a == "ascending") { v.s = "(!" + o + ".dn)"; v.t = bt["boolean"]; return v; }
+            }
         }
         TP bt0 = baseOf(pt);
         // signal attributes
@@ -1915,6 +2044,18 @@ private:
                     if (args[i].actual->k == EK::Str && ft && !(ft->k == Type::Array || ft->k == Type::String)) score -= 5;
                     continue;
                 }
+                if (args[i].actual->k == EK::Name && ft) {
+                    // an overloaded enumeration literal matches any of its types
+                    auto ls = lookupAll(args[i].actual->name);
+                    if (ls && ls->size() > 1 && ls->front().k == Sym::Lit) {
+                        bool any = false;
+                        for (auto& l : *ls)
+                            if (l.k == Sym::Lit && sameBase(l.type, ft)) any = true;
+                        if (any) { score += 3; continue; }
+                        ok = false;
+                        break;
+                    }
+                }
                 Val av = exQuiet(args[i].actual);
                 if (!av.t || !ft) continue;
                 if (sameBase(av.t, ft)) score += 3;
@@ -1930,6 +2071,9 @@ private:
             }
             if (score > bestScore) { bestScore = score; best = s; }
         }
+        if (!best)
+            for (auto* s : c)
+                if (!s->sub) return s;   // a built-in overload (its profile is checked when it is translated)
         return best ? best : c[0];
     }
     Val exQuiet(const EP& e) {
@@ -1955,12 +2099,12 @@ private:
         return it == retTypes.end() ? nullptr : it->second;
     }
 
-    Val callSub(const EP& nameE, const std::vector<Sym>& syms, const std::vector<Assoc>& args, const TP& want) {
+    Val callSub(const EP& nameE, const std::vector<Sym>& syms, const std::vector<Assoc>& args, const TP& want, const std::string& recv = "") {
         int line = nameE->line;
         const Sym* s = pickOverload(syms, args, want, line);
         if (!s->builtin.empty() && !s->sub) return builtinCall(s->builtin, args, want, line);
         if (!s->sub) fail(line, "not a subprogram");
-        return userCall(*s, args, want, line);
+        return userCall(*s, args, want, line, recv);
     }
 
     // arguments in parameter order (named association resolved)
@@ -1978,7 +2122,7 @@ private:
             for (size_t k = 0; k < sp.params.size(); ++k)
                 for (auto& n : sp.params[k]->names)
                     if (n == fn) { r[k] = a.actual; found = true; }
-            if (!found) fail(line, "'" + sp.text + "' has no parameter '" + fn + "'");
+            if (!found) fail(line, "'" + sp.text + "' has no parameter '" + fn + "' (" + std::to_string(sp.params.size()) + " parameters, line " + std::to_string(sp.line) + ")");
         }
         for (size_t k = 0; k < r.size(); ++k)
             if (!r[k]) {
@@ -2001,7 +2145,7 @@ private:
         return false;
     }
 
-    Val userCall(const Sym& s, const std::vector<Assoc>& args, const TP& want, int line) {
+    Val userCall(const Sym& s, const std::vector<Assoc>& args, const TP& want, int line, std::string recv = "") {
         (void)want;
         const Subprog& sp = *s.sub;
         std::vector<EP> ord = orderArgs(sp, args, line);
@@ -2012,10 +2156,12 @@ private:
             else av[i] = ex(ord[i], pt);
         }
         Val v;
+        if (s.member && recv.empty() && !cx->self.empty()) recv = cx->self;
         if (needsSpecialization(s)) {
-            return specializedCall(s, ord, av, line);
+            if (s.member && recv.empty()) recv = "this";
+            return specializedCall(s, ord, av, line, recv);
         }
-        std::string n = qualSub(s);
+        std::string n = s.member ? (recv.empty() ? s.sv : recv + "." + s.sv) : qualSub(s);
         std::string r = n + "(";
         for (size_t i = 0; i < av.size(); ++i) {
             std::string a = av[i].s;
@@ -2171,6 +2317,23 @@ private:
             if (b && b->k == Type::Enum && b->sv != "int") r.s = "vhdl_rt::lower(" + x.s + ".name())";
             return r;
         }
+        if ((id == "minimum" || id == "maximum") && args.size() == 1) {
+            // VHDL-2008 implicit MINIMUM/MAXIMUM of a one-dimensional array (5.3.2.4)
+            Val a = arg(0);
+            bool mx = id == "maximum";
+            TP at = baseOf(a.t);
+            if (at && (at->k == Type::String || (at->k == Type::Array && at->elem && baseOf(at->elem)->k == Type::Char))) {
+                v.s = std::string("vhdl_rt::str_") + (mx ? "max" : "min") + "(" + a.s + ")";
+                v.t = bt["character"];
+                return v;
+            }
+            if (at && at->k == Type::Array && at->elem) {
+                v.t = at->elem;
+                if (isVec(at)) v.s = std::string(mx ? "(|" : "(&") + a.s + ")";
+                else v.s = "((" + a.s + ")." + (mx ? "max" : "min") + "()[0])";
+                return v;
+            }
+        }
         if (id == "minimum" || id == "maximum") {
             Val a = arg(0);
             Val b = arg(1, a.t);
@@ -2212,6 +2375,33 @@ private:
             v.t = bt["integer"];
             return v;
         }
+        // std.env tool and source queries (VHDL-2019, 16.5)
+        if (id == "vhdl_version" || id == "tool_type" || id == "tool_vendor" || id == "tool_name" || id == "tool_edition" || id == "tool_version") {
+            static const std::map<std::string, std::string> info = {{"vhdl_version", "2019"}, {"tool_type", "SIMULATION"}, {"tool_vendor", "minisim"},
+                                                                    {"tool_name", "msim"}, {"tool_edition", ""}, {"tool_version", "0.1"}};
+            v.s = "\"" + info.at(id) + "\"";
+            v.t = bt["string"];
+            return v;
+        }
+        if (id == "file_name" || id == "file_path") {
+            std::string f = cx->file;
+            size_t sl = f.find_last_of('/');
+            std::string r = id == "file_name" ? (sl == std::string::npos ? f : f.substr(sl + 1)) : (sl == std::string::npos ? "." : f.substr(0, sl));
+            v.s = "\"" + r + "\"";
+            v.t = bt["string"];
+            return v;
+        }
+        if (id == "justify") {   // std.textio (16.4)
+            Val x = arg(0, bt["string"]);
+            Val sd = args.size() > 1 ? arg(1, bt["side"]) : Val{"0", bt["side"]};
+            Val w = args.size() > 2 ? arg(2, bt["integer"]) : Val{"0", bt["integer"]};
+            if (EP n = named("justified")) sd = ex(n, bt["side"]);
+            if (EP n = named("field")) w = ex(n, bt["integer"]);
+            v.s = "vhdl_rt::justify(" + x.s + ", " + sd.s + ", " + w.s + ")";
+            v.t = bt["string"];
+            return v;
+        }
+        if (id == "file_line") { v.s = "\"" + std::to_string(line) + "\""; v.t = bt["string"]; return v; }
         if (id == "resolution_limit") { v.s = "(1fs)"; v.t = bt["time"]; return v; }
         if (id == "abs") { Val x = arg(0); v.t = x.t; v.s = "((" + x.s + ") < 0 ? -(" + x.s + ") : (" + x.s + "))"; return v; }
         if (id == "unsigned_num_bits") { Val x = arg(0); v.s = "vhdl_rt::num_bits(" + x.s + ")"; v.t = bt["integer"]; return v; }
@@ -2301,7 +2491,11 @@ private:
         }
         if (id == "file_close") { Val f = arg(0); return "$fclose(" + f.s + ");"; }
         if (id == "flush") { Val f = arg(0); return "$fflush(" + f.s + ");"; }
-        if (id == "deallocate") { Val l = arg(0); return l.s + " = \"\";"; }
+        if (id == "deallocate") {
+            Val l = arg(0);
+            if (l.t && l.t->k == Type::Access) return l.s + " = null;";
+            return l.s + " = \"\";";
+        }
         if (id == "uniform") {
             Val s1 = arg(0), s2 = arg(1), x = arg(2);
             return "vhdl_rt::uniform(" + s1.s + ", " + s2.s + ", " + x.s + ");";
@@ -2330,6 +2524,21 @@ package vhdl_rt;
   endfunction
   function automatic string lower(string s);
     return s.tolower();
+  endfunction
+  function automatic string justify(string s, int left, int field);
+    string pad = "";
+    for (int i = s.len(); i < field; i++) pad = {pad, " "};
+    return left ? {s, pad} : {pad, s};
+  endfunction
+  function automatic byte unsigned str_max(string s);
+    byte unsigned r = 0;
+    foreach (s[i]) if (s[i] > r) r = s[i];
+    return r;
+  endfunction
+  function automatic byte unsigned str_min(string s);
+    byte unsigned r = 255;
+    foreach (s[i]) if (s[i] < r) r = s[i];
+    return r;
   endfunction
   function automatic string sl_str(logic v);
     case (v)
@@ -2407,13 +2616,13 @@ package vhdl_rt;
     if (fs % 64'd1000 == 0) return $sformatf("%0dps", fs / 64'd1000);
     return $sformatf("%0dfs", fs);
   endfunction
-  task automatic report(string msg, int sev, string loc, bit is_assert);
+  function automatic void report(string msg, int sev, string loc, bit is_assert);
     string sv;
     case (sev) 0: sv = "note"; 1: sv = "warning"; 2: sv = "error"; default: sv = "failure"; endcase
     $display("%s:@%s:(%s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
     if (sev >= 2) errors++;
     if (sev >= 3) $fatal(0, "VHDL severity failure");
-  endtask
+  endfunction
   function automatic int int_value(string s);
     int v;
     void'($sscanf(s, "%d", v));
@@ -2444,27 +2653,27 @@ package vhdl_rt;
     return lo - 1;
   endfunction
   // textio: a line is a string
-  task automatic write(inout string l, input string img, input int just, input int width);
+  function automatic void write(inout string l, input string img, input int just, input int width);
     while (img.len() < width) img = just ? {img, " "} : {" ", img};
     l = {l, img};
-  endtask
-  task automatic writeline(input int f, inout string l);
+  endfunction
+  function automatic void writeline(input int f, inout string l);
     if (f == 32'h8000_0001) $display("%s", l);
     else $fdisplay(f, "%s", l);
     l = "";
-  endtask
+  endfunction
   function automatic int fopen(string name, int mode);
     if (name == "STD_OUTPUT") return 32'h8000_0001;
     return $fopen(name, mode == 0 ? "r" : mode == 1 ? "w" : "a");
   endfunction
-  task automatic readline(input int f, output string l);
+  function automatic void readline(input int f, output string l);
     string s;
     l = "";
     if (f == 32'h8000_0000) return;
     if ($fgets(s, f) == 0) return;
     while (s.len() > 0 && (s[s.len()-1] == "\n" || s[s.len()-1] == 8'd13)) s = s.substr(0, s.len() - 2);
     l = s;
-  endtask
+  endfunction
   function automatic void skip_ws(inout string l);
     int i = 0;
     while (i < l.len() && (l[i] == " " || l[i] == "\t")) i++;
@@ -2560,13 +2769,13 @@ package vhdl_rt;
     return 1;
   endfunction
   // ieee.math_real.uniform: L'Ecuyer's combined generator (CACM 31(6), 1988)
-  task automatic uniform(inout int s1, inout int s2, output real x);
+  function automatic void uniform(inout int s1, inout int s2, output real x);
     int k, z;
     k = s1 / 53668; s1 = 40014 * (s1 - k * 53668) - k * 12211; if (s1 < 0) s1 += 2147483563;
     k = s2 / 52774; s2 = 40692 * (s2 - k * 52774) - k * 3791; if (s2 < 0) s2 += 2147483399;
     z = s1 - s2; if (z < 1) z += 2147483562;
     x = real'(z) * 4.656613057e-10;
-  endtask
+  endfunction
 endpackage
 )SV";
     }
@@ -2757,9 +2966,30 @@ endpackage
         } else cx->useItems[item] = {pkg, item};
     }
 
+    TP completing;   // the incomplete type a full type declaration completes
     void emitTypeDecl(std::ostringstream& o, const DP& d, const std::string& where) {
+        TP ph;
+        if (d->tdef->k != TypeDef::Incomplete) {
+            auto f = cx->scopes.back().find(d->names[0]);
+            if (f != cx->scopes.back().end())
+                for (auto& y : f->second)
+                    if (y.k == Sym::TypeK && y.type && y.type->k == Type::Unknown && y.type->flavor == "incomplete") ph = y.type;
+        }
+        completing = ph;
+        emitTypeDecl0(o, d, where);
+        completing = nullptr;
+        if (ph) {
+            bool hoist = where == "process" || where == "function";
+            std::ostringstream& out = hoist && cx->extra ? *cx->extra : o;
+            std::string pre = hoist && cx->extra ? std::string("  ") : ind();
+            for (auto& at : pendingAcc[ph.get()]) emitAccClass(out, pre, at);
+            pendingAcc.erase(ph.get());
+        }
+    }
+    void emitTypeDecl0(std::ostringstream& o, const DP& d, const std::string& where) {
         auto& td = *d->tdef;
-        auto t = std::make_shared<Type>();
+        auto t = completing ? completing : std::make_shared<Type>();
+        if (completing) *t = Type();
         t->name = d->names[0];
         t->text = d->texts[0];
         t->home = cx->isPackage ? cx->container : "";
@@ -2910,6 +3140,12 @@ endpackage
             t->k = Type::Access;
             t->target = subtype(td.elem);
             if (t->target->k == Type::String) t->k = Type::Line;
+            else {
+                t->sv = svId(t->text + (hoist ? "__" + std::to_string(++uniq) : ""));
+                out << pre << "typedef class " << t->sv << ";\n";
+                if (t->target->k == Type::Unknown && t->target->flavor == "incomplete") pendingAcc[t->target.get()].push_back(t);
+                else emitAccClass(out, pre, t);
+            }
             Sym y;
             y.k = Sym::TypeK;
             y.name = t->name;
@@ -2931,12 +3167,312 @@ endpackage
             declare(y);
             return;
         }
-        case TypeDef::Incomplete: return;
-        case TypeDef::Protected: case TypeDef::ProtectedBody:
-            fail(d->line, "protected types are not supported yet");
+        case TypeDef::Incomplete: {
+            // completed by a later full declaration in the same region (5.4.2)
+            t->k = Type::Unknown;
+            t->flavor = "incomplete";
+            t->sv = svId(t->text);
+            Sym y;
+            y.k = Sym::TypeK;
+            y.name = t->name;
+            y.text = t->text;
+            y.type = t;
+            y.home = t->home;
+            declare(y);
+            return;
+        }
+        case TypeDef::Protected: {
+            // a protected type is a SystemVerilog class (5.6); its methods are declared here
+            t->k = Type::Protected;
+            t->sv = svId(t->text);
+            out << pre << "typedef class " << t->sv << ";\n";
+            Sym y;
+            y.k = Sym::TypeK;
+            y.name = t->name;
+            y.text = t->text;
+            y.type = t;
+            y.home = t->home;
+            declare(y);
+            Scope& ms = protMembers[t.get()];
+            for (auto& md : td.decls) {
+                if (md->k != DK::Subprog) continue;
+                auto sp = md->sub;
+                splitParams(*sp);
+                Sym m;
+                m.k = Sym::Sub;
+                m.name = sp->name;
+                m.text = sp->text;
+                m.sub = sp;
+                m.sv = subSvName(*sp);
+                m.member = true;
+                m.owner = t;
+                // overloads: one SV name each
+                if (ms.count(sp->name)) m.sv += "__" + std::to_string(ms[sp->name].size());
+                ms[sp->name].push_back(m);
+                subprogramTypes(ms[sp->name].back());
+            }
+            return;
+        }
+        case TypeDef::ProtectedBody: {
+            const Sym* ty = lookup(t->name);
+            if (!ty || ty->k != Sym::TypeK || !ty->type || ty->type->k != Type::Protected) fail(d->line, "protected body '" + t->text + "' without a protected type declaration");
+            TP pt = ty->type;
+            std::string key = "prot:" + pt->name + "@" + std::to_string((uintptr_t)pt.get());
+            for (auto& bd : td.decls)
+                if (bd->k == DK::Subprog) { splitParams(*bd->sub); pendingBodies[key].push_back(bd->sub); }
+            Ctx c = *cx;
+            c.isPackage = false;
+            c.scopes.push_back(protMembers[pt.get()]);
+            c.indent = cx->indent + 1;
+            Ctx* saved = cx;
+            cx = &c;
+            std::ostringstream cls;
+            try {
+                std::set<Subprog*> isMethod;
+                for (auto& [n, v] : cx->scopes.back())
+                    for (auto& m : v)
+                        if (m.k == Sym::Sub && m.sub) {
+                            auto b = findBody(key, *m.sub);
+                            if (!b) fail(d->line, "protected body '" + t->text + "' has no body for method '" + m.text + "'");
+                            isMethod.insert(b.get());
+                            *m.sub = *b;
+                            splitParams(*m.sub);
+                        }
+                // the body's own variables, constants, types and helper subprograms
+                for (auto& bd : td.decls) {
+                    if (bd->k == DK::Subprog && isMethod.count(bd->sub.get())) continue;
+                    if (bd->k == DK::Subprog) {
+                        // a helper that is not a method: a method of the class all the same
+                        auto sp = bd->sub;
+                        Sym m;
+                        m.k = Sym::Sub;
+                        m.name = sp->name;
+                        m.text = sp->text;
+                        m.sub = sp;
+                        m.sv = subSvName(*sp) + "__h" + std::to_string(++uniq);
+                        m.member = true;
+                        m.owner = pt;
+                        declare(m);
+                        subprogramTypes(cx->scopes.back()[sp->name].back());
+                        continue;
+                    }
+                    emitDecl(cls, bd, "class", nullptr);
+                }
+                auto& pc = protCtx[pt.get()];
+                pc.scopes = cx->scopes;
+                pc.usePkgs = cx->usePkgs;
+                pc.useItems = cx->useItems;
+                pc.file = cx->file;
+                for (auto& [n, v] : pc.scopes.back())
+                    for (auto& m : v)
+                        if (m.k == Sym::Obj) m.member = true;
+                for (auto& [n, v] : cx->scopes.back())
+                    for (auto& m : v)
+                        if (m.k == Sym::Sub && m.sub && m.member && m.sub->hasBody && !needsSpecialization(m)) emitSubprog(cls, m, "class");
+            } catch (...) {
+                cx = saved;
+                throw;
+            }
+            cx = saved;
+            out << pre << "class " << pt->sv << ";\n" << cls.str() << pre << "endclass\n";
+            return;
+        }
         }
     }
     std::set<std::string> litNames;   // enumeration literal SV names used in the current container
+    std::map<Type*, Scope> protMembers;   // protected type -> its methods
+    struct ProtCtx {
+        std::vector<Scope> scopes;
+        std::vector<std::string> usePkgs;
+        std::map<std::string, std::pair<std::string, std::string>> useItems;
+        std::string file;
+    };
+    std::map<Type*, ProtCtx> protCtx;     // protected type -> the scope its methods see
+
+    // ------------------------------------------------------- access types
+    // An access type is a SystemVerilog class (5.4): `v` holds a designated
+    // scalar or record; an array is the dynamic array `a` with its left bound
+    // `l` and direction `dn`.
+    static bool accArray(const TP& t) { return t && t->k == Type::Access && t->target && t->target->k == Type::Array; }
+    void emitAccClass(std::ostream& out, const std::string& pre, const TP& t) {
+        TP d = t->target;
+        std::string c = t->sv;
+        out << pre << "class " << c << ";\n";
+        if (d->k == Type::Array) {
+            if (d->dims.size() != 1) fail(0, "access to a multidimensional array is not supported yet");
+            if (isScalarBit(d->elem)) fail(0, "access to a bit vector type is not supported yet");
+            std::string ep, epost;
+            svParts(d->elem, ep, epost);
+            std::string dn = d->dims[0].box ? "1'b0" : (d->dims[0].downto ? "1'b1" : "1'b0");
+            out << pre << "  typedef " << ep << " arr_t[]" << epost << ";\n";
+            out << pre << "  arr_t a;\n";
+            out << pre << "  int l; bit dn;\n";
+            out << pre << "  static function " << c << " alloc(int l, int r, bit dn);\n";
+            out << pre << "    " << c << " p = new(); p.l = l; p.dn = dn;\n";
+            out << pre << "    p.a = new[(dn ? l - r : r - l) >= 0 ? (dn ? l - r : r - l) + 1 : 0];\n";
+            out << pre << "    return p;\n";
+            out << pre << "  endfunction\n";
+            out << pre << "  static function " << c << " from(int l, bit dn, " << ep << " x[]" << epost << ");\n";
+            out << pre << "    " << c << " p = new(); p.l = l; p.dn = dn; p.a = x; return p;\n";
+            out << pre << "  endfunction\n";
+            out << pre << "  function int right(); return dn ? l - a.size() + 1 : l + a.size() - 1; endfunction\n";
+            out << pre << "  function int idx(int i); return dn ? l - i : i - l; endfunction\n";
+            out << pre << "  function arr_t slice(int i, int j);\n";
+            out << pre << "    arr_t r = new[j >= i ? j - i + 1 : 0];\n";
+            out << pre << "    foreach (r[k]) r[k] = a[i + k];\n";
+            out << pre << "    return r;\n";
+            out << pre << "  endfunction\n";
+            out << pre << "  function void set_slice(int i, arr_t x);\n";
+            out << pre << "    foreach (x[k]) a[i + k] = x[k];\n";
+            out << pre << "  endfunction\n";
+            (void)dn;
+        } else if (baseOf(d)->k == Type::Record) {
+            // the record's elements are the class's own members, so a record
+            // holding this access type does not contain itself
+            TP rd = baseOf(d);
+            std::string get, set;
+            for (size_t i = 0; i < rd->fnames.size(); ++i) {
+                std::string f = svId(rd->ftext[i]);
+                out << pre << "  " << svDecl(rd->ftypes[i], f) << ";\n";
+                get += (i ? ", " : "") + f;
+                set += " " + f + " = x." + f + ";";
+            }
+            std::string tn = typeName(d);
+            out << pre << "  function " << tn << " get(); return '{" << get << "}; endfunction\n";
+            out << pre << "  function void set(" << tn << " x);" << set << " endfunction\n";
+            out << pre << "  static function " << c << " make(" << tn << " x);\n";
+            out << pre << "    " << c << " p = new(); p.set(x); return p;\n";
+            out << pre << "  endfunction\n";
+        } else {
+            out << pre << "  " << svDecl(d, "v") << ";\n";
+            out << pre << "  static function " << c << " make(" << svDecl(d, "x") << ");\n";
+            out << pre << "    " << c << " p = new(); p.v = x; return p;\n";
+            out << pre << "  endfunction\n";
+        }
+        out << pre << "endclass\n";
+    }
+    std::map<Type*, std::vector<TP>> pendingAcc;   // incomplete type -> access types waiting for it
+    Val derefArray(const Val& p) {
+        TP d = p.t->target;
+        Val v;
+        v.s = p.s + ".a";
+        v.accObj = p.s;
+        TP n = std::make_shared<Type>(*d);
+        n->name = n->text = "";
+        n->base = baseOf(d);
+        Rng g = mkRng(p.s + ".l", p.s + ".right()", !d->dims[0].box && d->dims[0].downto);
+        g.idx = d->dims[0].idx;
+        n->dims[0] = g;
+        v.t = n;
+        return v;
+    }
+    Val deref(const Val& p) {
+        if (accArray(p.t)) return derefArray(p);
+        Val v;
+        if (p.t->target && baseOf(p.t->target)->k == Type::Record) {
+            v.s = p.s + ".get()";
+            v.t = p.t->target;
+            return v;
+        }
+        v.s = p.s + ".v";
+        v.t = p.t->target;
+        return v;
+    }
+    Val allocator(const EP& e, const TP& at) {
+        TP d = at->target;
+        std::string c = typeName(at);
+        Val v;
+        v.t = at;
+        EP x = e->a;
+        if (x && x->k == EK::Qual) {
+            // new T'(value)
+            EP vx = x->b;
+            std::optional<int64_t> lo;
+            if (d->k == Type::Array && vx->k == EK::Agg && !vx->agg.empty()) {
+                // named static choices: the elements in index order (a dynamic array takes them positionally)
+                std::map<int64_t, EP> byIdx;
+                bool ok = true;
+                for (auto& a : vx->agg) {
+                    if (a.choices.size() != 1) { ok = false; break; }
+                    auto f = fold(a.choices[0]);
+                    if (!f || byIdx.count(*f)) { ok = false; break; }
+                    byIdx[*f] = a.value;
+                }
+                if (ok && (int64_t)byIdx.size() == byIdx.rbegin()->first - byIdx.begin()->first + 1) {
+                    auto pos = std::make_shared<Expr>(EK::Agg, vx->line);
+                    for (auto& [k, val] : byIdx) pos->agg.push_back(AggElem{{}, val});
+                    vx = pos;
+                    lo = byIdx.begin()->first;
+                }
+            }
+            Val val = ex(vx, d);
+            if (d->k == Type::Array) {
+                TP vt = val.t && val.t->k == Type::Array && !val.t->dims.empty() ? val.t : d;
+                const Rng& r = vt->dims[0];
+                // a positional aggregate starts at the index subtype's 'left (9.3.3.3)
+                std::string l = r.l;
+                if (lo) l = std::to_string(*lo);
+                else if (r.box) {
+                    TP it = d->dims[0].idx;
+                    if (it && it->range && !it->range->l.empty()) l = it->range->l;
+                    else if (it && it->k == Type::Enum) l = "0";
+                    else l = "(-2147483647-1)";
+                }
+                std::string dn = r.box ? "1'b0" : (r.downto ? "1'b1" : "1'b0");
+                std::string ep, epost;
+                svParts(d->elem, ep, epost);
+                // the value may be a fixed-size array: copy it into the dynamic one
+                v.s = c + "::from(" + l + ", " + dn + ", " + val.s + ")";
+                return v;
+            }
+            v.s = c + "::make(" + val.s + ")";
+            return v;
+        }
+        // new T / new T(range)
+        if (d->k == Type::Array) {
+            Rng r;
+            if (x && x->k == EK::Call && !x->args.empty()) r = rangeOf(x->args[0].actual);
+            else {
+                TP st = x ? typeOfMark(x) : d;
+                if (!st || st->k != Type::Array || st->dims[0].box) fail(e->line, "allocator of an unconstrained array needs a range");
+                r = st->dims[0];
+            }
+            v.s = c + "::alloc(" + r.l + ", " + r.r + ", " + (r.downto ? "1'b1" : "1'b0") + ")";
+            return v;
+        }
+        TP st = x ? typeOfMark(x) : d;
+        std::string init = defaultInit(st);
+        if (init.empty()) {
+            std::string pre, post;
+            svParts(d, pre, post);
+            init = post.empty() ? pre + "'(0)" : "'{default: 0}";
+            if (d->k == Type::Record) init = "'{default: 0}";
+            if (d->k == Type::Access) init = "null";
+            if (d->k == Type::Real || d->k == Type::Time) init = "0.0";
+            if (d->k == Type::String || d->k == Type::Line) init = "\"\"";
+        }
+        v.s = c + "::make(" + init + ")";
+        return v;
+    }
+
+    // x.m where x is an object of a protected type: the method overloads, and x's SV text
+    const std::vector<Sym>* methodOf(const EP& sel, std::string& recv) {
+        if (!sel || sel->k != EK::Sel || lookupSel(sel)) return nullptr;
+        if (sel->a->k == EK::Name) {
+            const Sym* y = lookup(sel->a->name);
+            if (!y || y->k != Sym::Obj) return nullptr;
+        }
+        Val p = ex(sel->a, nullptr);
+        TP t = p.t;
+        while (t && t->k != Type::Protected && t->base) t = t->base;
+        if (!t || t->k != Type::Protected) return nullptr;
+        auto it = protMembers.find(t.get());
+        if (it == protMembers.end()) fail(sel->line, "protected type '" + t->text + "' has no methods");
+        auto f = it->second.find(sel->name);
+        if (f == it->second.end()) fail(sel->line, "protected type '" + t->text + "' has no method '" + sel->text + "'");
+        recv = p.s;
+        return &f->second;
+    }
 
     void emitObject(std::ostringstream& o, const DP& d, const std::string& where) {
         // Diagnostics about a signal (mlint's unused-signal rules) point at its declaration.
@@ -2964,6 +3500,8 @@ endpackage
                     ot->base = baseOf(t);
                     if (t->k == Type::Array && iv.t->k == Type::Array && !iv.t->dims.empty() && iv.t->dims[0].box) fail(d->line, "cannot infer the range of '" + y.text + "'");
                 }
+            } else if (d->k == DK::Variable && t && t->k == Type::Protected) {
+                init = "new()";
             } else if (d->k == DK::Signal || d->k == DK::Variable) {
                 init = defaultInit(t);
                 if (t->k == Type::Array && !isScalarBit(t->elem)) {
@@ -2994,8 +3532,10 @@ endpackage
             std::string kw;
             if (d->k == DK::Constant) {
                 if (where == "package" || where == "module") kw = "localparam ";
-                else kw = where == "process" ? "static const " : "const ";
+                else kw = where == "process" ? "const static " : "const ";
                 if ((where == "package" || where == "module") && (ot->k == Type::String || ot->k == Type::Line)) kw = "localparam ";
+                // a table of records with strings (read with a run-time index): a constant variable
+                if (where == "module" && ot->k == Type::Array && ot->elem && !isPackable(ot->elem)) kw = "const ";
             } else if (where == "process") kw = "static ";
             else if (d->k == DK::Variable && d->shared) kw = "";
             std::string dname = y.sv;
@@ -3039,10 +3579,12 @@ endpackage
         }
         y.sub = sp;
         y.sv = subSvName(*sp) + (where == "process" ? "__" + std::to_string(++uniq) : "");
+        bool fromBody = false;
         if (!sp->hasBody && cx->isPackage) {
             if (auto b = findBody(cx->container, *sp)) {
                 *sp = *b;
                 splitParams(*sp);
+                fromBody = true;
             }
         }
         declare(y);
@@ -3050,6 +3592,8 @@ endpackage
         subprogramTypes(stored);
         if (!sp->hasBody) return;
         if (needsSpecialization(stored)) return;   // emitted per call site
+        // the body may use the package body's own declarations: emit it after them
+        if (fromBody && cx->deferSubs) { cx->deferSubs->push_back(stored); return; }
         emitSubprog(where == "process" && cx->extra ? *cx->extra : o, stored, where);
     }
 
@@ -3062,6 +3606,17 @@ endpackage
         const Subprog& sp = *s.sub;
         auto& pts = paramTypes[s.sub.get()];
         Ctx sub = *cx;
+        std::vector<std::string> formals;
+        if (spec && s.member && s.owner) {
+            // a method specialized at a call site: a free function of the object
+            auto pc = protCtx.find(s.owner.get());
+            if (pc == protCtx.end()) fail(sp.line, "method '" + sp.text + "' used before its protected body");
+            sub.scopes = pc->second.scopes;
+            sub.usePkgs = pc->second.usePkgs;
+            sub.useItems = pc->second.useItems;
+            sub.self = "self";
+            formals.push_back("input " + typeName(s.owner) + " self");
+        }
         sub.scopes.push_back(Scope());
         sub.inFunc = true;
         sub.proc = nullptr;
@@ -3072,7 +3627,6 @@ endpackage
         Ctx* saved = cx;
         cx = &sub;
         std::ostringstream body, head;
-        std::vector<std::string> formals;
         bool hasWait = containsWait(sp.body) || callsProcWithWait(sp.body);
         try {
             for (size_t i = 0; i < sp.params.size(); ++i) {
@@ -3107,9 +3661,22 @@ endpackage
             if (sp.isFunc && !rt) rt = cx->retSeen ? cx->retSeen : bt["integer"];
             std::string name = svName.empty() ? s.sv : svName;
             if (sp.isFunc) {
-                head << "  function automatic " << svRetType(rt) << " " << name << "(";
+                std::string rpre, rpost;
+                svParts(rt, rpre, rpost);
+                if (!rpost.empty()) {
+                    // an unpacked result needs a type name
+                    std::string tn = (name[0] == '\\' ? name.substr(1, name.size() - 2) : name) + "__rt";
+                    tn = svId(tn);
+                    head << "  typedef " << rpre << " " << tn << rpost << ";\n";
+                    rpre = tn;
+                }
+                head << "  function automatic " << rpre << " " << name << "(";
                 retTypes[s.sub.get()] = retTypes[s.sub.get()] ? retTypes[s.sub.get()] : rt;
                 if (spec) specRet = rt;
+            } else if (!hasWait && procIsFunction(sp)) {
+                // no wait and no signal assignment: a void function, so VHDL functions may call it
+                voidFns.insert(s.sub.get());
+                head << "  function automatic void " << name << "(";
             } else head << "  task automatic " << name << "(";
             (void)hasWait;
             for (size_t i = 0; i < formals.size(); ++i) head << (i ? ", " : "") << formals[i];
@@ -3119,7 +3686,7 @@ endpackage
             throw;
         }
         cx = saved;
-        o << lineDir(sp.line) << head.str() << body.str() << (sp.isFunc ? "  endfunction\n" : "  endtask\n");
+        o << lineDir(sp.line) << head.str() << body.str() << (sp.isFunc || voidFns.count(s.sub.get()) ? "  endfunction\n" : "  endtask\n");
         (void)where;
     }
     TP specRet;
@@ -3132,6 +3699,36 @@ endpackage
         }
         return pre;
     }
+    std::set<const Subprog*> voidFns;   // procedures emitted as void functions
+    static bool assignsSignal(const std::vector<SP>& b) {
+        for (auto& s : b) {
+            if (s->k == SK::SigAssign || s->k == SK::CondSigAssign || s->k == SK::SelSigAssign || s->k == SK::Force || s->k == SK::Release) return true;
+            for (auto& a : s->alts) if (assignsSignal(a.body)) return true;
+            if (assignsSignal(s->body)) return true;
+        }
+        return false;
+    }
+    // every procedure the body calls is built in or already a void function
+    bool callsOnlyFunctions(const std::vector<SP>& b) {
+        for (auto& s : b) {
+            if (s->k == SK::Call && s->call) {
+                EP n = s->call->k == EK::Call ? s->call->a : s->call;
+                if (n->k != EK::Name) return false;
+                auto syms = lookupAll(n->name);
+                if (!syms) return false;
+                for (auto& y : *syms)
+                    if (y.k == Sym::Sub && y.sub && !y.sub->isFunc && !voidFns.count(y.sub.get())) return false;
+            }
+            for (auto& a : s->alts) if (!callsOnlyFunctions(a.body)) return false;
+            if (!callsOnlyFunctions(s->body)) return false;
+        }
+        return true;
+    }
+    bool procIsFunction(const Subprog& sp) {
+        for (auto& p : sp.params)
+            if (p->cls == "signal") return false;
+        return !containsWait(sp.body) && !assignsSignal(sp.body) && callsOnlyFunctions(sp.body);
+    }
     static bool containsWait(const std::vector<SP>& b) {
         for (auto& s : b) {
             if (s->k == SK::Wait) return true;
@@ -3143,7 +3740,7 @@ endpackage
     bool callsProcWithWait(const std::vector<SP>&) { return false; }
 
     std::map<std::string, TP> specRetTypes;
-    Val specializedCall(const Sym& s, const std::vector<EP>& ord, const std::vector<Val>& av, int line) {
+    Val specializedCall(const Sym& s, const std::vector<EP>& ord, const std::vector<Val>& av, int line, const std::string& recv = "") {
         (void)line;
         const Subprog& sp = *s.sub;
         Spec spec;
@@ -3160,6 +3757,8 @@ endpackage
             } else if (retUnconstrained && pt && pt->k != Type::Array && pt->k != Type::Record && isStatic(ord[i])) {
                 // the result's width may depend on this value: specialize on it
                 act = "(" + av[i].s + ")";
+            } else if (isUnconstrained(pt) && !av[i].accObj.empty()) {
+                // the elements of an access-to-array object: a dynamic array parameter
             } else if (isUnconstrained(pt) && !(pt->elem && pt->elem->k == Type::Char && pt->dims.size() == 1)) {
                 TP at = av[i].t;
                 if (!at || at->k != Type::Array || isUnconstrained(at)) {
@@ -3168,6 +3767,16 @@ endpackage
                 }
                 TP n = std::make_shared<Type>(*pt);
                 n->dims = at && at->k == Type::Array ? at->dims : pt->dims;
+                if (!n->dims.empty() && !n->dims[0].box && !(n->dims[0].lv && n->dims[0].rv) && n->dims[0].len) {
+                    // a slice at a variable position (x(i*8+7 downto i*8)): only its length is fixed
+                    Rng g = n->dims[0];
+                    int64_t L = *g.len;
+                    Rng c = g.downto ? mkRng(std::to_string(L - 1), "0", true) : mkRng("0", std::to_string(L - 1), false);
+                    c.lv = g.downto ? L - 1 : 0;
+                    c.rv = g.downto ? 0 : L - 1;
+                    c.idx = g.idx;
+                    n->dims[0] = c;
+                }
                 if (at && at->k == Type::Array && n->dims.size() == 1 && !at->dims.empty() && !at->dims[0].box && at->dims[0].idx && pt->dims[0].idx &&
                     baseOf(at->dims[0].idx)->k != baseOf(pt->dims[0].idx)->k)
                     n->dims[0].idx = pt->dims[0].idx;
@@ -3184,7 +3793,7 @@ endpackage
         auto& done = *cx->specDone;
         auto it = specNames.find(key);
         if (it == specNames.end() || !done.count(key)) {
-            name = (it == specNames.end()) ? s.sv + "__s" + std::to_string(++uniq) : it->second;
+            name = (it == specNames.end()) ? (s.member && s.owner ? s.owner->sv + "__" : std::string()) + s.sv + "__s" + std::to_string(++uniq) : it->second;
             specNames[key] = name;
             done.insert(key);
             std::ostringstream fo;
@@ -3199,6 +3808,7 @@ endpackage
         Val v;
         std::string r = name + "(";
         bool first = true;
+        if (s.member) { r += recv; first = false; }
         for (size_t i = 0; i < av.size(); ++i) {
             if (!spec.actual[i].empty()) continue;
             r += (first ? "" : ", ") + av[i].s;
@@ -3282,6 +3892,23 @@ endpackage
         std::string I = ind();
         switch (s.k) {
         case SK::VarAssign: {
+            if (s.target->k == EK::Sel && s.target->name == "all") {
+                Val p = ex(s.target->a, nullptr);
+                if (p.t && p.t->k == Type::Access && p.t->target && baseOf(p.t->target)->k == Type::Record) {
+                    r = I + p.s + ".set(" + assignRhs(s.value, p.t->target) + ");\n";
+                    break;
+                }
+            }
+            if (s.target->k == EK::Call && s.target->args.size() == 1 && s.target->args[0].actual->k == EK::Range) {
+                // p.all(a to b) := x on an access-to-array object
+                Val p = ex(s.target->a, nullptr);
+                if (accArray(p.t)) p = derefArray(p);
+                if (!p.accObj.empty()) {
+                    Rng g = rangeOf(s.target->args[0].actual);
+                    r = I + p.accObj + ".set_slice(" + p.accObj + ".idx(" + g.l + "), " + ex(s.value, p.t).s + ");\n";
+                    break;
+                }
+            }
             TP tt = targetType(s.target);
             r = I + target(s.target, false) + " = " + assignRhs(s.value, tt) + ";\n";
             break;
@@ -3319,13 +3946,15 @@ endpackage
             std::string tg = target(s.target, sig);
             Val sel = ex(s.value, nullptr);
             r += I + caseKw(s, sel) + " (" + sel.s + ")\n";
-            for (auto& a : s.alts) {
+            std::vector<std::string> labels = caseLabels(s, sel);
+            for (size_t ai = 0; ai < s.alts.size(); ++ai) {
+                auto& a = s.alts[ai];
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
                     body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + "; ";
                 }
-                r += I + "  " + choiceList(a.choices, sel.t, s.matching) + ": begin " + body + "end\n";
+                r += I + "  " + labels[ai] + ": begin " + body + "end\n";
             }
             r += I + "endcase\n";
             break;
@@ -3345,8 +3974,10 @@ endpackage
         case SK::Case: {
             Val sel = ex(s.value, nullptr);
             r += I + caseKw(s, sel) + " (" + sel.s + ")\n";
-            for (auto& a : s.alts) {
-                r += I + "  " + choiceList(a.choices, sel.t, s.matching) + ": begin\n";
+            std::vector<std::string> labels = caseLabels(s, sel);
+            for (size_t ai = 0; ai < s.alts.size(); ++ai) {
+                auto& a = s.alts[ai];
+                r += I + "  " + labels[ai] + ": begin\n";
                 cx->indent += 2;
                 r += seqStmts(a.body);
                 cx->indent -= 2;
@@ -3554,6 +4185,15 @@ endpackage
                 for (int64_t i = std::min(*d.lv, *d.rv); i <= std::max(*d.lv, *d.rv); ++i) addEvent(out, sv + "[" + std::to_string(i) + "]", sub);
                 return;
             }
+            if (isPackable(t->elem) && cx->extra && !d.box) {
+                // an unpacked array whose range depends on generics: wait on its bits as one packed value
+                std::string tn;
+                for (char ch : sv) tn.push_back(std::isalnum((unsigned char)ch) ? ch : '_');
+                tn += "__ev_t";
+                if (evTypes.insert(cx->container + "|" + tn).second) *cx->extra << "  typedef logic [$bits(" << sv << ")-1:0] " << tn << ";\n";
+                addUnique(out, tn + "'(" + sv + ")");
+                return;
+            }
         }
         if (t && t->k == Type::Record && !isPackable(t)) {
             for (size_t i = 0; i < t->fnames.size(); ++i) addEvent(out, sv + "." + svId(t->ftext[i]), t->ftypes[i]);
@@ -3562,6 +4202,7 @@ endpackage
         if (t && (t->k == Type::String || t->k == Type::Line || t->k == Type::File)) return;
         addUnique(out, sv);
     }
+    std::set<std::string> evTypes;   // container|typedef of the packed views used in event controls
     static void addUnique(std::vector<std::string>& v, const std::string& s) {
         if (std::find(v.begin(), v.end(), s) == v.end()) v.push_back(s);
     }
@@ -3682,6 +4323,8 @@ endpackage
                 else if (builtinScope.count(n->name)) syms = &builtinScope[n->name];
             }
         }
+        std::string recv;
+        if (!syms && n->k == EK::Sel) syms = methodOf(n, recv);
         if (!syms || syms->empty()) fail(line, "unknown procedure '" + (n->text.empty() ? n->name : n->text) + "'");
         std::vector<Sym> procs;
         for (auto& s : *syms)
@@ -3689,7 +4332,7 @@ endpackage
         if (procs.empty()) fail(line, "'" + n->text + "' is not a procedure");
         const Sym* s = pickOverload(procs, args, nullptr, line);
         if (!s->sub) return builtinProc(s->builtin, args, line);
-        Val v = userCall(*s, args, nullptr, line);
+        Val v = userCall(*s, args, nullptr, line, recv);
         return v.s + ";";
     }
 
@@ -3701,39 +4344,157 @@ endpackage
         TP type;
     };
 
+    // A deep copy of declarations whose subprograms and protected types the
+    // translator completes in place (one copy per package instance).
+    static std::shared_ptr<Subprog> cloneSub(const std::shared_ptr<Subprog>& sp) {
+        if (!sp) return sp;
+        auto n = std::make_shared<Subprog>(*sp);
+        for (auto& p : n->params) p = std::make_shared<Decl>(*p);
+        n->decls = cloneDecls(n->decls);
+        return n;
+    }
+    static std::vector<DP> cloneDecls(const std::vector<DP>& ds) {
+        std::vector<DP> r;
+        for (auto& d : ds) {
+            auto n = std::make_shared<Decl>(*d);
+            n->sub = cloneSub(d->sub);
+            if (d->tdef) {
+                n->tdef = std::make_shared<TypeDef>(*d->tdef);
+                n->tdef->decls = cloneDecls(d->tdef->decls);
+            }
+            r.push_back(n);
+        }
+        return r;
+    }
+
+    // Generics of a package instance (6.5.6.2): constants become localparams,
+    // types and subprograms are names for the actuals.
+    void bindPackageGenerics(std::ostringstream& o, const UP& src, const UP& inst) {
+        auto actualOf = [&](const std::string& n) -> EP {
+            size_t pos = 0;
+            for (auto& g : src->generics)
+                for (auto& gn : g->names) {
+                    for (size_t i = 0; i < inst->genericMap.size(); ++i) {
+                        auto& a = inst->genericMap[i];
+                        if (a.formal && a.formal->k == EK::Name && a.formal->name == n) return a.actual;
+                        if (!a.formal && i == pos && gn == n) return a.actual;
+                    }
+                    ++pos;
+                }
+            return nullptr;
+        };
+        for (auto& g : src->generics) {
+            for (size_t k = 0; k < g->names.size(); ++k) {
+                const std::string& n = g->names[k];
+                EP act = actualOf(n);
+                if (act && act->k == EK::Open) act = nullptr;
+                if (g->cls == "type") {
+                    if (!act) fail(inst->line, "no actual for generic type '" + g->texts[k] + "'");
+                    Sym y;
+                    y.k = Sym::TypeK;
+                    y.name = n;
+                    y.text = g->texts[k];
+                    if (act->k == EK::Call) {
+                        SubInd si;
+                        si.mark = act->a;
+                        for (auto& a : act->args) si.idx.push_back(a.actual);
+                        y.type = subtype(si);
+                    } else y.type = typeOfMark(act);
+                    declare(y);
+                    continue;
+                }
+                if (g->cls == "subprogram") {
+                    std::string look = n;
+                    if (act && (act->k == EK::Name || act->k == EK::Sel)) look = act->name;
+                    else if (!act && g->target) look = g->target->name;
+                    else if (act && act->k == EK::Str) look = "\"" + lowerStr(act->text) + "\"";
+                    const std::vector<Sym>* syms = lookupAll(look);
+                    if (!syms) {
+                        if (n.size() > 2 && n[0] == '"') continue;   // a predefined operator stays predefined
+                        fail(inst->line, "no subprogram '" + look + "' for generic '" + g->texts[k] + "'");
+                    }
+                    for (auto y : *syms) {
+                        if (y.k != Sym::Sub) continue;
+                        y.name = n;
+                        declare(y);
+                    }
+                    continue;
+                }
+                if (g->cls == "package") fail(inst->line, "package generics are not supported yet");
+                // constant
+                TP t = subtype(g->type);
+                EP val = act ? act : g->init;
+                if (!val) fail(inst->line, "no actual for generic '" + g->texts[k] + "'");
+                Val v = ex(val, t);
+                Sym y;
+                y.k = Sym::Obj;
+                y.cls = "constant";
+                y.name = n;
+                y.text = g->texts[k];
+                y.sv = svId(g->texts[k]);
+                y.home = cx->container;
+                y.type = isUnconstrained(t) && v.t ? v.t : t;
+                declare(y);
+                o << ind() << "localparam " << svDecl(y.type, y.sv) << " = " << v.s << ";\n";
+            }
+        }
+    }
+
     std::string emitPackage(const UP& u) {
+        UP src = u, body, inst;
+        if (u->k == Unit::PackageInst) {
+            auto it = packages.find(u->of);
+            if (it == packages.end() || it->second->k != Unit::Package) fail(u->line, "unknown generic package '" + u->ofText + "'");
+            inst = u;
+            src = std::make_shared<Unit>(*it->second);
+            src->decls = cloneDecls(src->decls);
+        } else if (!u->generics.empty()) {
+            return "";   // an uninstantiated package: each instance is emitted
+        }
+        if (auto b = bodies.find(src->name); b != bodies.end()) {
+            body = b->second;
+            if (inst) {
+                body = std::make_shared<Unit>(*body);
+                body->decls = cloneDecls(body->decls);
+            }
+        }
         Ctx c;
         c.container = u->name;
         c.isPackage = true;
         c.scopes.push_back(Scope());
-        c.file = u->file;
+        c.file = src->file;
         std::ostringstream extra;
         std::set<std::string> specDone;
         c.extra = &extra;
         c.specDone = &specDone;
+        std::vector<Sym> deferSubs;
+        c.deferSubs = &deferSubs;
         Ctx* saved = cx;
         cx = &c;
         litNames.clear();
         std::ostringstream o;
         try {
-            for (auto& d : allCtx(*u))
-                for (auto& n : d->uses) useClause(n);
-            if (u->k == Unit::PackageInst) fail(u->line, "package instantiation is not supported yet");
-            if (!u->generics.empty()) fail(u->line, "generic packages are not supported yet");
-            // the package body's subprograms complete the declarations
-            if (auto b = bodies.find(u->name); b != bodies.end()) {
-                for (auto& d : b->second->decls)
-                    if (d->k == DK::Subprog) { splitParams(*d->sub); pendingBodies[u->name].push_back(d->sub); }
-                for (auto& d : allCtx(*b->second))
-                    for (auto& n : d->uses) useClause(n);
-            }
             o << lineDir(u->line) << "package " << svId(u->text) << ";\n";
             o << "  timeunit " << timeUnit << "; timeprecision " << timePrec << ";\n";
-            emitDecls(o, u->decls, "package");
+            if (inst) {
+                for (auto& d : allCtx(*inst))
+                    for (auto& n : d->uses) useClause(n);
+                bindPackageGenerics(o, src, inst);
+            }
+            for (auto& d : allCtx(*src))
+                for (auto& n : d->uses) useClause(n);
+            // the package body's subprograms complete the declarations
+            if (body) {
+                for (auto& d : body->decls)
+                    if (d->k == DK::Subprog) { splitParams(*d->sub); pendingBodies[u->name].push_back(d->sub); }
+                for (auto& d : allCtx(*body))
+                    for (auto& n : d->uses) useClause(n);
+            }
+            emitDecls(o, src->decls, "package");
             // body-only declarations (constants, helper subprograms) after the visible part
-            if (auto b = bodies.find(u->name); b != bodies.end()) {
-                c.file = b->second->file;
-                for (auto& d : b->second->decls) {
+            if (body) {
+                c.file = body->file;
+                for (auto& d : body->decls) {
                     if (d->k == DK::Subprog) {
                         // already emitted with its declaration?
                         bool declared = false;
@@ -3754,6 +4515,8 @@ endpackage
                     emitDecl(o, d, "package", nullptr);
                 }
             }
+            c.deferSubs = nullptr;
+            for (auto& y : deferSubs) emitSubprog(o, y, "package");
             o << extra.str();
             o << "endpackage\n";
         } catch (...) {
@@ -4017,6 +4780,22 @@ endpackage
     // ===================================================================
     // Concurrent statements
     // ===================================================================
+    // The labels of a case or selected assignment. VHDL requires the choices
+    // to cover every value, so for synthesis the last one becomes `default`
+    // when there is no `others`: the SystemVerilog type (an enum is an int)
+    // may have values the VHDL type does not, which would infer a latch.
+    template <class S>
+    std::vector<std::string> caseLabels(const S& s, const Val& sel) {
+        std::vector<std::string> l;
+        bool def = false;
+        for (auto& a : s.alts) {
+            l.push_back(choiceList(a.choices, sel.t, s.matching));
+            def = def || l.back().rfind("default", 0) == 0;
+        }
+        if (synth && !def && !l.empty()) l.back() = "default";
+        return l;
+    }
+
     std::string procName(const std::string& label) { return label.empty() ? "" : " : " + svId(label); }
 
     // an equivalent process: body once at time 0, then wait on the signals read
@@ -4029,6 +4808,8 @@ endpackage
                 prevUpd += prevName(p) + " = " + p + "; ";
             }
         replaceAll(bodyText, "@@PREV@@", prevUpd);
+        if (synth && prevDecl.empty() && !sigs.empty() && bodyText.find("@(") == std::string::npos && bodyText.find("wait") == std::string::npos)
+            return "  always @* begin" + procName(label) + "\n" + bodyText + "  end\n";
         std::string r = "  always begin" + procName(label) + "\n" + prevDecl + bodyText;
         if (sigs.empty()) r += "    " + prevUpd + "wait (0);\n";
         else r += "    " + prevUpd + "@(" + eventList(sigs) + ");\n";
@@ -4231,14 +5012,18 @@ endpackage
                     prevUpd += prevName(p) + " = " + p + "; ";
                 }
                 replaceAll(body, "@@PREV@@", prevUpd);
-                out = "  always begin" + procName(s.label) + "\n" + decls.str() + prevDecl + body;
-                if (s.hasSens) {
-                    if (sens.empty()) out += "    " + prevUpd + "wait (0);\n";
-                    else out += "    " + prevUpd + "@(" + eventList(sens) + ");\n";
-                } else if (!containsWait(s.body)) {
-                    out += "    wait (0);\n";   // a process without wait would loop forever
+                if (synth && s.hasSens && !sens.empty() && prevDecl.empty()) {
+                    out = "  always @* begin" + procName(s.label) + "\n" + decls.str() + body + "  end\n";
+                } else {
+                    out = "  always begin" + procName(s.label) + "\n" + decls.str() + prevDecl + body;
+                    if (s.hasSens) {
+                        if (sens.empty()) out += "    " + prevUpd + "wait (0);\n";
+                        else out += "    " + prevUpd + "@(" + eventList(sens) + ");\n";
+                    } else if (!containsWait(s.body)) {
+                        out += "    wait (0);\n";   // a process without wait would loop forever
+                    }
+                    out += "  end\n";
                 }
-                out += "  end\n";
             }
         } catch (...) {
             cx->proc = saved;
@@ -4445,7 +5230,8 @@ endpackage
                 TP ft;
                 for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == fl) { formalSv = order[i]; ft = types[i]; }
                 if (!ft) for (size_t i = 0; i < compOrder.size(); ++i) if (compOrder[i] == fl && i < compTypes.size()) ft = compTypes[i];
-                if (!ft || ft->k != Type::Array || !ft->dims[0].lv || !ft->dims[0].rv) fail(s.line, "partial association of '" + fl + "' needs a constant range");
+                // the parts cover the whole formal; their indices give the order
+                if (!ft || ft->k != Type::Array) fail(s.line, "partial association of '" + fl + "' needs an array formal");
                 std::map<int64_t, std::string> bits;
                 for (auto& [f, act] : parts) {
                     if (f->args.size() != 1) fail(s.line, "partial association form not supported");

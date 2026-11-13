@@ -268,7 +268,10 @@ private:
             d->sub = subprogramSpec();
             d->names.push_back(d->sub->name);
             d->texts.push_back(d->sub->text);
-            if (accept("is")) { if (!accept("<>")) name(); }
+            if (accept("is")) {
+                if (accept("<>")) d->mode = "box";   // default: the visible subprogram of the same name
+                else d->target = name();
+            }
             return d;
         } else if (isKw("package")) {
             next();

@@ -9410,11 +9410,14 @@ struct Lowerer {
         struct RestoreLoc { SrcLoc& l; SrcLoc v; ~RestoreLoc() { g_emitLoc = v; } } restoreLoc{g_emitLoc, savedLoc};
         if (s.kind != slang::ast::StatementKind::List && s.kind != slang::ast::StatementKind::Block) {
             covLoc(s.sourceRange.start());
-            lastLoc() = s.sourceRange.start();
+            if (s.sourceRange.start().valid()) lastLoc() = s.sourceRange.start();   // keep the last known place
         }
         using namespace slang::ast;
         switch (s.kind) {
             case StatementKind::Empty: break;
+            // slang leaves a statement it could not bind as Invalid without an error only
+            // in a branch it proved dead (a constant-false condition): nothing to run
+            case StatementKind::Invalid: break;
             case StatementKind::List:
                 if ((!loops.empty() && loops.back().xpBrk >= 0) || (!xp.dis.empty() && !xp.clean)) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
@@ -10211,7 +10214,15 @@ struct Lowerer {
             }
             case StatementKind::DisableFork: { Instr i; i.k = IK::DisableFork; prog.emit(i); break; }
             default:
-                throw std::runtime_error("lower: unsupported statement kind " + std::string(toString(s.kind)));
+                {
+                    // where: the statement's own location when it has one
+                    std::string at = whereStr();
+                    if (const auto* sm = srcMgr(); sm && s.sourceRange.start().valid()) {
+                        auto ol = sm->getFullyOriginalLoc(s.sourceRange.start());
+                        at = std::string(sm->getFileName(ol)) + ":" + std::to_string(sm->getLineNumber(ol)) + ": ";
+                    }
+                    throw std::runtime_error(at + "lower: unsupported statement kind " + std::string(toString(s.kind)));
+                }
         }
     }
 };

@@ -324,8 +324,11 @@ into fields once. As the ISA allows, a hart sees a store to code only after
 it executes `FENCE.I`; loading a program, a debugger write and `-restore`
 empty the cache too. With paging on, the page that instructions were last
 fetched from stays translated and PMP-checked until the next `SFENCE.VMA`,
-`satp` or PMP write or change of privilege. Linux boots at about 43 MIPS:
-loads and stores still walk the TLB and PMP each time. Loads and stores to plain memory with nothing to check
+`satp` or PMP write or change of privilege. Loads and stores with paging on
+keep the same for the last 64 pages of plain memory each read and wrote
+(a page any part of which is a device, is only partly allowed by PMP, or holds
+`tohost` takes the general path). Linux boots at about 50 MIPS. Loads and
+stores to plain memory with nothing to check
 (no PMP in force, no watchpoint, no write buffer) take an inline path. RAM is
 mapped on first touch, so a large memory costs nothing until it is used. A
 co-simulated RTL access costs two socket round trips plus the RTL's own
