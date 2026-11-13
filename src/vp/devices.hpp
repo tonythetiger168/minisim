@@ -265,7 +265,8 @@ private:
     }
 };
 
-// PLIC (SiFive layout), one M-mode context per hart. Sources are level
+// PLIC (SiFive layout), two contexts per hart, as QEMU's virt board has them:
+// context 2h is hart h's machine mode, 2h + 1 its supervisor mode. Sources are level
 // sensitive: a source is pending while its line is high and it is not being
 // serviced; a claim takes the highest-priority pending enabled source above
 // the context's threshold (the lowest id on a tie); a complete ends service.
@@ -280,8 +281,8 @@ public:
         prio_.assign(nsrc + 1, 0);
         busy_.assign(nsrc + 1, 0);
         unsigned words = (nsrc + 32) / 32;
-        en_.assign(p->hartCount(), std::vector<uint32_t>(words, 0));
-        thr_.assign(p->hartCount(), 0);
+        en_.assign(2 * p->hartCount(), std::vector<uint32_t>(words, 0));
+        thr_.assign(2 * p->hartCount(), 0);
     }
     bool pending(unsigned s) const { return s && s <= nsrc && level[s] && !busy_[s]; }
     // Does context `c` see an interrupt?

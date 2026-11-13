@@ -163,10 +163,49 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
     }
 }
 // The definition of a covergroup type, built on first use.
+// Block events (19.3): the task or function a block event names, null for
+// a named block; and the number of its begin or end point.
+static const slang::ast::SubroutineSymbol* blockEventSub(const slang::ast::Expression& e) {
+    using namespace slang::ast;
+    const Symbol* s = nullptr;
+    if (e.kind == ExpressionKind::ArbitrarySymbol) s = e.as<ArbitrarySymbolExpression>().symbol;
+    else if (ValueExpressionBase::isKind(e.kind)) s = &e.as<ValueExpressionBase>().symbol;
+    return s && s->kind == SymbolKind::Subroutine ? &s->as<SubroutineSymbol>() : nullptr;
+}
+static std::map<std::pair<const slang::ast::SubroutineSymbol*, bool>, size_t>& blockEventIds() {
+    static std::map<std::pair<const slang::ast::SubroutineSymbol*, bool>, size_t> m;
+    return m;
+}
+static size_t blockEventId(const slang::ast::SubroutineSymbol* sub, bool begin) {
+    auto [it, fresh] = blockEventIds().try_emplace({sub, begin}, cgBlockDefs().size());
+    if (fresh) cgBlockDefs().emplace_back();
+    return it->second;
+}
+// Every block event of every covergroup, numbered before any subroutine is
+// lowered, so a subroutine knows to sample at its start or end.
+static void scanBlockEvents(const slang::ast::Symbol& root) {
+    using namespace slang::ast;
+    struct V : ASTVisitor<V, VisitFlags::Symbols> {
+        void handle(const CovergroupType& t) {
+            if (const TimingControl* ev = t.getCoverageEvent(); ev && ev->kind == TimingControlKind::BlockEventList)
+                for (const auto& be : ev->as<BlockEventListControl>().events)
+                    if (const auto* sub = blockEventSub(*be.target)) blockEventId(sub, be.isBegin);
+            visitDefault(t);
+        }
+    } v;
+    root.visit(v);
+}
+// The sampling call at a block event's point, or nothing.
+void blockEventSample(const slang::ast::SubroutineSymbol* sub, bool begin) {
+    auto it = blockEventIds().find({sub, begin});
+    if (it == blockEventIds().end()) return;
+    Instr i; i.k = IK::Assign; i.sig = fresh(64);
+    i.e = sysFnNode(SF_CG, {konst(make((uint64_t)it->second, 0, 32))}, CG_BLOCK);
+    prog.emit(i);
+}
 int cgDefOf(const slang::ast::CovergroupType& t) {
     using namespace slang::ast;
     if (auto it = cgIdxMap().find(&t); it != cgIdxMap().end()) return it->second;
-    if (t.getBaseGroup()) unsupported("a covergroup that extends another (19.4.1)");
     auto savedScope = scope;
     auto savedUnit = tsUnit, savedPrec = tsPrec;
     setScope(t.getParentScope());
@@ -190,22 +229,41 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         sigmap[&s] = id;
         return id;
     };
-    for (const FormalArgumentSymbol* a : t.getArguments()) {
+    // covergroup extends base (19.4.1): the base's members, then this one's;
+    // a member with a base member's name replaces it.
+    std::vector<const CovergroupType*> chain;
+    for (const CovergroupType* g = &t; g;) {
+        chain.insert(chain.begin(), g);
+        const Type* bt = g->getBaseGroup();
+        g = bt && bt->getCanonicalType().kind == SymbolKind::CovergroupType ? &bt->getCanonicalType().as<CovergroupType>() : nullptr;
+    }
+    const CovergroupType* argT = chain.front();   // arguments and the sampling event: the base's, unless given again
+    for (const CovergroupType* g : chain)
+        if (!g->getArguments().empty() || g->getCoverageEvent()) argT = g;
+    for (const FormalArgumentSymbol* a : argT->getArguments()) {
         d.argSigs.push_back(hidden(*a, a->getType()));
         d.argRef.push_back(a->direction == ArgumentDirection::Ref);
     }
-    for (const auto& m : t.members())
+    for (const auto& m : argT->members())
         if (const auto* a = m.as_if<FormalArgumentSymbol>(); a && (a->flags & VariableFlags::CoverageSampleFormal))
             d.sampleSigs.push_back(hidden(*a, a->getType()));
-    if (const TimingControl* ev = t.getCoverageEvent()) {
-        if (ev->kind != TimingControlKind::SignalEvent && ev->kind != TimingControlKind::EventList)
-            unsupported("this covergroup sampling event (block events, 19.3)");
-        clockOf(*ev, d.ev, d.evIff);
+    std::vector<size_t> blockAt;   // the block events this covergroup samples at
+    if (const TimingControl* ev = argT->getCoverageEvent()) {
+        if (ev->kind == TimingControlKind::BlockEventList) {   // @@(begin f or end g) (19.3)
+            for (const auto& be : ev->as<BlockEventListControl>().events) {
+                const SubroutineSymbol* sub = blockEventSub(*be.target);
+                if (!sub) unsupported("a block event on a named block (19.3)");
+                blockAt.push_back(blockEventId(sub, be.isBegin));
+            }
+        } else if (ev->kind != TimingControlKind::SignalEvent && ev->kind != TimingControlKind::EventList)
+            unsupported("this covergroup sampling event (19.3)");
+        else clockOf(*ev, d.ev, d.evIff);
     }
-    const auto& body = t.getBody();
-    cgOpts(body.options, d.opts, &d.realInterval);
+    for (const CovergroupType* g : chain) cgOpts(g->getBody().options, d.opts, &d.realInterval);
     std::unordered_map<const CoverpointSymbol*, int> cpIdx;
-    for (const auto& m : body.members()) {
+    std::unordered_map<std::string, int> cpByName, xByName;
+    for (const CovergroupType* g : chain)
+    for (const auto& m : g->getBody().members()) {
         const auto* cp = m.as_if<CoverpointSymbol>();
         if (!cp) continue;
         CgCpDef c;
@@ -326,10 +384,16 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         }
         if (c.isReal && std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0; }))
             unsupported("a real coverpoint without bins: there are no automatic bins for reals (19.5.3)");
-        cpIdx[cp] = (int)d.cps.size();
-        d.cps.push_back(std::move(c));
+        if (auto it = cpByName.find(c.name); it != cpByName.end()) {   // replaces the base's (19.4.1)
+            cpIdx[cp] = it->second;
+            d.cps[(size_t)it->second] = std::move(c);
+        } else {
+            cpIdx[cp] = cpByName[c.name] = (int)d.cps.size();
+            d.cps.push_back(std::move(c));
+        }
     }
-    for (const auto& m : body.members()) {
+    for (const CovergroupType* g : chain)
+    for (const auto& m : g->getBody().members()) {
         const auto* x = m.as_if<CoverCrossSymbol>();
         if (!x) continue;
         CgCrossDef cd;
@@ -356,11 +420,16 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             }
         };
         bins(*x);
-        d.crosses.push_back(std::move(cd));
+        if (auto it = xByName.find(cd.name); it != xByName.end()) d.crosses[(size_t)it->second] = std::move(cd);
+        else {
+            xByName[cd.name] = (int)d.crosses.size();
+            d.crosses.push_back(std::move(cd));
+        }
     }
     cgDefs().push_back(std::move(d));
     int idx = (int)cgDefs().size() - 1;
     cgIdxMap()[&t] = idx;
+    for (size_t b : blockAt) cgBlockDefs()[b].push_back(idx);
     curClass = savedCls;
     frames = std::move(savedFrames);
     scope = savedScope;

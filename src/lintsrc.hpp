@@ -36,12 +36,13 @@ struct Found {
 };
 
 inline const std::vector<const char*>& textRules() {
-    static const std::vector<const char*> r = {"FMT001", "FMT002", "FMT003", "FMT004", "STY004", "NAME014"};
+    static const std::vector<const char*> r = {"FMT001", "FMT002", "FMT003", "FMT004", "STY004", "NAME014", "STY011"};
     return r;
 }
 inline const std::vector<const char*>& syntaxRules() {
     static const std::vector<const char*> r = {"SUS001", "STY005", "STY006", "STY007",
-                                               "STY008", "STY009", "W009"};
+                                               "STY008", "STY009", "W009", "NAME015", "NAME016", "NAME017",
+                                               "SUS002", "SUS003", "STY010", "STY012"};
     return r;
 }
 inline bool any(const Rules& rules, const std::vector<const char*>& ids) {
@@ -58,7 +59,7 @@ inline void checkText(BufferID buf, std::string_view text, const Rules& rules, c
     while (!text.empty() && text.back() == '\0') text.remove_suffix(1);
     if (text.empty()) return;
     bool fmt1 = rules.enabled("FMT001"), fmt2 = rules.enabled("FMT002"), fmt3 = rules.enabled("FMT003");
-    bool sty4 = rules.enabled("STY004"), name14 = rules.enabled("NAME014");
+    bool sty4 = rules.enabled("STY004"), name14 = rules.enabled("NAME014"), sty11 = rules.enabled("STY011");
     auto at = [&](size_t off) { return SourceLocation(buf, off); };
     size_t pos = 0;
     while (pos < text.size()) {
@@ -84,10 +85,17 @@ inline void checkText(BufferID buf, std::string_view text, const Rules& rules, c
             size_t last = line.find_last_not_of(" \t");
             out.push_back({"FMT003", at(pos + (last == std::string_view::npos ? 0 : last + 1)), "trailing whitespace"});
         }
-        if (sty4 || name14) {
+        if (sty4 || name14 || sty11) {
             size_t f = line.find_first_not_of(" \t");
             if (f != std::string_view::npos && line[f] == '`') {
                 std::string_view d = line.substr(f + 1);
+                // `uvm_info(...);  The macro brings its own semicolon; a second one ends an if early.
+                if (sty11 && d.substr(0, 4) == "uvm_") {
+                    std::string_view code = d.substr(0, d.find("//"));
+                    size_t e = code.find_last_not_of(" \t");
+                    if (e != std::string_view::npos && e > 0 && code[e] == ';' && code[e - 1] == ')')
+                        out.push_back({"STY011", at(pos + f + 1 + e), "a semicolon after a UVM macro"});
+                }
                 if (sty4 && d.substr(0, 5) == "endif" && d.find_first_not_of(" \t", 5) == std::string_view::npos)
                     out.push_back({"STY004", at(pos + f),
                                    "`endif with no comment saying which `ifdef it closes"});
@@ -116,10 +124,13 @@ inline void checkText(BufferID buf, std::string_view text, const Rules& rules, c
 struct Walk : SyntaxVisitor<Walk> {
     const Rules& rules;
     const SourceManager& sm;
+    const lintrules::Params& P;
     std::vector<Found>& out;
+    std::vector<std::string_view> blocks;   // names of the begin blocks we are inside
     int inClass = 0;       // methods of a class are automatic already
     int autoScope = 0;     // module automatic ...: its functions are too
-    Walk(const Rules& r, const SourceManager& s, std::vector<Found>& o) : rules(r), sm(s), out(o) {}
+    Walk(const Rules& r, const SourceManager& s, const lintrules::Params& p, std::vector<Found>& o)
+        : rules(r), sm(s), P(p), out(o) {}
 
     void add(const char* rule, SourceLocation loc, std::string text) {
         if (rules.enabled(rule)) out.push_back({rule, loc, std::move(text)});
@@ -130,6 +141,69 @@ struct Walk : SyntaxVisitor<Walk> {
     void handle(const BlockStatementSyntax& s) {
         for (auto* item : s.items)
             if (item && empty(*item)) add("SUS001", item->getFirstToken().location(), "a stray semicolon");
+        // begin : name   or   name : begin
+        std::string_view name;
+        if (s.kind == SyntaxKind::SequentialBlockStatement) {
+            if (s.blockName) name = s.blockName->name.valueText();
+            else if (s.label) name = s.label->name.valueText();
+        }
+        if (!name.empty()) blocks.push_back(name);
+        visitDefault(s);
+        if (!name.empty()) blocks.pop_back();
+    }
+    // disable name; of anything but a begin block we are inside: a fork, another process.
+    void handle(const DisableStatementSyntax& s) {
+        if (s.kind == SyntaxKind::DisableStatement && rules.enabled("STY012")) {
+            std::string name = s.name->toString();
+            while (!name.empty() && std::isspace((unsigned char)name.front())) name.erase(0, 1);
+            while (!name.empty() && std::isspace((unsigned char)name.back())) name.pop_back();
+            bool mine = false;
+            for (auto b : blocks) mine |= b == name;
+            if (!mine)
+                add("STY012", s.disable.location(),
+                    "disable " + name + " stops something other than a begin block this statement is in; use disable fork");
+        }
+        visitDefault(s);
+    }
+    // void'(obj.randomize()) throws the failure away.
+    void handle(const VoidCastedCallStatementSyntax& s) {
+        if (rules.enabled("SUS002")) {
+            std::string inner = s.expr->toString();
+            for (std::string_view f : {"randomize", "uvm_hdl_read"})
+                if (inner.find(f) != std::string::npos) {
+                    add("SUS002", s.voidKeyword.location(),
+                        "void'() throws away the result of " + std::string(f) + ": a failure goes unseen");
+                    break;
+                }
+        }
+        visitDefault(s);
+    }
+    void handle(const SystemNameSyntax& s) {
+        std::string_view n = s.systemIdentifier.valueText();
+        const char* instead = n == "$psprintf" ? "$sformatf"
+                              : n == "$random" ? "$urandom"
+                              : n == "$srandom" ? "process::self().srandom()"
+                              : n.substr(0, 6) == "$dist_" ? "$urandom_range or constraints"
+                              : nullptr;
+        if (instead)
+            add("SUS003", s.systemIdentifier.location(), std::string(n) + ": use " + instead);
+    }
+    void handle(const LiteralExpressionSyntax& s) {
+        if (s.kind == SyntaxKind::StringLiteralExpression && rules.enabled("STY010")) {
+            std::string_view raw = s.literal.rawText();
+            size_t at = raw.find("\\\n");
+            if (at == std::string_view::npos) at = raw.find("\\\r\n");
+            if (at != std::string_view::npos)
+                add("STY010", s.literal.location() + at, "a string carried over the line with a backslash; join two strings with {}");
+        }
+    }
+    void handle(const ConstraintDeclarationSyntax& s) {
+        if (rules.enabled("NAME016")) {
+            Token t = s.name->getLastToken();
+            if (!t.valueText().empty() && !P.constraint.ok(t.valueText()))
+                add("NAME016", t.location(),
+                    "constraint '" + std::string(t.valueText()) + "' does not match " + P.constraint.src);
+        }
         visitDefault(s);
     }
     void handle(const EmptyMemberSyntax& s) {
@@ -144,6 +218,12 @@ struct Walk : SyntaxVisitor<Walk> {
     }
     void handle(const ModuleDeclarationSyntax& s) {
         bool isAuto = s.header->lifetime.kind == TokenKind::AutomaticKeyword;
+        if (s.kind == SyntaxKind::InterfaceDeclaration && rules.enabled("NAME015")) {
+            Token name = s.header->name;
+            if (!name.valueText().empty() && !P.interface.ok(name.valueText()))
+                add("NAME015", name.location(),
+                    "interface '" + std::string(name.valueText()) + "' does not match " + P.interface.src);
+        }
         if (s.kind == SyntaxKind::PackageDeclaration && rules.enabled("STY005")) {
             Token name = s.header->name;
             SourceLocation full = sm.getFullyOriginalLoc(name.location());
@@ -173,6 +253,16 @@ struct Walk : SyntaxVisitor<Walk> {
         visitDefault(s);
     }
     void handle(const ParameterDeclarationSyntax& s) {
+        // parameter DisableFoo = 0: "not disabled" is a double negative at every use.
+        if (rules.enabled("NAME017"))
+            for (auto* d : s.declarators) {
+                std::string n(d->name.valueText());
+                for (char& c : n) c = (char)std::tolower((unsigned char)c);
+                if (n.rfind("disable", 0) == 0 && n.size() > 7)
+                    add("NAME017", d->name.location(),
+                        "parameter '" + std::string(d->name.valueText()) +
+                            "' says what is turned off; name it for what is turned on (Enable...)");
+            }
         if (s.type->kind == SyntaxKind::ImplicitType) {
             auto& t = s.type->as<ImplicitTypeSyntax>();
             if (t.signing.kind == TokenKind::Unknown && t.dimensions.empty() && !s.declarators.empty())
@@ -261,7 +351,7 @@ void run(Compilation& comp, Report& rep, const lintrules::Params& P, unsigned th
         if (i < bufs.size()) {
             checkText(bufs[i], sm.getSourceText(bufs[i]), rep.rules, P, found[i]);
         } else {
-            Walk w(rep.rules, sm, found[i]);
+            Walk w(rep.rules, sm, P, found[i]);
             trees[i - bufs.size()]->root().visit(w);
         }
     });

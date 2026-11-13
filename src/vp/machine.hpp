@@ -264,12 +264,13 @@ public:
         irqDirty_ = false;
         for (auto& hp : harts) {
             Hart& h = *hp;
-            uint32_t mip = h.mip & ~(MIP_MSIP | MIP_MTIP | MIP_MEIP);
+            uint32_t mip = h.mipSw;
             if (clint) {
                 if (clint->msip[h.id]) mip |= MIP_MSIP;
                 if (clint->mtimeAtCycle(h.cycle) >= clint->mtimecmp[h.id]) mip |= MIP_MTIP;
             }
-            if (plic && plic->eip(h.id)) mip |= MIP_MEIP;
+            if (plic && plic->eip(2 * h.id)) mip |= MIP_MEIP;
+            if (plic && plic->eip(2 * h.id + 1)) mip |= MIP_SEIP;
             h.mip = mip;
             if (h.wfi && (h.mip & h.mie)) h.wfi = false;
         }
@@ -281,10 +282,25 @@ public:
     }
     bool csrRead(Hart& h, unsigned csr, uint32_t& v) {
         if (((csr >> 8) & 3) > h.priv) return false;
-        auto counter = [&](unsigned bit) { return h.priv == 3 || ((h.mcounteren >> bit) & 1); };
+        auto counter = [&](unsigned bit) {
+            return h.priv == 3 || (((h.mcounteren >> bit) & 1) && (h.priv == 1 || ((h.scounteren >> bit) & 1)));
+        };
         switch (csr) {
             case 0x300: v = h.mstatus; return true;
-            case 0x301: v = (1u << 30) | (1u << 0) | (1u << 2) | (1u << 8) | (1u << 12) | (1u << 20); return true;  // RV32 A C I M U
+            case 0x301: v = (1u << 30) | (1u << 0) | (1u << 2) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20); return true;  // RV32 A C I M S U
+            case 0x302: v = h.medeleg; return true;
+            case 0x303: v = h.mideleg; return true;
+            case 0x100: v = h.mstatus & SSTATUS_MASK; return true;
+            case 0x104: v = h.mie & h.mideleg; return true;
+            case 0x105: v = h.stvec; return true;
+            case 0x106: v = h.scounteren; return true;
+            case 0x10a: v = 0; return true;  // senvcfg
+            case 0x140: v = h.sscratch; return true;
+            case 0x141: v = h.sepc; return true;
+            case 0x142: v = h.scause; return true;
+            case 0x143: v = h.stval; return true;
+            case 0x144: v = h.mip & h.mideleg; return true;
+            case 0x180: if (h.priv == 1 && (h.mstatus & MSTATUS_TVM)) return false; v = h.satp; return true;
             case 0x304: v = h.mie; return true;
             case 0x305: v = h.mtvec; return true;
             case 0x306: v = h.mcounteren; return true;
@@ -330,12 +346,31 @@ public:
         switch (csr) {
             case 0x300: {
                 uint32_t mpp = (v >> 11) & 3;
-                if (mpp != 0 && mpp != 3) mpp = h.mstatus >> 11 & 3;  // WARL: M or U only
-                h.mstatus = (v & (MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPRV | MSTATUS_TW)) | mpp << 11;
+                if (mpp == 2) mpp = h.mstatus >> 11 & 3;  // WARL: M, S or U
+                h.mstatus = (v & (MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPRV | MSTATUS_TW | MSTATUS_SIE | MSTATUS_SPIE |
+                                  MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR)) | mpp << 11;
                 return true;
             }
             case 0x301: return true;  // misa: fixed
-            case 0x304: h.mie = v & (MIP_MSIP | MIP_MTIP | MIP_MEIP); if (h.wfi && (h.mip & h.mie)) h.wfi = false; return true;
+            case 0x304: h.mie = v & (MIP_MSIP | MIP_MTIP | MIP_MEIP | MIP_SSIP | MIP_STIP | MIP_SEIP); if (h.wfi && (h.mip & h.mie)) h.wfi = false; return true;
+            case 0x302: h.medeleg = v & 0xb3ffu; return true;  // not ecall from M
+            case 0x303: h.mideleg = v & (MIP_SSIP | MIP_STIP | MIP_SEIP); return true;
+            case 0x100: h.mstatus = (h.mstatus & ~SSTATUS_MASK) | (v & SSTATUS_MASK); return true;
+            case 0x104: h.mie = (h.mie & ~h.mideleg) | (v & h.mideleg); if (h.wfi && (h.mip & h.mie)) h.wfi = false; return true;
+            case 0x105: h.stvec = v & ~2u; return true;
+            case 0x106: h.scounteren = v & 7; return true;
+            case 0x10a: return true;
+            case 0x140: h.sscratch = v; return true;
+            case 0x141: h.sepc = v & ~1u; return true;
+            case 0x142: h.scause = v; return true;
+            case 0x143: h.stval = v; return true;
+            case 0x144: setMipSw(h, (h.mipSw & ~(h.mideleg & MIP_SSIP)) | (v & h.mideleg & MIP_SSIP)); return true;
+            case 0x180:
+                if (h.priv == 1 && (h.mstatus & MSTATUS_TVM)) return false;
+                h.satp = v & 0x803fffffu;  // MODE, PPN; no ASIDs
+                h.flushTlb();
+                h.flushDecoded();
+                return true;
             case 0x305: h.mtvec = v & ~2u; return true;
             case 0x306: h.mcounteren = v & 7; return true;
             case 0x310: return true;
@@ -344,7 +379,7 @@ public:
             case 0x341: h.mepc = v & ~1u; return true;
             case 0x342: h.mcause = v; return true;
             case 0x343: h.mtval = v; return true;
-            case 0x344: return true;  // mip: the M bits are read-only
+            case 0x344: setMipSw(h, v & (MIP_SSIP | MIP_STIP | MIP_SEIP)); return true;  // the M bits are read-only
             case 0x30a: case 0x31a: case 0x747: case 0x757: return true;
             case 0x7a0: case 0x7a1: case 0x7a2: case 0x7a3: case 0x7a5: return true;
             case 0x7a4: return false;
@@ -432,22 +467,41 @@ public:
     }
 
     // ------------------------------------------------------------ traps
+    void setMipSw(Hart& h, uint32_t v) {
+        h.mipSw = v;
+        h.mip = (h.mip & ~(MIP_SSIP | MIP_STIP | MIP_SEIP)) | v |
+                ((plic && plic->eip(2 * h.id + 1)) ? MIP_SEIP : 0u);
+        if (h.wfi && (h.mip & h.mie)) h.wfi = false;
+    }
     void trap(Hart& h, uint32_t cause, uint32_t tval, bool intr) {
-        h.mepc = h.pc;
-        h.mcause = cause | (intr ? 0x80000000u : 0);
-        h.mtval = tval;
+        bool toS = h.priv <= 1 && (((intr ? h.mideleg : h.medeleg) >> cause) & 1);
         uint32_t s = h.mstatus;
-        s = (s & ~MSTATUS_MPIE) | ((s & MSTATUS_MIE) ? (uint32_t)MSTATUS_MPIE : 0u);
-        s &= ~MSTATUS_MIE;
-        s = (s & ~MSTATUS_MPP) | (uint32_t)h.priv << 11;
-        h.mstatus = s;
-        h.priv = 3;
+        if (toS) {
+            h.sepc = h.pc;
+            h.scause = cause | (intr ? 0x80000000u : 0);
+            h.stval = tval;
+            s = (s & ~MSTATUS_SPIE) | ((s & MSTATUS_SIE) ? (uint32_t)MSTATUS_SPIE : 0u);
+            s &= ~MSTATUS_SIE;
+            s = (s & ~MSTATUS_SPP) | (h.priv ? (uint32_t)MSTATUS_SPP : 0u);
+            h.mstatus = s;
+            h.priv = 1;
+            h.pc = (h.stvec & ~3u) + ((h.stvec & 1) && intr ? 4 * cause : 0);
+        } else {
+            h.mepc = h.pc;
+            h.mcause = cause | (intr ? 0x80000000u : 0);
+            h.mtval = tval;
+            s = (s & ~MSTATUS_MPIE) | ((s & MSTATUS_MIE) ? (uint32_t)MSTATUS_MPIE : 0u);
+            s &= ~MSTATUS_MIE;
+            s = (s & ~MSTATUS_MPP) | (uint32_t)h.priv << 11;
+            h.mstatus = s;
+            h.priv = 3;
+            h.pc = (h.mtvec & ~3u) + ((h.mtvec & 1) && intr ? 4 * cause : 0);
+        }
         h.resv = false;
-        h.pc = (h.mtvec & ~3u) + ((h.mtvec & 1) && intr ? 4 * cause : 0);
         if (trace) {
             char b[96];
             snprintf(b, sizeof b, "core %3u: exception %s%u, epc 0x%08x, tval 0x%08x\n", h.id,
-                     intr ? "interrupt " : "", cause, h.mepc, tval);
+                     intr ? "interrupt " : "", cause, toS ? h.sepc : h.mepc, tval);
             h.traceBuf += b;
         }
     }
@@ -455,10 +509,91 @@ public:
     bool interrupt(Hart& h) {
         uint32_t pend = h.mip & h.mie;
         if (!pend) return false;
-        if (h.priv == 3 && !(h.mstatus & MSTATUS_MIE)) return false;
-        uint32_t cause = (pend & MIP_MEIP) ? 11 : (pend & MIP_MSIP) ? 3 : 7;
-        trap(h, cause, 0, true);
-        return true;
+        // Taken in M unless delegated; in S only from S with SIE, or from U.
+        bool mOn = h.priv < 3 || (h.mstatus & MSTATUS_MIE);
+        bool sOn = h.priv < 1 || (h.priv == 1 && (h.mstatus & MSTATUS_SIE));
+        uint32_t m = mOn ? pend & ~h.mideleg : 0, sv = sOn ? pend & h.mideleg : 0;
+        uint32_t take = m ? m : sv;
+        if (!take) return false;
+        static const uint32_t order[] = {11, 3, 7, 9, 1, 5};  // MEI MSI MTI SEI SSI STI
+        for (uint32_t c : order)
+            if ((take >> c) & 1) { trap(h, c, 0, true); return true; }
+        return false;
+    }
+
+    // ------------------------------------------------------------ Sv32
+    // Translate `va` for an access of kind 0 read, 1 write, 2 execute at
+    // privilege `priv`. Svade: a clear A, or a clear D on a write, is a page
+    // fault, which software answers by setting the bit. Page-table reads are
+    // checked by PMP as supervisor accesses.
+    Acc physRead32(Hart& h, uint32_t pa, uint32_t& v) {
+        if (!(((uint64_t)pa >= h.cBase && (uint64_t)pa + 4 <= h.cEnd))) {
+            Device* d = bus.find(pa);
+            if (!d || !d->memory() || pa + 4 > d->base + d->size) return Acc::Fault;
+            h.cBase = d->base; h.cEnd = d->base + d->size; h.cPtr = d->memory(); h.cRw = d->writable();
+        }
+        return ramRead(h, pa, 4, v);
+    }
+    Acc translate(Hart& h, uint32_t va, int kind, unsigned priv, uint32_t& pa) {
+        if (priv == 3 || !(h.satp >> 31)) { pa = va; return Acc::Ok; }
+        uint32_t vpn = va >> 12;
+        Hart::Tlb& t = h.tlb[vpn & (Hart::TLB_SIZE - 1)];
+        for (int pass = 0; pass < 2; pass++) {
+            if (!(t.valid && t.vpn == vpn)) {
+                // Walk the two-level table.
+                uint32_t a = (h.satp & 0x3fffffu) << 12, pte = 0;
+                int i = 1;
+                for (;; i--) {
+                    uint32_t pteA = a + ((vpn >> (10 * i)) & 0x3ff) * 4;
+                    if (!pmpAllows(h, pteA, 4, PMP_R, 1)) return Acc::Fault;
+                    if (physRead32(h, pteA, pte) != Acc::Ok) return Acc::Fault;
+                    if (!(pte & 1) || ((pte & 6) == 4)) return Acc::PageFault;  // invalid, or W without R
+                    if (pte & 0xa) break;                                         // R or X: a leaf
+                    if (i == 0) return Acc::PageFault;
+                    a = (pte >> 10) << 12;
+                }
+                uint32_t ppn = pte >> 10;
+                if (i == 1) {
+                    if (ppn & 0x3ff) return Acc::PageFault;  // misaligned superpage
+                    ppn |= vpn & 0x3ff;
+                }
+                t.valid = true; t.vpn = vpn; t.ppn = ppn & 0x3fffffu; t.pte = (uint8_t)pte;
+            }
+            uint8_t f = t.pte;
+            bool ok = true;
+            if (f & 0x10) {                                                       // U page
+                if (priv == 1 && (kind == 2 || !(h.mstatus & MSTATUS_SUM))) ok = false;
+            } else if (priv == 0) ok = false;
+            if (kind == 0 && !((f & 2) || ((h.mstatus & MSTATUS_MXR) && (f & 8)))) ok = false;
+            if (kind == 1 && !(f & 4)) ok = false;
+            if (kind == 2 && !(f & 8)) ok = false;
+            bool ad = (f & 0x40) && (kind != 1 || (f & 0x80));
+            if (ok && ad) { pa = (t.ppn << 12) | (va & 0xfff); return Acc::Ok; }
+            if (ok && !ad && pass == 0) { t.valid = false; continue; }  // software may have set A/D since
+            return Acc::PageFault;
+        }
+        return Acc::PageFault;
+    }
+    bool dataXlat(const Hart& h) const { return (h.satp >> 31) && dataPriv(h) != 3; }
+    // A data access of `n` bytes at virtual `va`, split where it crosses a page.
+    template <class F>
+    Acc xlatData(Hart& h, uint32_t va, unsigned n, int kind, F&& f) {
+        unsigned priv = dataPriv(h);
+        if (((va & 0xfff) + n) <= 4096) {
+            uint32_t pa;
+            Acc r = translate(h, va, kind, priv, pa);
+            if (r != Acc::Ok) return r;
+            return f(pa, 0u, n);
+        }
+        unsigned first = 4096 - (va & 0xfff);
+        uint32_t pa0, pa1;
+        Acc r = translate(h, va, kind, priv, pa0);
+        if (r != Acc::Ok) return r;
+        r = translate(h, va + first, kind, priv, pa1);
+        if (r != Acc::Ok) return r;
+        r = f(pa0, 0u, first);
+        if (r != Acc::Ok) return r;
+        return f(pa1, first, n - first);
     }
 
     // ------------------------------------------------------------ memory
@@ -569,15 +704,78 @@ public:
     }
     __attribute__((noinline)) Acc loadSlow(Hart& h, uint32_t a, unsigned n, uint32_t& v) {
         if (!watches.empty()) watchCheck(h, a, n, 3);
+        if (dataXlat(h)) {
+            uint32_t out = 0;
+            Acc r = xlatData(h, a, n, 0, [&](uint32_t pa, unsigned at, unsigned k) {
+                uint32_t part = 0;
+                Acc q = physLoad(h, pa, k, part);
+                out |= part << (8 * at);
+                return q;
+            });
+            if (r == Acc::Ok) v = out;
+            return r;
+        }
+        return physLoad(h, a, n, v);
+    }
+    __attribute__((noinline)) Acc storeSlow(Hart& h, uint32_t a, unsigned n, uint32_t v) {
+        if (!watches.empty()) watchCheck(h, a, n, 2);
+        if (dataXlat(h))
+            return xlatData(h, a, n, 1, [&](uint32_t pa, unsigned at, unsigned k) {
+                return physStore(h, pa, k, at < 4 ? v >> (8 * at) : 0);
+            });
+        return physStore(h, a, n, v);
+    }
+    Acc physLoad(Hart& h, uint32_t a, unsigned n, uint32_t& v) {
         if ((h.priv != 3 || h.pmpLock || (h.mstatus & MSTATUS_MPRV)) && !pmpData(h, a, n, PMP_R)) return Acc::Fault;
         if ((uint64_t)a >= h.cBase && (uint64_t)a + n <= h.cEnd) return ramRead(h, a, n, v);
         return devRead(h, a, n, v);
     }
-    __attribute__((noinline)) Acc storeSlow(Hart& h, uint32_t a, unsigned n, uint32_t v) {
-        if (!watches.empty()) watchCheck(h, a, n, 2);
+    Acc physStore(Hart& h, uint32_t a, unsigned n, uint32_t v) {
         if ((h.priv != 3 || h.pmpLock || (h.mstatus & MSTATUS_MPRV)) && !pmpData(h, a, n, PMP_W)) return Acc::Fault;
         if ((uint64_t)a >= h.cBase && (uint64_t)a + n <= h.cEnd && h.cRw) return ramWrite(h, a, n, v);
         return devWrite(h, a, n, v);
+    }
+    // An AMO needs write permission for its read too.
+    Acc amoCheck(Hart& h, uint32_t a) {
+        if (!dataXlat(h)) return Acc::Ok;
+        uint32_t pa;
+        return translate(h, a, 1, dataPriv(h), pa);
+    }
+    // Fetch through the MMU: the instruction's bits and the trap, if any
+    // (cause and tval; cause 0 = none).
+    uint32_t fetchXlat(Hart& h, uint32_t pc, uint32_t& raw, uint32_t& tval, bool readBits, unsigned knownLen) {
+        uint32_t pa;
+        Acc r = translate(h, pc, 2, h.priv, pa);
+        tval = pc;
+        if (r == Acc::PageFault) return 12;
+        if (r != Acc::Ok || !pmpAllows(h, pa, 2, PMP_X, h.priv)) return 1;
+        uint32_t lo = 0;
+        if (readBits) {
+            Device* d = bus.find(pa);
+            if (!d || !d->memory() || pa + 2 > d->base + d->size) return 1;
+            h.cBase = d->base; h.cEnd = d->base + d->size; h.cPtr = d->memory(); h.cRw = d->writable();
+            ramRead(h, pa, 2, lo);
+            raw = lo;
+        }
+        unsigned len = readBits ? ((lo & 3) == 3 ? 4 : 2) : knownLen;
+        if (len == 2) return 0;
+        uint32_t pa2 = pa + 2;
+        if (((pc + 2) & 0xfff) == 0) {
+            r = translate(h, pc + 2, 2, h.priv, pa2);
+            tval = pc + 2;
+            if (r == Acc::PageFault) return 12;
+            if (r != Acc::Ok) return 1;
+        }
+        if (!pmpAllows(h, pa2, 2, PMP_X, h.priv)) { tval = pc + 2; return 1; }
+        if (readBits) {
+            Device* d = bus.find(pa2);
+            if (!d || !d->memory() || pa2 + 2 > d->base + d->size) { tval = pc + 2; return 1; }
+            h.cBase = d->base; h.cEnd = d->base + d->size; h.cPtr = d->memory(); h.cRw = d->writable();
+            uint32_t hi = 0;
+            ramRead(h, pa2, 2, hi);
+            raw |= hi << 16;
+        }
+        return 0;
     }
     void watchCheck(Hart& h, uint32_t a, unsigned n, int kind) {
         for (auto& w : watches)
@@ -762,11 +960,30 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
         uint32_t insn, raw;
         unsigned len;
         Hart::Decoded& dce = h.dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
-        if (dce.pc == pc) {
+        const bool fx = h.priv != 3 && (h.satp >> 31);
+        if (dce.pc == pc && dce.xlat == fx) {
             insn = dce.insn; raw = dce.raw; len = dce.len;
-            if ((h.priv != 3 || h.pmpLock) && !pmpAllows(h, pc, len, PMP_X, h.priv)) {
+            if (fx) {
+                uint32_t tv, dummy = 0;
+                if (uint32_t c = fetchXlat(h, pc, dummy, tv, false, len)) { trap(h, c, tv, false); h.cycle++; continue; }
+            } else if ((h.priv != 3 || h.pmpLock) && !pmpAllows(h, pc, len, PMP_X, h.priv)) {
                 trap(h, 1, pc, false); h.cycle++; continue;
             }
+        } else if (fx) {
+            uint32_t tv;
+            raw = 0;
+            if (uint32_t c = fetchXlat(h, pc, raw, tv, true, 0)) { trap(h, c, tv, false); h.cycle++; continue; }
+            if ((raw & 3) == 3) { insn = raw; len = 4; }
+            else {
+                raw &= 0xffff;
+                len = 2;
+                insn = rvc::expand(raw);
+                if (!insn) { trap(h, 2, raw, false); h.cycle++; continue; }
+            }
+            dce.pc = pc; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len; dce.xlat = true;
+            dce.op = insn & 0x7f; dce.rd = (insn >> 7) & 31; dce.f3 = (insn >> 12) & 7;
+            dce.rs1 = (insn >> 15) & 31; dce.rs2 = (insn >> 20) & 31; dce.f7 = (uint8_t)(insn >> 25);
+            dce.immI = (int32_t)insn >> 20;
         } else {
             {
                 uint32_t lo;
@@ -804,7 +1021,7 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 insn = rvc::expand(raw);
                 if (!insn) { trap(h, 2, raw, false); h.cycle++; continue; }
             }
-            dce.pc = pc; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len;
+            dce.pc = pc; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len; dce.xlat = false;
             dce.op = insn & 0x7f; dce.rd = (insn >> 7) & 31; dce.f3 = (insn >> 12) & 7;
             dce.rs1 = (insn >> 15) & 31; dce.rs2 = (insn >> 20) & 31; dce.f7 = (uint8_t)(insn >> 25);
             dce.immI = (int32_t)insn >> 20;
@@ -828,7 +1045,7 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
 #define RD(v) do { uint32_t _v = (v); if (rd) { x[rd] = _v; wrd = (int)rd; wval = _v; } } while (0)
 #define TRAP(c, t) do { trap(h, (c), (t), false); h.cycle++; goto next_insn; } while (0)
 #define ILLEGAL() TRAP(2, len == 4 ? insn : raw)
-#define MEMFAIL(r, cause, a) do { if ((r) == Acc::Pending) return Stop::Pending; TRAP(cause, a); } while (0)
+#define MEMFAIL(r, cause, a) do { if ((r) == Acc::Pending) return Stop::Pending; TRAP((r) == Acc::PageFault ? (cause) + 8 : (cause), a); } while (0)
 
         switch (op) {
             case 0x37: RD(insn & 0xfffff000u); break;                  // LUI
@@ -974,7 +1191,9 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                     h.resv = false;
                     break;
                 }
-                Acc r = load(h, a, 4, v);
+                Acc r = amoCheck(h, a);
+                if (r != Acc::Ok) MEMFAIL(r, 7, a);
+                r = load(h, a, 4, v);
                 if (r != Acc::Ok) MEMFAIL(r, 7, a);
                 uint32_t b = x[rs2], w;
                 switch (f5) {
@@ -1000,7 +1219,7 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 cls = C_SYSTEM;
                 if (f3 == 0) {
                     if (insn == 0x00000073) {                          // ECALL
-                        TRAP(h.priv == 3 ? 11 : 8, 0);
+                        TRAP(8 + h.priv, 0);
                     }
                     if (insn == 0x00100073) {                          // EBREAK
                         if (dbg) { h.stopSig = 5; return Stop::Break; }
@@ -1019,8 +1238,21 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                         npc = h.mepc;
                         break;
                     }
+                    if (insn == 0x10200073) {                          // SRET
+                        if (h.priv == 0 || (h.priv == 1 && (h.mstatus & MSTATUS_TSR))) ILLEGAL();
+                        uint32_t s = h.mstatus;
+                        uint8_t spp = (s & MSTATUS_SPP) ? 1 : 0;
+                        s = (s & ~MSTATUS_SIE) | ((s & MSTATUS_SPIE) ? (uint32_t)MSTATUS_SIE : 0u);
+                        s |= MSTATUS_SPIE;
+                        s &= ~MSTATUS_SPP;
+                        s &= ~MSTATUS_MPRV;  // the new mode is below M
+                        h.mstatus = s;
+                        h.priv = spp;
+                        npc = h.sepc;
+                        break;
+                    }
                     if (insn == 0x10500073) {                          // WFI
-                        if (h.priv != 3 && (h.mstatus & MSTATUS_TW)) ILLEGAL();
+                        if (h.priv == 0 || (h.priv == 1 && (h.mstatus & MSTATUS_TW))) ILLEGAL();
                         h.pc = npc;
                         h.cycle++;
                         h.instret++;
@@ -1029,7 +1261,12 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                         if (h.wfi) { h.cycle = std::max(h.cycle, end); return Stop::Budget; }
                         continue;
                     }
-                    if ((insn & 0xfe007fff) == 0x12000073) break;      // SFENCE.VMA: no MMU, a no-op
+                    if ((insn & 0xfe007fff) == 0x12000073) {           // SFENCE.VMA
+                        if (h.priv == 0 || (h.priv == 1 && (h.mstatus & MSTATUS_TVM))) ILLEGAL();
+                        h.flushTlb();
+                        h.flushDecoded();
+                        break;
+                    }
                     ILLEGAL();
                 }
                 if (f3 == 4) ILLEGAL();

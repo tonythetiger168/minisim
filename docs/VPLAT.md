@@ -38,15 +38,33 @@ names what is missing. Sections marked *(extension)* describe these parts.
 
 ## What it simulates
 
-**Harts.** RV32IMAC with Zicsr and Zifencei, machine and user mode:
+**Harts.** RV32IMAC with Zicsr and Zifencei, in machine, supervisor and
+user mode:
 `mstatus`, `mtvec` (direct and vectored), `mepc`, `mcause`, `mtval`, `mie`,
 `mip`, `mscratch`, `mcounteren`, `mcountinhibit`, the cycle, time and
 instret counters, `mhartid`, physical memory protection (16 entries, 4-byte grain: OFF, TOR,
 NA4 and NAPOT, locked entries, MPRV), and the Sdtrig CSRs reporting no
 triggers. One instruction per cycle; WFI sleeps
 until an interrupt is pending. Misaligned loads and stores are done, not
-trapped. The RISC-V architecture tests (riscv-tests: rv32ui, rv32um, rv32ua,
-rv32uc, rv32mi, 77 programs) all pass; `tests/mvplat_isa.sh` runs them.
+trapped.
+
+**Supervisor mode and the MMU.** `medeleg` and `mideleg` hand exceptions
+and interrupts to supervisor mode; `sstatus`, `sie` and `sip` are the
+supervisor's views of the machine registers, with `stvec`, `sscratch`,
+`sepc`, `scause`, `stval`, `scounteren` and `satp`. SRET, SFENCE.VMA and the
+`mstatus` bits SUM, MXR, TVM, TW and TSR work as the privileged
+specification says. `satp` selects Sv32 paging: two-level page tables,
+4 MiB megapages, a 256-entry TLB per hart, and page faults (causes 12, 13
+and 15). Accessed and dirty bits follow Svade: a page whose A bit is clear,
+or a store to a page whose D bit is clear, faults and the supervisor sets
+them, as spike and QEMU do by default. The page walk is checked by PMP.
+The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
+interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
+(SEIP).
+
+The RISC-V architecture tests all pass, 144 programs: rv32ui, rv32um,
+rv32ua and rv32uc both bare (`p`) and under the riscv-tests supervisor with
+paging on (`v`), and rv32mi and rv32si. `tests/mvplat_isa.sh` runs them.
 
 **Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000) on
 its own and then the platform synchronises: devices see time move and
@@ -252,9 +270,11 @@ simulation time.
 
 ## Limits / Not yet
 
-- RV32 only: no RV64, no F/D (floating point), no V, no B (bit-manipulation)
-  extensions, and no supervisor mode or MMU, so no Linux. Bare-metal
-  software, RTOSes (FreeRTOS, Zephyr) and the architecture tests run.
+- RV32 only: no RV64 (so no Sv39), no F/D (floating point), no V, no B
+  (bit-manipulation) extensions, and no Svadu (hardware A/D update). No
+  Linux boot yet: that needs RV64, a device tree and SBI firmware. Bare-metal
+  software, RTOSes (FreeRTOS, Zephyr), supervisor-mode kernels with Sv32
+  paging and the architecture tests run.
 - No hardware triggers, no Smepmp (`mseccfg`).
 - One instruction per cycle: no pipeline or cache timing model.
 - No Spike or QEMU back end yet (Spike is BSD-licensed and could be linked;

@@ -13,7 +13,7 @@ static void reg(const char* name, const char* text) {
 }
 static PLI_INT32 unresolved(p_cb_data d) {
     const char* name = d->value && d->value->format == vpiStringVal ? d->value->value.str : "?";
-    vpi_printf("unresolved: %s\n", name);
+    vpi_printf("unresolved: %s%s\n", name, d->user_data && strcmp((const char*)d->user_data, name) == 0 ? " (user_data)" : "");
     if (strcmp(name, "$late") == 0) reg("$late", "late");
     return 0;
 }

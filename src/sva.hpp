@@ -7,6 +7,7 @@
 // kernel reads and changes them.
 #pragma once
 #include <cstdint>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,7 +36,9 @@ struct AssertInfo {
     bool vacOn = true;                   // VacuousOff clears it, PassOn sets it
     bool hidden = false;                 // tracks a sequence's end points (16.13.6): not an assertion
     bool prot = false;                   // declared in protected code (34): kept out of the coverage database
-    bool step = false;                   // VPI stepping is on (39.5.2): report each clock step of each attempt
+    // VPI per-attempt control (39.5.2), by attempt start time: the attempts
+    // whose clock steps are reported, and the attempts to discard.
+    std::set<uint64_t> stepAt, killAt;
     // Where it is, for VPI (39.3): the slang statement and scope, the source line.
     const void* stmt = nullptr;
     const void* scope = nullptr;
