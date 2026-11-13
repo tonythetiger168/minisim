@@ -36,6 +36,8 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
   object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
   `vpiRefObj` has `vpiName` and `vpiFullName`.
+- VPI coverage stop and start on one instance below the top (40.5.1):
+  its statement, toggle or FSM counts freeze until `vpiCoverageStart`.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction

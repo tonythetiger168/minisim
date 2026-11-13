@@ -161,6 +161,8 @@ inline void fireErrorCbs(int reason);
 inline void onTchk(int id);
 inline void onNewObj(int obj);
 inline void onSizeChange(int sig);
+inline bool covAnyFrozen();
+inline void covThaw();
 inline void error(int level, const std::string& msg) {
     auto& s = st();
     s.err = true;
@@ -1072,6 +1074,7 @@ inline void onChange(int s) {
 inline bool onRegion(int r) {
     auto& s = st();
     if (r == Sim::VR_START) {
+        if (covAnyFrozen()) covThaw();   // coverage stopped on an instance (40.5.1)
         auto [a, b] = s.timed.equal_range(S.now);
         std::vector<Cb*> due;
         for (auto it = a; it != b; ++it) due.push_back(it->second);
@@ -1519,7 +1522,9 @@ inline std::pair<int, int> assertCovOf(const InstanceSymbol* inst) {
         if (assertIn(k, inst)) { m++; n += k < st().assertCov.size() && st().assertCov[k][1] > 0; }
     return {n, m};
 }
+inline void covThaw();
 inline std::pair<int, int> covOf(int type, const InstanceSymbol* inst) {
+    covThaw();
     switch (type) {
         case vpiStatementCoverage: return stmtCov(inst);
         case vpiToggleCoverage: return togCov(inst);
@@ -1600,6 +1605,54 @@ inline void covReset(int type, const InstanceSymbol* inst, const Obj* a) {
             if (!inst || sigInst(fsmDefs()[k].sig) == inst) { S.fsmSeen[k].clear(); S.fsmTrans[k].clear(); }
     }
 }
+// Coverage stopped on one instance below the top (40.5.1): its counts are
+// kept as they were at vpiCoverageStop and written back (dropping what the
+// run counted since) before every read, at each new time step and at the
+// end, until vpiCoverageStart.
+struct CovFreeze {
+    int type = 0;
+    const InstanceSymbol* inst = nullptr;
+    std::vector<std::pair<Instr*, std::pair<uint64_t, uint64_t>>> stmts;
+    std::vector<std::pair<size_t, std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>> togs;
+    std::vector<std::tuple<size_t, std::map<uint64_t, uint64_t>, std::map<std::pair<uint64_t, uint64_t>, uint64_t>>> fsms;
+};
+inline std::vector<CovFreeze>& covFrozen() { static std::vector<CovFreeze> v; return v; }
+inline bool covAnyFrozen() { return !covFrozen().empty(); }
+inline void covThaw() {   // write the frozen counts back
+    for (auto& f : covFrozen()) {
+        for (auto& [i, v] : f.stmts) { i->hits = v.first; i->taken = v.second; }
+        for (auto& [g, v] : f.togs) {
+            if (g < S.togRise.size()) S.togRise[g] = v.first;
+            if (g < S.togFall.size()) S.togFall[g] = v.second;
+        }
+        for (auto& [k, seen, tr] : f.fsms)
+            if (k < S.fsmSeen.size() && k < S.fsmTrans.size()) { S.fsmSeen[k] = seen; S.fsmTrans[k] = tr; }
+    }
+}
+inline void covFreeze(int type, const InstanceSymbol* inst, bool stop) {
+    auto& v = covFrozen();
+    auto it = std::find_if(v.begin(), v.end(), [&](const CovFreeze& f) { return f.type == type && f.inst == inst; });
+    if (!stop) {   // vpiCoverageStart: counting goes on from the frozen counts
+        if (it != v.end()) { covThaw(); v.erase(it); }
+        return;
+    }
+    if (it != v.end()) return;
+    CovFreeze f;
+    f.type = type;
+    f.inst = inst;
+    if (type == vpiStatementCoverage) {
+        for (const Prog* p : st().progs)
+            if (p->inst == inst)
+                for (auto& i : const_cast<Prog*>(p)->code) f.stmts.push_back({&i, {i.hits, i.taken}});
+    } else if (type == vpiToggleCoverage) {
+        for (size_t g = 0; g < S.togRise.size(); g++)
+            if (sigInst((int)g) == inst) f.togs.push_back({g, {S.togRise[g], g < S.togFall.size() ? S.togFall[g] : std::vector<uint64_t>{}}});
+    } else {
+        for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++)
+            if (sigInst(fsmDefs()[k].sig) == inst) f.fsms.push_back({k, S.fsmSeen[k], S.fsmTrans[k]});
+    }
+    v.push_back(std::move(f));
+}
 #include "vpi_covmerge.inc"
 // vpi_control for coverage (40.5.1): vpiCoverageStart / Stop / Reset /
 // Check with a coverage type and an instance or assertion handle (null: the
@@ -1616,6 +1669,7 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
         error(vpiWarning, "vpi_control: statement, toggle and FSM coverage are collected only with msim -cov");
         return 0;
     }
+    covThaw();
     if (op == vpiCoverageSave || op == vpiCoverageMerge) {
         const char* name = va_arg(ap, const char*);
         if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return 0; }
@@ -1639,7 +1693,17 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
         auto [n, m] = covOf(type, inst);
         return n == m ? 1 : 0;
     }
-    if (op == vpiCoverageReset) { covReset(type, inst, o && o->kind == Obj::Assertion ? o : nullptr); return 1; }
+    if (op == vpiCoverageReset) {
+        // A frozen instance (stopped below the top) stays stopped, from 0.
+        std::vector<const InstanceSymbol*> refreeze;
+        auto& fz = covFrozen();
+        for (auto it = fz.begin(); it != fz.end();)
+            if (it->type == type && (!inst || it->inst == inst)) { refreeze.push_back(it->inst); it = fz.erase(it); }
+            else ++it;
+        covReset(type, inst, o && o->kind == Obj::Assertion ? o : nullptr);
+        for (const InstanceSymbol* f : refreeze) covFreeze(type, f, true);
+        return 1;
+    }
     bool stop = op == vpiCoverageStop;
     if (type == vpiAssertCoverage) {
         if (!o) s.assertCovAllOff = stop;
@@ -1648,11 +1712,10 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
             else if (!o) s.assertCovOff[k] = 0;
         return 1;
     }
-    // Statement, toggle and FSM counting stops for the whole design: a top
-    // instance (or null) only.
+    // Below the top: that instance's counts freeze until vpiCoverageStart.
     if (inst && inst->getParentScope() != &s.comp->getRoot()) {
-        error(vpiWarning, "vpi_control: statement, toggle and FSM coverage start and stop only for the whole design (a top instance or null)");
-        return 0;
+        covFreeze(type, inst, stop);
+        return 1;
     }
     int bit = type == vpiStatementCoverage ? 1 : type == vpiToggleCoverage ? 2 : 4;
     g_covStop = stop ? (g_covStop | bit) : (g_covStop & ~bit);
@@ -1702,7 +1765,9 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
 }
 inline void end() {
     if (!st().assertEnded) fireSys(cbAssertionSysEnd);
+    covThaw();
     fireList(st().endSim);
+    covThaw();   // before msim writes the coverage database
 }
 }   // namespace vpi
 

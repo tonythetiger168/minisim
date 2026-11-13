@@ -173,9 +173,12 @@ coverage database (the `-cov` JSON) to `name` now, and
 its counts of that type to the current ones: statement hits by source line,
 toggled bits by signal name and width, FSM state and transition counts by
 instance and register, assertion attempts, successes and failures by
-assertion name (items the design does not have are skipped). Not
-supported: starting or stopping statement, toggle or FSM coverage for an
-instance below the top (it is for the whole design).
+assertion name (items the design does not have are skipped).
+`vpiCoverageStop` of statement, toggle or FSM coverage on an instance below
+the top freezes that instance's counts (only its own items, not those of
+the instances inside it) until `vpiCoverageStart`; other instances keep
+counting. A `vpiCoverageReset` of a stopped instance zeroes it and leaves
+it stopped. On a top instance or NULL the stop is for the whole design.
 
 **Structs, containers and classes (37.17, 37.18, 37.29).** An unpacked
 struct or union variable is a `vpiStructVar` / `vpiUnionVar` (its value is
@@ -388,7 +391,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
