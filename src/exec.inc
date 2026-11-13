@@ -1625,7 +1625,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 std::string str;
                 int64_t num = -1;
                 if (!i.args.empty()) {
-                    if (i.dcmd == DC_FILE) { a.str = true; str = v_str(a); }
+                    if (i.dcmd == DC_FILE || i.dcmd == DC_VFILE) { a.str = true; str = v_str(a); }
                     else if (!a.x) num = v_to_i64(a);
                 }
                 S.dumpTask(i.dcmd, str, num, i.dsel);
