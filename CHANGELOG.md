@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -upf` with VHDL: the VHDL value conversion tables of IEEE 1801-2024
+  Annex B (`VHDL_SL2UPF`, `UPF2VHDL_SL`, the `_GNDZERO` ones, `VHDL_TIED_HI`,
+  `VHDL_TIED_LO`) connect `std_logic` ports of VHDL entities to supply nets.
 - mvplat boots Linux: `-bios`, `-kernel`, `-initrd`, `-append`, `-dtb` as on
   QEMU's virt board, a device tree made from the platform (`-dump-dtb`), and
   OpenSBI's `fw_dynamic` hand-off. OpenSBI 1.7 and Ubuntu 24.04's stock
