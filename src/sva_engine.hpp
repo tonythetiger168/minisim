@@ -460,6 +460,19 @@ struct Deriv {
         ex.erase(std::unique(ex.begin(), ex.end()), ex.end());
         for (int e : ex) out.push_back(dIn(e, next));
     }
+    // A derivative that can match now but never at a later tick: EMPTY, also
+    // in an environment, with match items run on it (16.10), or a choice of
+    // such.
+    static bool endsNow(const Node* r) {
+        switch (r->k) {
+            case NUL: case EMPTY: return true;
+            case ENV: case MATCH: return endsNow(r->kids[0]);
+            case SOR:
+                for (const Node* x : r->kids) if (!endsNow(x)) return false;
+                return true;
+            default: return false;
+        }
+    }
     const Node* step(const Node* n) {
         const auto& k = n->kids;
         switch (n->k) {
@@ -521,7 +534,7 @@ struct Deriv {
             case IMPL: {
                 const Node* r = d(k[0]);
                 // No later match: an antecedent that can only end now (EMPTY) has no more.
-                bool over = r->k == NUL || r->k == EMPTY || (r->k == ENV && r->kids[0]->k == EMPTY);
+                bool over = endsNow(r);
                 const Node* later = over ? st.ptrue() : st.impl(r, k[1], n->flags & NONOVERLAP);
                 if (!r->nullable) return later;
                 nonvac = true;
