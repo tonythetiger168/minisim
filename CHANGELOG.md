@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI instance arrays (37.11): `vpi_iterate(vpiModuleArray /
+  vpiInterfaceArray / vpiProgramArray / vpiPrimitiveArray /
+  vpiInstanceArray, module)`, an array's name, size, ranges and elements,
+  `vpi_handle_by_index` / `vpi_handle_by_multi_index` on it, and from an
+  element `vpiIndex` and its array. Array elements are now named `u[2]`, and
+  `vpi_handle_by_name` picks the right element of a descending array
+  (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
+- `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
+  flop, the nets and logic between it and the reader (a glitch source for
+  CDC003), the synchronizer stages, and the qualifier of an enable-qualified
+  bus.
 - `mlint -cdc-sva`: handshake checks are now an alternation check that
   holds on both sides (the side that starts a transfer and the side that
   answers), and an acknowledge read back through logic (an FSM) counts.
@@ -29,6 +40,10 @@ Spec references are IEEE 1800-2023 clauses.
   writes in the generated code. Without `-upf` the generated C++ is
   unchanged. `tests/msim_compile.cmake` runs four UPF designs and the
   low-power coverage report both ways.
+- `mlint -upf` rules `UPF008` to `UPF012`: isolation and retention controls
+  driven from a domain that can be off, isolation or retention powered by
+  the switched supply of the domain itself, a power switch controlled from
+  the domain it powers, and redundant level shifters.
 - `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
@@ -785,6 +800,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: blocking writes to an element of an array of 64 elements or
+  fewer chosen at run time merge exactly: the branch saves, puts back and
+  merges the array's elements like variables, so two branches that write
+  the same element no longer merge with its old value.
 - `-xprop`: `case ... inside` is merged: an item may match when its `==?`
   or range compare is unknown. The merging code of a combinational block
   now writes without change events and publishes each final value once, so

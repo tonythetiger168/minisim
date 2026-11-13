@@ -3745,6 +3745,81 @@ inline std::vector<Finding> check(const Model& m, const DesignView& dv) {
         if (differ && !ls)
             add("UPF004", c.p->where, "no level shifter on " + what + ": the supplies can be at different voltages");
     }
+    // Controls and supplies of the strategies (as a low-power checker's
+    // ISO_CONTROL, ISO_SUPPLY, RET_CONTROL, PSW_CONTROL and LS_REDUNDANT).
+    // A signal belongs to the domain of its scope.
+    auto domOfSig = [&](const std::string& upfName) { return dm.of(parentOf(m.design(upfName))); };
+    auto setRoot = [&](const std::string& set) -> std::string {
+        auto it = m.sets.find(m.setOf(set));
+        if (it == m.sets.end()) return "";
+        auto pw = it->second.fn.find("power");
+        return pw == it->second.fn.end() ? "" : g.find(pw->second);
+    };
+    auto rootOff = [&](const std::string& r) {
+        auto it = info.find(r);
+        return !r.empty() && it != info.end() && it->second.switchable;
+    };
+    for (auto& is : m.isos) {
+        if (is.noIso) continue;
+        std::string isoRoot = is.supply.empty() ? "" : setRoot(is.supply);
+        // UPF008: the enable comes from logic that can be off while the cell must clamp
+        for (auto& s : is.signals) {
+            if (!sigExists(s)) continue;
+            std::string d = domOfSig(s);
+            if (d.empty() || !canBeOff(d) || powerRoot(d) == isoRoot) continue;
+            add("UPF008", is.where, "isolation " + is.name + ": control " + m.design(s) + " is in " + d +
+                                        ", which can be off while the isolation cell must clamp; drive it from always-on logic");
+        }
+        // UPF009: output isolation powered by the domain it isolates
+        if (!isoRoot.empty() && is.appliesTo != 0 && rootOff(isoRoot) && isoRoot == powerRoot(is.domain))
+            add("UPF009", is.where, "isolation " + is.name + ": -isolation_supply " + is.supply + " is the switched supply of " +
+                                        is.domain + ", so the clamp is lost exactly when " + is.domain + " is off");
+    }
+    for (auto& rt : m.rets) {
+        if (rt.noRet) continue;
+        // UPF010: save / restore driven from the domain that is powered down
+        std::set<std::string> nets{rt.save.net, rt.restore.net};
+        for (auto& s : nets) {
+            if (s.empty() || !sigExists(s)) continue;
+            std::string d = domOfSig(s);
+            if (d.empty() || !canBeOff(d)) continue;
+            if (!rt.supply.empty() && setRoot(rt.supply) == powerRoot(d)) continue;
+            add("UPF010", rt.where, "retention " + rt.name + ": control " + m.design(s) + " is in " + d +
+                                        ", which can be off; save and restore must come from always-on logic");
+        }
+        // UPF010: a retention supply that is off whenever the domain is
+        if (!rt.supply.empty() && rootOff(setRoot(rt.supply)) && setRoot(rt.supply) == powerRoot(rt.domain))
+            add("UPF010", rt.where, "retention " + rt.name + ": -retention_supply " + rt.supply + " is the switched supply of " +
+                                        rt.domain + ", so the retained state is lost when it is off");
+    }
+    // UPF011: a power switch controlled from the domain it powers
+    for (auto& [n, sw] : m.switches) {
+        if (sw.outNet.empty()) continue;
+        std::string out = g.find(sw.outNet);
+        for (auto& [p, net] : sw.ctrls) {
+            if (net.empty() || !sigExists(net)) continue;
+            std::string d = domOfSig(net);
+            if (!d.empty() && powerRoot(d) == out)
+                add("UPF011", sw.where, "power switch " + n + ": control " + p + " (" + m.design(net) + ") is in " + d +
+                                            ", which this switch powers: once off it cannot turn itself on again");
+        }
+    }
+    // UPF012: a level shifter between supplies that are always at the same voltage
+    for (const Crossing& c : crossings(dm, dv.ports)) {
+        std::string ra = powerRoot(c.from), rb = powerRoot(c.to);
+        bool ls = false;
+        for (auto& l : m.lss)
+            if (lsApplies(m, l, c) && !l.noShift) ls = true;
+        if (!ls) continue;
+        bool same = ra == rb && !ra.empty();
+        if (!same && !ra.empty() && !rb.empty()) {
+            auto va = info[ra].volts, vb = info[rb].volts;
+            same = !va.empty() && va == vb && va.size() == 1;
+        }
+        if (same)
+            add("UPF012", c.p->where, "level shifter on " + c.p->inst + "." + c.p->port + " (" + (c.from.empty() ? "always-on" : c.from) +
+                                          " -> " + (c.to.empty() ? "always-on" : c.to) + "), but both sides are always at the same voltage");
+    }
     // UPF006: a PST state that names an undefined port state
     for (auto& t : m.psts)
         for (auto& row : t.rows)
@@ -3770,6 +3845,11 @@ inline const std::vector<std::pair<const char*, const char*>>& rules() {
         {"UPF005", "an isolation strategy on a domain whose supply is never off (redundant isolation)"},
         {"UPF006", "a PST state names a supply port state that was not defined with add_port_state"},
         {"UPF007", "the power intent contradicts itself: a composite domain's subdomain on another supply, a required retention list that is not retained"},
+        {"UPF008", "an isolation control signal comes from a domain that can be off (it must be always-on while the cell clamps)"},
+        {"UPF009", "output isolation is powered by the switched supply of the domain it isolates"},
+        {"UPF010", "a retention save/restore control comes from a domain that can be off, or the retention supply is the domain's switched supply"},
+        {"UPF011", "a power switch's control signal is in the domain the switch powers"},
+        {"UPF012", "a level shifter between supplies that are always at the same voltage (redundant level shifter)"},
     };
     return r;
 }

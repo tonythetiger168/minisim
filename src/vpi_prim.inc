@@ -60,14 +60,22 @@ inline int primTermDir(const PrimitiveInstanceSymbol& g, int k) {
     if (t == vpiRtranif0Prim || t == vpiRtranif1Prim) return k < 2 ? vpiInout : vpiInput;
     return k == 0 ? vpiOutput : vpiInput;
 }
+inline std::string iarrElemName(const Symbol& e);   // vpi_iarr.inc
+inline void iarrElems(const InstanceArraySymbol& a, std::vector<const Symbol*>& out);
 inline bool primIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
     if ((type == vpiPrimitive || type == vpiGate || type == vpiSwitch || type == vpiUdp) &&
         (o->kind == Obj::Module || o->kind == Obj::Scope)) {
         const Scope* sc = scopeOf(o);
         if (!sc) return false;
+        // The elements of a primitive array are primitives of the module too.
+        std::vector<const Symbol*> ms;
         for (const Symbol& m : sc->members()) {
-            if (m.kind != SymbolKind::PrimitiveInstance) continue;
-            Obj* p = primObj(m.as<PrimitiveInstanceSymbol>());
+            if (m.kind == SymbolKind::InstanceArray) iarrElems(m.as<InstanceArraySymbol>(), ms);
+            else ms.push_back(&m);
+        }
+        for (const Symbol* m : ms) {
+            if (m->kind != SymbolKind::PrimitiveInstance) continue;
+            Obj* p = primObj(m->as<PrimitiveInstanceSymbol>());
             if (type == vpiPrimitive || p->type == type) items.push_back(H(p));
         }
         return true;
@@ -105,8 +113,13 @@ inline int64_t primGet(int prop, const Obj* o) {
 inline bool primGetStr(int prop, const Obj* o, std::string& r) {
     const auto& g = o->sym->as<PrimitiveInstanceSymbol>();
     if (o->kind != Obj::Prim) return false;
-    if (prop == vpiName) { r = std::string(g.name); return true; }
-    if (prop == vpiFullName) { r = Lowerer::instPath(g.getParentScope()) + "." + std::string(g.name); return true; }
+    if (prop == vpiName) { r = iarrElemName(g); return true; }
+    if (prop == vpiFullName) {
+        const Scope* sc = g.getParentScope();   // outside its array, if in one
+        while (sc && sc->asSymbol().kind == SymbolKind::InstanceArray) sc = sc->asSymbol().getParentScope();
+        r = Lowerer::instPath(sc) + "." + iarrElemName(g);
+        return true;
+    }
     if (prop == vpiDefName) { r = std::string(g.primitiveType.name); return true; }
     if (prop == vpiFile && srcMgr()) { r = std::string(srcMgr()->getFileName(g.location)); return true; }
     return false;

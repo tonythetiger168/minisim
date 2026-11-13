@@ -47,7 +47,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem, Thread, Frame } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem, Thread, Frame, InstArr } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -526,6 +526,7 @@ inline bool isProt(const Obj* o) {
             break;
         }
         case Obj::Dyn: p = protSym(o->sym); break;
+        case Obj::InstArr: p = protectedInstance(instOf(o->sym->getParentScope())); break;
         case Obj::DynElem: p = isProt(o->parent); break;
         case Obj::Fsm:
         case Obj::FsmState: {   // the state register's declaration
@@ -2411,6 +2412,8 @@ inline const char* typeName(int type) {
         {vpiPartSelect, "vpiPartSelect"}, {vpiRegArray, "vpiRegArray"}, {vpiNetArray, "vpiNetArray"},
         {vpiRange, "vpiRange"}, {vpiTask, "vpiTask"}, {vpiFunction, "vpiFunction"}, {vpiNamedBegin, "vpiNamedBegin"},
         {vpiNamedFork, "vpiNamedFork"}, {vpiGenScope, "vpiGenScope"}, {vpiGenScopeArray, "vpiGenScopeArray"},
+        {vpiModuleArray, "vpiModuleArray"}, {vpiInterfaceArray, "vpiInterfaceArray"}, {vpiProgramArray, "vpiProgramArray"},
+        {vpiGateArray, "vpiGateArray"}, {vpiSwitchArray, "vpiSwitchArray"}, {vpiUdpArray, "vpiUdpArray"},
         {vpiPackage, "vpiPackage"}, {vpiInterface, "vpiInterface"}, {vpiProgram, "vpiProgram"}, {vpiModport, "vpiModport"},
         {vpiLongIntVar, "vpiLongIntVar"}, {vpiShortIntVar, "vpiShortIntVar"}, {vpiIntVar, "vpiIntVar"},
         {vpiShortRealVar, "vpiShortRealVar"}, {vpiByteVar, "vpiByteVar"}, {vpiStringVar, "vpiStringVar"},
@@ -2443,6 +2446,7 @@ inline const char* typeName(int type) {
 #include "vpi_code.inc"
 #include "vpi_tchk.inc"
 #include "vpi_prim.inc"
+#include "vpi_iarr.inc"
 #include "vpi_constr.inc"
 #include "vpi_svcb.inc"
 #include "vpi_thread.inc"
@@ -2469,6 +2473,8 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (o->kind == Obj::InterModPath) return nullptr;
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return H(vpi::tchkHandle(type, o));   // timing checks
     if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return H(vpi::pathHandle(type, o));   // module paths
+    if (o->kind == Obj::InstArr) return H(vpi::iarrHandle(type, o));   // instance arrays (37.11)
+    if (Obj* x = nullptr; vpi::elemHandle(type, o, x)) return H(x);   // an element's array and index
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return H(vpi::primHandle(type, o));   // primitives
     if (o->kind == Obj::DynElem) {
         if (type == vpiParent) return H(const_cast<Obj*>(o->parent));
@@ -2631,6 +2637,8 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return nullptr;
     if (vpi::pathIterate(type, o, items)) return vpi::iter(std::move(items));   // module paths
     if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return nullptr;
+    if (vpi::iarrIterate(type, o, items)) return vpi::iter(std::move(items));   // instance arrays (37.11)
+    if (o->kind == Obj::InstArr) return nullptr;
     if (vpi::primIterate(type, o, items)) return vpi::iter(std::move(items));   // primitives
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return nullptr;   // drivers, loads (37.16, 37.17)
     if (vpi::constrIterate(type, o, items)) return vpi::iter(std::move(items));   // constraints (37.31)
@@ -2927,8 +2935,7 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
                         if (e->getArrayIndex() && e->getArrayIndex()->as<int64_t>() == idx) nx = e;
                 } else if (sym->kind == SymbolKind::InstanceArray) {
                     const auto& a = sym->as<slang::ast::InstanceArraySymbol>();
-                    int64_t off = a.range.left <= a.range.right ? idx - a.range.left : a.range.left - idx;
-                    if (off >= 0 && off < (int64_t)a.elements.size()) nx = a.elements[(size_t)off];
+                    nx = vpi::iarrAt(a, idx);
                 } else break;   // indices of a variable or net
                 if (!nx) return nullptr;
                 sym = nx;
@@ -2968,6 +2975,12 @@ vpiHandle vpi_handle_by_name(PLI_BYTE8* name, vpiHandle scope) {
                 return H(x);
             }
             if (sym->kind == SymbolKind::TypeAlias) return H(vpi::typespecObj(&sym->as<slang::ast::TypeAliasType>()));
+            if (sym->kind == SymbolKind::InstanceArray) {   // 37.11: the whole array, or an element
+                const auto& a = sym->as<slang::ast::InstanceArraySymbol>();
+                if (&vpi::iarrRoot(a) == &a) return H(vpi::iarrObj(a));
+                return nullptr;
+            }
+            if (sym->kind == SymbolKind::PrimitiveInstance) return H(vpi::primObj(sym->as<slang::ast::PrimitiveInstanceSymbol>()));
             return H(vpi::scopeObj(*sym));
         }
         return nullptr;
@@ -3004,6 +3017,7 @@ vpiHandle vpi_handle_by_index(vpiHandle h, PLI_INT32 i) {
         } else if (i < 0 || (size_t)i >= d->vec.size()) return nullptr;
         return H(vpi::dynElemObj(o, k));
     }
+    if (o && o->kind == Obj::InstArr) return H(vpi::iarrByIndex(o, 1, &i));   // 37.11
     if (!o || (o->kind != Obj::Signal && o->kind != Obj::Word)) return nullptr;
     if (vpi::denied(o, "vpi_handle_by_index")) return nullptr;
     if (o->arr) return H(vpi::wordObj(o, i));
@@ -3018,6 +3032,7 @@ vpiHandle vpi_handle_by_multi_index(vpiHandle h, PLI_INT32 n, PLI_INT32* idx) {
     Obj* o = O(h);
     if (!o || !idx || n < 1) { vpi::error(vpiError, "vpi_handle_by_multi_index: no object or indices"); return nullptr; }
     if (vpi::denied(o, "vpi_handle_by_multi_index")) return nullptr;
+    if (o->kind == Obj::InstArr) return H(vpi::iarrByIndex(o, n, idx));   // 37.11
     if (o->kind != Obj::Signal || !o->arr) return n == 1 ? vpi_handle_by_index(h, idx[0]) : nullptr;
     size_t nd = arrMap().find(o->sym)->second->dims.size();
     if ((size_t)n != nd && (size_t)n != nd + 1) {
@@ -3066,6 +3081,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return (PLI_INT32)vpi::tchkGet(prop, o);
     if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return (PLI_INT32)vpi::pathGet(prop, o);
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return (PLI_INT32)vpi::primGet(prop, o);
+    if (o->kind == Obj::InstArr) return (PLI_INT32)vpi::iarrGet(prop, o);
     if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return (PLI_INT32)vpi::constrGet(prop, o);
     if (o->kind == Obj::Thread || o->kind == Obj::Frame) return (PLI_INT32)vpi::thrGet(prop, o);
     if (prop == vpiVirtual && vpi::isMethod(o))
@@ -3346,6 +3362,7 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
                 [[fallthrough]];
             default:
                 if (!x->sym) return "";
+                if (!full && x->kind == Obj::Module && x->sym->name.empty()) return vpi::iarrElemName(*x->sym);   // "u[2]"
                 return full ? vpi::fullName(*x->sym) : std::string(x->sym->name);
         }
     };
@@ -3430,7 +3447,7 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
         o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends || o->kind == Obj::InterModPath || o->kind == Obj::Tchk || o->kind == Obj::TchkTerm ||
         o->kind == Obj::ModPath || o->kind == Obj::PathTerm || o->kind == Obj::Prim || o->kind == Obj::PrimTerm ||
-        o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) {
+        o->kind == Obj::Constraint || o->kind == Obj::ConstrItem || o->kind == Obj::InstArr) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }

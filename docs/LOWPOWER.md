@@ -182,6 +182,11 @@ example.
 | `UPF005` | An isolation strategy on a domain that is never off: redundant isolation |
 | `UPF006` | A PST state that names a supply port state never defined with `add_port_state` |
 | `UPF007` | Power intent that breaks a rule of the standard: a composite domain whose subdomains have primary supplies that are not equivalent (6.17), a required retention list element that no strategy retains (6.54) |
+| `UPF008` | An isolation control signal in a domain that can be off (and is not on the isolation supply): the enable is lost while the cell must clamp |
+| `UPF009` | Output isolation whose `-isolation_supply` is the switched supply of the domain it isolates: the clamp dies with the domain |
+| `UPF010` | A retention save or restore signal in a domain that can be off (and not on the retention supply), or a `-retention_supply` that is the domain's own switched supply |
+| `UPF011` | A power switch whose control signal is in the domain the switch powers: once off, nothing can turn it on |
+| `UPF012` | A level shifter on a crossing whose two sides are on one supply, or always at one voltage (redundant level shifter) |
 
 Findings on ports point at the instance's port connection in the HDL;
 findings on the power intent point at the UPF line.
