@@ -45,6 +45,8 @@ Spec references are IEEE 1800-2023 clauses.
   closed); msim, mdebug and mlint all accept them, and `msim -i` takes the
   UCLI commands `fsdbDumpfile` / `fsdbDumpvars` / `fsdbDumpoff`.
   `docs/DEBUG.md`, `tests/msim_vendor_dump.cmake`.
+- `msim -maxtime` takes a unit: `-maxtime 3ms`, `500ns`, `1.5us` (before,
+  only a count of time-precision ticks, so `3ms` stopped after 3 ticks).
 - VPI assertion steps list their matched expressions
   (`matched_expression_count`, `matched_exprs`, 39.5.2), and `failExpr` of a
   concurrent assertion with sequence operators is the boolean that did not
@@ -154,6 +156,18 @@ Spec references are IEEE 1800-2023 clauses.
   off.
 
 ### Fixed
+- A continuous assignment to part of a variable (a bit, a slice, a member of
+  a packed struct, also through an output port) no longer makes the rest of
+  the variable z: procedures keep writing the other bits (6.5).
+  `tests/spec/6.5-var-partial-cont-assign.sv`.
+- msim VHDL, found running the NEORV32 testbench against GHDL: a
+  delayed signal update due at time T is applied before a `wait for` that
+  ends at T resumes (1076-2019 14.7.5); positional elements before `others`
+  in an array aggregate were dropped (a ROM image read as zeros); a local
+  `string(1 to n)` variable starts with n characters; a process with a
+  branch slang proved dead (a null slice for one generic value) lost its
+  whole body and looped at time 0; `T'(x)` of an unpacked struct with a
+  string member failed to lower. `tests/vhdl/sim_order.vhd` (GHDL golden).
 - mvplat: a CSRRS/CSRRC on `mip` no longer latches the PLIC's SEIP into the
   software-written bit (privileged ISA 3.1.9). OpenSBI's timer code does such
   a read-modify-write, after which Linux took the same external interrupt
