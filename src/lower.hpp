@@ -5320,6 +5320,9 @@ struct Lowerer {
                     return sized(r, storeW(*e.type), e.type->isSigned(), ctx);
                 }
                 if (isHandleType(*m.value().type)) {   // h.x (8.4): read through the handle when evaluated
+                    // h.P, a parameter or enum value of the class (8.25): its constant
+                    if (m.member.kind == SymbolKind::Parameter || m.member.kind == SymbolKind::EnumValue)
+                        return constSym(m.member, e, ctx);
                     const PropSlot* ps = memberSlot(m);
                     E r;
                     if (!ps) {
@@ -5508,11 +5511,23 @@ struct Lowerer {
                 break;
             }
             default: {  // SignalEvent or EventList: @(posedge a or negedge b ...)
+                // @(ev iff c) (9.4.2.3): the event counts only when c is true
+                // as it happens, so wait again otherwise.
+                const Expression* iff = nullptr;
+                if (t.kind == TimingControlKind::SignalEvent) iff = t.as<SignalEventControl>().iffCondition;
+                else if (t.kind == TimingControlKind::EventList)
+                    for (auto* sub : t.as<EventListControl>().events)
+                        if (sub->kind == TimingControlKind::SignalEvent && sub->as<SignalEventControl>().iffCondition)
+                            unsupported("iff in an event list");
                 Instr i; i.k = IK::WaitEdge;
                 collectEvents(t, i.events);
                 i.sig = i.events[0].first;
                 i.edge = i.events[0].second;
-                prog.emit(i);
+                size_t top = prog.emit(i);
+                if (iff) {
+                    Instr j; j.k = IK::JmpIfNot; j.e = expr(*iff); j.target = top;
+                    prog.emit(j);
+                }
             }
         }
     }
@@ -8983,6 +8998,12 @@ struct Lowerer {
                     for (int k = 0; k < a->count; k++) { Instr i; i.k = IK::Assign; i.sig = a->base + k; i.e = konst(iv); prog.emit(i); }
                     break;
                 }
+                // An array with an initializer in a function that keeps static
+                // signals: assigned at each entry, as an automatic one is.
+                if (init && vd.symbol.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType &&
+                    !(current && vd.symbol.lifetime == VariableLifetime::Static) && arrFind(&vd.symbol) &&
+                    assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false))
+                    break;
                 if (localMap().count(&vd.symbol)) {   // an automatic variable starts over at each entry (6.21)
                     if (vd.symbol.getType().isEvent()) break;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol);
@@ -9905,10 +9926,20 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
     }
+    int subrDepth = 0;
     void handle(const slang::ast::SubroutineSymbol& sub) {
         bool m = isClassMethod(sub);
         inMethod += m;
+        // Every signal made in here belongs to the subroutine (see subrLocalSigs).
+        MkSig saved = mkSig;
+        if (subrDepth++ == 0)
+            mkSig = [saved](const std::string& n, int w, bool net) {
+                int id = saved(n, w, net);
+                subrLocalSigs().insert(id);
+                return id;
+            };
         visitDefault(sub);
+        if (--subrDepth == 0) mkSig = saved;
         inMethod -= m;
     }
     // extern task t in an interface (25.7): the module task that exports it
@@ -12023,6 +12054,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     classRt().clear();
     layoutStore() = &out.layouts;
     netKinds().clear();
+    subrLocalSigs().clear();
     usesForce() = false;
     srcMgr() = comp.getSourceManager();
     dynMap().clear();

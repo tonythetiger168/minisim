@@ -1125,6 +1125,21 @@ static shared_ptr<ExpectWait> startExpect(const Instr& i, const shared_ptr<ProcC
     return w;
 }
 // `ticked`: the clocks that ticked (16.13); attempts start at the leading one.
+// A function called in an assertion's boolean: run to its end now.
+static void runAtomCall(const Prog* p) {
+    Frame* sf = g_fr;
+    Frame* sr = g_ret;
+    auto ctl = make_shared<ProcCtl>();
+    Task t = exec(p, ctl, newFrame(nullptr, nullptr, 0));
+    t.h.resume();
+    if (!t.h.done()) {
+        cerr << "error: a function called in an assertion waited (time " << S.now << ")\n";
+        exit(1);
+    }
+    t.h.destroy();
+    g_fr = sf;
+    g_ret = sr;
+}
 static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
@@ -1179,6 +1194,7 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
             for (size_t k = 0; k < c.capSlot.size(); k++) c.capSlot[k]->k = (*caps)[k];
         valCaps = caps.get();
         have = true;
+        for (const Prog* p : c.pre) runAtomCall(p);
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};

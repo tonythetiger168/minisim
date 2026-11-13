@@ -110,6 +110,36 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
+- VIP library: `vip/` holds UVM verification IP that runs on `msim -uvm`:
+  AXI4, APB4 and a memory model (from SoC-tb-regress-builder) and a new
+  AXI4-Lite VIP, each with agents, monitor, coverage, protocol assertions
+  and sequences, and self-test benches in `tests/vip` (`ctest -L vip`).
+  `tools/mvip.py` runs the 146 VIPs of open-vip-portfolio on msim. See
+  `docs/VIP.md`.
+- A `tri0` / `tri1` / `wand` / `wor` net connected to an inout port
+  (23.3.3.7) read `x` as soon as either side drove it; the port's net is now
+  the same net, of the external kind, so the pull and the drivers resolve.
+- The implicit sensitivity of a continuous assignment, `always_comb` or `@*`
+  no longer holds the arguments, result and locals of the functions it calls
+  (9.2.2.2.1): two assignments calling one function that writes its result
+  bit by bit woke each other for ever, and the simulation hung at time 0.
+- `@(event iff expr)` in procedures (9.4.2.3): the condition was ignored, so
+  `@(posedge clk iff rst_n)` woke on the first edge.
+- A user function called in the boolean of a concurrent assertion (16.6) is
+  run at each clock tick on the sampled values of its arguments; its result
+  was garbage before.
+- An array declared with an initializer in a non-recursive function,
+  `bit [5:0] t[4] = '{...};` (6.21), was an unsupported reference.
+- A queue or dynamic array reached through handles in a coverpoint or its
+  `iff` guard, `coverpoint tr.txn.data[0] iff (tr.txn.data.size() > 0)`
+  (19.5): it was a null object access.
+- Constraints on part-selects (18.5): `addr[1:0] == 0; addr[31:12] == 0;`
+  with a range on `addr` failed nearly every `randomize()`; the solver now
+  narrows a variable's range through a part-select.
+- A parameter or localparam of a class read through a handle, `h.N` (8.25).
+- VPI: `vpi_get_vlog_info` gives a `-f` file's arguments as the nested
+  array 38.36 describes, so `msim -uvm -f files.f` no longer crashes in
+  UVM's command line reader.
 - UPF `find_objects` (IEEE 1801-2024 6.33): a UPF file can search the
   design for instances, instances of a module, ports by direction, nets and
   its own supply ports and nets (`-transitive`, `-regexp`, `-exact`,
