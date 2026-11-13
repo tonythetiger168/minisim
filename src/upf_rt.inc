@@ -476,7 +476,8 @@ struct Rt {
                 for (auto& [a, b] : t.paired) { chk(a); chk(b); }
             }
         }
-        for (auto& e : intentErrors(m, dm, [this](const std::string& p) { return modelOf(p); }))
+        for (auto& e : intentErrors(m, dm, [this](const std::string& p) { return modelOf(p); },
+                                        [this](const std::string& n) { return sigOf(n) >= 0; }))
             throw Error(e.where + ": " + e.text);
         for (auto& sb : m.simBehaviors)
             if (sb.loaded)

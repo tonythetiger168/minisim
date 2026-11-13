@@ -243,7 +243,7 @@ private:
 struct Ex;
 using ExP = std::shared_ptr<Ex>;
 struct Ex {
-    enum K { Id, Num, Tuple, Not, And, Or, BAnd, BOr, BXor, Eq, Ne } k = Num;
+    enum K { Id, Num, Tuple, Not, And, Or, BAnd, BOr, BXor, Eq, Ne, Lt, Le, Gt, Ge } k = Num;
     std::string s;          // Id: the name; Num: its text
     uint64_t v = 0, x = 0;  // Num: value and unknown bits
     double real = 0;        // Num: as a voltage
@@ -290,11 +290,16 @@ inline ExP parseExprTree(const std::string& text, const std::string& where) {
         ExP borE() { ExP a = bxorE(); while (eat("|")) a = mk(Ex::BOr, a, bxorE()); return a; }
         ExP bxorE() { ExP a = bandE(); while (eat("^")) a = mk(Ex::BXor, a, bandE()); return a; }
         ExP bandE() { ExP a = eqE(); while (eat("&")) a = mk(Ex::BAnd, a, eqE()); return a; }
+        // the relational operators of Table 6 (5.4), one level above the bit-wise ones
         ExP eqE() {
             ExP a = unary();
             for (;;) {
                 if (eat("==")) a = mk(Ex::Eq, a, unary());
                 else if (eat("!=")) a = mk(Ex::Ne, a, unary());
+                else if (eat("<=")) a = mk(Ex::Le, a, unary());
+                else if (eat(">=")) a = mk(Ex::Ge, a, unary());
+                else if (eat("<")) a = mk(Ex::Lt, a, unary());
+                else if (eat(">")) a = mk(Ex::Gt, a, unary());
                 else return a;
             }
         }
@@ -413,6 +418,8 @@ struct EVal {
     SupplyVal sv;
     bool tupleV = false;   // a {STATE v} tuple: compare the voltage too
     std::string sym;
+    double real = 0;       // Logic: a real literal or a voltage (5.13: in volts)
+    bool isReal = false;
 };
 // How names in an expression are read. A callback returns false for a name
 // it does not know.
@@ -469,11 +476,26 @@ inline EVal evalEx(const ExP& e, const EvalCtx& c, const std::string& where) {
             EVal r;
             r.v = e->v;
             r.x = e->x;
+            r.real = e->real;
+            r.isReal = e->isReal;
             return r;
         }
         case Ex::Id: {
             EVal r;
             if (c.id && c.id(e->s, r)) return r;
+            // supply.voltage and supply.state (5.4 examples)
+            for (const char* f : {".voltage", ".state"}) {
+                size_t n = std::char_traits<char>::length(f);
+                if (e->s.size() <= n || e->s.compare(e->s.size() - n, n, f) != 0) continue;
+                EVal b;
+                if (!c.id || !c.id(e->s.substr(0, e->s.size() - n), b) || b.k != EVal::Supply) break;
+                if (f[1] == 's') { b.tupleV = false; return b; }
+                if (!b.sv.hasV || b.sv.st == S_OFF || b.sv.st == S_UNDETERMINED) return logicV(2);
+                r.real = b.sv.v;
+                r.isReal = true;
+                r.v = (uint64_t)b.sv.v;
+                return r;
+            }
             r.k = EVal::Sym;   // a state name, compared with a supply or an object
             r.sym = e->s;
             return r;
@@ -508,8 +530,32 @@ inline EVal evalEx(const ExP& e, const EvalCtx& c, const std::string& where) {
             return logicV(a == 2 || b == 2 ? 2 : a ^ b);
         }
         case Ex::Eq: case Ex::Ne: {
-            int r = compareV(evalEx(e->kids[0], c, where), evalEx(e->kids[1], c, where), c, where);
+            EVal a = evalEx(e->kids[0], c, where), b = evalEx(e->kids[1], c, where);
+            int r;
+            if (a.k == EVal::Logic && b.k == EVal::Logic && (a.isReal || b.isReal))
+                r = a.x || b.x ? 2 : (a.isReal ? a.real : (double)a.v) == (b.isReal ? b.real : (double)b.v);
+            else
+                r = compareV(a, b, c, where);
             if (e->k == Ex::Ne && r != 2) r = !r;
+            return logicV(r);
+        }
+        case Ex::Lt: case Ex::Le: case Ex::Gt: case Ex::Ge: {
+            // numbers: logic values, real literals and voltages
+            auto num = [&](const EVal& v, double& out) {
+                if (v.k == EVal::Supply) {
+                    if (!v.sv.hasV) return false;
+                    out = v.sv.v;
+                    return true;
+                }
+                if (v.k != EVal::Logic) throw Error(where + ": '" + v.sym + "' is not a number and cannot be compared with < <= > >= (5.4)");
+                if (v.x) return false;
+                out = v.isReal ? v.real : (double)v.v;
+                return true;
+            };
+            double a, b;
+            bool ka = num(evalEx(e->kids[0], c, where), a), kb = num(evalEx(e->kids[1], c, where), b);
+            if (!ka || !kb) return logicV(2);
+            bool r = e->k == Ex::Lt ? a < b : e->k == Ex::Le ? a <= b : e->k == Ex::Gt ? a > b : a >= b;
             return logicV(r);
         }
     }
@@ -644,6 +690,7 @@ inline int senseOf(const std::string& s) {
 struct Isolation {
     std::string name, domain, where;
     std::vector<std::string> elements, exclude;
+    std::vector<std::string> cells;   // -instance: the instances that implement it (8.3.2)
     int appliesTo = 2;   // 0 inputs, 1 outputs, 2 both
     std::string clamp = "0";
     std::vector<std::string> signals;
@@ -655,6 +702,7 @@ struct Isolation {
 struct LevelShifter {
     std::string name, domain, where;
     std::vector<std::string> elements, exclude;
+    std::vector<std::string> cells;   // -instance: the instances that implement it (8.3.2)
     int appliesTo = 2;
     std::string inSupply, outSupply, rule = "both";
     bool noShift = false;
@@ -674,6 +722,7 @@ struct LogicConn { std::string net, port, scope, where; bool reconnect = false; 
 struct Retention {
     std::string name, domain, where;
     std::vector<std::string> elements, exclude;
+    std::vector<std::string> cells;   // -instance: the instances that implement it (8.3.2)
     std::string supply;
     SigSense save, restore;
     ExP saveCond, restoreCond, restorePeriodCond, powerdownCond;
@@ -840,6 +889,7 @@ struct Model {
     std::map<std::string, SupplySet> sets;
     std::map<std::string, std::string> setAlias;   // handle -> supply set
     std::set<std::string> ports, nets;              // supply ports and nets
+    std::map<std::string, std::string> portWhere;   // supply port -> its create_supply_port
     std::map<std::string, std::string> portDir;     // supply port -> in / out
     std::map<std::string, std::string> resolve;     // supply net -> resolution
     std::map<std::string, std::vector<std::string>> connects;   // supply net -> ports it connects
@@ -1001,6 +1051,15 @@ struct Model {
     // again in simv, which has no design, with these answers.
     std::string loadStart;
     std::map<std::string, std::string> topSeen;
+    // Simple names declared in each scope, and in each power domain for its
+    // strategies (5.3.3.2, 5.3.3.3, 5.5): name -> the kind of object.
+    std::map<std::string, std::string> declared;
+    std::map<std::string, std::string> portAttrSeen;   // port "\n" attribute -> value (5.7.7)
+    static bool identifier(const std::string& n) {   // 5.3.2
+        if (n.empty() || !std::isalpha((unsigned char)n[0])) return false;
+        for (char ch : n) if (!std::isalnum((unsigned char)ch) && ch != '_') return false;
+        return true;
+    }
     std::string result;   // the Tcl result of the UPF command just run
     std::map<std::string, std::string> supplyWhere;   // "net:" / "port:" + supply name -> file:line
     // The information model (clause 10), built at the first query command
@@ -1552,6 +1611,59 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             for (auto& e : l) r.push_back(join(scope, e));
             return r;
         };
+        // A new UPF object named `simple` in scope `at` (a design scope, or
+        // "<domain>." for a strategy): a valid identifier (5.3.2), and no other
+        // object of that simple name there (5.3.3.2, 5.5). A supply port and the
+        // supply net of the same name are one connection, as are a logic port
+        // and its logic net.
+        // 5.10: the first command for a strategy has no -update; every later
+        // one refines it and must have -update.
+        // -instance {{instance port} ...}: the instance names, rooted; an
+        // empty name is no cell.
+        auto cellsOf = [&](const Opts& o) {
+            std::vector<std::string> r;
+            for (auto& v : o.all("-instance"))
+                for (auto& pair : splitList(v)) {
+                    auto l = splitList(pair);
+                    if (!l.empty() && !l[0].empty()) r.push_back(join(scope, l[0]));
+                }
+            return r;
+        };
+        auto strategyUpdate = [&](const Cmd& c, const Opts& o, bool exists, const char* what, const std::string& dn) {
+            if (!exists && o.has("-update"))
+                throw Error(c.where() + ": " + n + " -update of unknown " + what + " strategy " + o.pos[0] + " in domain " + dn + " (5.10)");
+            if (exists && !o.has("-update"))
+                throw Error(c.where() + ": " + what + " strategy " + o.pos[0] + " is already defined in domain " + dn + "; refine it with -update (5.10)");
+        };
+        auto declare = [&](const std::string& at, const std::string& simple, const std::string& kind) {
+            if (simple.find('/') != std::string::npos) return;   // a hierarchical name: declared in another scope
+            if (!identifier(simple))
+                throw Error(c.where() + ": " + n + ": '" + simple + "' is not a valid UPF identifier (a letter, then letters, digits and _, 5.3.2)");
+            std::string key = at.empty() || at.back() == '.' ? at + simple : at + "/" + simple;
+            auto [it, fresh] = declared.emplace(key, kind);
+            if (fresh) return;
+            std::string old = it->second;   // one kind, or "port kind|net kind"
+            auto pair = [&](const char* a, const char* b) { return (old == a && kind == b) || (old == b && kind == a); };
+            if (pair("supply port", "supply net") || pair("logic port", "logic net")) {
+                it->second = old + "|" + kind;
+                return;
+            }
+            if (old.find('|') != std::string::npos) old = kind.find("net") != std::string::npos ? old.substr(old.find('|') + 1) : old.substr(0, old.find('|'));
+            throw Error(c.where() + ": " + n + ": '" + simple + "' is already declared " + (at.empty() || at.back() != '.' ? "in this scope" : "in power domain " + at.substr(0, at.size() - 1)) +
+                        " as a " + old + " (5.3.3.2)");
+        };
+        {   // 5.9 e), g): -elements {.} or -exclude_elements {.} with -model or -models
+            bool models = false;
+            std::string dotIn;
+            for (size_t k = 1; k < c.w.size(); k++) {
+                if (c.w[k] == "-model" || c.w[k] == "-models") models = true;
+                if ((c.w[k] == "-elements" || c.w[k] == "-exclude_elements") && k + 1 < c.w.size())
+                    for (auto& e : splitList(c.w[k + 1]))
+                        if (e == ".") dotIn = c.w[k];
+            }
+            if (models && !dotIn.empty())
+                throw Error(c.where() + ": " + n + ": " + dotIn + " {.} with -model or -models (5.9 e, g)");
+        }
         if (n == "upf_version") {
             if (c.w.size() > 1) version = c.w[1];
             continue;
@@ -1596,6 +1708,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             bool fresh = !domains.count(name);
             if (fresh && o.has("-update")) throw Error(c.where() + ": -update of unknown domain " + name);
             if (!fresh && !o.has("-update")) throw Error(c.where() + ": domain " + name + " is already defined");
+            if (fresh) declare(scope, o.pos[0], "power domain");
             Domain& d = domains[name];
             if (fresh) {
                 d.name = name;
@@ -1631,7 +1744,9 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                                                           ? domains[join(scope, o.get("-domain"))].scope : scope
                                                     : scope;
                 std::string name = join(base, p);
+                declare(base, p, "supply port");
                 ports.insert(name);
+                portWhere.emplace(name, c.where());
                 if (!supplyWhere.count("port:" + name)) supplyWhere["port:" + name] = c.where();
                 portDir[name] = o.get("-direction", "in");
             }
@@ -1648,6 +1763,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                     base = it->second.scope;
                 }
                 std::string name = join(base, p);
+                if (!o.has("-reuse")) declare(base, p, "supply net");
                 nets.insert(name);
                 if (!supplyWhere.count("net:" + name)) supplyWhere["net:" + name] = c.where();
                 if (o.has("-resolve")) resolve[name] = o.get("-resolve");
@@ -2054,6 +2170,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 }
                 continue;
             }
+            declare(scope, o.pos[0], "supply set");
             SupplySet& s = sets[name];
             s.name = name;
             s.where = c.where();
@@ -2070,6 +2187,11 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (!o.has("-handle")) throw Error(c.where() + ": associate_supply_set needs -handle");
             std::string h = join(scope, o.get("-handle"));
             std::string s = setOf(join(scope, o.pos[0]));
+            if (!sets.count(s)) {   // 5.3.3.1: a reference names an object that exists
+                size_t d = s.rfind('.');
+                if (d == std::string::npos || (!domains.count(s.substr(0, d)) && !sources.count(s.substr(0, d))))
+                    throw Error(c.where() + ": associate_supply_set: no supply set " + o.pos[0] + " (5.3.3.1)");
+            }
             // a handle that was made as an anonymous set takes the target's place
             if (sets.count(h) && sets[h].fn.empty()) sets.erase(h);
             setAlias[h] = s;
@@ -2182,6 +2304,9 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             Opts o = opts(c, {"-update"});
             need(o, 1, "a switch name");
             std::string name = join(scope, o.pos[0]);
+            if (!switches.count(name) && o.has("-update")) throw Error(c.where() + ": -update of unknown power switch " + o.pos[0] + " (5.10)");
+            if (switches.count(name) && !o.has("-update")) throw Error(c.where() + ": power switch " + o.pos[0] + " is already defined; refine it with -update (5.10)");
+            if (!o.has("-update")) declare(scope, o.pos[0], "power switch");
             Switch& sw = switches[name];
             sw.name = name;
             sw.where = c.where();
@@ -2267,11 +2392,14 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             std::string dn = join(scope, o.get("-domain"));
             if (!domains.count(dn)) throw Error(c.where() + ": no domain " + o.get("-domain"));
             Isolation* is = nullptr;
-            if (o.has("-update"))
-                for (auto& x : isos) if (x.name == o.pos[0] && x.domain == dn) is = &x;
+            for (auto& x : isos) if (x.name == o.pos[0] && x.domain == dn) is = &x;
+            strategyUpdate(c, o, is != nullptr, "isolation", dn);
+            if (is && o.has("-clamp_value") && is->clampSet && is->clamp != o.get("-clamp_value"))
+                throw Error(c.where() + ": set_isolation -update changes -clamp_value of " + o.pos[0] + " from " + is->clamp + " to " + o.get("-clamp_value") + " (5.10)");
             if (!is) { isos.push_back({}); is = &isos.back(); is->name = o.pos[0]; is->domain = dn; is->where = c.where(); }
             for (auto& e : rooted(o.list("-elements"))) is->elements.push_back(e);
             for (auto& e : rooted(o.list("-exclude_elements"))) is->exclude.push_back(e);
+            for (auto& ci : cellsOf(o)) is->cells.push_back(ci);
             if (o.has("-applies_to")) {
                 std::string a = o.get("-applies_to");
                 is->appliesTo = a == "inputs" ? 0 : a == "outputs" ? 1 : 2;
@@ -2311,23 +2439,27 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             Opts o = opts(c, {"-no_shift", "-force_shift", "-update"});
             need(o, 1, "a strategy name");
             if (!o.has("-domain")) throw Error(c.where() + ": set_level_shifter needs -domain");
-            LevelShifter l;
-            l.name = o.pos[0];
-            l.domain = join(scope, o.get("-domain"));
-            if (!domains.count(l.domain)) throw Error(c.where() + ": no domain " + o.get("-domain"));
-            l.where = c.where();
-            l.elements = rooted(o.list("-elements"));
-            l.exclude = rooted(o.list("-exclude_elements"));
-            std::string a = o.get("-applies_to", "both");
-            l.appliesTo = a == "inputs" ? 0 : a == "outputs" ? 1 : 2;
+            std::string dn = join(scope, o.get("-domain"));
+            if (!domains.count(dn)) throw Error(c.where() + ": no domain " + o.get("-domain"));
+            LevelShifter* lp = nullptr;
+            for (auto& x : lss) if (x.name == o.pos[0] && x.domain == dn) lp = &x;
+            strategyUpdate(c, o, lp != nullptr, "level shifter", dn);
+            if (!lp) { lss.push_back({}); lp = &lss.back(); lp->name = o.pos[0]; lp->domain = dn; lp->where = c.where(); lp->rule = "both"; }
+            LevelShifter& l = *lp;
+            for (auto& e : rooted(o.list("-elements"))) l.elements.push_back(e);
+            for (auto& e : rooted(o.list("-exclude_elements"))) l.exclude.push_back(e);
+            for (auto& ci : cellsOf(o)) l.cells.push_back(ci);
+            if (o.has("-applies_to")) {
+                std::string a = o.get("-applies_to");
+                l.appliesTo = a == "inputs" ? 0 : a == "outputs" ? 1 : 2;
+            }
             if (o.has("-input_supply")) l.inSupply = join(scope, o.get("-input_supply"));
             if (o.has("-output_supply")) l.outSupply = join(scope, o.get("-output_supply"));
-            l.rule = o.get("-rule", "both");
-            l.noShift = o.has("-no_shift");
+            if (o.has("-rule")) l.rule = o.get("-rule");
+            if (o.has("-no_shift")) l.noShift = true;
             if (o.has("-applies_to_boundary")) l.boundary = boundaryOf(o.get("-applies_to_boundary"), c);
             if (o.has("-source")) l.source = join(scope, o.get("-source"));
             if (o.has("-sink")) l.sink = join(scope, o.get("-sink"));
-            lss.push_back(l);
             continue;
         }
         if (n == "set_retention") {
@@ -2337,8 +2469,8 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             std::string dn = join(scope, o.get("-domain"));
             if (!domains.count(dn)) throw Error(c.where() + ": no domain " + o.get("-domain"));
             Retention* rt = nullptr;
-            if (o.has("-update"))
-                for (auto& x : rets) if (x.name == o.pos[0] && x.domain == dn) rt = &x;
+            for (auto& x : rets) if (x.name == o.pos[0] && x.domain == dn) rt = &x;
+            strategyUpdate(c, o, rt != nullptr, "retention", dn);
             if (!rt) { rets.push_back({}); rt = &rets.back(); rt->name = o.pos[0]; rt->domain = dn; rt->where = c.where(); }
             for (auto& e : rooted(o.list("-elements"))) {
                 auto rl = retLists.find(e);   // a named list of set_retention_elements (6.54)
@@ -2347,6 +2479,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 for (auto& x : rl->second.exclude) rt->exclude.push_back(x);
             }
             for (auto& e : rooted(o.list("-exclude_elements"))) rt->exclude.push_back(e);
+            for (auto& ci : cellsOf(o)) rt->cells.push_back(ci);
             if (o.has("-retention_supply")) rt->supply = join(scope, o.get("-retention_supply"));
             auto ss = [&](const char* opt, SigSense& out) {
                 if (!o.has(opt)) return;
@@ -2392,6 +2525,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (fresh && o.has("-update")) throw Error(c.where() + ": -update of unknown composite domain " + o.pos[0]);
             if (!fresh && !o.has("-update")) throw Error(c.where() + ": composite domain " + o.pos[0] + " is already defined");
             if (fresh && domains.count(name)) throw Error(c.where() + ": " + o.pos[0] + " is already a power domain");
+            if (fresh) declare(scope, o.pos[0], "composite domain");
             Composite& cd = composites[name];
             if (fresh) {
                 cd.name = name;
@@ -2904,6 +3038,16 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             auto acv = r.attrs.find("UPF_async_clamp_value");
             if (acv != r.attrs.end() && acv->second != "0" && acv->second != "1")
                 throw Error(c.where() + ": -async_clamp_value " + acv->second + " (0 or 1)");
+            // 5.7.7: two set_port_attributes commands that give one port the
+            // same attribute with different values are an error.
+            if (r.model.empty() && !r.hasElements)
+                for (auto& pn : r.ports)
+                    for (auto& [an, av] : r.attrs) {
+                        auto [it, fresh] = portAttrSeen.emplace(pn + "\n" + an, av);
+                        if (!fresh && it->second != av)
+                            throw Error(c.where() + ": set_port_attributes gives " + an + " of port " + pn + " the value " + av +
+                                        ", but an earlier command gave it " + it->second + " (5.7.7)");
+                    }
             portAttrs.push_back(r);
             continue;
         }
@@ -2912,6 +3056,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             need(o, 1, "a group name");
             std::string name = join(scope, o.pos[0]);
             if (groups.count(name)) throw Error(c.where() + ": power state group " + o.pos[0] + " is already defined");
+            declare(scope, o.pos[0], "power state group");
             StateGroup& g = groups[name];
             g.name = name;
             g.scope = scope;
@@ -3027,7 +3172,10 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (l.empty()) throw Error(c.where() + ": create_logic_port: the port list is empty (6.20)");
             std::string dir = o.get("-direction", "in");
             if (dir != "in" && dir != "out" && dir != "inout") throw Error(c.where() + ": -direction " + dir);
-            for (auto& p : l) logicPorts[join(scope, p)] = dir;
+            for (auto& p : l) {
+                declare(scope, p, "logic port");
+                logicPorts[join(scope, p)] = dir;
+            }
             continue;
         }
         if (n == "create_logic_net") {   // 6.19
@@ -3035,7 +3183,10 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             need(o, 1, "a net name");
             auto l = splitList(o.pos[0]);
             if (l.empty()) throw Error(c.where() + ": create_logic_net: the net list is empty (6.19)");
-            for (auto& p : l) logicNets.insert(join(scope, p));
+            for (auto& p : l) {
+                declare(scope, p, "logic net");
+                logicNets.insert(join(scope, p));
+            }
             continue;
         }
         if (n == "connect_logic_net") {   // 6.13
@@ -3152,6 +3303,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
         if (n == "create_pst") {
             Opts o = opts(c, {});
             need(o, 1, "a table name");
+            declare(scope, o.pos[0], "power state table");
             Pst t;
             t.name = join(scope, o.pos[0]);
             t.where = c.where();
@@ -3320,8 +3472,26 @@ struct Finding {
 // retained while another element of its domain is (6.54). `modelOf` gives
 // the model of an instance (for the UPF_retention attribute).
 inline std::vector<Finding> intentErrors(const Model& m, const DomainMap& dm,
-                                         const std::function<std::string(const std::string&)>& modelOf) {
+                                         const std::function<std::string(const std::string&)>& modelOf,
+                                         const std::function<bool(const std::string&)>& isSignal = {}) {
     std::vector<Finding> out;
+    // -instance of a strategy names an instance of the design (8.3.2)
+    if (modelOf) {
+        auto cells = [&](const char* what, const std::string& name, const std::string& where, const std::vector<std::string>& l) {
+            for (auto& ci : l)
+                if (modelOf(m.design(ci)).empty())
+                    out.push_back({"UPF001", where, what + (" " + name) + ": -instance names '" + m.design(ci) + "', which is not an instance in the design (8.3.2)"});
+        };
+        for (auto& x : m.isos) cells("isolation", x.name, x.where, x.cells);
+        for (auto& x : m.lss) cells("level shifter", x.name, x.where, x.cells);
+        for (auto& x : m.rets) cells("retention", x.name, x.where, x.cells);
+    }
+    // A supply port made by create_supply_port where the HDL already has a
+    // logic port or net of that name: the types differ (8.3.4).
+    if (isSignal)
+        for (auto& p : m.ports)
+            if (isSignal(p))
+                out.push_back({"UPF001", m.portWhere.count(p) ? m.portWhere.at(p) : std::string(), "create_supply_port " + m.design(p) + ": the design already has a logic port or net of that name (8.3.4)"});
     // apply_power_model (6.9): each instance exists and is of a model the power model is for (6.31)
     if (modelOf)
         for (auto& [inst, pmName] : m.appliedModels) {
@@ -3642,7 +3812,7 @@ inline std::vector<Finding> check(const Model& m, const DesignView& dv) {
         auto it = dv.models.find(inst);
         return it == dv.models.end() ? std::string() : it->second;
     };
-    for (auto& e : intentErrors(m, dm, modelOf)) f.push_back(e);
+    for (auto& e : intentErrors(m, dm, modelOf, [&](const std::string& n) { return dv.signals.count(m.design(n)) != 0; })) f.push_back(e);
     // UPF001: names that are not in the design
     for (auto& dn : m.domainOrder) {
         const Domain& d = m.domains.at(dn);

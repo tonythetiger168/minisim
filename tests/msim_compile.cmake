@@ -101,8 +101,9 @@ endforeach()
 # power intent from msim's snapshot (upf_rt.inc). Domains switched off and
 # on, isolation, corruption, retention of flops and latches, isolation cells
 # by their functional model (HDL ports on supply nets), replayed initial
-# blocks, and the low-power coverage report.
-foreach(t gating retlatch isomodel replay)
+# blocks, a process whose domain powers down in the middle of its body, and
+# the low-power coverage report.
+foreach(t gating retlatch isomodel replay restart)
   set(files ${SRC}/tests/upf/${t}.sv -upf ${SRC}/tests/upf/${t}.upf)
   execute_process(COMMAND ${MSIM} ${files} OUTPUT_VARIABLE want RESULT_VARIABLE r1)
   execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/upf_${t} ${files}

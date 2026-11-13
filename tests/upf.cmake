@@ -66,6 +66,32 @@ upf_error(e_rep "set_repeater R2 -domain PD_CORE" "set_repeater needs -repeater_
 upf_error(e_tr1 "add_state_transition PD_CORE -domain -transition {t -from A}" "needs both -from and -to (6.7)")
 upf_error(e_tr2 "add_power_state PD_CORE -domain -state {A -logic_expr {u_pmu/req}}\nadd_state_transition PD_CORE -domain -transition {t -from A -to B}" "B is not a power state of PD_CORE (6.7)")
 upf_error(e_tr3 "add_state_transition PD_CORE -domain -transition {t -from A -to A}" "A is both the -from and the -to state (6.7)")
+# Names (5.3.2, 5.3.3, 5.5): a name is an identifier, one object of a name
+# in a scope (a supply port and its supply net, or a logic port and its
+# logic net, may share one), and a reference names an object that exists.
+upf_error(e_ident "create_power_domain 1PD -elements {u_pmu}" "'1PD' is not a valid UPF identifier")
+upf_error(e_dupnet "create_supply_net VDD" "'VDD' is already declared in this scope as a supply net")
+upf_error(e_dupset "create_supply_set VDD" "'VDD' is already declared in this scope as a supply port")
+upf_error(e_duppd "create_supply_set PD_CORE" "'PD_CORE' is already declared in this scope as a power domain")
+upf_error(e_dupln "create_logic_net iso_w" "'iso_w' is already declared in this scope as a logic net")
+upf_error(e_dupsw "create_power_switch iso_w -output_supply_port {o VDD} -input_supply_port {i VDD} -control_port {c u_pmu/req} -on_state {on i c}" "'iso_w' is already declared")
+upf_error(e_undef "associate_supply_set SS_NOPE -handle PD_TOP.primary" "no supply set SS_NOPE (5.3.3.1)")
+# 5.9: the current scope ({.}) is not an element of a model.
+upf_error(e_dotm "set_design_attributes -models core -elements {.} -attribute A 1" "-elements {.} with -model or -models (5.9 e, g)")
+upf_error(e_dotx "sim_corruption_control -models core -exclude_elements {.} -elements {q}" "-exclude_elements {.} with -model or -models (5.9 e, g)")
+# -update (5.10): the first command for a strategy has none, every later one
+# has it, and an update does not change a value already given.
+upf_error(e_upd1 "set_isolation ISO2 -domain PD_CORE -update -elements {u_core/r}" "-update of unknown isolation strategy ISO2")
+upf_error(e_upd2 "set_isolation ISO -domain PD_CORE -elements {u_core/r}" "isolation strategy ISO is already defined in domain")
+upf_error(e_upd3 "set_isolation ISO -domain PD_CORE -update -clamp_value 0" "changes -clamp_value of ISO from 1 to 0 (5.10)")
+upf_error(e_upd4 "set_level_shifter LS -domain PD_CORE -applies_to outputs\nset_level_shifter LS -domain PD_CORE -rule low_to_high" "level shifter strategy LS is already defined")
+upf_error(e_upd5 "set_retention RET -domain PD_CORE -update -elements {u_core}" "-update of unknown retention strategy RET")
+# 5.7.7: one attribute of one port, two values.
+upf_error(e_attr "set_port_attributes -ports {u_core/q} -clamp_value 0\nset_port_attributes -ports {u_core/q} -clamp_value 1" "an earlier command gave it 0 (5.7.7)")
+# 8.3: -instance names an instance of the design; a supply port does not take
+# the name of a logic port of the HDL.
+upf_error(e_cell "set_isolation ISO -domain PD_CORE -update -instance {{u_core/nope q}}" "-instance names 'u_dut.u_core.nope', which is not an instance in the design (8.3.2)")
+upf_error(e_spclash "create_supply_port req" "create_supply_port u_dut.req: the design already has a logic port or net of that name (8.3.4)")
 # UPF is Tcl (5.1): the same intent written with proc, foreach, if, expr and
 # [command] substitution simulates the same.
 execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/tcl.upf

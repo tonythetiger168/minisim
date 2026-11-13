@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- UPF language rules of IEEE 1801-2024 clause 5 and 8.3 in `msim -upf` and
+  `mlint -upf`: identifier and name-conflict checks, references to objects
+  that do not exist, `-update` refinement of strategies and switches,
+  conflicting port attributes, `{.}` with `-models`, `-instance` cells that
+  are not in the design, and supply ports named like HDL logic ports are
+  errors. Expressions gain `<`, `<=`, `>`, `>=`, `.voltage` and `.state`;
+  Tcl `catch` sets `errorInfo` and `errorCode`.
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their
