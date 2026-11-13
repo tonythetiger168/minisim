@@ -37,6 +37,10 @@
 //                    for power analysis with mpower (docs/POWER.md)
 //   -restore <file> [+args]  go back to a $save checkpoint and go on (docs/CHECKPOINT.md)
 //   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
+//   -parse           stop after parsing: syntax errors only (vlog / vlogan, mstep.inc)
+//   -vlog, -vcom, -vsim, -vlib, -vmap, -vlogan, -vhdlan, -vcs
+//                    the rest is that Siemens / Synopsys step (also when msim
+//                    runs under that name): docs/COMPAT.md
 //   -xrun, -irun     take the rest of the command line as xrun / irun options
 //                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
 //   -profile [<file>] time every process and region and write a report
@@ -186,6 +190,7 @@
 #include "objview.inc"
 #include "statview.inc"
 #include "xrun.inc"
+#include "mstep.inc"
 #include "vhdl/front.hpp"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
@@ -2448,6 +2453,8 @@ static void usage() {
                  "  -vcd-class [N]  also write the properties of the object each class handle\n"
                  "                 variable points to, as h.addr (x while h is null); handle\n"
                  "                 properties are followed N levels (default 1)\n"
+                 "  -tr FILE       where $begin_transaction / $fsdbTrans_begin record their\n"
+                 "                 transactions (default transactions.log; read with mdebug -tr)\n"
                  "  -vcd-sva       also write how many times each assertion and cover has\n"
                  "                 passed and failed, as a.passes and a.fails\n"
                  "  -vcd-power     with -upf: also write each power domain's simstate and each\n"
@@ -2503,6 +2510,25 @@ int main(int argc, char** argv) {
             (void)!write(2, w.data(), w.size());
             _exit(139);
         });
+    // Siemens vlib / vmap / vlog / vcom / vsim and Synopsys vlogan / vhdlan /
+    // vcs / simv (mstep.inc): the analysis steps run there; vsim and simv
+    // become an msim command line on the libraries' sources.
+    mstep::Opts mo;
+    std::vector<char*> margv;
+    if (mstep::wanted(argc, argv, mo)) {
+        if (mo.exitNow >= 0) return mo.exitNow;
+        for (auto& s : mo.out) margv.push_back(s.data());
+        margv.push_back(nullptr);
+        argc = (int)margv.size() - 1;
+        argv = margv.data();
+        if (!mo.log.empty()) {
+            xrun::Opts lo;
+            lo.tool = mo.name;
+            lo.log = mo.log;
+            lo.appendLog = mo.appendLog;
+            xrun::teeLog(lo);
+        }
+    }
     // xrun / irun command line (xrun.inc): translated to msim's options.
     xrun::Opts xo;
     std::vector<char*> xargv;
@@ -2534,6 +2560,7 @@ int main(int argc, char** argv) {
     bool interactiveMode = false;   // -i / -do FILE
     std::string doPath;
     bool elabOnly = false;   // -elab: stop after elaboration (xrun -elaborate)
+    bool parseOnly = false;  // -parse: stop after parsing (the analysis steps of mstep.inc)
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
     bool threadsGiven = false;
@@ -2566,6 +2593,7 @@ int main(int argc, char** argv) {
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
         if (a == "-elab") { elabOnly = true; continue; }
+        if (a == "-parse") { parseOnly = true; continue; }
         if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
         if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
         if (a == "-no-static-comb") { staticComb = false; continue; }
@@ -2748,6 +2776,8 @@ int main(int argc, char** argv) {
                 vcdClass = std::max(1, std::atoi(argv[++i]));
             continue;
         }
+        // -tr FILE: where $begin_transaction / $fsdbTrans_begin record (default transactions.log).
+        if (a == "-tr" && i + 1 < argc) { trrec::path() = argv[++i]; setenv("MSIM_TR", argv[i], 1); continue; }
         // -vcd-sva / -vcd-power: assertion counts, power states and supplies as signals (statview.inc).
         if (a == "-vcd-sva" || a == "-fst-sva") { vcdSva = true; continue; }
         if (a == "-vcd-power" || a == "-fst-power") { vcdPower = true; continue; }
@@ -2956,6 +2986,7 @@ int main(int argc, char** argv) {
         vhdl::Translator vtr;
         if (!vhdl::addVhdl(driver, vhdlFiles, vhdlSv, "msim", vtr)) return 1;
     }
+    if (parseOnly) return driver.reportParseDiags() ? 0 : 1;
     // A design element with no `timescale or timeunit, in a design where
     // others have one, gets 1ns/1ps instead of an error (--timescale sets
     // another default). A design with no timescale at all keeps 1ns/1ns.

@@ -11,6 +11,11 @@ Spec references are IEEE 1800-2023 clauses.
 - mvplat: virtio-console (VIRTIO 1.2, 5.3). `-vcon` adds one and sends
   `-input` to it; Linux runs its console on `hvc0`. Input is typed once the
   guest has printed and been quiet for 100 ms of simulated time.
+- Transaction recording without UVM: Questa's `$create_transaction_stream`,
+  `$begin_transaction`, `$add_attribute`, `$end_transaction` and Verdi's
+  `$fsdbTrans_begin`, `$fsdbTrans_add_attribute`, `$fsdbTrans_end` write
+  the text format of UVM's `uvm_text_tr_database` (`transactions.log`,
+  `msim -tr FILE`), which `mdebug -tr` reads. `tests/msim_tr.cmake`.
 - mvplat: virtio-net over virtio-mmio (VIRTIO 1.2, 5.1). `-net user` gives a
   built-in gateway at 10.0.2.2 that answers ARP and ping; `-net
   dgram:LOCAL,REMOTE` links platforms (or a host program) over Unix datagram

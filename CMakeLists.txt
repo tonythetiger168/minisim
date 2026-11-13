@@ -256,6 +256,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_partcomp
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_partcomp.cmake)
+  # Siemens vlib/vlog/vcom/vsim and Synopsys vlogan/vhdlan/vcs/simv flows.
+  add_test(NAME msim_mstep
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mstep
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_mstep.cmake)
   # Simulation profile (msim -profile): processes, instances, kinds.
   add_test(NAME msim_profile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -361,6 +366,11 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_wave_state
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_wave_state.cmake)
   endif()
+  # Transaction recording without UVM ($begin_transaction, $fsdbTrans_begin), read by mdebug -tr.
+  add_test(NAME msim_tr
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug>
+                   -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_tr
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_tr.cmake)
   # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
   add_test(NAME msim_dpi
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
