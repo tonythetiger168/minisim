@@ -99,4 +99,48 @@ J
 "$MVPLAT" -platform wfi.json "$E/irq.elf" -q -max-cycles 100000000 > wfi.out 2>&1; rc=$?
 [ $rc -ne 0 ] && ok "a program with no CLINT does not hang (exit $rc)" || bad "wfi with no interrupt source"
 
+# The device tree made from the platform, as firmware and Linux read it.
+"$MVPLAT" "$E/hello.elf" -harts 2 -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
+if [ $rc = 0 ] && [ "$(od -An -tx1 -N4 board.dtb | tr -d ' ')" = d00dfeed ]; then ok "-dump-dtb writes a device tree blob"
+else bad "-dump-dtb (exit $rc)"; fi
+if command -v dtc > /dev/null 2>&1; then
+  dtc -I dtb -O dts board.dtb > board.dts 2> dtc.err; rc=$?
+  if [ $rc = 0 ] && ! [ -s dtc.err ] && grep -q 'cpu@1' board.dts && grep -q 'riscv,sv32' board.dts &&
+     grep -q 'ns16550a' board.dts && grep -q 'riscv,plic0' board.dts && grep -q 'syscon-poweroff' board.dts; then
+    ok "the device tree decompiles cleanly with dtc and has the harts and devices"
+  else bad "dtc on the device tree"; cat dtc.err; fi
+fi
+"$MVPLAT" "$E/hello.elf" -initrd x > p.out 2>&1; rc=$?
+expect "-initrd without -kernel" 2 p.out "need -kernel or -bios"
+
+# OpenSBI (the distribution's fw_dynamic) starts a supervisor-mode payload;
+# the payload starts the other harts through SBI HSM and shuts down via SRST.
+BIOS=${MVPLAT_BIOS:-}
+for b in /usr/lib/riscv64-linux-gnu/opensbi/generic/fw_dynamic.elf /usr/share/opensbi/lp64/generic/firmware/fw_dynamic.elf; do
+  [ -z "$BIOS" ] && [ -f "$b" ] && BIOS=$b
+done
+if [ -n "$BIOS" ]; then
+  for n in 1 4; do
+    "$MVPLAT" -bios "$BIOS" -kernel "$E/sbi64.elf" -harts $n -q > sbi$n.out 2>&1; rc=$?
+    expect "OpenSBI boots an S-mode payload on $n hart(s)" 0 sbi$n.out "sbi: harts running: $n"
+    grep -q "sbi: PASS" sbi$n.out || bad "S-mode payload on $n hart(s) did not pass"
+  done
+  grep -q "Platform Name *: minisim mvplat" sbi1.out && ok "OpenSBI read the platform's device tree" || bad "OpenSBI platform name"
+else
+  echo "skip  OpenSBI tests: no fw_dynamic.elf (apt install opensbi, or set MVPLAT_BIOS)"
+fi
+
+# A stock Linux kernel to user space and power-off (tests/vplat/get-linux.sh
+# fetches one): MVPLAT_LINUX_KERNEL=.../Image.
+if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
+  printf '%s\n' '{"devices": [{"type":"finisher","base":"0x100000"},{"type":"clint","base":"0x2000000"},{"type":"plic","base":"0xc000000"},{"type":"uart16550","base":"0x10000000","irq":10},{"type":"ram","base":"0x80000000","size":"512M"}]}' > linux.json
+  "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd "$E/initramfs64.cpio" \
+    -append "console=ttyS0 rdinit=/init" -harts 2 -q > linux.out 2>&1; rc=$?
+  expect "Linux boots to /init on 2 harts and powers off" 0 linux.out "mvplat-init: powering off"
+  grep -q "^Linux version" linux.out && grep -q "smp: Brought up 1 node, 2 CPUs" linux.out &&
+    ok "Linux brought up both harts and printed /proc/version" || bad "Linux SMP bring-up"
+else
+  echo "skip  Linux boot: set MVPLAT_LINUX_KERNEL (tests/vplat/get-linux.sh fetches a kernel)"
+fi
+
 exit $fail

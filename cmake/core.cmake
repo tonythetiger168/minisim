@@ -115,6 +115,7 @@ set(MINISIM_CORE_VP_HEADERS
     devices.hpp
     elf.hpp
     ext.hpp
+    fdt.hpp
     json.hpp
     machine.hpp
     rv32.hpp)

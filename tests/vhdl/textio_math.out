@@ -1,0 +1,5 @@
+textio_math.vhd:17:3:@0ms:(report note): a+b=46
+textio_math.vhd:19:3:@0ms:(report note): v=0101 h=AB eof=true
+textio_math.vhd:21:3:@0ms:(report note): u=1000 clog=7
+textio_math.vhd:23:19:@0ms:(report note): match
+textio_math.vhd:26:3:@0ms:(assertion failure): fatal one

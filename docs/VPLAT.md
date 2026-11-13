@@ -10,6 +10,7 @@ mvplat prog.elf                                  # the built-in board
 mvplat -platform soc.json prog.elf               # a board described in JSON
 mvplat -platform soc.json prog.elf -harts 8      # eight harts, on every core
 mvplat prog.elf -trace commits.log               # what ran, in spike's format
+mvplat -kernel Image -initrd root.cpio -append "console=ttyS0"   # boot Linux under OpenSBI
 ```
 
 The exit code is the program's own (the test finisher or HTIF `tohost`), so a
@@ -203,6 +204,49 @@ DMA wrote only after `FENCE.I`.
 0). One `rtl` device per platform. `MVPLAT_MSIM` (or `msim_path` in the
 device) names the simulator when it is not on `PATH`.
 
+## Booting an operating system
+
+mvplat boots firmware and a kernel the way QEMU's `virt` board does, with the
+same options:
+
+```sh
+mvplat -platform board.json -bios fw_dynamic.elf -kernel Image \
+       -initrd root.cpio -append "console=ttyS0 rdinit=/init" -harts 4
+```
+
+- `-bios FILE` is the firmware, run first in machine mode on every hart:
+  OpenSBI's `fw_dynamic` (an ELF or a raw binary; position-independent
+  firmware linked at 0 runs from the start of RAM). With `-kernel` and no
+  `-bios`, mvplat takes `$MVPLAT_BIOS` or the `fw_dynamic.elf` that the
+  distribution's `opensbi` package installs.
+- `-kernel FILE` is the kernel: a raw `Image` goes at RAM + 2 MiB (4 MiB on
+  RV32), an ELF where it is linked. The firmware starts it in supervisor mode.
+- `-initrd FILE` goes just below the device tree; `-append TEXT` becomes
+  `/chosen/bootargs`.
+- Every hart starts at the firmware with `a0` = hart id, `a1` = the device
+  tree and `a2` = OpenSBI's `struct fw_dynamic_info` (next address, next mode
+  = supervisor, any boot hart).
+
+The device tree is made from the platform: a `cpu` node per hart (with
+`riscv,isa`, `mmu-type` and its interrupt controller), a `memory` node per
+RAM, and the CLINT (`riscv,clint0`), PLIC (`riscv,plic0`), each 16550 UART
+(`ns16550a`; the first is `stdout-path`) and the finisher (`sifive,test1` with
+`syscon-poweroff` and `syscon-reboot`), with the compatible strings that
+OpenSBI, Linux, U-Boot and Zephyr already have drivers for. It sits at the top
+of the first RAM on a 2 MiB boundary. `-dump-dtb FILE` writes it out
+(`dtc -I dtb -O dts FILE` shows it), and `-dtb FILE` passes another one
+instead.
+
+Checked: OpenSBI 1.7 (Ubuntu 24.04's `opensbi` package) starts on 1 to 8
+harts, finds the UART, the ACLINT timer and IPIs, the PLIC and the syscon
+reset from the tree, and starts the other harts through SBI HSM. Ubuntu
+24.04's stock riscv64 kernel (6.8, `tests/vplat/get-linux.sh` fetches it)
+boots to `/init` in an initramfs on 1 to 4 harts, with its console on the
+16550 through the 8250 driver and interrupts from the PLIC, and powers the
+board off (exit code 0). One hart takes about 870 million instructions, 20 s
+on the machine this was measured on. `tests/vplat/linux_init.c` is the
+`/init` the test uses (`tests/vplat/build.sh` builds it and the initramfs).
+
 ## Debugging
 
 `-trace FILE` writes a commit log, one line per instruction with the
@@ -244,6 +288,8 @@ their state lives outside the platform, and the save says so.
 | `-max-cycles N` | stop after N cycles, exit code 4 |
 | `-input TEXT` | what the first UART receives |
 | `-trace FILE` | commit log |
+| `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
+| `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |
 | `-profile FILE` | profile (`-`: stdout) *(extension)* |
 | `-gdb PORT`, `-gdb-portfile FILE` | gdb server *(extension)* |
 | `-save FILE`, `-restore FILE` | checkpoints *(extension)* |
@@ -267,7 +313,10 @@ Each hart keeps a cache of decoded instructions (8192 entries, by address),
 so an instruction is fetched, expanded from its compressed form and split
 into fields once. As the ISA allows, a hart sees a store to code only after
 it executes `FENCE.I`; loading a program, a debugger write and `-restore`
-empty the cache too. Loads and stores to plain memory with nothing to check
+empty the cache too. With paging on, the page that instructions were last
+fetched from stays translated and PMP-checked until the next `SFENCE.VMA`,
+`satp` or PMP write or change of privilege. Linux boots at about 43 MIPS:
+loads and stores still walk the TLB and PMP each time. Loads and stores to plain memory with nothing to check
 (no PMP in force, no watchpoint, no write buffer) take an inline path. RAM is
 mapped on first touch, so a large memory costs nothing until it is used. A
 co-simulated RTL access costs two socket round trips plus the RTL's own
@@ -277,9 +326,12 @@ simulation time.
 
 - No F/D (floating point), no V, no B (bit-manipulation) extensions, no
   Sv48/Sv57, no Svadu (hardware A/D update), and every hart of a platform has
-  the program's width. No Linux boot yet: that needs a device tree and SBI
-  firmware. Bare-metal software, RTOSes (FreeRTOS, Zephyr), supervisor-mode
-  kernels with Sv32 or Sv39 paging and the architecture tests run.
+  the program's width. Linux runs without an FPU: user space built for
+  `rv64gc` (most distributions) needs F/D. Bare-metal software, RTOSes
+  (FreeRTOS, Zephyr), OpenSBI, Linux with an initramfs and the architecture
+  tests run.
+- No virtio devices: Linux has its console and an initramfs, but no disk or
+  network yet.
 - No hardware triggers, no Smepmp (`mseccfg`).
 - One instruction per cycle: no pipeline or cache timing model.
 - No Spike or QEMU back end yet (Spike is BSD-licensed and could be linked;

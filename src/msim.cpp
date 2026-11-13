@@ -182,6 +182,7 @@
 #include "interactive.inc"
 #include "objview.inc"
 #include "xrun.inc"
+#include "vhdl/front.hpp"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -1434,6 +1435,64 @@ static bool readCompiledCov(const std::string& path, const std::vector<std::pair
 }
 
 static int g_cfiles = 0;   // -cfiles: 0 = automatic
+// msim -compile: the kernel (minisim.cpp and what it includes) compiled
+// once into an object that every simv links. A generated file defines
+// MINISIM_CLIENT and only declares the kernel's large functions (MSIM_KDEF),
+// so a design's C++ build no longer compiles them again: a small design
+// went from 21 s to 8 s. The object is kept in $MSIM_KCACHE (default
+// $XDG_CACHE_HOME/msim or ~/.cache/msim), one per compiler, flags and
+// kernel sources; parallel builds wait on its lock. Empty on failure.
+// MSIM_NOKOBJ=1 compiles the kernel into the design as before.
+static bool useKernelObject() { return !std::getenv("MSIM_NOKOBJ"); }
+static std::string kernelObject(const std::string& cc, const std::string& cflags, const std::string& inc, const std::string& dir) {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](const std::string& t) { for (unsigned char c : t) { h ^= c; h *= 1099511628211ULL; } h ^= 0xff; h *= 1099511628211ULL; };
+    mix(cc);
+    mix(cflags);
+    std::error_code ec;
+    std::vector<std::string> srcs;
+    for (auto it = std::filesystem::recursive_directory_iterator(inc, ec); !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file(ec)) continue;
+        std::string e = it->path().extension().string();
+        if (e == ".hpp" || e == ".inc" || e == ".h" || e == ".cpp" || e == ".c") srcs.push_back(it->path().string());
+    }
+    std::sort(srcs.begin(), srcs.end());
+    for (auto& f : srcs) {
+        auto t = std::filesystem::last_write_time(f, ec);
+        mix(f + " " + std::to_string(std::filesystem::file_size(f, ec)) + " " + std::to_string((long long)t.time_since_epoch().count()));
+    }
+    std::string cache;
+    if (const char* k = std::getenv("MSIM_KCACHE"); k && *k) cache = k;
+    else if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) cache = std::string(x) + "/msim";
+    else if (const char* home = std::getenv("HOME"); home && *home) cache = std::string(home) + "/.cache/msim";
+    std::filesystem::create_directories(cache, ec);
+    if (cache.empty() || ec) { cache = dir; ec.clear(); }
+    char hx[17];
+    std::snprintf(hx, sizeof hx, "%016llx", (unsigned long long)h);
+    std::string obj = cache + "/kernel-" + hx + ".o";
+    if (std::filesystem::exists(obj, ec)) return obj;
+    int fd = ::open((obj + ".lock").c_str(), O_CREAT | O_RDWR, 0644);
+    if (fd >= 0) ::flock(fd, LOCK_EX);
+    struct Unlock { int fd; ~Unlock() { if (fd >= 0) ::close(fd); } } unlock{fd};
+    if (std::filesystem::exists(obj, ec)) return obj;   // built while this one waited
+    std::string src = cache + "/kernel-" + hx + ".cpp", tmp = obj + ".tmp" + std::to_string(::getpid());
+    {
+        std::ofstream f(src);
+        f << "// The msim -compile kernel object (msim.cpp kernelObject).\n"
+             "#define MINISIM_NO_MAIN\n#define MINISIM_KERNEL_TU\n#include \"minisim.cpp\"\n";
+        if (!f) return "";
+    }
+    std::string cmd = shq(cc) + cflags + " -c " + shq(src) + " -o " + shq(tmp);
+    if (std::system(cmd.c_str()) != 0) {
+        std::cerr << "msim: -compile: kernel build failed: " << cmd << "\n";
+        std::filesystem::remove(tmp, ec);
+        return "";
+    }
+    std::filesystem::rename(tmp, obj, ec);
+    if (ec) return "";
+    return obj;
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -1482,7 +1541,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // With a VCD every signal must live in S.sigs, so no private signals.
         // A large design is built as several files at once, one per core (16 at most).
         src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath && !upf, g_cov ? &covSlots : nullptr,
-                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale(), upf);
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale(), upf,
+                      useKernelObject());
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -1528,6 +1588,16 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         std::ifstream f(path, std::ios::binary);
         return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     };
+    // The kernel object: built (once, cached) while the design's files compile.
+    std::string kobj;
+    std::thread kthread;
+    if (useKernelObject())
+        kthread = std::thread([&] { kobj = kernelObject(cc, " -std=c++20 " + opt + " -I" + shq(inc) + fstC, inc, dir); });
+    auto kernelReady = [&]() -> bool {
+        if (kthread.joinable()) kthread.join();
+        return !useKernelObject() || !kobj.empty();
+    };
+    struct KJoin { std::thread& t; ~KJoin() { if (t.joinable()) t.join(); } } kjoin{kthread};
     std::string stamp = build + "\n";
     std::vector<const char*> kfiles = {"minisim.cpp", "exec.inc", "expr.hpp", "prog.hpp", "cpu.hpp"};
     if (upf) kfiles.insert(kfiles.end(), {"upf_rt.inc", "upf.hpp", "upf_impl.inc", "upf_vct.hpp", "tcl.hpp"});
@@ -1619,13 +1689,20 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             });
         for (auto& t : pool) t.join();
         if (failed) return 1;
-        if (!jobs.empty() || !std::filesystem::exists(exe, ec)) {
+        if (!kernelReady()) return 1;   // a new kernel object relinks (simv.kobj)
+        if (!jobs.empty() || !std::filesystem::exists(exe, ec) || slurp(dir + "/simv.kobj") != kobj) {
             std::string link = shq(cc) + " " + opt;
             for (auto& o : objs) link += " " + shq(o);
+            if (!kobj.empty()) link += " " + shq(kobj);
             link += fstL + " -o " + shq(exe);
             if (std::system(link.c_str()) != 0) { std::cerr << "msim: -compile: link failed: " << link << "\n"; return 1; }
+            std::ofstream(dir + "/simv.kobj") << kobj;
         }
         std::ofstream(dir + "/simv.stamp") << stamp;
+    }
+    if (files.empty()) {   // one file: compiled and linked with the kernel object in one command
+        if (!kernelReady()) return 1;
+        if (!kobj.empty()) { build += " " + shq(kobj); stamp += "kernel " + kobj + "\n"; }
     }
     bool fresh = !files.empty() || (std::filesystem::exists(exe, ec) && slurp(dir + "/simv.stamp") == stamp && slurp(cpp) == src);
     if (!fresh) {
@@ -2459,6 +2536,8 @@ int main(int argc, char** argv) {
     bool powerTopSet = false, upfVerbose = false;
     std::string upfCov;   // -upf_cov: the low-power coverage report
     std::vector<std::string> svLibs, cFiles, soFiles;
+    std::vector<std::string> vhdlFiles;
+    std::string vhdlSv;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
     std::string uvmHome;    // -uvm / -uvmhome: a uvm-core checkout
@@ -2714,6 +2793,10 @@ int main(int argc, char** argv) {
         if (a == "-LDFLAGS") { ldflags += " " + next("flags"); continue; }
         if (a.size() && a[0] != '-' && hasExt(a, {".c", ".cc", ".cpp", ".cxx", ".C", ".o", ".a"})) { cFiles.push_back(a); continue; }
         if (a.size() && a[0] != '-' && hasExt(a, {".so"})) { soFiles.push_back(a); continue; }
+        // VHDL sources (docs/VHDL.md): translated for the same engine after slang reads the SV files
+        if (a.size() && a[0] != '-' && vhdl::isVhdlFile(a)) { vhdlFiles.push_back(a); continue; }
+        if (a == "-vhdl-sv") { vhdlSv = next("a file name"); continue; }
+        if (a == "-v93" || a == "-v2008" || a == "-vhdl2008" || a == "-v200x" || a == "-vhdl93" || a == "-vhdl87") continue;
         fwd.push_back(a);
     }
     if (uvmWanted) {   // -uvm: the package first, then its C code (regex, command line, HDL backdoor)
@@ -2753,6 +2836,17 @@ int main(int argc, char** argv) {
         fwd.insert(fwd.begin() + 1, upfPkgFile);
     }
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
+    // VHDL only: slang wants at least one SystemVerilog source; an empty one stands in
+    std::string vhdlStub;
+    if (!vhdlFiles.empty()) {
+        char tmpl[] = "/tmp/msim_vhdlXXXXXX.sv";
+        int fd = mkstemps(tmpl, 3);
+        if (fd < 0) { std::cerr << "msim: cannot write a temporary file\n"; return 1; }
+        close(fd);
+        vhdlStub = tmpl;
+        fwd.push_back(vhdlStub);
+    }
+    struct RmStub { std::string f; ~RmStub() { if (!f.empty()) std::remove(f.c_str()); } } rmStub{vhdlStub};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
     if (!saifForward.empty() && saifPath.empty()) saifPath = "dump.saif";   // -saif_forward implies -saif
@@ -2826,6 +2920,10 @@ int main(int argc, char** argv) {
         hideMsgIf() = [&pc](slang::SourceLocation l) { return pc.hidden(l); };
     }
     if (!driver.parseAllSources()) return 1;
+    if (!vhdlFiles.empty()) {
+        vhdl::Translator vtr;
+        if (!vhdl::addVhdl(driver, vhdlFiles, vhdlSv, "msim", vtr)) return 1;
+    }
     // A design element with no `timescale or timeunit, in a design where
     // others have one, gets 1ns/1ps instead of an error (--timescale sets
     // another default). A design with no timescale at all keeps 1ns/1ns.

@@ -3,7 +3,7 @@
 // definition's name, vpiVirtual (abstract), vpiExtends with its class
 // typespec, vpiMethods (with vpiVirtual and vpiClassDefn back; a pure
 // virtual prototype is a method too),
-// vpiDerivedClasses and its static properties; a derived object's
+// vpiDerivedClasses and its properties (static and automatic, 37.31); a derived object's
 // properties include the derived class's own.
 //! icarus-skip: Icarus 13 has no SystemVerilog classes through VPI
 //! args: data/vpi/classes.c
@@ -39,10 +39,12 @@ endmodule
 //>   method vpiFunction get virtual 1 of Base
 //>   method vpiFunction bump virtual 0 of Base
 //>   derived Child
-//>   static count
+//>   variable a automatic 1
+//>   variable count automatic 0
 //> vpiClassDefn Child (top.Child) virtual 0 line 17
 //>   vpiExtends Base -> Base
 //>   method vpiFunction new virtual 0 of Child
 //>   method vpiFunction get virtual 1 of Child
 //>   method vpiTask show virtual 0 of Child
+//>   variable b automatic 1
 //> child 4

@@ -25,6 +25,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **Module instances.** A parent instantiates a child. Named (`.a(x)`) and positional port connections carry an `input` into the child and an `output` back to the parent. The output may be a continuous assign or a procedural write. An `inout` net is connected in both directions. A grandchild uses the same connection. A `#(.W(8))` override changes the port width. Child signals are named on the instance path (`u.y`).
 - **Waveforms**: VCD (`msim -vcd`) or compressed FST (`msim -fst`), with the instance hierarchy as scopes, for GTKWave or Surfer
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
+- **VHDL and mixed language**: `.vhd` files run on the same engine, and SV and VHDL instantiate each other; see [`docs/VHDL.md`](docs/VHDL.md)
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
 - **Verification IP**: AXI4, AXI4-Lite, APB4 and memory UVM VIPs in `vip/`, and `tools/mvip.py` to run the 146 VIPs of open-vip-portfolio on msim; see [`docs/VIP.md`](docs/VIP.md)
@@ -52,6 +53,7 @@ where it does, is in [docs/LICENSING.md](docs/LICENSING.md).
 | `src/wave_reader.hpp` | Shared by the tools: `wave::Reader`, VCD (parallel, mapped) and FST into memory |
 | `src/protect.hpp` | Protected envelopes (1800-2023 clause 34 / IEEE 1735): `msim -keyfile` decrypts with OpenSSL |
 | `src/licproxy.hpp` | IEEE 1735 clause 8 license system: msim asks the IP author's license proxy over TLS |
+| `src/vhdl/` | VHDL front end: lexer, parser, translation to SystemVerilog for the msim engine (`docs/VHDL.md`) |
 | `src/codegen.hpp` | Compiled mode (`msim -compile`): each process as generated C++ |
 | `src/dpi.inc`, `include/svdpi.h` | DPI-C run time (libffi calls, exports, svdpi.h functions) and the C header |
 | `src/vpi.inc`, `include/vpi_user.h` | VPI run time (user system tasks, objects, values, callbacks) and the C header |
@@ -441,7 +443,13 @@ VM, g++ 13, seconds of run time, build time not included):
 | `bench/chain.sv` (8-deep assign chain, 1M cycles) | 1.35 | 0.74 | 0.20 | 7.82 |
 | `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.14 | 0.19 | 0.31 |
 
-The C++ build adds 2 to 4 seconds per design.
+The kernel itself is compiled once into an object that every `simv` links:
+it is kept in `$MSIM_KCACHE` (default `$XDG_CACHE_HOME/msim` or
+`~/.cache/msim`), one per compiler, flags and kernel version, so the first
+`-compile` after installing or updating msim takes about 20 s longer and a
+small design then builds in about 8 s (it was 21 s when every design
+compiled the kernel again; OpenTitan Ibex 68 -> 50 s). `MSIM_NOKOBJ=1`
+compiles the kernel into the design as before.
 
 ### Static combinational schedule
 
