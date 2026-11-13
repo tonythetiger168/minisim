@@ -480,6 +480,7 @@ struct SvaBuild {
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
     bool future = false;   // uses $future_gclk and friends (16.9.4)
+    bool matchItems = false;   // has sequence match items (16.10, 16.11)
 };
 SvaBuild* svb = nullptr;
 
@@ -674,6 +675,7 @@ const Prog* callProg(const slang::ast::CallExpression& call, std::vector<E>& cap
 int matchAct(std::span<const slang::ast::Expression* const> items) {
     using namespace slang::ast;
     if (items.empty()) return -1;
+    if (svb) svb->matchItems = true;
     std::vector<ConcAssert::Item> act;
     auto localOf = [&](const Expression& x) -> int {
         const Expression& t = peel(x);
@@ -936,7 +938,6 @@ const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
             if (same.size() < 2) unsupported("recursive property (16.12.17)");
             if (!sameArgs(*recStack[same[0]].ai, *recStack[same[1]].ai, true))
                 unsupported("a recursive property whose arguments change from one level to the next (16.12.17)");
-            if (svb && !svb->more.empty()) unsupported("a recursive property in a multiclock assertion (16.12.17)");
             RecEnt& e = recStack[same[0]];
             if (e.idx < 0) e.idx = st.recNew();
             return st.init(recLocals(*ai, *e.ai, *recStack[same[1]].ai), st.rec(e.idx));
@@ -1249,11 +1250,13 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     if (b.future) {   // checked one global clock tick late (16.9.4)
         SampleClock& g = gclkSampler();
         if (c.ev != g.ev) unsupported("a future sampled value function in an assertion not clocked by the global clock (16.9.4)");
+        if (b.matchItems)   // 16.9.4: not allowed at all (local formals and initializers are)
+            throw std::runtime_error(whereStr() + "lower: a global clocking future sampled value function shall not be used "
+                                                  "in an assertion with sequence match items (16.9.4)");
         if (!c.more.empty() || !staticAssert)
             unsupported("a future sampled value function with several clocks or in a procedure (16.9.4)");
         for (auto& act : c.acts)
             for (auto& item : act) {
-                if (item.call) unsupported("a future sampled value function with a subroutine call match item (16.9.4)");
                 item.rhs = futureShift(item.rhs);
             }
         for (auto& at : c.atoms) at = futureShift(at);
