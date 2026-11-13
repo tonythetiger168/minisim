@@ -4831,6 +4831,22 @@ struct Lowerer {
                 // (11.8.3): extend with the operand's signedness. An outer width
                 // still wins, so a truncating assign stays narrow.
                 const auto& c = e.as<ConversionExpression>();
+                // To a 2-state type (bit, int, byte) from a 4-state one: x and
+                // z bits become 0 (6.11.2, 10.7). The conversion is lowered as
+                // usual, then its x and z bits are cleared.
+                if (to2State != &e && c.type->isIntegral() && !c.type->isFourState() &&
+                    c.operand().type->isIntegral() && c.operand().type->isFourState()) {
+                    const Expression* saved = to2State;
+                    to2State = &e;
+                    E v = expr(e, ctx);
+                    to2State = saved;
+                    if (v->op == Op::Const) {
+                        Val k = v->k;
+                        for (int i = 0; i < limbCount(k.w); i++) setLimb(k, i, limbV(k, i) & ~limbX(k, i), 0, 0);
+                        return konst(k);
+                    }
+                    return sysFnNode(SF_TO_2STATE, {std::move(v)});
+                }
                 if (peel(c.operand()).kind == ExpressionKind::Streaming && c.type->isIntegral()) {
                     // a stream into a wider integral type is left-aligned,
                     // padded with zeros on the right (11.4.14)
@@ -6833,6 +6849,7 @@ struct Lowerer {
     // ---------- constrained randomization (18) ----------
     std::unordered_map<const slang::ast::Symbol*, Val> constVals;     // foreach indices of a constraint, unrolled
     std::unordered_map<const slang::ast::Symbol*, int> symOverride;   // with {...}: the caller's properties, copied
+    const slang::ast::Expression* to2State = nullptr;   // the conversion being lowered without its x/z clearing
     // with {...}: an element of the caller's array or container, by an index
     // the caller knows (addrs[i]), read into a signal before the call.
     std::unordered_map<const slang::ast::Expression*, int> exprOverride;
@@ -12369,6 +12386,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             if (sub->cls->builtin) lw.builtinMethod(*sub->cls, *sub);
             else lw.ctorBody(*sub->cls, sub->sym ? &sub->sym->getBody() : nullptr);
             *sub->prog = std::move(lw.prog);
+            sub->prog->sub = sub->sym;
             continue;
         }
         g_covInst = 0;
@@ -12388,6 +12406,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);
+        sub->prog->sub = sub->sym;   // VPI frames (38.36.1)
         if (!sub->lay) {   // its static variables: callers are not sensitive to them
             struct Walk {
                 const std::unordered_map<const slang::ast::Symbol*, int>& sm;
@@ -12514,7 +12533,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
-                            if (rv.w > 64 && (rv.dyn || rv.randc)) Lowerer::unsupported(rv.randc ? "randc variable wider than 64 bits" : "rand container of elements wider than 64 bits");
+                            if (rv.w > 64 && rv.randc) Lowerer::unsupported("randc variable wider than 64 bits");
                         } else Lowerer::unsupported("rand property of this type");
                         if (et->isEnum() && rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // each element: one of the named values
                             RandItem loop;

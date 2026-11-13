@@ -447,6 +447,7 @@ struct Prog {
     // the event (see Sim::set), as other simulators order them.
     bool alwaysTop = false;
     std::vector<Instr> code;
+    const void* sub = nullptr;    // a task or function body: its slang SubroutineSymbol (VPI frames)
     const void* inst = nullptr;   // msim -cov: the instance it runs in (slang InstanceSymbol), for VPI (40)
     uint32_t covInst = 0;  // g_covInsts: the instance it was lowered in (per-instance coverage)
     // msim -xprop, a clocked block with a clean copy: code[1] tests for an

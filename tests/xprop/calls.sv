@@ -1,6 +1,7 @@
 // msim -xprop: a branch that calls a task or a function with side effects
 // is merged like any other: the variables the call writes take the merge.
-// A task with a nonblocking assignment or a delay is still not merged.
+// A task with a nonblocking assignment is merged too: its target becomes x.
+// A task with a delay is still not merged.
 //! args: -xprop
 module top;
   logic c, d;
@@ -38,4 +39,4 @@ module top;
   end
 endmodule
 //> a=10 b=11 n=06 cnt=06 q=55
-//> a=000100x0 b=000100x1 n=00000xxx cnt=0000011x q=55
+//> a=000100x0 b=000100x1 n=00000xxx cnt=0000011x q=xx
