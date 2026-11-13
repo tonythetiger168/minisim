@@ -10,6 +10,7 @@
 // fiber resumes when the exported task ends (35.5.2).
 #include <cstdarg>
 #include <cstring>
+#include <deque>
 #include <dlfcn.h>
 #include <ffi.h>
 #include <sys/mman.h>
@@ -120,7 +121,7 @@ inline uint8_t logicAt(const Val& v, int i) {
 
 // Write an SV value into C storage at p (C layout of type t).
 // strs keeps the text of strings alive for the call.
-inline void toC(void* p, DpiType t, int w, const Val& v, std::vector<std::string>& strs) {
+inline void toC(void* p, DpiType t, int w, const Val& v, std::deque<std::string>& strs) {
     switch (t) {
         case DT_BYTE: { int8_t x = (int8_t)bits64(v); memcpy(p, &x, 1); break; }
         case DT_SHORT: { int16_t x = (int16_t)bits64(v); memcpy(p, &x, 2); break; }
@@ -133,7 +134,6 @@ inline void toC(void* p, DpiType t, int w, const Val& v, std::vector<std::string
             Val s = v;
             s.str = true;
             strs.push_back(v_str(s));
-            // reserve() above keeps earlier entries in place
             const char* c = strs.back().c_str();
             memcpy(p, &c, sizeof c);
             break;
@@ -234,7 +234,21 @@ struct ArrBuf {
 };
 // C element k of the buffer is actual element map[k] (a flat offset in the
 // actual's own order: row-major, each dimension from its left bound).
-inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<std::string>& strs,
+// One scalar of a C struct (35.5.6): to C storage and back.
+inline void fieldToC(char* base, const DpiField& fl, const Val& whole, std::deque<std::string>& strs) {
+    Val fv = v_slice(whole, fl.lo + fl.w - 1, fl.lo);
+    if (fl.t == DT_REAL || fl.t == DT_SHORTREAL) fv.real = true;
+    toC(base + fl.off, fl.t, fl.w, fv, strs);
+}
+inline Val fieldFromC(const char* base, const DpiField& fl, Val whole) {
+    Val fv = fromC(base + fl.off, fl.t, fl.w, fl.sgn);
+    fv.real = false;
+    fv.str = false;
+    fv = v_resize(fv, fl.w, false);
+    return v_insert(whole, fv, fl.lo + fl.w - 1, fl.lo);
+}
+
+inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::deque<std::string>& strs,
                   std::vector<size_t>& map) {
     int w = f.popen ? a.pw : f.w;
     b.oa.t = f.t;
@@ -271,15 +285,10 @@ inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<st
     }
     b.bytes.assign(b.oa.count * b.oa.elemSize + 8, 0);
     b.oa.data = b.bytes.data();
-    if (f.t == DT_STRING) strs.reserve(strs.size() + vals.size());
     for (size_t k = 0; k < vals.size(); k++) {
         char* p = b.oa.data + k * b.oa.elemSize;
         if (f.t != DT_STRUCT) { toC(p, f.t, w, vals[map[k]], strs); continue; }
-        for (const DpiField& fl : f.fields) {   // an array of structs: each a C struct (35.5.6)
-            Val fv = v_slice(vals[map[k]], fl.lo + fl.w - 1, fl.lo);
-            if (fl.t == DT_REAL || fl.t == DT_SHORTREAL) fv.real = true;
-            toC(p + fl.off, fl.t, fl.w, fv, strs);
-        }
+        for (const DpiField& fl : f.fields) fieldToC(p, fl, vals[map[k]], strs);   // an array of structs: each a C struct (35.5.6)
     }
 }
 inline void arrOut(const ArrBuf& b, const DpiArg& f, const DpiActual& a, const std::vector<size_t>& map) {
@@ -287,11 +296,7 @@ inline void arrOut(const ArrBuf& b, const DpiArg& f, const DpiActual& a, const s
         Val v;
         if (f.t == DT_STRUCT) {
             v = make(0, 0, f.w);
-            for (const DpiField& fl : f.fields) {
-                Val fv = fromC(b.oa.data + k * b.oa.elemSize + fl.off, fl.t, fl.w, fl.sgn);
-                fv.real = false;
-                v = v_insert(v, v_resize(fv, fl.w, false), fl.lo + fl.w - 1, fl.lo);
-            }
+            for (const DpiField& fl : f.fields) v = fieldFromC(b.oa.data + k * b.oa.elemSize, fl, v);
         } else v = fromC(b.oa.data + k * b.oa.elemSize, f.t, b.oa.w, f.sgn);
         if (a.arr) {
             if (a.arr->twoState) { v.x = 0; v.z = 0; for (auto& h : v.hi) { h.x = h.z = 0; } }
@@ -317,8 +322,7 @@ inline void invoke(const Instr& ins) {
     std::vector<ArrBuf> arrs(n);
     std::vector<std::vector<size_t>> maps(n);
     std::vector<void*> argv(n);
-    std::vector<std::string> strs;
-    strs.reserve(2 * n + 1);
+    std::deque<std::string> strs;   // a deque: the text keeps its place as more are added
     for (size_t k = 0; k < n; k++) {
         const DpiArg& a = f.args[k];
         Slot& s = slots[k];
@@ -332,11 +336,7 @@ inline void invoke(const Instr& ins) {
         Val v = S.get(a.sig);
         if (a.t == DT_STRUCT) {   // a C struct, passed by pointer whatever the direction
             s.vec.assign(std::max<size_t>(a.cSize, 1), 0);
-            for (const DpiField& fl : a.fields) {
-                Val fv = v_slice(v, fl.lo + fl.w - 1, fl.lo);
-                if (fl.t == DT_REAL || fl.t == DT_SHORTREAL) fv.real = true;
-                toC(s.vec.data() + fl.off, fl.t, fl.w, fv, strs);
-            }
+            for (const DpiField& fl : a.fields) fieldToC((char*)s.vec.data(), fl, v, strs);
             s.ptr = s.vec.data();
             argv[k] = &s.ptr;
             continue;
@@ -369,11 +369,7 @@ inline void invoke(const Instr& ins) {
         if (a.uarr) { arrOut(arrs[k], a, ins.dact[k], maps[k]); continue; }
         if (a.t == DT_STRUCT) {
             Val v = S.get(a.sig);
-            for (const DpiField& fl : a.fields) {
-                Val fv = fromC(slots[k].vec.data() + fl.off, fl.t, fl.w, fl.sgn);
-                fv.real = false;
-                v = v_insert(v, v_resize(fv, fl.w, false), fl.lo + fl.w - 1, fl.lo);
-            }
+            for (const DpiField& fl : a.fields) v = fieldFromC((const char*)slots[k].vec.data(), fl, v);
             S.set(a.sig, v);
             continue;
         }
@@ -490,7 +486,7 @@ extern "C" int msim_dpi_export(int id, void** args, void* ret) {
         if (f.task && ret) { int one = 1; memcpy(ret, &one, sizeof one); }
         return 0;
     }
-    std::vector<std::string> strs;
+    std::deque<std::string> strs;   // a deque: the text keeps its place as more are added
     for (size_t k = 0; k < f.args.size(); k++) {
         const DpiArg& a = f.args[k];
         if (a.dir == 1) continue;
@@ -531,7 +527,7 @@ extern "C" int msim_dpi_export(int id, void** args, void* ret) {
         t.h.destroy();
     st().scope = sc;
     st().call = cl;
-    std::vector<std::string> keep;
+    std::deque<std::string> keep;
     for (size_t k = 0; k < f.args.size(); k++) {
         const DpiArg& a = f.args[k];
         if (a.dir == 0) continue;

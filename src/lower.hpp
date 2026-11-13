@@ -607,7 +607,7 @@ inline void dpiStructFields(const slang::ast::Type& t0, int lo, size_t& cur, std
         for (int k = 0; k < n; k++) dpiStructFields(a.elementType, lo + (n - 1 - k) * ew, cur, out);
         return;
     }
-    if (t.isUnpackedUnion() || t.isString()) throw std::runtime_error("lower: unsupported DPI struct member of type " + t0.toString());
+    if (t.isUnpackedUnion()) throw std::runtime_error("lower: unsupported DPI struct member of type " + t0.toString());
     DpiField f;
     f.t = dpiType(t, f.w, f.sgn);
     f.lo = lo;
