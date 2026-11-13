@@ -39,10 +39,13 @@ names what is missing. Sections marked *(extension)* describe these parts.
 
 ## What it simulates
 
-**Harts.** RV32IMAC or RV64IMAC with Zicsr and Zifencei, in machine,
+**Harts.** RV32GC or RV64GC (IMAFDC with Zicsr and Zifencei), in machine,
 supervisor and user mode. The program's ELF class picks the width: a 64-bit
 ELF file runs on RV64 harts (`misa.MXL` 2, `UXL` and `SXL` fixed at 64), with
-the W instructions, LD/SD/LWU, 64-bit atomics (`.D`) and RV64C. The CSRs:
+the W instructions, LD/SD/LWU, 64-bit atomics (`.D`) and RV64C. Single and
+double floating point (F, D) follow IEEE 754 with every rounding mode, the
+exception flags in `fflags`, NaN boxing and canonical NaNs, and `mstatus.FS`
+(off until software turns it on; dirty after a write, with `SD`). The CSRs:
 `mstatus`, `mtvec` (direct and vectored), `mepc`, `mcause`, `mtval`, `mie`,
 `mip`, `mscratch`, `mcounteren`, `mcountinhibit`, the cycle, time and
 instret counters, `mhartid`, physical memory protection (16 entries, 4-byte grain: OFF, TOR,
@@ -67,8 +70,8 @@ The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
 interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
 (SEIP).
 
-The RISC-V architecture tests all pass, 342 programs: ui, um, ua and uc for
-RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
+The RISC-V architecture tests all pass, 430 programs: ui, um, ua, uc, uf and
+ud for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
 paging on (`v`, Sv32 and Sv39), and mi and si for both. `tests/mvplat_isa.sh`
 runs them.
 
@@ -246,6 +249,12 @@ boots to `/init` in an initramfs on 1 to 4 harts, with its console on the
 board off (exit code 0). One hart takes about 870 million instructions, 20 s
 on the machine this was measured on. `tests/vplat/linux_init.c` is the
 `/init` the test uses (`tests/vplat/build.sh` builds it and the initramfs).
+Ubuntu's static BusyBox, built for `rv64gc` (floating point included), runs
+as the user space: its shell reads what `-input` types and runs it.
+`-input` with `-kernel` or `-bios` holds the characters back until the
+kernel's driver turns the receive interrupt on (a driver empties the FIFO
+when it sets the port up, so earlier characters would be lost), as if they
+were typed once the system is up.
 
 ## Debugging
 
@@ -324,12 +333,12 @@ simulation time.
 
 ## Limits / Not yet
 
-- No F/D (floating point), no V, no B (bit-manipulation) extensions, no
-  Sv48/Sv57, no Svadu (hardware A/D update), and every hart of a platform has
-  the program's width. Linux runs without an FPU: user space built for
-  `rv64gc` (most distributions) needs F/D. Bare-metal software, RTOSes
-  (FreeRTOS, Zephyr), OpenSBI, Linux with an initramfs and the architecture
-  tests run.
+- No V, no B (bit-manipulation), no Zfh, no Sv48/Sv57, no Svadu (hardware
+  A/D update), and every hart of a platform has the program's width. F and D
+  round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions
+  to integers; other RMM results round as ties-to-even (differs only for a
+  value exactly half way). Bare-metal software, RTOSes (FreeRTOS, Zephyr),
+  OpenSBI, Linux with an rv64gc user space and the architecture tests run.
 - No virtio devices: Linux has its console and an initramfs, but no disk or
   network yet.
 - No hardware triggers, no Smepmp (`mseccfg`).

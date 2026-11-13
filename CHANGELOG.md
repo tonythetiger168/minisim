@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat harts are RV32GC / RV64GC: the F and D extensions (IEEE 754 single
+  and double, every rounding mode, `fflags`/`frm`/`fcsr`, NaN boxing,
+  `mstatus.FS`/`SD`, the compressed FP loads and stores). 430 riscv-tests
+  pass (uf and ud added). Linux runs Ubuntu's rv64gc BusyBox; `-input`
+  reaches the shell once the kernel's UART driver is up. Extension ABI 5.
 - mvplat boots Linux: `-bios`, `-kernel`, `-initrd`, `-append`, `-dtb` as on
   QEMU's virt board, a device tree made from the platform (`-dump-dtb`), and
   OpenSBI's `fw_dynamic` hand-off. OpenSBI 1.7 and Ubuntu 24.04's stock
@@ -63,6 +68,10 @@ Spec references are IEEE 1800-2023 clauses.
   off by default.
 
 ### Fixed
+- mvplat: a CSRRS/CSRRC on `mip` no longer latches the PLIC's SEIP into the
+  software-written bit (privileged ISA 3.1.9). OpenSBI's timer code does such
+  a read-modify-write, after which Linux took the same external interrupt
+  forever.
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
   the reader takes), which failed on correct FIFOs such as common_cells
   `cdc_fifo_gray`.

@@ -30,6 +30,7 @@
 #include "bus.hpp"
 #include "devices.hpp"
 #include "elf.hpp"
+#include "fpu.hpp"
 #include "parallel.hpp"
 #include "rv32.hpp"
 
@@ -280,8 +281,13 @@ public:
     uint64_t mtime(const Hart& h) const {
         return clint ? clint->mtimeAtCycle(h.cycle) : h.cycle * cycle_ps / tick_ps;
     }
-    // The extensions misa reports: A C I M S U.
-    static constexpr uint64_t MISA_EXT = (1u << 0) | (1u << 2) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20);
+    // The extensions misa reports: A C D F I M S U.
+    static constexpr uint64_t MISA_EXT =
+        (1u << 0) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20);
+    // mstatus.SD: set when the FP state is dirty (FS = 3); bit XLEN-1.
+    static uint64_t sd(const Hart& h) {
+        return (h.mstatus & MSTATUS_FS) == MSTATUS_FS ? (h.rv64 ? 1ull << 63 : 1ull << 31) : 0;
+    }
     // UXL and SXL in mstatus (sstatus has UXL): XLEN 64, fixed.
     static constexpr uint64_t MSTATUS_XL64 = (2ull << 32) | (2ull << 34);
     bool csrRead(Hart& h, unsigned csr, uint64_t& v) {
@@ -295,11 +301,14 @@ public:
                        (csr >= 0xc80 && csr <= 0xc9f)))
             return false;
         switch (csr) {
-            case 0x300: v = h.mstatus | (h.rv64 ? MSTATUS_XL64 : 0); return true;
+            case 0x300: v = h.mstatus | (h.rv64 ? MSTATUS_XL64 : 0) | sd(h); return true;
+            case 0x001: if (!(h.mstatus & MSTATUS_FS)) return false; v = h.fcsr & 0x1f; return true;
+            case 0x002: if (!(h.mstatus & MSTATUS_FS)) return false; v = (h.fcsr >> 5) & 7; return true;
+            case 0x003: if (!(h.mstatus & MSTATUS_FS)) return false; v = h.fcsr & 0xff; return true;
             case 0x301: v = (h.rv64 ? 2ull << 62 : 1ull << 30) | MISA_EXT; return true;
             case 0x302: v = h.medeleg; return true;
             case 0x303: v = h.mideleg; return true;
-            case 0x100: v = (h.mstatus & SSTATUS_MASK) | (h.rv64 ? 2ull << 32 : 0); return true;
+            case 0x100: v = (h.mstatus & SSTATUS_MASK) | (h.rv64 ? 2ull << 32 : 0) | sd(h); return true;
             case 0x104: v = h.mie & h.mideleg; return true;
             case 0x105: v = h.stvec; return true;
             case 0x106: v = h.scounteren; return true;
@@ -366,9 +375,13 @@ public:
                 uint64_t mpp = (v >> 11) & 3;
                 if (mpp == 2) mpp = h.mstatus >> 11 & 3;  // WARL: M, S or U
                 h.mstatus = (v & (MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPRV | MSTATUS_TW | MSTATUS_SIE | MSTATUS_SPIE |
-                                  MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR)) | mpp << 11;
+                                  MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR | MSTATUS_FS)) |
+                            mpp << 11;
                 return true;
             }
+            case 0x001: if (!(h.mstatus & MSTATUS_FS)) return false; h.fcsr = (h.fcsr & ~0x1fu) | (v & 0x1f); h.mstatus |= MSTATUS_FS; return true;
+            case 0x002: if (!(h.mstatus & MSTATUS_FS)) return false; h.fcsr = (h.fcsr & 0x1f) | (v & 7) << 5; h.mstatus |= MSTATUS_FS; return true;
+            case 0x003: if (!(h.mstatus & MSTATUS_FS)) return false; h.fcsr = v & 0xff; h.mstatus |= MSTATUS_FS; return true;
             case 0x301: return true;  // misa: fixed
             case 0x304: h.mie = (uint32_t)v & (MIP_MSIP | MIP_MTIP | MIP_MEIP | MIP_SSIP | MIP_STIP | MIP_SEIP); if (h.wfi && (h.mip & h.mie)) h.wfi = false; return true;
             case 0x302: h.medeleg = (uint32_t)v & 0xb3ffu; return true;  // not ecall from M
@@ -872,9 +885,10 @@ private:
         if (trace) {
             char b[128];
             int w = h.rv64 ? 16 : 8;
-            if (!h.rv64) wval = (uint32_t)wval;
+            if (!h.rv64 && wrd < 32) wval = (uint32_t)wval;
             h.traceBuf += h.traceHead;
-            if (wrd > 0) { snprintf(b, sizeof b, " x%-2d 0x%0*llx", wrd, w, (unsigned long long)wval); h.traceBuf += b; }
+            if (wrd >= 32) { snprintf(b, sizeof b, " f%-2d 0x%016llx", wrd - 32, (unsigned long long)wval); h.traceBuf += b; }
+            else if (wrd > 0) { snprintf(b, sizeof b, " x%-2d 0x%0*llx", wrd, w, (unsigned long long)wval); h.traceBuf += b; }
             if (memAcc) {
                 if (memW) snprintf(b, sizeof b, " mem 0x%0*llx 0x%0*llx", w, (unsigned long long)memA, (int)(2 * memN),
                                    (unsigned long long)memV);
@@ -1100,6 +1114,8 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
 // instructions of RV64, and every result on RV32).
 #define RD(v) do { uint64_t _v = h.sx(v); if (rd) { x[rd] = _v; wrd = (int)rd; wval = _v; } } while (0)
 #define W(v) ((uint64_t)(int64_t)(int32_t)(uint32_t)(v))
+// FD: write the floating-point register rd, and mark the FP state dirty.
+#define FD(v) do { uint64_t _v = (v); h.f[rd] = _v; h.mstatus |= MSTATUS_FS; wrd = 32 + (int)rd; wval = _v; } while (0)
 #define TRAP(c, t) do { trap(h, (c), (t), false); h.cycle++; goto next_insn; } while (0)
 #define ILLEGAL() TRAP(2, len == 4 ? insn : raw)
 #define MEMFAIL(r, cause, a) do { if ((r) == Acc::Pending) return Stop::Pending; TRAP((r) == Acc::PageFault ? (cause) + 8 : (cause), a); } while (0)
@@ -1350,6 +1366,108 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 memAcc = true; memW = true; memA = a; memN = n; memV = n == 4 ? (uint32_t)w : w;
                 break;
             }
+            case 0x07:                                                 // FLW, FLD
+            case 0x27: {                                               // FSW, FSD
+                if (!(h.mstatus & MSTATUS_FS) || (f3 != 2 && f3 != 3)) ILLEGAL();
+                unsigned n = f3 == 2 ? 4 : 8;
+                if (op == 0x07) {
+                    uint64_t a = h.ax(x[rs1] + immI), v;
+                    Acc r = load(h, a, n, v);
+                    if (r != Acc::Ok) MEMFAIL(r, 5, a);
+                    FD(n == 4 ? fpu::box((uint32_t)v) : v);
+                    cls = C_LOAD;
+                    memAcc = true; memA = a; memN = n;
+                } else {
+                    int64_t imm = (int32_t)(((insn >> 25) << 5) | ((insn >> 7) & 31)) << 20 >> 20;
+                    uint64_t a = h.ax(x[rs1] + imm), v = n == 4 ? (uint32_t)h.f[rs2] : h.f[rs2];
+                    Acc r = store(h, a, n, v);
+                    if (r != Acc::Ok) MEMFAIL(r, 7, a);
+                    cls = C_STORE;
+                    memAcc = true; memW = true; memA = a; memN = n; memV = v;
+                }
+                break;
+            }
+            case 0x43: case 0x47: case 0x4b: case 0x4f:                // FMADD, FMSUB, FNMSUB, FNMADD
+            case 0x53: {                                               // OP-FP
+                if (!(h.mstatus & MSTATUS_FS)) ILLEGAL();
+                const unsigned fmt = (insn >> 25) & 3;
+                if (fmt > 1) ILLEGAL();                                // H and Q: not here
+                const bool dbl = fmt == 1;
+                unsigned rm = f3 == 7 ? (h.fcsr >> 5) & 7 : f3;
+                uint32_t fl = 0;
+                const uint64_t ra = h.f[rs1], rb = h.f[rs2];
+                auto A = [&](fpu::Op o, uint64_t c) {
+                    if (rm > 4) return false;
+                    if (dbl) FD(fpu::arith<double>(o, ra, rb, c, rm, fl));
+                    else FD(fpu::box(fpu::arith<float>(o, fpu::unbox(ra), fpu::unbox(rb), fpu::unbox(c), rm, fl)));
+                    return true;
+                };
+                cls = C_ALU;
+                if (op != 0x53) {
+                    static const fpu::Op fused[4] = {fpu::Op::Madd, fpu::Op::Msub, fpu::Op::Nmsub, fpu::Op::Nmadd};
+                    if (!A(fused[(op >> 2) & 3], h.f[(insn >> 27) & 31])) ILLEGAL();
+                } else {
+                    const unsigned f5 = insn >> 27;
+                    const uint64_t sa = fpu::unbox(ra), sb = fpu::unbox(rb);
+                    switch (f5) {
+                        case 0x00: if (!A(fpu::Op::Add, 0)) ILLEGAL(); break;
+                        case 0x01: if (!A(fpu::Op::Sub, 0)) ILLEGAL(); break;
+                        case 0x02: if (!A(fpu::Op::Mul, 0)) ILLEGAL(); break;
+                        case 0x03: if (!A(fpu::Op::Div, 0)) ILLEGAL(); break;
+                        case 0x0b: if (rs2 || !A(fpu::Op::Sqrt, 0)) ILLEGAL(); break;
+                        case 0x04:                                     // FSGNJ, FSGNJN, FSGNJX
+                            if (f3 > 2) ILLEGAL();
+                            if (dbl) FD(fpu::sgnj<uint64_t>(ra, rb, f3));
+                            else FD(fpu::box(fpu::sgnj<uint32_t>((uint32_t)sa, (uint32_t)sb, f3)));
+                            break;
+                        case 0x05:                                     // FMIN, FMAX
+                            if (f3 > 1) ILLEGAL();
+                            if (dbl) FD(fpu::minmax<double>(ra, rb, f3, fl));
+                            else FD(fpu::box(fpu::minmax<float>((uint32_t)sa, (uint32_t)sb, f3, fl)));
+                            break;
+                        case 0x08:                                     // FCVT.S.D, FCVT.D.S
+                            if (rm > 4 || rs2 != (dbl ? 0u : 1u)) ILLEGAL();
+                            if (dbl) FD(fpu::sToD((uint32_t)sa, fl));
+                            else FD(fpu::box(fpu::dToS(ra, rm, fl)));
+                            break;
+                        case 0x14:                                     // FLE, FLT, FEQ
+                            if (f3 > 2) ILLEGAL();
+                            RD(dbl ? fpu::compare<double>(ra, rb, f3, fl) : fpu::compare<float>((uint32_t)sa, (uint32_t)sb, f3, fl));
+                            break;
+                        case 0x18: {                                   // FCVT.W/WU/L/LU
+                            if (rm > 4 || rs2 > 3 || (rs2 > 1 && !rv64)) ILLEGAL();
+                            bool sg = !(rs2 & 1);
+                            unsigned b = rs2 > 1 ? 64 : 32;
+                            RD(dbl ? fpu::toInt<double>(ra, rm, sg, b, fl) : fpu::toInt<float>((uint32_t)sa, rm, sg, b, fl));
+                            break;
+                        }
+                        case 0x1a: {                                   // FCVT.S/D.W/WU/L/LU
+                            if (rm > 4 || rs2 > 3 || (rs2 > 1 && !rv64)) ILLEGAL();
+                            bool sg = !(rs2 & 1);
+                            unsigned b = rs2 > 1 ? 64 : 32;
+                            if (dbl) FD(fpu::fromInt<double>(x[rs1], sg, b, rm, fl));
+                            else FD(fpu::box(fpu::fromInt<float>(x[rs1], sg, b, rm, fl)));
+                            break;
+                        }
+                        case 0x1c:                                     // FMV.X.W/D, FCLASS
+                            if (rs2) ILLEGAL();
+                            if (f3 == 0) {
+                                if (dbl && !rv64) ILLEGAL();
+                                RD(dbl ? ra : W(ra));
+                            } else if (f3 == 1) {
+                                RD(dbl ? fpu::classify<double>(ra) : fpu::classify<float>((uint32_t)sa));
+                            } else ILLEGAL();
+                            break;
+                        case 0x1e:                                     // FMV.W.X, FMV.D.X
+                            if (rs2 || f3 || (dbl && !rv64)) ILLEGAL();
+                            FD(dbl ? x[rs1] : fpu::box((uint32_t)x[rs1]));
+                            break;
+                        default: ILLEGAL();
+                    }
+                }
+                if (fl) { h.fcsr |= fl; h.mstatus |= MSTATUS_FS; }
+                break;
+            }
             case 0x73: {                                               // SYSTEM
                 cls = C_SYSTEM;
                 if (f3 == 0) {
@@ -1416,7 +1534,11 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                     old = h.ax(old);
                 } else if (((csr >> 8) & 3) > h.priv) ILLEGAL();
                 if (doWrite) {
-                    uint64_t nv = (f3 & 3) == 1 ? src : (f3 & 3) == 2 ? old | src : old & ~src;
+                    // In a CSRRS or CSRRC on mip only the software-writable
+                    // SEIP takes part, not the PLIC's line (privileged ISA
+                    // 3.1.9): a set or clear of another bit must not latch it.
+                    uint64_t base = csr == 0x344 ? (old & ~(uint64_t)MIP_SEIP) | (h.mipSw & MIP_SEIP) : old;
+                    uint64_t nv = (f3 & 3) == 1 ? src : (f3 & 3) == 2 ? base | src : base & ~src;
                     if (!csrWrite(h, csr, nv)) ILLEGAL();
                 }
                 RD(old);
@@ -1426,6 +1548,7 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
         }
 #undef RD
 #undef W
+#undef FD
 #undef TRAP
 #undef ILLEGAL
 #undef MEMFAIL
