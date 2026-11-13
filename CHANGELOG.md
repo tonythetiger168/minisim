@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint` CDC on generated register blocks: a register struct written field
+  by field through ports on fields or on concatenations of fields, copied
+  whole (`assign hw2reg_regtop = hw2reg`) and passed whole down a port, is
+  kept field by field, so one field's crossing no longer spreads to every
+  register. A clock behind a scan mux is the functional clock. `-static`
+  takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
 - VPI containers of structs, classes and containers (37.18): an element of
   a queue, dynamic or associative array of unpacked structs is a
   `vpiStructVar` whose members read and write the element; one of class
