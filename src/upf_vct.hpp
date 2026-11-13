@@ -177,14 +177,13 @@ inline const std::map<std::string, Vct>& predefinedVcts() {
         // B.8, B.9: SystemVerilog logic, a ground: on is 0
         add("SV_LOGIC2UPF_GNDZERO", true, "sv", {{"X", U}, {"Z", U}, {"0", "FULL_ON"}, {"1", "OFF"}});
         add("UPF_GNDZERO2SV_LOGIC", false, "sv", {{"OFF", "1"}, {"FULL_ON", "0"}, {"PARTIAL_ON", "X"}, {"UNDETERMINED", "X"}});
-        // B.10 to B.13: a port tied high or low is a supply that is always on / always off
-        add("VHDL_TIED_HI", true, "vhdl",
-            {{"U", "FULL_ON"}, {"X", "FULL_ON"}, {"0", "FULL_ON"}, {"1", "FULL_ON"}, {"Z", "FULL_ON"}, {"W", "FULL_ON"},
-             {"L", "FULL_ON"}, {"H", "FULL_ON"}, {"-", "FULL_ON"}});
-        add("SV_TIED_HI", true, "sv", {{"X", "FULL_ON"}, {"Z", "FULL_ON"}, {"0", "FULL_ON"}, {"1", "FULL_ON"}});
-        add("VHDL_TIED_LO", true, "vhdl",
-            {{"U", "OFF"}, {"X", "OFF"}, {"0", "OFF"}, {"1", "OFF"}, {"Z", "OFF"}, {"W", "OFF"}, {"L", "OFF"}, {"H", "OFF"}, {"-", "OFF"}});
-        add("SV_TIED_LO", true, "sv", {{"X", "OFF"}, {"Z", "OFF"}, {"0", "OFF"}, {"1", "OFF"}});
+        // B.10 to B.13: an HDL port tied to a supply (upf2hdl): the tie value while
+        // the supply is FULL_ON, X otherwise. VHDL_TIED_LO maps PARTIAL_ON to '0' as
+        // 1801-2024 Annex B prints it.
+        add("SV_TIED_HI", false, "sv", {{"UNDETERMINED", "X"}, {"FULL_ON", "1"}, {"PARTIAL_ON", "X"}, {"OFF", "X"}});
+        add("SV_TIED_LO", false, "sv", {{"UNDETERMINED", "X"}, {"FULL_ON", "0"}, {"PARTIAL_ON", "X"}, {"OFF", "X"}});
+        add("VHDL_TIED_HI", false, "vhdl", {{"UNDETERMINED", "X"}, {"FULL_ON", "1"}, {"PARTIAL_ON", "X"}, {"OFF", "X"}});
+        add("VHDL_TIED_LO", false, "vhdl", {{"UNDETERMINED", "X"}, {"FULL_ON", "0"}, {"PARTIAL_ON", "0"}, {"OFF", "X"}});
         return m;
     }();
     return all;

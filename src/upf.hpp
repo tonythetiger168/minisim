@@ -249,9 +249,16 @@ struct Ex {
     double real = 0;        // Num: as a voltage
     bool isReal = false;
     std::vector<ExP> kids;
+    std::string text;       // the root of a parsed expression: its source text (upf_expr_string, 10.6.3.4)
 };
 
+inline ExP parseExprTree(const std::string& text, const std::string& where);
 inline ExP parseExpr(const std::string& text, const std::string& where) {
+    ExP e = parseExprTree(text, where);
+    if (e) e->text = text;
+    return e;
+}
+inline ExP parseExprTree(const std::string& text, const std::string& where) {
     struct P {
         const std::string& t;
         const std::string& where;
@@ -923,6 +930,11 @@ struct Model {
     std::string loadStart;
     std::map<std::string, std::string> topSeen;
     std::string result;   // the Tcl result of the UPF command just run
+    std::map<std::string, std::string> supplyWhere;   // "net:" / "port:" + supply name -> file:line
+    // The information model (clause 10), built at the first query command
+    // (11.1): from then on only the commands of phase 5 may follow (11.1.1).
+    std::shared_ptr<struct InfoModel> im;
+    bool phase5 = false;
 
     // ---- names ----
     static std::string join(const std::string& scope, const std::string& n) {
@@ -1423,6 +1435,11 @@ struct Model {
 
     void run(const std::vector<Cmd>& cmds, std::string& scope, Reader& r, const std::string& file);
     std::string findObjects(const Cmd& c, const std::string& scope) const;
+    std::string query(const Cmd& c, const std::string& scope);   // upf_query_* and query_upf (upf_query.hpp)
+    static bool isQuery(const std::string& n) {
+        return n == "upf_query_object_properties" || n == "upf_query_object_type" || n == "upf_object_in_class" ||
+               n == "upf_query_object_pathname" || n == "query_upf";
+    }
 };
 
 #include "upf_impl.inc"
@@ -1431,6 +1448,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
     for (const Cmd& c : cmds) {
         const std::string& n = c.w[0];
         if (!recording.empty() && n != "end_power_model") {   // inside begin_power_model (6.11)
+            if (isQuery(n)) throw Error(c.where() + ": " + n + " inside power model " + recording + ": a query may not be used in a power model (11.1)");
             if (n == "begin_power_model" || n == "define_power_model")
                 throw Error(c.where() + ": " + n + " inside power model " + recording + "; power models do not nest (6.31)");
             powerModels[recording].cmds.push_back(c);
@@ -1440,6 +1458,13 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
         if (!curLib.empty() && n != "create_vcm" && n != "use_upf_library")
             throw Error(c.where() + ": " + n + " inside create_upf_library " + curLib +
                         "; a UPF library holds only create_vcm and use_upf_library (6.29)");
+        if (isQuery(n)) {   // 11.1
+            result = query(c, scope);
+            continue;
+        }
+        if (phase5 && n != "set_scope" && n != "bind_checker" && n != "find_objects" && n != "load_upf")
+            throw Error(c.where() + ": " + n + " after a UPF query command: only set_scope, bind_checker, find_objects and "
+                        "load_upf may follow one (11.1.1)");
         if (!noLog && pmStack.empty() && curLib.empty() && n != "save_upf" && n != "load_upf" && n != "set_scope" &&
             n != "load_simstate_behavior")
             history.push_back({scope, c});
@@ -1531,6 +1556,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                                                     : scope;
                 std::string name = join(base, p);
                 ports.insert(name);
+                if (!supplyWhere.count("port:" + name)) supplyWhere["port:" + name] = c.where();
                 portDir[name] = o.get("-direction", "in");
             }
             continue;
@@ -1547,6 +1573,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
                 }
                 std::string name = join(base, p);
                 nets.insert(name);
+                if (!supplyWhere.count("net:" + name)) supplyWhere["net:" + name] = c.where();
                 if (o.has("-resolve")) resolve[name] = o.get("-resolve");
             }
             continue;
@@ -3077,7 +3104,7 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
         // Accepted and not needed for simulation.
         static const std::set<std::string> ignored = {
             "map_isolation_cell", "map_level_shifter_cell", "set_retention_control", "set_pin_related_supply",
-            "set_related_supply_net", "query_upf", "add_parameter"};
+            "set_related_supply_net", "add_parameter"};
         if (ignored.count(n)) {
             warnings.push_back(c.where() + ": " + n + " is accepted and has no effect in simulation");
             continue;
@@ -3286,6 +3313,7 @@ struct DesignView {
     std::vector<PortSite> ports;
     std::map<std::string, std::string> model;   // instance path ("" the top) -> its module; none for a generate block
     std::map<std::string, std::vector<std::pair<std::string, int>>> portsOf;   // instance path -> its ports, 0 in 1 out 2 inout
+    std::map<std::string, int> width;   // signal -> bits
 };
 
 // find_objects (6.33): HDL objects of the design below a scope whose names
@@ -3650,3 +3678,5 @@ endpackage
 }
 
 }  // namespace upf
+
+#include "upf_query.hpp"

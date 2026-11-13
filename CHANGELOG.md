@@ -110,6 +110,10 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiCovered` of an assertion needs an attempt, a success and no failure.
 - VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
   immediate assertion, or the boolean of a single-expression property.
+- UPF information model and Tcl queries (IEEE 1801-2024 clause 10, 11.1):
+  `upf_query_object_properties`, `upf_query_object_type`,
+  `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
+  phase 5 enforced after the first query (docs/LOWPOWER.md).
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -133,6 +137,10 @@ Spec references are IEEE 1800-2023 clauses.
 
   The engine is mcov's own, and it reads mcov's own databases.
   A database that does not exist is now a one-line error instead of a traceback.
+
+### Fixed
+- The `SV_TIED_HI`, `SV_TIED_LO`, `VHDL_TIED_HI` and `VHDL_TIED_LO` value
+  conversion tables are upf2hdl tables, as in IEEE 1801-2024 Annex B.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
