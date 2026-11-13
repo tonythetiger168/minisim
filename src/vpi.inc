@@ -114,6 +114,7 @@ struct State {
     std::map<std::pair<int, size_t>, Obj*> fsmStateObj;
     const VpiSite* cur = nullptr;         // the call whose calltf / compiletf is running
     std::vector<Cb*> start, endCompile, endSim, rw, ro, next;
+    std::vector<Cb*> unresolved;          // cbUnresolvedSystf (38.36.3)
     std::multimap<uint64_t, Cb*> timed;   // cbAfterDelay, cbAtStartOfSimTime, and delayed synch callbacks
     std::unordered_map<int, std::vector<Cb*>> change;   // signal -> its cbValueChange callbacks
     std::vector<std::unique_ptr<Cb>> cbs;
@@ -1688,7 +1689,39 @@ inline bool load(const std::string& path, const std::string& boot, std::string& 
     return true;
 }
 // Make the registered names known to slang before elaboration.
+// cbUnresolvedSystf (38.36.3): each system task or function name in the
+// source that is neither built in nor registered, once, with the name in
+// cb_data->value (vpiStringVal); the callback may vpi_register_systf it.
+struct SysNames : slang::syntax::SyntaxVisitor<SysNames> {
+    std::vector<std::string> names;
+    void visitToken(slang::parsing::Token t) {
+        if (t.kind == slang::parsing::TokenKind::SystemIdentifier) names.emplace_back(t.valueText());
+    }
+};
+inline void fireUnresolved(Compilation& comp) {
+    auto& s = st();
+    if (s.unresolved.empty()) return;
+    SysNames v;
+    for (const auto& t : comp.getSyntaxTrees()) t->root().visit(v);
+    std::set<std::string> done;
+    for (const std::string& n : v.names) {
+        if (!done.insert(n).second || vpiSystfNames().count(n) || comp.getSystemSubroutine(n)) continue;
+        auto due = s.unresolved;
+        for (Cb* c : due) {
+            if (!c->live) continue;
+            s_cb_data d = c->d;
+            s_vpi_value val{};
+            val.format = vpiStringVal;
+            val.value.str = const_cast<PLI_BYTE8*>(n.c_str());
+            d.obj = nullptr;
+            d.time = nullptr;
+            d.value = &val;
+            d.cb_rtn(&d);
+        }
+    }
+}
 inline void declare(Compilation& comp) {
+    fireUnresolved(comp);
     for (auto& [n, i] : vpiSystfNames()) comp.addSystemSubroutine(std::make_shared<UserSystf>(n, i));
 }
 inline void setup(Compilation& comp, const LowerResult& lr) {
@@ -1907,6 +1940,7 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             if (d->reason == cbError) g_errHook = vpi::onRunError;
             break;
         case cbEndOfCompile: s.endCompile.push_back(c); break;
+        case cbUnresolvedSystf: s.unresolved.push_back(c); break;   // runs before elaboration (declare)
         case cbStartOfSimulation: s.start.push_back(c); break;
         case cbEndOfSimulation: s.endSim.push_back(c); break;
         default:

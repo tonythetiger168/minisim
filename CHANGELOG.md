@@ -44,6 +44,8 @@ Spec references are IEEE 1800-2023 clauses.
   with `vpiValid`, and the callbacks `cbStartOfThread`, `cbEndOfThread`,
   `cbEnterThread`, `cbStartOfFrame` and `cbEndOfFrame`. The value of a
   system task argument that is an automatic variable no longer crashes.
+- VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
+  unknown system task or function name, which the callback may register.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
