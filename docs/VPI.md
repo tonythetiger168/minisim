@@ -305,8 +305,13 @@ iteration), `vpiConstant` (`vpiConstType`, value), `vpiFuncCall` /
 `vpiArgument`), `vpiBitSelect` (`vpiParent`, `vpiIndex`), `vpiPartSelect` /
 `vpiIndexedPartSelect` with a variable index. Every one has `vpiLineNo`,
 `vpiFile`, `vpiParent`, `vpiModule`, `vpiScope`; an expression has
-`vpiSize` and `vpiDecompile` (its source text). `vpi_get_value` reads an
-expression only when it is constant.
+`vpiSize` and `vpiDecompile` (its source text). `vpi_get_value` reads the
+value an expression has now (38.15): the nets and variables it reads,
+whole memories included, take their current values, so an operation, a
+select with a variable index, a conditional, a concatenation or a call of
+a function of the design all have a value. An expression that reads an
+automatic variable, a class property or a hierarchical name has none
+(`vpi_chk_error` says so).
 
 **Scheduling and more callbacks (38.10, 38.30, 38.35, 38.36).** A delayed
 `vpi_put_value` with `vpiReturnEvent` returns a `vpiSchedEvent` handle;
@@ -481,8 +486,7 @@ waveform tools (`mwave`, the FST and VCD readers).
 
 ## Not yet
 
-The value of a non-constant expression,
-the connection list of an instance array (`vpiExpr`, a
+The connection list of an instance array (`vpiExpr`, a
 `vpiListOp` operation) and its `vpiParamAssign`, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
@@ -492,7 +496,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `37.18-vpi-nested-containers.sv`, `37.31-vpi-class-defn.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `37.18-vpi-nested-containers.sv`, `37.31-vpi-class-defn.sv`, `37.35-vpi-expr-values.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

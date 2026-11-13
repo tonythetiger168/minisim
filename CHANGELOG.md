@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI expression values (37.35, 38.15): `vpi_get_value` on an expression
+  object gives its value now, not only for a constant expression. The nets
+  and variables it reads (memories too) take their current values, so
+  operations, variable selects, conditionals, concatenations and calls of
+  the design's functions have a value. `tests/spec/37.35-vpi-expr-values.sv`.
 - `msim -upf` with VHDL: the VHDL value conversion tables of IEEE 1801-2024
   Annex B (`VHDL_SL2UPF`, `UPF2VHDL_SL`, the `_GNDZERO` ones, `VHDL_TIED_HI`,
   `VHDL_TIED_LO`) connect `std_logic` ports of VHDL entities to supply nets.
