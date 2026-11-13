@@ -135,6 +135,7 @@ int main() {
                     {"u_dut.g[0].u_b", "blk"}, {"u_dut.u_c", "cell"}};
         dv.portsOf["u_dut.u_a"] = {{"clk", 0}, {"q", 1}, {"io", 2}};
         dv.signals = {"u_dut.n1", "u_dut.u_a.n1", "u_dut.u_a.q"};
+        dv.range["u_dut.u_a.q"] = {3, 0};
         std::string path = "test_upf_find.upf";
         auto run = [&](const std::string& text) {
             std::ofstream(path) << "set_scope u_a\nset_scope ..\nset r [" << text << "]\nputs $r\n";
@@ -150,8 +151,19 @@ int main() {
         assert(run("find_objects . -pattern u_*") == "u_a u_c");
         assert(run("find_objects . -pattern u_* -transitive") == "u_a u_c {g[0]/u_b} u_a/u_leaf");
         assert(run("find_objects . -pattern blk -object_type model -transitive") == "u_a {g[0]/u_b}");
-        assert(run("find_objects . -pattern * -leaf_only") == "u_c");
-        assert(run("find_objects . -pattern * -non_leaf") == "u_a");
+        assert(run("find_objects . -pattern * -leaf_only -object_type inst") == "u_c");
+        assert(run("find_objects . -pattern * -non_leaf -object_type inst") == "u_a");
+        // 6.33: by default instances, logic ports and nets; -leaf_only / -non_leaf by the owner's kind
+        assert(run("find_objects . -pattern *") == "u_a u_c n1");
+        assert(run("find_objects . -pattern * -non_leaf") == "u_a n1");
+        assert(run("find_objects u_a -pattern * -object_type port -leaf_only") == "");
+        // 6.33.2: [chars] with ranges, \x and {a,b,c}
+        assert(run("find_objects . -pattern {u_[a-b]}") == "u_a");
+        assert(run("find_objects . -pattern {u_{a,c}}") == "u_a u_c");
+        assert(run("find_objects . -pattern {g\\[0\\]} -object_type inst") == "");
+        assert(run("find_objects g\\[0\\] -pattern u_? -object_type inst") == "{g[0]/u_b}");
+        // -expand_to_bits: each bit of a multi-bit port or net
+        assert(run("find_objects u_a -pattern q -object_type port -expand_to_bits") == "{u_a/q[3]} {u_a/q[2]} {u_a/q[1]} {u_a/q[0]}");
         assert(run("find_objects u_a -pattern * -object_type port -direction out") == "u_a/q");
         assert(run("find_objects u_a -pattern * -object_type port") == "u_a/clk u_a/q u_a/io");
         assert(run("find_objects . -pattern n1 -object_type net -transitive") == "n1 u_a/n1");
@@ -161,10 +173,32 @@ int main() {
         for (const char* bad : {"find_objects . -pattern * -object_type wire", "find_objects nope -pattern *",
                                 "find_objects . -pattern * -direction in", "find_objects .",
                                 "find_objects . -pattern * -bogus", "find_objects . -pattern * -regexp -exact",
-                                "find_objects . -pattern * -object_type process"}) {
+                                "find_objects . -pattern * -object_type process",
+                                "find_objects . -pattern * -traverse_macros -leaf_only",
+                                "find_objects . -pattern * -traverse_macros -transitive FALSE", "find_objects .. -pattern *",
+                                "find_objects . -pattern * -object_type net -direction in"}) {
             bool threw = false;
             try { run(bad); } catch (const Error& e) { threw = std::string(e.what()).find(path + ":3: find_objects") != std::string::npos; }
             assert(threw);
+        }
+        // a hard macro is a leaf cell (4.9.2.5): a transitive search stops at it, -traverse_macros goes in
+        {
+            auto mrun = [&](const std::string& q) {
+                std::ofstream(path) << "set_design_attributes -models blk -is_hard_macro TRUE\nputs [" << q << "]\n";
+                Model m;
+                m.dv = &dv;
+                std::ostringstream out;
+                m.out = &out;
+                m.load(path, "u_dut");
+                std::string r = out.str();
+                if (!r.empty()) r.pop_back();
+                return r;
+            };
+            assert(mrun("find_objects . -pattern u_* -object_type inst -transitive") == "u_a u_c {g[0]/u_b}");
+            assert(mrun("find_objects . -pattern u_* -object_type inst -traverse_macros") == "u_a u_c {g[0]/u_b} u_a/u_leaf");
+            assert(mrun("find_objects . -pattern * -object_type inst -leaf_only") == "u_a u_c");
+            assert(mrun("find_objects . -pattern q -object_type port -transitive") == "u_a/q");
+            assert(mrun("find_objects . -pattern n1 -object_type net -transitive") == "n1");
         }
         // without a design, find_objects is an error; supply objects need none
         std::ofstream(path) << "create_supply_net VDD\ncreate_supply_port P -direction out\n"

@@ -15,6 +15,10 @@ Spec references are IEEE 1800-2023 clauses.
 - The UPF information model also holds abstract power sources, composite
   domains, power state groups, state transitions, repeater strategies, power
   models and attributes (IEEE 1801-2024 10.6.1, 10.6.3).
+- `find_objects` follows 1801-2024 6.33 in full: instances, ports and nets
+  by default, `-traverse_macros`, `-expand_to_bits`, transitive searches that
+  stop at leaf cells and macros, `-leaf_only` / `-non_leaf` for every object
+  type, and the glob forms of 6.33.2 (`[a-z]`, `\x`, `{a,b,c}`).
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
