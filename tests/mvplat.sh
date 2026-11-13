@@ -233,6 +233,11 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
     else
       echo "skip  ext4 disk: no mkfs.ext4 and debugfs (e2fsprogs)"
     fi
+    # Sv48: with the device tree offering it, Linux pages with 4 levels.
+    "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio -q \
+      -append "console=ttyS0 rdinit=/init quiet" -mmu sv48 -input "grep -m1 mmu /proc/cpuinfo; poweroff -f
+" > sv48.out 2>&1; rc=$?
+    expect "Linux runs with Sv48 paging (-mmu sv48)" 0 sv48.out "^mmu.*: sv48"
     # A network: Linux's virtio-net driver brings eth0 up and pings the
     # built-in gateway.
     "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio -q \

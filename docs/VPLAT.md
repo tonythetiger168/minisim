@@ -61,8 +61,9 @@ supervisor's views of the machine registers, with `stvec`, `sscratch`,
 `sepc`, `scause`, `stval`, `scounteren` and `satp`. SRET, SFENCE.VMA and the
 `mstatus` bits SUM, MXR, TVM, TW and TSR work as the privileged
 specification says. `satp` selects Sv32 paging on RV32 (two levels, 4 MiB
-megapages) and Sv39 on RV64 (three levels, 2 MiB and 1 GiB pages; a virtual
-address not sign-extended from bit 38 faults), with a 256-entry TLB per hart
+megapages) and Sv39, Sv48 or Sv57 on RV64 (three, four or five levels, with
+superpages at every level; a virtual address not sign-extended from bit 38,
+47 or 56 faults), with a 256-entry TLB per hart
 and page faults (causes 12, 13 and 15). No ASIDs (`satp.ASID` reads 0), no
 Svnapot or Svpbmt (those PTE bits fault). Accessed and dirty bits follow Svade: a page whose A bit is clear,
 or a store to a page whose D bit is clear, faults and the supervisor sets
@@ -71,9 +72,10 @@ The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
 interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
 (SEIP).
 
-The RISC-V architecture tests all pass, 588 programs: ui, um, ua, uc, uf,
+The RISC-V architecture tests all pass, 675 programs: ui, um, ua, uc, uf,
 ud, uzba, uzbb, uzbc, uzbs and uzicond for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
-paging on (`v`, Sv32 and Sv39), and mi and si for both. `tests/mvplat_isa.sh`
+paging on (`v`, Sv32 and Sv39, and RV64's ui, um, ua and uc under Sv48
+too), and mi and si for both. `tests/mvplat_isa.sh`
 runs them.
 
 **Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000) on
@@ -369,6 +371,7 @@ for it.
 | `-trace FILE` | commit log |
 | `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
 | `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |
+| `-mmu sv39\|sv48\|sv57` | the largest paging mode the device tree offers an RV64 OS (default `sv39`; the platform file's `"mmu"` too). The harts take Sv39, Sv48 and Sv57 whatever it says |
 | `-disk FILE`, `-disk-write` | a raw disk image on virtio-blk; let writes reach the file (see "Disks") |
 | `-vcon` | a virtio console; `-input` goes to it (see "A virtio console") |
 | `-net user`, `-net dgram:LOCAL,REMOTE`, `-net-pcap FILE` | a virtio-net interface and its back end; record its frames (see "Networks") |
@@ -409,7 +412,7 @@ simulation time.
 
 ## Limits / Not yet
 
-- No V, no Zbkb/Zbkc/Zbkx (crypto bit-manipulation), no Zfh, no Sv48/Sv57, no Svadu (hardware
+- No V, no Zbkb/Zbkc/Zbkx (crypto bit-manipulation), no Zfh, no Svadu (hardware
   A/D update), and every hart of a platform has the program's width. F and D
   round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions
   to integers; other RMM results round as ties-to-even (differs only for a
