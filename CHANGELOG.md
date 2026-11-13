@@ -83,6 +83,9 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI drivers and loads as 37.16 and 37.46 read: of a bit or part select
+  (only what touches those bits), primitive terminals, and the ports of
+  the net's own module as local drivers (inputs) and loads (outputs).
 - VPI `cbEndOfObject` (38.36.1) on a thread or frame runs when it ends;
   `cbReclaimObj` and `cbEndOfObject` on class objects register (msim never
   reclaims class objects).
