@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: the B extension (Zba, Zbb, Zbs) with Zbc and Zicond on RV32 and
+  RV64, in `misa` and the device tree; 588 riscv-tests now (uzba, uzbb, uzbc,
+  uzbs, uzicond added, `p` and `v`).
 - mvplat: virtio-console (VIRTIO 1.2, 5.3). `-vcon` adds one and sends
   `-input` to it; Linux runs its console on `hvc0`. Input is typed once the
   guest has printed and been quiet for 100 ms of simulated time.

@@ -39,7 +39,8 @@ names what is missing. Sections marked *(extension)* describe these parts.
 
 ## What it simulates
 
-**Harts.** RV32GC or RV64GC (IMAFDC with Zicsr and Zifencei), in machine,
+**Harts.** RV32GCB or RV64GCB (IMAFDC with Zicsr and Zifencei, the B
+extension's Zba, Zbb and Zbs, and Zbc and Zicond), in machine,
 supervisor and user mode. The program's ELF class picks the width: a 64-bit
 ELF file runs on RV64 harts (`misa.MXL` 2, `UXL` and `SXL` fixed at 64), with
 the W instructions, LD/SD/LWU, 64-bit atomics (`.D`) and RV64C. Single and
@@ -70,8 +71,8 @@ The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
 interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
 (SEIP).
 
-The RISC-V architecture tests all pass, 430 programs: ui, um, ua, uc, uf and
-ud for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
+The RISC-V architecture tests all pass, 588 programs: ui, um, ua, uc, uf,
+ud, uzba, uzbb, uzbc, uzbs and uzicond for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
 paging on (`v`, Sv32 and Sv39), and mi and si for both. `tests/mvplat_isa.sh`
 runs them.
 
@@ -408,7 +409,7 @@ simulation time.
 
 ## Limits / Not yet
 
-- No V, no B (bit-manipulation), no Zfh, no Sv48/Sv57, no Svadu (hardware
+- No V, no Zbkb/Zbkc/Zbkx (crypto bit-manipulation), no Zfh, no Sv48/Sv57, no Svadu (hardware
   A/D update), and every hart of a platform has the program's width. F and D
   round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions
   to integers; other RMM results round as ties-to-even (differs only for a

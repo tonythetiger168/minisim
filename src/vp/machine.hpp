@@ -288,8 +288,148 @@ public:
         return clint ? clint->mtimeAtCycle(h.cycle) : h.cycle * cycle_ps / tick_ps;
     }
     // The extensions misa reports: A C D F I M S U.
+    // Zba, Zbb, Zbc, Zbs and Zicond (unprivileged ISA, chapters 28 and 12):
+    // the OP, OP-IMM, OP-32 and OP-IMM-32 encodings the base ISA leaves
+    // free. Values are XLEN wide; the caller sign-extends an RV32 result.
+    // Returns false for an encoding that is none of them.
+    static bool bitmanip(uint32_t insn, bool rv64, uint64_t a, uint64_t b, uint64_t& r) {
+        const unsigned op = insn & 0x7f, f3 = (insn >> 12) & 7, f7 = insn >> 25, rs2 = (insn >> 20) & 31;
+        const unsigned xl = rv64 ? 64 : 32;
+        const uint64_t m = rv64 ? ~0ull : 0xffffffffull;
+        a &= m; b &= m;
+        auto rol = [&](uint64_t v, unsigned s, unsigned w) -> uint64_t {
+            uint64_t mm = w == 64 ? ~0ull : (1ull << w) - 1;
+            s &= w - 1;
+            v &= mm;
+            return s ? ((v << s) | (v >> (w - s))) & mm : v;
+        };
+        auto clz = [&](uint64_t v, unsigned w) -> uint64_t {
+            v &= w == 64 ? ~0ull : (1ull << w) - 1;
+            return v ? (uint64_t)(__builtin_clzll(v) - (64 - w)) : w;
+        };
+        auto ctz = [&](uint64_t v, unsigned w) -> uint64_t {
+            v &= w == 64 ? ~0ull : (1ull << w) - 1;
+            return v ? (uint64_t)__builtin_ctzll(v) : w;
+        };
+        auto clmul = [&](uint64_t x, uint64_t y, int kind) -> uint64_t {  // 0 low, 1 high, 2 reversed
+            uint64_t out = 0;
+            for (unsigned i = 0; i < xl; i++) {
+                if (!((y >> i) & 1)) continue;
+                if (kind == 0) out ^= x << i;
+                else if (kind == 1) out ^= i ? x >> (xl - i) : 0;
+                else out ^= x >> (xl - i - 1);
+            }
+            return out & m;
+        };
+        auto sext = [&](uint64_t v, unsigned w) -> uint64_t { return (uint64_t)((int64_t)(v << (64 - w)) >> (64 - w)) & m; };
+        const unsigned sh = (insn >> 20) & (xl - 1);
+        const unsigned f6 = insn >> 26;
+        const unsigned f12 = insn >> 20;
+        switch (op) {
+            case 0x33:
+                switch (f7) {
+                    case 0x10:
+                        if (f3 == 2) { r = ((a << 1) + b) & m; return true; }
+                        if (f3 == 4) { r = ((a << 2) + b) & m; return true; }
+                        if (f3 == 6) { r = ((a << 3) + b) & m; return true; }
+                        return false;
+                    case 0x20:
+                        if (f3 == 7) { r = a & ~b & m; return true; }
+                        if (f3 == 6) { r = (a | ~b) & m; return true; }
+                        if (f3 == 4) { r = ~(a ^ b) & m; return true; }
+                        return false;
+                    case 0x05: {
+                        int64_t sa = (int64_t)(rv64 ? a : (uint64_t)(int64_t)(int32_t)a);
+                        int64_t sb = (int64_t)(rv64 ? b : (uint64_t)(int64_t)(int32_t)b);
+                        switch (f3) {
+                            case 1: r = clmul(a, b, 0); return true;
+                            case 2: r = clmul(a, b, 2); return true;
+                            case 3: r = clmul(a, b, 1); return true;
+                            case 4: r = (uint64_t)(sa < sb ? sa : sb) & m; return true;
+                            case 5: r = a < b ? a : b; return true;
+                            case 6: r = (uint64_t)(sa > sb ? sa : sb) & m; return true;
+                            case 7: r = a > b ? a : b; return true;
+                        }
+                        return false;
+                    }
+                    case 0x30:
+                        if (f3 == 1) { r = rol(a, (unsigned)b, xl); return true; }
+                        if (f3 == 5) { r = rol(a, (xl - (unsigned)(b & (xl - 1))) & (xl - 1), xl); return true; }
+                        return false;
+                    case 0x24:
+                        if (f3 == 1) { r = a & ~(1ull << (b & (xl - 1))); return true; }
+                        if (f3 == 5) { r = (a >> (b & (xl - 1))) & 1; return true; }
+                        return false;
+                    case 0x14: if (f3 == 1) { r = a | (1ull << (b & (xl - 1))); return true; } return false;
+                    case 0x34: if (f3 == 1) { r = a ^ (1ull << (b & (xl - 1))); return true; } return false;
+                    case 0x04: if (!rv64 && f3 == 4 && rs2 == 0) { r = a & 0xffff; return true; } return false;  // zext.h
+                    case 0x07:
+                        if (f3 == 5) { r = b == 0 ? 0 : a; return true; }   // czero.eqz
+                        if (f3 == 7) { r = b != 0 ? 0 : a; return true; }   // czero.nez
+                        return false;
+                }
+                return false;
+            case 0x13:
+                if (f3 == 1) {
+                    if (f12 == 0x600) { r = clz(a, xl); return true; }
+                    if (f12 == 0x601) { r = ctz(a, xl); return true; }
+                    if (f12 == 0x602) { r = (uint64_t)__builtin_popcountll(a); return true; }
+                    if (f12 == 0x604) { r = sext(a, 8); return true; }
+                    if (f12 == 0x605) { r = sext(a, 16); return true; }
+                    unsigned hi = rv64 ? f6 << 1 : f7;  // funct7 with RV64's shamt[5] cleared
+                    if (hi == 0x14) { r = a | (1ull << sh); return true; }   // bseti
+                    if (hi == 0x24) { r = a & ~(1ull << sh); return true; }  // bclri
+                    if (hi == 0x34) { r = a ^ (1ull << sh); return true; }   // binvi
+                    return false;
+                }
+                if (f3 == 5) {
+                    if (f12 == 0x287) {  // orc.b
+                        uint64_t o = 0;
+                        for (unsigned i = 0; i < xl; i += 8) if ((a >> i) & 0xff) o |= 0xffull << i;
+                        r = o;
+                        return true;
+                    }
+                    if ((rv64 && f12 == 0x6b8) || (!rv64 && f12 == 0x698)) {  // rev8
+                        r = rv64 ? __builtin_bswap64(a) : __builtin_bswap32((uint32_t)a);
+                        return true;
+                    }
+                    unsigned hi = rv64 ? f6 << 1 : f7;
+                    if (hi == 0x30) { r = rol(a, (xl - sh) & (xl - 1), xl); return true; }  // rori
+                    if (hi == 0x24) { r = (a >> sh) & 1; return true; }                     // bexti
+                    return false;
+                }
+                return false;
+            case 0x1b: {  // RV64 only
+                uint32_t w = (uint32_t)a;
+                unsigned s5 = (insn >> 20) & 31;
+                if (f3 == 1 && f6 == 0x02) {  // slli.uw
+                    r = (a & 0xffffffffull) << ((insn >> 20) & 63);
+                    return true;
+                }
+                if (f3 == 1 && f12 == 0x600) { r = clz(w, 32); return true; }
+                if (f3 == 1 && f12 == 0x601) { r = ctz(w, 32); return true; }
+                if (f3 == 1 && f12 == 0x602) { r = (uint64_t)__builtin_popcount(w); return true; }
+                if (f3 == 5 && f7 == 0x30) { r = (uint64_t)(int64_t)(int32_t)(uint32_t)(rol(w, (32 - s5) & 31, 32)); return true; }  // roriw
+                return false;
+            }
+            case 0x3b: {  // RV64 only
+                uint32_t wa = (uint32_t)a;
+                if (f7 == 0x04 && f3 == 0) { r = (a & 0xffffffffull) + b; return true; }       // add.uw
+                if (f7 == 0x04 && f3 == 4 && rs2 == 0) { r = a & 0xffff; return true; }      // zext.h
+                if (f7 == 0x10 && (f3 == 2 || f3 == 4 || f3 == 6)) {                         // shNadd.uw
+                    r = ((a & 0xffffffffull) << (f3 >> 1)) + b;
+                    return true;
+                }
+                if (f7 == 0x30 && f3 == 1) { r = (uint64_t)(int64_t)(int32_t)(uint32_t)(rol(wa, (unsigned)b & 31, 32)); return true; }                   // rolw
+                if (f7 == 0x30 && f3 == 5) { r = (uint64_t)(int64_t)(int32_t)(uint32_t)(rol(wa, (32 - ((unsigned)b & 31)) & 31, 32)); return true; }     // rorw
+                return false;
+            }
+        }
+        return false;
+    }
+
     static constexpr uint64_t MISA_EXT =
-        (1u << 0) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20);
+        (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20);
     // mstatus.SD: set when the FP state is dirty (FS = 3); bit XLEN-1.
     static uint64_t sd(const Hart& h) {
         return (h.mstatus & MSTATUS_FS) == MSTATUS_FS ? (h.rv64 ? 1ull << 63 : 1ull << 31) : 0;
@@ -1244,6 +1384,12 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 unsigned sh = (insn >> 20) & (rv64 ? 63 : 31);
                 uint32_t hi = rv64 ? insn >> 26 : f7;                  // funct6 on RV64
                 uint32_t sra = rv64 ? 0x10 : 0x20;
+                if ((f3 == 1 && hi) || (f3 == 5 && hi && hi != sra)) {
+                    uint64_t br;
+                    if (!bitmanip(insn, rv64, a, 0, br)) ILLEGAL();
+                    RD(br);
+                    break;
+                }
                 switch (f3) {
                     case 0: RD(a + immI); break;
                     case 1: if (hi) ILLEGAL(); RD(a << sh); break;
@@ -1263,6 +1409,12 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             case 0x1b: {                                               // OP-IMM-32 (RV64)
                 if (!rv64) ILLEGAL();
                 uint32_t a = (uint32_t)x[rs1], sh = (insn >> 20) & 31;
+                if ((f3 == 1 && f7) || (f3 == 5 && f7 && f7 != 0x20)) {
+                    uint64_t br;
+                    if (!bitmanip(insn, rv64, x[rs1], 0, br)) ILLEGAL();
+                    RD(br);
+                    break;
+                }
                 switch (f3) {
                     case 0: RD(W(a + (uint32_t)immI)); break;                          // ADDIW
                     case 1: if (f7) ILLEGAL(); RD(W(a << sh)); break;                  // SLLIW
@@ -1307,7 +1459,12 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                     }
                     break;
                 }
-                if (f7 != 0 && !(f7 == 0x20 && (f3 == 0 || f3 == 5))) ILLEGAL();
+                if (f7 != 0 && !(f7 == 0x20 && (f3 == 0 || f3 == 5))) {
+                    uint64_t br;
+                    if (!bitmanip(insn, rv64, a, b, br)) ILLEGAL();
+                    RD(br);
+                    break;
+                }
                 unsigned sm = rv64 ? 63 : 31;
                 switch (f3) {
                     case 0: RD(f7 ? a - b : a + b); break;
@@ -1327,6 +1484,12 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             case 0x3b: {                                               // OP-32 (RV64)
                 if (!rv64) ILLEGAL();
                 uint32_t a = (uint32_t)x[rs1], b = (uint32_t)x[rs2];
+                if (f7 != 0 && f7 != 1 && !(f7 == 0x20 && (f3 == 0 || f3 == 5))) {
+                    uint64_t br;
+                    if (!bitmanip(insn, rv64, x[rs1], x[rs2], br)) ILLEGAL();
+                    RD(br);
+                    break;
+                }
                 if (f7 == 1) {
                     int32_t sa = (int32_t)a, sb = (int32_t)b;
                     cls = f3 == 0 ? C_MUL : C_DIV;
