@@ -525,7 +525,7 @@ inline bool isProt(const Obj* o) {
             p = w && w->sym && protectedInstance(instOf(w->sym->getParentScope()));
             break;
         }
-        case Obj::Dyn: p = protSym(o->sym); break;
+        case Obj::Dyn: p = o->parent ? isProt(o->parent) : protSym(o->sym); break;
         case Obj::InstArr: p = protectedInstance(instOf(o->sym->getParentScope())); break;
         case Obj::DynElem: p = isProt(o->parent); break;
         case Obj::Fsm:
@@ -688,6 +688,7 @@ inline Val readObj(const Obj* o) {
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::String) return mkstr(o->site->args[(size_t)o->idx].text);
     if (o->kind == Obj::Arg && o->site->args[(size_t)o->idx].kind == VpiArg::Empty) return make(0, ~0ULL, 1);
     if (o->kind == Obj::Bit) {   // a bit or a part select
+        if (const Obj* r = dynRoot(o)) return v_slice(dynRead(r), o->off + o->w - 1, o->off);   // a member of a container's element
         Val v = S.get(o->sig);
         return v_slice(v, o->off + o->w - 1, o->off);
     }
@@ -3325,6 +3326,12 @@ PLI_BYTE8* vpi_get_str(PLI_INT32 prop, vpiHandle h) {
                 for (int64_t i : x->index) b += "[" + std::to_string(i) + "]";
                 return b;
             }
+            case Obj::Dyn:
+                if (!x->parent) {
+                    if (!x->sym) return "";
+                    return full ? vpi::fullName(*x->sym) : std::string(x->sym->name);
+                }
+                [[fallthrough]];
             case Obj::DynElem: {
                 std::string b = nameOf(x->parent, full);
                 const DynObj* d = vpi::dynOf(x->parent);
@@ -3473,6 +3480,15 @@ vpiHandle vpi_put_value(vpiHandle h, p_vpi_value v, p_vpi_time t, PLI_INT32 flag
         if ((flags & 0xfff) == vpiForceFlag || (flags & 0xfff) == vpiReleaseFlag) { vpi::error(vpiError, "vpi_put_value: an element of a dynamic array, queue or associative array cannot be forced"); return nullptr; }
         if (!vpi::fromValue(o, v, val)) return nullptr;
         if (!vpi::dynWrite(o, val)) vpi::error(vpiError, "vpi_put_value: the element is no longer in the array");
+        return nullptr;
+    }
+    if (const Obj* r = vpi::dynRoot(o)) {   // a member of a struct element of a container (37.18): written now
+        Val val;
+        if ((flags & 0xfff) == vpiForceFlag || (flags & 0xfff) == vpiReleaseFlag) { vpi::error(vpiError, "vpi_put_value: an element of a dynamic array, queue or associative array cannot be forced"); return nullptr; }
+        if (!vpi::fromValue(o, v, val)) return nullptr;
+        Val all = vpi::dynRead(r);
+        for (int i = 0; i < o->w; i++) setBit(all, o->off + i, bitAt(val, i));
+        if (!vpi::dynWrite(r, all)) vpi::error(vpiError, "vpi_put_value: the element is no longer in the array");
         return nullptr;
     }
     bool target = (o->kind == Obj::Signal && !o->arr && o->type != vpiClassVar) || o->kind == Obj::Word || o->kind == Obj::Bit ||

@@ -205,7 +205,13 @@ associative array of integral, real or string elements is a `vpiArrayVar`
 with `vpiArrayType` (`vpiDynamicArray`, `vpiQueueArray`, `vpiAssocArray`)
 and `vpiSize` (the elements it has now); `vpi_handle_by_index` and
 `vpi_iterate(vpiReg, ...)` give its elements (entries in key order), which
-`vpi_get_value` reads and `vpi_put_value` writes (no delay). A class
+`vpi_get_value` reads and `vpi_put_value` writes (no delay). The elements
+may also be unpacked structs or unions (a `vpiStructVar` / `vpiUnionVar`
+element whose `vpiMember`s read and write the element), class handles (a
+`vpiClassVar` element that gives its object through `vpiClassObj`) or
+containers (a `vpiArrayVar` element with its own `vpiArrayType`, size and
+elements, named `m["x"][0]`); a nested container is looked up each time,
+so it follows the element if the element is replaced. A class
 variable is a `vpiClassVar`; `vpi_handle(vpiClassObj, var)` gives the
 object it refers to (NULL for a null handle, `vpiObjId`), and
 `vpi_iterate(vpiVariables, obj)` its properties, base class first, static
@@ -468,8 +474,7 @@ waveform tools (`mwave`, the FST and VCD readers).
 ## Not yet
 
 The non-static property
-declarations of a class definition, containers of structs,
-classes or containers, the value of a non-constant expression,
+declarations of a class definition, the value of a non-constant expression,
 the connection list of an instance array (`vpiExpr`, a
 `vpiListOp` operation) and its `vpiParamAssign`, the per-source
 delay of an inter-module path on a net with several sources,
@@ -480,7 +485,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `37.18-vpi-nested-containers.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

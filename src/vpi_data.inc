@@ -27,7 +27,7 @@ inline Obj* memberObj(const Obj* parent, const FieldSymbol& f) {
     return o;
 }
 inline bool isStructObj(const Obj* o) {
-    if (!o->ty || (o->kind != Obj::Signal && o->kind != Obj::Bit && o->kind != Obj::Word) || o->arr) return false;
+    if (!o->ty || (o->kind != Obj::Signal && o->kind != Obj::Bit && o->kind != Obj::Word && o->kind != Obj::DynElem) || o->arr) return false;
     const Type& t = o->ty->getCanonicalType();
     return t.isStruct() || t.kind == SymbolKind::PackedUnionType || t.isUnpackedUnion();
 }
@@ -36,26 +36,79 @@ inline void members(const Obj* o, std::vector<vpiHandle>& items) {
         if (Obj* m = memberObj(o, f)) items.push_back(H(m));
 }
 
-// An element of a dynamic array, queue or associative array: its index or key.
-inline const DynObj* dynOf(const Obj* o) {
-    auto it = dynStore().find(o->sig);
+// The contents of a container object. A container that is itself an
+// element of a container (or of a class object's property) holds the id of
+// its contents, read each time: the element may have been replaced.
+inline Val dynRead(const Obj* e);
+inline bool isContainerType(const Type& t) {
+    const Type& c = t.getCanonicalType();
+    return c.isQueue() || c.isAssociativeArray() || c.kind == SymbolKind::DynamicArrayType;
+}
+inline DynObj* dynOfMut(const Obj* o) {
+    int id = o->sig;
+    if (o->kind == Obj::Dyn && o->parent) {   // an element that is a container
+        Val v = dynRead(o);
+        if (v.x || !v.v) return nullptr;
+        id = (int)v.v;
+    }
+    auto it = dynStore().find(id);
     return it == dynStore().end() ? nullptr : &it->second;
 }
+inline const DynObj* dynOf(const Obj* o) { return dynOfMut(o); }
+// The id whose change count wakes a container's readers.
+inline int dynSig(const Obj* o) {
+    if (o->kind == Obj::Dyn && o->parent) {
+        Val v = dynRead(o);
+        return v.x ? -1 : (int)v.v;
+    }
+    return o->sig;
+}
+// The element shape of a container of type t (37.18): integral, real,
+// string, class handle, unpacked struct or union, or another container.
+inline bool dynShape(Obj* o, const Type& t) {
+    const Type* ep = t.getCanonicalType().getArrayElementType();
+    if (!ep) return false;
+    const Type& e = ep->getCanonicalType();
+    int et = 0, w = 0, t05 = 0;
+    if (e.isIntegral() || e.isFloating() || e.isString()) {
+        et = varType(e, false, t05);
+        w = e.isFloating() || e.isString() ? 64 : (int)e.getBitWidth();
+    } else if (e.isClass()) { et = vpiClassVar; w = 64; }
+    else if (e.isUnpackedStruct() || e.isUnpackedUnion()) { et = e.isUnpackedStruct() ? vpiStructVar : vpiUnionVar; w = uWidth(e); }
+    else if (isContainerType(e)) { et = vpiArrayVar; w = 64; }
+    if (!et || w <= 0) return false;
+    o->t01 = et;   // the elements' type
+    o->w = w;
+    o->sgn = e.isIntegral() && e.isSigned();
+    o->real = e.isFloating();
+    o->str = e.isString();
+    o->ty = &e;
+    o->left = t.getCanonicalType().kind == SymbolKind::QueueType ? vpiQueueArray : t.getCanonicalType().isAssociativeArray() ? vpiAssocArray : vpiDynamicArray;
+    return true;
+}
+// An element of a dynamic array, queue or associative array: its index or
+// key. An element that is itself a container is a container object.
 inline Obj* dynElemObj(const Obj* arr, const Val& key) {
     const DynObj* d = dynOf(arr);
     std::string k = d ? (d->strKey ? v_str(key) : std::to_string(d->kind == 2 ? d->key(key).i : v_to_i64(key))) : "";
     auto& slot = st().dynElems[{arr, k}];
     if (!slot) {
-        slot = mkObj(Obj::DynElem, arr->type == vpiArrayVar ? arr->t01 : arr->type);
+        bool cont = arr->ty && isContainerType(*arr->ty);
+        slot = mkObj(cont ? Obj::Dyn : Obj::DynElem, arr->type == vpiArrayVar ? arr->t01 : arr->type);
         slot->parent = arr;
         slot->sig = arr->sig;
         slot->cval = key;
+        slot->idx = d && !d->strKey && d->kind != 2 ? (int)v_to_i64(key) : -1;
+        if (cont) {
+            if (!dynShape(slot, *arr->ty)) slot->t01 = 0;
+            slot->type = vpiArrayVar;
+            return slot;
+        }
         slot->w = arr->w;
         slot->real = arr->real;
         slot->str = arr->str;
         slot->sgn = arr->sgn;
         slot->ty = arr->ty;
-        slot->idx = d && !d->strKey && d->kind != 2 ? (int)v_to_i64(key) : -1;
     }
     return slot;
 }
@@ -67,17 +120,18 @@ inline Val dynRead(const Obj* e) {
     return v;
 }
 inline bool dynWrite(const Obj* e, const Val& v) {
-    auto it = dynStore().find(e->parent->sig);
-    if (it == dynStore().end()) return false;
-    DynObj& d = it->second;
+    DynObj* dp = dynOfMut(e->parent);
+    int cs = dynSig(e->parent);
+    if (!dp || cs < 0) return false;
+    DynObj& d = *dp;
     if (d.kind == 2) d.map[d.key(e->cval)] = v;
     else {
         int64_t k = v_to_i64(e->cval);
         if (e->cval.x || k < 0 || k >= (int64_t)d.vec.size()) return false;
         d.vec[(size_t)k] = v;
     }
-    Val c = S.get(e->parent->sig);   // the container's change count: its readers wake up
-    S.set(e->parent->sig, make((c.x ? 0 : c.v) + 1, 0, 64));
+    Val c = S.get(cs);   // the container's change count: its readers wake up
+    S.set(cs, make((c.x ? 0 : c.v) + 1, 0, 64));
     return true;
 }
 inline void dynElems(const Obj* arr, std::vector<vpiHandle>& items) {
@@ -91,26 +145,21 @@ inline void dynElems(const Obj* arr, std::vector<vpiHandle>& items) {
     }
     for (size_t i = 0; i < d->vec.size(); i++) items.push_back(H(dynElemObj(arr, make(i, 0, 64))));
 }
-// A dynamic array, queue or associative array variable of integral, real or
-// string elements: a vpiArrayVar whose elements change as the simulation runs.
+// A dynamic array, queue or associative array variable: a vpiArrayVar
+// whose elements change as the simulation runs.
 inline Obj* containerObj(const Symbol* s, const Type& t) {
     auto dm = dynMap().find(s);   // the container's handle signal (lower.hpp)
     int sg = dm == dynMap().end() ? -1 : dm->second;
     if (sg < 0) return nullptr;
-    const Type& e = t.getArrayElementType()->getCanonicalType();
-    if (!e.isIntegral() && !e.isFloating() && !e.isString()) return nullptr;
-    int t05 = 0, et = varType(e, false, t05);
-    if (!et) return nullptr;
     Obj* o = mkObj(Obj::Dyn, vpiArrayVar);
-    o->t01 = et;   // the elements' type
+    if (!dynShape(o, t)) return nullptr;   // (the object is kept; it is never handed out)
     o->sig = sg;
-    o->w = e.isFloating() || e.isString() ? 64 : (int)e.getBitWidth();
-    o->sgn = e.isSigned();
-    o->real = e.isFloating();
-    o->str = e.isString();
-    o->ty = &e;
-    o->left = t.kind == SymbolKind::QueueType ? vpiQueueArray : t.isAssociativeArray() ? vpiAssocArray : vpiDynamicArray;
     return o;
+}
+// The element (or member of one) a struct member of an element is in.
+inline const Obj* dynRoot(const Obj* o) {
+    while (o && o->kind == Obj::Bit) o = o->parent;
+    return o && o->kind == Obj::DynElem ? o : nullptr;
 }
 
 // ---- class objects (37.29) ----
@@ -135,7 +184,7 @@ inline const Type* dynClass(int base) {
 }
 // The object a class variable refers to now; null for a null handle.
 inline Obj* classObjOf(const Obj* var) {
-    Val h = S.get(var->sig);
+    Val h = var->kind == Obj::DynElem ? dynRead(var) : S.get(var->sig);   // a variable, or an element of a container
     if (h.x || !h.v) return nullptr;
     auto& slot = st().classObjs[(int64_t)h.v];
     if (!slot) {

@@ -8,11 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
-- `mlint`: `NAME018` (Verible dff-name-style: a register written in
-  `always_ff` whose name does not match `name.dff`, default
-  `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
-  declaration that hides one of the same name in an enclosing scope). Both
-  off by default.
+- VPI containers of structs, classes and containers (37.18): an element of
+  a queue, dynamic or associative array of unpacked structs is a
+  `vpiStructVar` whose members read and write the element; one of class
+  handles gives its object through `vpiClassObj`; one that is itself a
+  container is a `vpiArrayVar` with its own size and elements.
+  `tests/spec/37.18-vpi-nested-containers.sv`.
 - VPI instance arrays (37.11): `vpi_iterate(vpiModuleArray /
   vpiInterfaceArray / vpiProgramArray / vpiPrimitiveArray /
   vpiInstanceArray, module)`, an array's name, size, ranges and elements,
@@ -29,6 +30,11 @@ Spec references are IEEE 1800-2023 clauses.
   answers), and an acknowledge read back through logic (an FSM) counts.
   Checked by simulation on pulp common_cells `cdc_2phase`, `cdc_4phase`,
   `cdc_fifo_2phase` and `cdc_fifo_gray`: no assertion fails.
+- `mlint`: `NAME018` (Verible dff-name-style: a register written in
+  `always_ff` whose name does not match `name.dff`, default
+  `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
+  declaration that hides one of the same name in an enclosing scope). Both
+  off by default.
 
 ### Fixed
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
