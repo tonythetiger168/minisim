@@ -1122,6 +1122,8 @@ Spec references are IEEE 1800-2023 clauses.
   abstract (ports and what the block does with them, parameters, open
   findings); `-abstract` checks the top against it without the block's RTL
   (rules `ABS001`..`ABS004`); `-bbox` makes modules black boxes.
+- `mlint -html FILE`: a self-contained report page with counts by severity
+  and rule, the source around each finding, and filters.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar

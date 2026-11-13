@@ -118,6 +118,7 @@ void usage() {
                  "  -waivers FILE    the same format; by habit the file with the waive lines\n"
                  "  -show-waived     also print the waived findings, with the reason\n"
                  "  -json FILE       write the findings (waived ones too) as JSON\n"
+                 "  -html FILE       write a self-contained report page: counts, filters, source around each finding\n"
                  "  -abstract-out F  write the top block's abstract (ports, open findings) for the SoC flow\n"
                  "  -abstract FILE   check the top against a block abstract, without the block's RTL\n"
                  "  -bbox PATTERN    treat matching modules as black boxes: nothing inside is reported\n"
@@ -237,6 +238,100 @@ void printText(std::ostream& os, const std::vector<Final>& fs, const lintcfg::Co
         if (!w.hits) os << "mlint: " << w.origin << ": this waiver matched nothing; remove it\n";
 }
 
+// -html: one self-contained page (no server, no network): counts by severity
+// and rule, every finding with the source lines around it, a filter box, and
+// clicks on a rule or a severity to show only those.
+bool writeHtml(const std::string& path, const std::vector<Final>& fs) {
+    std::ofstream os(path);
+    if (!os) return false;
+    using lintcfg::jsonStr;
+    // "</script>" must not appear inside the data.
+    auto js = [&](std::string_view t) {
+        std::string q = jsonStr(t), o;
+        for (size_t i = 0; i < q.size(); i++) {
+            if (q[i] == '<' && i + 1 < q.size() && q[i + 1] == '/') o += "<\\";
+            else o += q[i];
+        }
+        return o;
+    };
+    std::map<std::string, std::vector<std::string>> files;
+    auto lines = [&](const std::string& f) -> const std::vector<std::string>& {
+        auto it = files.find(f);
+        if (it != files.end()) return it->second;
+        std::vector<std::string> v;
+        std::ifstream in(f);
+        for (std::string l; std::getline(in, l);) v.push_back(l);
+        return files[f] = std::move(v);
+    };
+    os << R"HTML(<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>mlint report</title>
+<style>
+body{font:14px system-ui,sans-serif;margin:0;color:#1d1d1f;background:#fafafa}
+header{padding:16px 24px;background:#fff;border-bottom:1px solid #ddd}
+h1{font-size:18px;margin:0 0 8px}
+.tiles{display:flex;gap:12px;flex-wrap:wrap}
+.tile{padding:8px 14px;border:1px solid #ddd;border-radius:8px;background:#fff;cursor:pointer}
+.tile b{font-size:20px;display:block}
+.tile.on{outline:2px solid #3366cc}
+main{display:grid;grid-template-columns:260px minmax(0,1fr);gap:16px;padding:16px 24px}
+table{border-collapse:collapse;width:100%;background:#fff}
+td,th{padding:4px 8px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+tr.rule{cursor:pointer}tr.rule.on{background:#e8eefb}
+.f{border:1px solid #e3e3e3;border-radius:8px;background:#fff;margin-bottom:10px}
+.f .h{padding:6px 10px;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.sev{font-weight:600;text-transform:uppercase;font-size:11px;padding:1px 6px;border-radius:4px}
+.error{background:#fde2e1;color:#a4161a}.warning{background:#fff1d6;color:#8a5300}.info{background:#e3effd;color:#1b4f9c}
+.waived{background:#eee;color:#666}
+.loc{font-family:ui-monospace,monospace;color:#555}
+pre{margin:0;padding:6px 10px;background:#f6f6f6;border-top:1px solid #eee;overflow:auto;font-size:12px}
+pre .hl{background:#fff3b0;display:block}
+#q{padding:6px 10px;width:320px;border:1px solid #ccc;border-radius:6px}
+.msg{flex-basis:100%}
+.reason{color:#666;font-style:italic}
+</style></head><body>
+<header><h1>mlint report</h1><div class="tiles" id="tiles"></div>
+<p><input id="q" placeholder="filter: text, file, rule"> <label><input type="checkbox" id="sw"> show waived</label></p></header>
+<main><div><table id="rules"><thead><tr><th>rule</th><th>group</th><th>n</th></tr></thead><tbody></tbody></table></div>
+<div id="list"></div></main>
+<script>
+const F=[)HTML";
+    for (size_t i = 0; i < fs.size(); i++) {
+        const Final& x = fs[i];
+        const auto& L = lines(x.f.file);
+        size_t a = x.f.line > 2 ? x.f.line - 2 : 1, z = std::min(L.size(), x.f.line + 2);
+        std::string src;
+        for (size_t n = a; n <= z && n >= 1 && n <= L.size(); n++)
+            src += std::to_string(n) + (n == x.f.line ? "*" : " ") + L[n - 1] + "\n";
+        os << (i ? ",\n" : "\n") << "{f:" << js(x.f.file) << ",l:" << x.f.line << ",c:" << x.f.col
+           << ",r:" << js(x.f.rule) << ",g:" << js(lintcfg::groupOf(x.f.rule)) << ",s:" << js(lintcfg::sevName(x.sev))
+           << ",t:" << js(x.f.text) << ",w:" << (x.waived ? "1" : "0") << ",why:" << js(x.reason) << ",src:" << js(src)
+           << "}";
+    }
+    os << R"HTML(];
+let sev=null,rule=null;
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function draw(){
+  const q=document.getElementById('q').value.toLowerCase(),sw=document.getElementById('sw').checked;
+  const vis=F.filter(x=>(sw||!x.w)&&(!sev||(x.w?'waived':x.s)==sev)&&(!rule||x.r==rule)&&
+    (!q||(x.t+' '+x.f+' '+x.r).toLowerCase().includes(q)));
+  const cnt={error:0,warning:0,info:0,waived:0};F.forEach(x=>cnt[x.w?'waived':x.s]++);
+  document.getElementById('tiles').innerHTML=Object.keys(cnt).map(k=>
+    `<div class="tile ${sev==k?'on':''}" onclick="sev=sev=='${k}'?null:'${k}';draw()"><b>${cnt[k]}</b><span class="sev ${k}">${k}</span></div>`).join('');
+  const per={};F.filter(x=>sw||!x.w).forEach(x=>{per[x.r]=per[x.r]||{g:x.g,n:0};per[x.r].n++});
+  document.querySelector('#rules tbody').innerHTML=Object.keys(per).sort().map(r=>
+    `<tr class="rule ${rule==r?'on':''}" onclick="rule=rule=='${r}'?null:'${r}';draw()"><td>${r}</td><td>${per[r].g}</td><td>${per[r].n}</td></tr>`).join('');
+  document.getElementById('list').innerHTML=(vis.length?'':'<p>No findings.</p>')+vis.map(x=>{
+    const src=x.src?'<pre>'+x.src.split('\n').filter(l=>l).map(l=>{const hl=/^\d+\*/.test(l);
+      return hl?'<span class="hl">'+esc(l.replace('*',' '))+'</span>':esc(l)+'\n'}).join('')+'</pre>':'';
+    return `<div class="f"><div class="h"><span class="sev ${x.w?'waived':x.s}">${x.w?'waived':x.s}</span><b>${x.r}</b>
+      <span class="loc">${esc(x.f)}:${x.l}:${x.c}</span><span class="msg">${esc(x.t)}</span>${x.w?'<span class="reason">'+esc(x.why)+'</span>':''}</div>${src}</div>`}).join('');
+}
+document.getElementById('q').oninput=draw;document.getElementById('sw').onchange=draw;draw();
+</script></body></html>
+)HTML";
+    return bool(os);
+}
+
 bool writeJson(const std::string& path, const std::vector<Final>& fs) {
     std::ofstream os(path);
     if (!os) return false;
@@ -267,7 +362,7 @@ int main(int argc, char** argv) {
     bool werror = false, quiet = false, powerTopSet = false, showWaived = false, list = false, stats = false;
     std::string upfPath, powerTop, jsonPath, explainRule;
     std::vector<std::string> bboxPats, abstractIn;  // the SoC flow (lintsoc.hpp)
-    std::string abstractOut;
+    std::string abstractOut, htmlPath;
     unsigned threads = par::defaultThreads();
     FrontEnd fe;
     cdc::Options cdcOpt;
@@ -314,6 +409,7 @@ int main(int argc, char** argv) {
         if (a == "-show-waived") { showWaived = true; continue; }
         if (a == "-stats") { stats = true; continue; }
         if (a == "-json") { jsonPath = next("a file"); continue; }
+        if (a == "-html") { htmlPath = next("a file"); continue; }
         if (a == "-bbox") { bboxPats.push_back(next("a module name pattern")); continue; }
         if (a == "-abstract") { abstractIn.push_back(next("a block abstract")); continue; }
         if (a == "-abstract-out") { abstractOut = next("a file"); continue; }
@@ -551,6 +647,10 @@ int main(int argc, char** argv) {
     if (hidden)
         std::cout << "mlint: " << hidden << (hidden == 1 ? " finding" : " findings")
                   << " in protected code (details hidden)\n";
+    if (!htmlPath.empty() && !writeHtml(htmlPath, fs)) {
+        std::cerr << "mlint: cannot write '" << htmlPath << "'\n";
+        return 2;
+    }
     if (!jsonPath.empty() && !writeJson(jsonPath, fs)) {
         std::cerr << "mlint: cannot write '" << jsonPath << "'\n";
         return 2;

@@ -479,6 +479,12 @@ A waiver that matches nothing is reported, so stale waivers do not pile up.
  "summary": {"error": 0, "warning": 1, "info": 0, "waived": 0}}
 ```
 
+`-html FILE` writes one self-contained page (no server, no network) to
+read or pass on: counts by severity and by rule, each finding with the
+source lines around it, a filter box, and clicks on a severity or a rule
+that show only those. Waived findings are hidden until "show waived" is
+ticked, and then carry their reason.
+
 ## Speed
 
 mlint uses every logical CPU by default; `-threads N` sets the count

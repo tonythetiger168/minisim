@@ -360,3 +360,11 @@ execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/rules/soc.sv ${SRC}/tests/lin
 if(out MATCHES "blk.sv")
   message(FATAL_ERROR "-bbox: findings inside the black box:\n${out}")
 endif()
+
+# -html: one page with the findings and their source.
+set(page ${CMAKE_CURRENT_BINARY_DIR}/mlint_report.html)
+run(rules/formal.sv "-top;fml;-only;formal;-q;-html;${page}")
+file(READ ${page} html)
+if(NOT html MATCHES "mlint report" OR NOT html MATCHES "FML002" OR NOT html MATCHES "mem\\[wild\\] <= d")
+  message(FATAL_ERROR "-html: the page lacks the findings or their source")
+endif()
