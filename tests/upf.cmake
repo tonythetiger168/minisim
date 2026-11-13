@@ -44,6 +44,14 @@ foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr sour
     message(FATAL_ERROR "${t}: ${rc}\n--- got\n${out}${err}--- want\n${want}")
   endif()
 endforeach()
+# VHDL models on supply nets through the VHDL tables of Annex B (B.2 to
+# B.5, B.10, B.12).
+execute_process(COMMAND ${MSIM} ${D}/vct_vhdl.vhd ${D}/vct_vhdl.sv -top tb -upf ${D}/vct_vhdl.upf
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ ${D}/vct_vhdl.out want)
+if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
+  message(FATAL_ERROR "vct_vhdl: ${rc}\n--- got\n${out}${err}--- want\n${want}")
+endif()
 # A C model (a SystemC or TLM model, 5.14) reads power states through
 # include/msim_upf.h.
 execute_process(COMMAND ${MSIM} ${D}/syslevel.sv ${D}/syslevel.c -upf ${D}/syslevel.upf

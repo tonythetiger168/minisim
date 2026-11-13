@@ -42,6 +42,18 @@
 #include <utility>
 #include <vector>
 using namespace std;
+
+// msim -compile builds the kernel once into an object of its own (msim.cpp
+// kernelObject) and each generated file defines MINISIM_CLIENT: the large,
+// rarely inlined kernel functions marked MSIM_KDEF are then only declared
+// there, so a C++ build of a design does not compile them again. The
+// kernel object defines MINISIM_KERNEL_TU and emits every one of them; any
+// other program that includes this file keeps them inline.
+#if defined(MINISIM_KERNEL_TU)
+#define MSIM_KDEF
+#else
+#define MSIM_KDEF inline
+#endif
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
@@ -93,7 +105,11 @@ inline int defaultThreads() {
     int n = cpuTopo().fastCores();
     return n < 1 ? 1 : (n > 8 ? 8 : n);
 }
-inline int maxThreads() { return std::max(1, cpuTopo().logical()); }
+#ifdef MINISIM_CLIENT
+int maxThreads();
+#else
+MSIM_KDEF int maxThreads() { return std::max(1, cpuTopo().logical()); }
+#endif
 // Pin pool thread k to cpuTopo().order[k]: the same items of a batch then
 // stay in the same core's cache, and N threads sit on N distinct physical
 // cores. -1 (default): pin unless under a hypervisor, where a pinned thread
@@ -623,46 +639,7 @@ struct Sim {
     // `seqTargets`: the fixed NBA targets of each clocked process (an NBA whose
     // target is chosen at run time falls back to the serial path by itself).
     void buildPartitions(const vector<vector<int>>& combOuts, const vector<vector<int>>& combIns,
-                         const vector<int>& seqTargets) {
-        size_t ns = sigs.size();
-        combOf.resize(ns);
-        seqOf.resize(ns);
-        vector<int> up(ns);
-        for (size_t i = 0; i < ns; i++) up[i] = (int)i;
-        auto find = [&](int x) { while (up[x] != x) x = up[x] = up[up[x]]; return x; };
-        auto unite = [&](int a, int b) { a = find(a); b = find(b); if (a != b) up[max(a, b)] = min(a, b); };
-        vector<char> owned(ns, 0);
-        for (auto& o : combOuts) for (int x : o) owned[x] = 1;
-        for (int x : seqTargets) owned[x] = 1;
-        for (size_t r = 0; r < combOuts.size(); r++) {
-            int first = -1;
-            for (int x : combOuts[r]) { if (first < 0) first = x; else unite(first, x); }
-            for (int x : combIns[r])
-                if (owned[x]) { if (first < 0) first = x; else unite(first, x); }
-        }
-        vector<int> id(ns, -1);
-        parts.clear();
-        sigPart.assign(ns, -1);
-        for (size_t x = 0; x < ns; x++) {
-            if (!owned[x]) continue;
-            int root = find((int)x);
-            if (id[root] < 0) { id[root] = (int)parts.size(); parts.emplace_back(); }
-            sigPart[x] = id[root];
-            parts[id[root]].written.push_back((int)x);
-        }
-        combLocal.assign(combs.size(), -1);
-        for (size_t r = 0; r < combOuts.size(); r++) {
-            if (combOuts[r].empty()) continue;
-            Part& pt = parts[sigPart[combOuts[r][0]]];
-            combLocal[r] = (int)pt.combs.size();
-            pt.combs.push_back((int)r);
-        }
-        for (auto& pt : parts) {
-            pt.pend.assign(pt.combs.size(), 0);
-            for (int x : pt.written)
-                if ((size_t)x < seqOf.size() && !seqOf[x].empty()) pt.edgeSource = true;
-        }
-    }
+                         const vector<int>& seqTargets);   // kernel object (MSIM_KDEF below)
     // set() inside a partition task: only this partition reads the signal.
     // Stores a value nothing watches (Instr::tmp): no change detection, no
     // wake-ups, safe from a clocked batch running in parallel.
@@ -978,23 +955,7 @@ struct Sim {
     // before its last change and the time of that change (Sig::p0, at).
     bool edgeTrack = false;
     uint64_t xAt = ~0ULL;   // the last time step in which bit 0 of a signal changed from or to x (kept with edgeTrack)
-    int sig(const string& n, int w, bool net = false) {
-        self = this;
-        // An unpacked array element is named "m[3]". The VCD leaves memories
-        // out, as $dumpvars does by default (21.7.1.2).
-        // A name with '$' is internal (an event's last-trigger time).
-        // A variable starts at X and a net at Z, across every limb. Widths of
-        // 64 or less keep the single-word initial value they had before.
-        Val init = net ? allz(w) : (w > 64 ? allx(w) : Val{});
-        // Only the last name component decides "array element": u.m[3] is
-        // one, blk[2].x (a signal in a generate block) is not.
-        size_t dot = n.rfind('.');
-        bool elem = n.find('[', dot == string::npos ? 0 : dot + 1) != string::npos;
-        sigs.push_back({n, w, init, {}, net, elem || n.find('$') != string::npos});
-        if (n.starts_with("_xp$")) edgeTrack = true;   // a temporary of msim -xprop: the design asks about edges
-        waiters.emplace_back();
-        return (int)sigs.size() - 1;
-    }
+    int sig(const string& n, int w, bool net = false);   // kernel object (MSIM_KDEF below)
     void spawn(Task t) { all.push_back(t.h); wheel[now].push_back(t.h); }
     // Resolved nets: each continuous driver owns a slot (starts as Z).
     // s0/s1 are that driver's strength spec. Omitted means strong0 and strong1,
@@ -1135,44 +1096,7 @@ struct Sim {
     // A trailing edge due before its leading edge cancels it, or with
     // showcancelled makes x between the two (from now with on-detect)
     // (30.7.4).
-    void pulseSchedule(int s, int slot, const Val& cur, const Val& v, Lim L, uint8_t style, uint8_t s0, uint8_t s1) {
-        L.rj = std::min(L.rj, L.d);
-        L.er = std::min(std::max(L.er, L.rj), L.d);
-        auto& q = pq[{s, slot}];
-        uint64_t tB = now + L.d;
-        if (q.empty()) {
-            if (L.d == 0) { applySlot(s, slot, v, s0, s1); return; }
-            pqPush(s, slot, tB, v, s0, s1);
-            return;
-        }
-        PEv lead = q.back();
-        Val before = q.size() > 1 ? q[q.size() - 2].v : cur;
-        bool detect = style & PS_DETECT;
-        if (tB < lead.t) {   // a negative pulse (30.7.4.2)
-            q.pop_back();
-            if (style & PS_SHOWCANCELLED) {
-                Val x = pulseX(before, lead.v);
-                if (detect) applyOrPush(s, slot, now, x, lead.s0, lead.s1);
-                else pqPush(s, slot, tB, x, lead.s0, lead.s1);
-                pqPush(s, slot, lead.t, v, s0, s1);
-                return;
-            }
-            if (!sameVal(v, before)) pqPush(s, slot, tB, v, s0, s1);
-            return;
-        }
-        uint64_t width = tB - lead.t;
-        if (width >= L.er) { pqPush(s, slot, tB, v, s0, s1); return; }
-        if (width >= L.rj) {   // filtered to x
-            Val x = pulseX(before, lead.v);
-            q.pop_back();
-            if (detect) applyOrPush(s, slot, now, x, lead.s0, lead.s1);
-            else pqPush(s, slot, lead.t, x, lead.s0, lead.s1);
-            pqPush(s, slot, tB, v, s0, s1);
-            return;
-        }
-        q.pop_back();   // rejected
-        if (!sameVal(v, before)) pqPush(s, slot, tB, v, s0, s1);
-    }
+    void pulseSchedule(int s, int slot, const Val& cur, const Val& v, Lim L, uint8_t style, uint8_t s0, uint8_t s1);   // kernel object (MSIM_KDEF below)
     void applyOrPush(int s, int slot, uint64_t t, const Val& v, uint8_t s0, uint8_t s1) {
         if (t == now) applySlot(s, slot, v, s0, s1);
         else pqPush(s, slot, t, v, s0, s1);
@@ -1241,22 +1165,7 @@ struct Sim {
         }
         return it->second;
     }
-    void shadowDrive(int net, int d) {
-        auto li = loadsOf.find(net);
-        if (li == loadsOf.end()) return;
-        const Drv& now_ = sigs[(size_t)net].drv[(size_t)d];
-        for (int load : li->second) {
-            Shadow& sh = shadowOf[load];
-            if ((size_t)d >= sh.drv.size()) continue;
-            auto fi = sh.from.find(d);
-            const Delay12& D = fi != sh.from.end() ? fi->second : sh.all;
-            int slot = PQ_SRC - d;
-            Val from = projected(load, slot, sh.drv[(size_t)d].v);
-            if (sameVal(from, now_.v)) continue;
-            Lim L = lim12(D, from, now_.v);
-            pulseSchedule(load, slot, sh.drv[(size_t)d].v, now_.v, L, 0, now_.s0, now_.s1);
-        }
-    }
+    void shadowDrive(int net, int d);   // kernel object (MSIM_KDEF below)
     // A gate or UDP driver with SDF DEVICE delays (32.4.1): inertial, by
     // the transition's delay.
     void driveGate(int s, int d, Val v, uint8_t s0, uint8_t s1, const uint64_t* dl) {
@@ -1332,44 +1241,7 @@ struct Sim {
     // same ports holds) are active; the delay is the smallest of theirs.
     // With no active path there is no path delay. An interconnect delay to
     // a load port comes after the path delay of a path ending there.
-    Lim pathLim(int s, const Val& from, const Val& to) {
-        Lim t;
-        auto pt = pathsTo.find(s);
-        if (pt != pathsTo.end()) {
-            auto& P = pathRecs();
-            auto& ids = pt->second;
-            auto on = [&](const PathRec& p) {
-                if (p.hasCond) return !pathCond || pathCond(p.condE);
-                if (!p.ifnone) return true;
-                for (int j : ids) {
-                    const PathRec& q = P[(size_t)j];
-                    if (q.hasCond && q.src == p.src && (!pathCond || pathCond(q.condE))) return false;
-                }
-                return true;
-            };
-            uint64_t latest = 0;
-            bool any = false;
-            for (int j : ids) {
-                const PathRec& p = P[(size_t)j];
-                if (!on(p)) continue;
-                uint64_t lc = lastChg[(size_t)p.src];
-                Lim d = lim12(p, from, to);
-                // 30.6: delays inside the module (gates, assignments) that
-                // already passed count toward the path delay; the larger of
-                // the two applies.
-                d.d = lc + d.d > now ? lc + d.d - now : 0;
-                if (!any || lc > latest || (lc == latest && d.d < t.d)) { latest = lc; t = d; any = true; }
-            }
-        }
-        if (!icDelay.empty()) {
-            auto ic = icDelay.find(s);
-            if (ic != icDelay.end()) {
-                Lim d = lim12(ic->second, from, to);
-                t.d += d.d; t.rj += d.rj; t.er += d.er;
-            }
-        }
-        return t;
-    }
+    Lim pathLim(int s, const Val& from, const Val& to);   // kernel object (MSIM_KDEF below)
     // Bidirectional switches (28.8). Nets joined by switches that are on form
     // one group; every net in it takes the resolution of all the group's
     // drivers. A driver seen through a switch is reduced (28.13.1): supply
@@ -1960,10 +1832,7 @@ struct Sim {
         }
         return cout.str();
     }
-    void printSys(const string& fmt, const vector<E>& args, bool newline = true) {
-        std::cout << sformat(fmt, args, [&](int s) { return get(s); });
-        if (newline) std::cout << '\n';
-    }
+    void printSys(const string& fmt, const vector<E>& args, bool newline = true);   // kernel object (MSIM_KDEF below)
     void strobe(const string& fmt, const vector<E>& args) { postq.push_back({false, fmt, args}); }
     void queueMon() {
         if (!mon.on || mon.queued) return;
@@ -2073,7 +1942,7 @@ struct Sim {
         return t;
     }();
     // One value line, no timestamp. Shared so $dumpvars and later changes match.
-    void writeVal(int s) { writeVal(s, sigs[s].val); }
+    void writeVal(int s);   // kernel object (MSIM_KDEF below)
     void writeVal(int s, const Val& val) {
         const int w = sigs[s].w;
 #ifdef MINISIM_FST
@@ -2548,28 +2417,7 @@ struct Sim {
             if (p.fe || p.ae) nv = v_insert(nv, v_slice(sigs[s].val, p.hi, p.lo), p.hi, p.lo);
         return nv;
     }
-    void applyHold(int s) {
-        auto it = holds.find(s);
-        if (it == holds.end()) return;
-        auto rd = [&](int x) { return get(x); };
-        const E& e = it->second.fe ? it->second.fe : it->second.ae;
-        uint8_t fl = sigs[s].fl;
-        if (e) {
-            Val v = eval(e, rd);
-            sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
-            set(s, v);
-            sigs[s].fl = fl;
-            return;
-        }
-        Val v = sigs[s].val;
-        for (auto& p : it->second.parts) {
-            const E& pe = p.fe ? p.fe : p.ae;
-            if (pe) v = v_insert(v, eval(pe, rd), p.hi, p.lo);
-        }
-        sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
-        set(s, v);
-        sigs[s].fl = fl;
-    }
+    void applyHold(int s);   // kernel object (MSIM_KDEF below)
     // Recompute the flags of s from its holds.
     void holdFlags(int s, const Hold& h) {
         sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
@@ -3001,59 +2849,248 @@ struct Sim {
         for (auto& t : ts) spawn(t);
         run(~0ULL, false);
     }
-    void run(uint64_t end, bool start = true) {
-        if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); if (!objViews.empty()) rare = true; }
-        if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
-        while (!wheel.empty() && !finished) {
-            auto it = wheel.begin();
-            if (it->first > end) break;
-            uint64_t t = it->first;
-            bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t)) ||
-                       !active.empty() || !seqq.empty() || !nbaq.empty();   // work queued between slots (msim -i: force, deposit)
-            for (auto h : it->second)
-                if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
-            wheel.erase(it);
-            if (!any) continue;   // only disabled processes were waiting here
-            now = t;
-            g_simTime = now;
-            if (!freeVars.empty() && now && now != freeAt) { freeStep(); freeAt = now; }   // active free checker variables (17.7.2)
-            if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
-            if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
-                for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
-                sampledAt = now;
-            }
-            runLaterDrv();   // delayed continuous assignments and net delays due now (active region)
-            if (auto ln = laterNba.find(now); ln != laterNba.end()) {
-                for (auto& n : ln->second) nbaq.push_back(n);
-                laterNba.erase(ln);
-            }
-            for (;;) {                                         // one time slot
-                if (!active.empty()) {                         // active
-                    Handle h = active.front(); active.pop_front();
-                    if (!h.done()) ++resumeN;   // VPI cbEnterThread
-                    if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
-                    else if (!h.done()) h.resume();
-                } else if (!seqq.empty()) {                    // clocked processes, one parallel batch
-                    runSeqs();
-                } else if (!combq.empty()) {                   // levelized combinational logic
-                    runCombs();
-                } else if (!inactive.empty()) {                // inactive (#0)
-                    for (auto h : inactive) active.push_back(h);
-                    inactive.clear();
-                } else if (!nbaq.empty() || vpiNbaPend) {      // NBA
-                    if (vpiNbaPend && vpiRegion(VR_NBA)) continue;   // cbNBASynch first (38.36.2)
-                    if (nbaq.empty()) continue;
-                    // Swap, not move: both buffers keep their capacity across slots.
-                    nbaRun.clear();
-                    nbaRun.swap(nbaq);
-                    timedNba();
-                } else if (rare || !postq.empty()) {           // observed, reactive set, postponed
-                    if (!slotTail()) break;                    // then, and only then, time advances
-                } else break;
-            }
+    void run(uint64_t end, bool start = true);   // kernel object (MSIM_KDEF below)
+};
+
+// ---- kernel-object members (out of the class: built once in the kernel object, msim -compile) ----
+#ifndef MINISIM_CLIENT
+MSIM_KDEF void Sim::run(uint64_t end, bool start) {
+    if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); if (!objViews.empty()) rare = true; }
+    if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
+    while (!wheel.empty() && !finished) {
+        auto it = wheel.begin();
+        if (it->first > end) break;
+        uint64_t t = it->first;
+        bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t)) ||
+                   !active.empty() || !seqq.empty() || !nbaq.empty();   // work queued between slots (msim -i: force, deposit)
+        for (auto h : it->second)
+            if (dead.empty() || !dead.count(h.address())) { active.push_back(h); any = true; }
+        wheel.erase(it);
+        if (!any) continue;   // only disabled processes were waiting here
+        now = t;
+        g_simTime = now;
+        if (!freeVars.empty() && now && now != freeAt) { freeStep(); freeAt = now; }   // active free checker variables (17.7.2)
+        if (vpiRegion) vpiRegion(VR_START);   // cbNextSimTime, cbAtStartOfSimTime, cbAfterDelay
+        if (!shadows.empty() && now && now != sampledAt) {   // preponed (4.4.2.1): once per time step
+            for (auto [src, sh] : shadows) sigs[sh].val = sigs[src].val;
+            sampledAt = now;
+        }
+        runLaterDrv();   // delayed continuous assignments and net delays due now (active region)
+        if (auto ln = laterNba.find(now); ln != laterNba.end()) {
+            for (auto& n : ln->second) nbaq.push_back(n);
+            laterNba.erase(ln);
+        }
+        for (;;) {                                         // one time slot
+            if (!active.empty()) {                         // active
+                Handle h = active.front(); active.pop_front();
+                if (!h.done()) ++resumeN;   // VPI cbEnterThread
+                if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
+                else if (!h.done()) h.resume();
+            } else if (!seqq.empty()) {                    // clocked processes, one parallel batch
+                runSeqs();
+            } else if (!combq.empty()) {                   // levelized combinational logic
+                runCombs();
+            } else if (!inactive.empty()) {                // inactive (#0)
+                for (auto h : inactive) active.push_back(h);
+                inactive.clear();
+            } else if (!nbaq.empty() || vpiNbaPend) {      // NBA
+                if (vpiNbaPend && vpiRegion(VR_NBA)) continue;   // cbNBASynch first (38.36.2)
+                if (nbaq.empty()) continue;
+                // Swap, not move: both buffers keep their capacity across slots.
+                nbaRun.clear();
+                nbaRun.swap(nbaq);
+                timedNba();
+            } else if (rare || !postq.empty()) {           // observed, reactive set, postponed
+                if (!slotTail()) break;                    // then, and only then, time advances
+            } else break;
         }
     }
-};
+}
+
+MSIM_KDEF void Sim::printSys(const string& fmt, const vector<E>& args, bool newline) {
+    std::cout << sformat(fmt, args, [&](int s) { return get(s); });
+    if (newline) std::cout << '\n';
+}
+
+MSIM_KDEF void Sim::applyHold(int s) {
+    auto it = holds.find(s);
+    if (it == holds.end()) return;
+    auto rd = [&](int x) { return get(x); };
+    const E& e = it->second.fe ? it->second.fe : it->second.ae;
+    uint8_t fl = sigs[s].fl;
+    if (e) {
+        Val v = eval(e, rd);
+        sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
+        set(s, v);
+        sigs[s].fl = fl;
+        return;
+    }
+    Val v = sigs[s].val;
+    for (auto& p : it->second.parts) {
+        const E& pe = p.fe ? p.fe : p.ae;
+        if (pe) v = v_insert(v, eval(pe, rd), p.hi, p.lo);
+    }
+    sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
+    set(s, v);
+    sigs[s].fl = fl;
+}
+MSIM_KDEF void Sim::buildPartitions(const vector<vector<int>>& combOuts, const vector<vector<int>>& combIns,
+                     const vector<int>& seqTargets) {
+    size_t ns = sigs.size();
+    combOf.resize(ns);
+    seqOf.resize(ns);
+    vector<int> up(ns);
+    for (size_t i = 0; i < ns; i++) up[i] = (int)i;
+    auto find = [&](int x) { while (up[x] != x) x = up[x] = up[up[x]]; return x; };
+    auto unite = [&](int a, int b) { a = find(a); b = find(b); if (a != b) up[max(a, b)] = min(a, b); };
+    vector<char> owned(ns, 0);
+    for (auto& o : combOuts) for (int x : o) owned[x] = 1;
+    for (int x : seqTargets) owned[x] = 1;
+    for (size_t r = 0; r < combOuts.size(); r++) {
+        int first = -1;
+        for (int x : combOuts[r]) { if (first < 0) first = x; else unite(first, x); }
+        for (int x : combIns[r])
+            if (owned[x]) { if (first < 0) first = x; else unite(first, x); }
+    }
+    vector<int> id(ns, -1);
+    parts.clear();
+    sigPart.assign(ns, -1);
+    for (size_t x = 0; x < ns; x++) {
+        if (!owned[x]) continue;
+        int root = find((int)x);
+        if (id[root] < 0) { id[root] = (int)parts.size(); parts.emplace_back(); }
+        sigPart[x] = id[root];
+        parts[id[root]].written.push_back((int)x);
+    }
+    combLocal.assign(combs.size(), -1);
+    for (size_t r = 0; r < combOuts.size(); r++) {
+        if (combOuts[r].empty()) continue;
+        Part& pt = parts[sigPart[combOuts[r][0]]];
+        combLocal[r] = (int)pt.combs.size();
+        pt.combs.push_back((int)r);
+    }
+    for (auto& pt : parts) {
+        pt.pend.assign(pt.combs.size(), 0);
+        for (int x : pt.written)
+            if ((size_t)x < seqOf.size() && !seqOf[x].empty()) pt.edgeSource = true;
+    }
+}
+
+MSIM_KDEF void Sim::pulseSchedule(int s, int slot, const Val& cur, const Val& v, Lim L, uint8_t style, uint8_t s0, uint8_t s1) {
+    L.rj = std::min(L.rj, L.d);
+    L.er = std::min(std::max(L.er, L.rj), L.d);
+    auto& q = pq[{s, slot}];
+    uint64_t tB = now + L.d;
+    if (q.empty()) {
+        if (L.d == 0) { applySlot(s, slot, v, s0, s1); return; }
+        pqPush(s, slot, tB, v, s0, s1);
+        return;
+    }
+    PEv lead = q.back();
+    Val before = q.size() > 1 ? q[q.size() - 2].v : cur;
+    bool detect = style & PS_DETECT;
+    if (tB < lead.t) {   // a negative pulse (30.7.4.2)
+        q.pop_back();
+        if (style & PS_SHOWCANCELLED) {
+            Val x = pulseX(before, lead.v);
+            if (detect) applyOrPush(s, slot, now, x, lead.s0, lead.s1);
+            else pqPush(s, slot, tB, x, lead.s0, lead.s1);
+            pqPush(s, slot, lead.t, v, s0, s1);
+            return;
+        }
+        if (!sameVal(v, before)) pqPush(s, slot, tB, v, s0, s1);
+        return;
+    }
+    uint64_t width = tB - lead.t;
+    if (width >= L.er) { pqPush(s, slot, tB, v, s0, s1); return; }
+    if (width >= L.rj) {   // filtered to x
+        Val x = pulseX(before, lead.v);
+        q.pop_back();
+        if (detect) applyOrPush(s, slot, now, x, lead.s0, lead.s1);
+        else pqPush(s, slot, lead.t, x, lead.s0, lead.s1);
+        pqPush(s, slot, tB, v, s0, s1);
+        return;
+    }
+    q.pop_back();   // rejected
+    if (!sameVal(v, before)) pqPush(s, slot, tB, v, s0, s1);
+}
+
+MSIM_KDEF void Sim::writeVal(int s) { writeVal(s, sigs[s].val); }
+
+MSIM_KDEF void Sim::shadowDrive(int net, int d) {
+    auto li = loadsOf.find(net);
+    if (li == loadsOf.end()) return;
+    const Drv& now_ = sigs[(size_t)net].drv[(size_t)d];
+    for (int load : li->second) {
+        Shadow& sh = shadowOf[load];
+        if ((size_t)d >= sh.drv.size()) continue;
+        auto fi = sh.from.find(d);
+        const Delay12& D = fi != sh.from.end() ? fi->second : sh.all;
+        int slot = PQ_SRC - d;
+        Val from = projected(load, slot, sh.drv[(size_t)d].v);
+        if (sameVal(from, now_.v)) continue;
+        Lim L = lim12(D, from, now_.v);
+        pulseSchedule(load, slot, sh.drv[(size_t)d].v, now_.v, L, 0, now_.s0, now_.s1);
+    }
+}
+
+MSIM_KDEF Sim::Lim Sim::pathLim(int s, const Val& from, const Val& to) {
+    Lim t;
+    auto pt = pathsTo.find(s);
+    if (pt != pathsTo.end()) {
+        auto& P = pathRecs();
+        auto& ids = pt->second;
+        auto on = [&](const PathRec& p) {
+            if (p.hasCond) return !pathCond || pathCond(p.condE);
+            if (!p.ifnone) return true;
+            for (int j : ids) {
+                const PathRec& q = P[(size_t)j];
+                if (q.hasCond && q.src == p.src && (!pathCond || pathCond(q.condE))) return false;
+            }
+            return true;
+        };
+        uint64_t latest = 0;
+        bool any = false;
+        for (int j : ids) {
+            const PathRec& p = P[(size_t)j];
+            if (!on(p)) continue;
+            uint64_t lc = lastChg[(size_t)p.src];
+            Lim d = lim12(p, from, to);
+            // 30.6: delays inside the module (gates, assignments) that
+            // already passed count toward the path delay; the larger of
+            // the two applies.
+            d.d = lc + d.d > now ? lc + d.d - now : 0;
+            if (!any || lc > latest || (lc == latest && d.d < t.d)) { latest = lc; t = d; any = true; }
+        }
+    }
+    if (!icDelay.empty()) {
+        auto ic = icDelay.find(s);
+        if (ic != icDelay.end()) {
+            Lim d = lim12(ic->second, from, to);
+            t.d += d.d; t.rj += d.rj; t.er += d.er;
+        }
+    }
+    return t;
+}
+
+MSIM_KDEF int Sim::sig(const string& n, int w, bool net) {
+    self = this;
+    // An unpacked array element is named "m[3]". The VCD leaves memories
+    // out, as $dumpvars does by default (21.7.1.2).
+    // A name with '$' is internal (an event's last-trigger time).
+    // A variable starts at X and a net at Z, across every limb. Widths of
+    // 64 or less keep the single-word initial value they had before.
+    Val init = net ? allz(w) : (w > 64 ? allx(w) : Val{});
+    // Only the last name component decides "array element": u.m[3] is
+    // one, blk[2].x (a signal in a generate block) is not.
+    size_t dot = n.rfind('.');
+    bool elem = n.find('[', dot == string::npos ? 0 : dot + 1) != string::npos;
+    sigs.push_back({n, w, init, {}, net, elem || n.find('$') != string::npos});
+    if (n.starts_with("_xp$")) edgeTrack = true;   // a temporary of msim -xprop: the design asks about edges
+    waiters.emplace_back();
+    return (int)sigs.size() - 1;
+}
+#endif
 
 // A simv built as several files (msim -compile of a large design) defines S
 // once, in design.cpp: the other files do not compile its constructor and

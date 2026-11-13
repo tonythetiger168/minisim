@@ -13,6 +13,9 @@ Spec references are IEEE 1800-2023 clauses.
   and variables it reads (memories too) take their current values, so
   operations, variable selects, conditionals, concatenations and calls of
   the design's functions have a value. `tests/spec/37.35-vpi-expr-values.sv`.
+- `msim -upf` with VHDL: the VHDL value conversion tables of IEEE 1801-2024
+  Annex B (`VHDL_SL2UPF`, `UPF2VHDL_SL`, the `_GNDZERO` ones, `VHDL_TIED_HI`,
+  `VHDL_TIED_LO`) connect `std_logic` ports of VHDL entities to supply nets.
 - mvplat boots Linux: `-bios`, `-kernel`, `-initrd`, `-append`, `-dtb` as on
   QEMU's virt board, a device tree made from the platform (`-dump-dtb`), and
   OpenSBI's `fw_dynamic` hand-off. OpenSBI 1.7 and Ubuntu 24.04's stock
@@ -69,6 +72,13 @@ Spec references are IEEE 1800-2023 clauses.
   `(_q|_ff|_reg|_r)[0-9]*$`) and `NAME019` (Verible instance-shadowing: a
   declaration that hides one of the same name in an enclosing scope). Both
   off by default.
+
+### Changed
+- `msim -compile` builds the kernel once into a cached object
+  (`$MSIM_KCACHE`, default `~/.cache/msim`) that every `simv` links, instead
+  of compiling it into each design: a small design's C++ build goes from
+  21 s to 8 s and OpenTitan Ibex from 68 s to 50 s. `MSIM_NOKOBJ=1` turns it
+  off.
 
 ### Fixed
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
