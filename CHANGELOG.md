@@ -51,6 +51,11 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
+  `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
+  TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
+  context per hart. The riscv-tests run grows to 144 programs (rv32si, and
+  the `v` environment with paging on), all passing.
 - The `minisimCore` package installs `compat.hpp`, so a tool built against the
   installed kernel can register its vendor command-line rules too.
 - UPF `use_interface_cell -force_function` (IEEE 1801-2024 6.62) is
@@ -82,6 +87,14 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI drivers and loads as 37.16 and 37.46 read: of a bit or part select
+  (only what touches those bits), primitive terminals, and the ports of
+  the net's own module as local drivers (inputs) and loads (outputs).
+- VPI: `force` and procedural `assign` statements in effect are drivers
+  (a net: forces only) and loads of what they read (37.16, 37.21).
+- VPI `cbEndOfObject` (38.36.1) on a thread or frame runs when it ends;
+  `cbReclaimObj` and `cbEndOfObject` on class objects register (msim never
+  reclaims class objects).
 - VPI assertion control as 39.5 reads: `vpiAssertionEnableStep` /
   `DisableStep` and `vpiAssertionKill` act on one attempt, named by its
   start time (`vpiAssertionClockSteps` accepted); kill no longer disables
@@ -101,6 +114,17 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiCovered` of an assertion needs an attempt, a success and no failure.
 - VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
   immediate assertion, or the boolean of a single-expression property.
+- UPF information model and Tcl queries (IEEE 1801-2024 clause 10, 11.1):
+  `upf_query_object_properties`, `upf_query_object_type`,
+  `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
+  phase 5 enforced after the first query (docs/LOWPOWER.md).
+- The UPF information model also holds abstract power sources, composite
+  domains, power state groups, state transitions, repeater strategies, power
+  models and attributes (IEEE 1801-2024 10.6.1, 10.6.3).
+- `find_objects` follows 1801-2024 6.33 in full: instances, ports and nets
+  by default, `-traverse_macros`, `-expand_to_bits`, transitive searches that
+  stop at leaf cells and macros, `-leaf_only` / `-non_leaf` for every object
+  type, and the glob forms of 6.33.2 (`[a-z]`, `\x`, `{a,b,c}`).
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -125,6 +149,10 @@ Spec references are IEEE 1800-2023 clauses.
   The engine is mcov's own, and it reads mcov's own databases.
   A database that does not exist is now a one-line error instead of a traceback.
 
+### Fixed
+- The `SV_TIED_HI`, `SV_TIED_LO`, `VHDL_TIED_HI` and `VHDL_TIED_LO` value
+  conversion tables are upf2hdl tables, as in IEEE 1801-2024 Annex B.
+
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
   IJTAG, EDT scan compression, logic BIST and failure diagnosis are `mdfti`,
@@ -145,6 +173,12 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- A for loop with a constant trip count in an always_comb or always @* block
+  is unrolled, as loops in clocked blocks already were, so the block runs as
+  straight code and can be split per output. On OpenTitan Ibex this saves 8%
+  of the instructions executed (`tests/spec/12.7.1-comb-loop-unroll.sv`).
+  The unroller also substitutes the loop variable into an indexed
+  part-select's base (`v[i*8 +: 8] = ...`).
 - The interpreter finds the matching item of a case statement with constant
   labels through a table instead of comparing label by label, and a `unique
   case` whose labels are enum names is no longer treated as possibly
@@ -727,6 +761,12 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `case ... inside` is merged: an item may match when its `==?`
+  or range compare is unknown. The merging code of a combinational block
+  now writes without change events and publishes each final value once, so
+  blocks that read each other no longer wake each other forever (the
+  CV32E40P decoder and controller hung at time 0). CV32E40P runs with all
+  753 `if` / `case` / edge constructs merged and the same result.
 - `-xprop`: a write to an element of a multidimensional array whose indexes
   have unknown bits (`m[r][c] <= d`) merges into every element the indexes
   may name. Before, only one-dimensional arrays did, and the write was
@@ -1261,6 +1301,23 @@ Spec references are IEEE 1800-2023 clauses.
   comments, package file names, explicit lifetimes and parameter types,
   range direction, macro names, short binary literals. Off by default; one
   task per file, same output at any `-threads`.
+- `mlint`: eight more rules after Verible's: `NAME015`..`NAME017` (interface
+  and constraint names, parameters named for what they disable), `SUS002`
+  (`void'(x.randomize())`), `SUS003` (`$psprintf`, `$random`, `$dist_*`),
+  `STY010`..`STY012` (string line continuations, a semicolon after a UVM
+  macro, `disable` of something other than an enclosing block).
+- `mlint` formal-assisted checks (`FML001`..`FML003`, `src/lintformal.hpp`):
+  dead `if`/`case` branches, indexes and part selects that can fall out of
+  range, and registers that never leave their reset value, each proved by
+  enumerating the values of the signals involved through single-driver nets
+  and the reachable values of small registers. Multithreaded; settings
+  `formal.max_bits` and `formal.reg_bits`.
+- `mlint` SoC flow (`src/lintsoc.hpp`): `-abstract-out` writes a block
+  abstract (ports and what the block does with them, parameters, open
+  findings); `-abstract` checks the top against it without the block's RTL
+  (rules `ABS001`..`ABS004`); `-bbox` makes modules black boxes.
+- `mlint -html FILE`: a self-contained report page with counts by severity
+  and rule, the source around each finding, and filters.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar

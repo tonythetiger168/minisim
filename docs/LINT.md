@@ -227,13 +227,96 @@ or single rules.
 | `STY007` | info | off | A parameter with no type | explicit-parameter-storage-type |
 | `STY008` | info | off | A packed dimension that counts up (`[0:7]`) | packed-dimensions-range-ordering |
 | `STY009` | info | off | An unpacked dimension that counts down (`[3:0]`) | unpacked-dimensions-range-ordering |
+| `STY010` | info | off | A string literal carried over the line with a backslash | forbid-line-continuations |
+| `STY011` | info | off | A semicolon after a UVM macro (`` `uvm_info(...); ``) | uvm-macro-semicolon |
+| `STY012` | info | off | `disable name` where the name is not a `begin` block around the statement | disable-statement |
+| `SUS002` | warning | off | `void'()` around `randomize()` or `uvm_hdl_read()` | void-cast |
+| `SUS003` | info | off | `$psprintf`, `$random`, `$srandom` or a `$dist_` function | invalid-system-task-function |
 | `NAME014` | warning | off | A macro name does not match `name.macro` | macro-name-style |
+| `NAME015` | warning | off | An interface name does not match `name.interface` | interface-name-style |
+| `NAME016` | warning | off | A constraint name does not match `name.constraint` | constraint-name-style |
+| `NAME017` | info | off | A parameter named for what it disables (`DisableFoo`) | positive-meaning-parameter-name |
 | `W009` | info | off | A sized binary literal with fewer digits than its width (`8'b101`) | undersized-binary-literal |
 
 Verible's suspicious-semicolon (`if (c);`) is slang's own `-Wempty-body`
 warning, which mlint already prints, and its always-comb, case-missing-default,
 generate-label and name-style rules are `SYN`, `CASE`, `STY` and `NAME`
 rules above.
+
+### Formal-assisted checks (`formal`)
+
+These rules answer questions about the values the logic can take, and only
+report what they prove. Each question is a few conditions over a few
+signals: the signals are enumerated over every value they can hold and each
+combination is evaluated by slang's own expression evaluator, so the
+results follow the language exactly.
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `FML001` | warning | on | An `if` condition or `case` item that can never be true where it stands: the enclosing conditions or the earlier branches rule it out (dead code) |
+| `FML002` | warning | on | An index or indexed part select (`a[i]`, `a[i +: 4]`) that can fall outside the array or vector on a path that reaches it; the message gives one such value and the signal values that produce it |
+| `FML003` | warning | on | A register that never leaves its reset value: no assignment after reset can change it |
+
+What makes the answers precise:
+
+- A net with a single continuous assignment is replaced by its driver, so
+  the free signals are the inputs and registers of the cone
+  (`assign idx = sel; ... mem[idx]` is checked against `sel`).
+- A register of up to `formal.reg_bits` bits (default 8) with a reset gets
+  the set of values it can reach from reset, by a fixed point over its
+  next-state assignments. A counter that wraps at 5 is known to stay below
+  6, so `mem[cnt]` on a 6-entry memory is not reported. The fixed point runs
+  on all threads.
+- A signal assigned again in the same block (a blocking assignment, a loop
+  body) drops the conditions that read it, so a stale condition never
+  proves anything.
+
+What they leave alone, by design:
+
+- A question that needs more than `formal.max_bits` free bits (default 16)
+  is not answered.
+- Code whose outcome a parameter decides (a condition, driver or register
+  that reads a parameter, or a driver inside a generate block) is not
+  reported: it is written for one configuration and is dead in another.
+- `else` and `default` branches that can never be taken are defensive code
+  and are not reported.
+- Values are two-state: X and Z are not enumerated. Register values are
+  those reachable after reset. Initial and final blocks, and blocks that
+  wait inside their body, are not checked.
+
+### SoC flow: block abstracts and black boxes (`soc`)
+
+Large designs are signed off a block at a time. Each block is checked on
+its own and writes an abstract; the top is then checked with the blocks as
+black boxes, without their RTL:
+
+```sh
+mlint blk.sv -top blk -abstract-out blk.abs.json        # block sign-off
+mlint top.sv -top top -abstract blk.abs.json            # top, no blk RTL
+```
+
+An abstract (`mlint-abstract-1`, JSON) holds the block's parameters, its
+ports (direction, packed width, unpacked dimensions) with what the block
+does with each one (an input it never reads, an output it never drives, an
+input it uses only as a clock, also through its children), and the findings
+left after waivers, counted by rule. At the top mlint writes an empty
+module for each abstract so the top elaborates, reports nothing inside it,
+and checks every instance's connections against what the block said:
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `ABS001` | warning | on | A block output the block never drives is connected at the top: it floats |
+| `ABS002` | info | on | The top drives a block input the block never reads (a constant tie-off is fine) |
+| `ABS003` | warning | on | A block clock input is left open or tied to a constant |
+| `ABS004` | warning | on | The block was signed off with errors or warnings not waived (once per block) |
+
+`-bbox PATTERN` (repeatable, glob on module names) makes modules black
+boxes without an abstract: their RTL is read so the top elaborates, but no
+finding inside them is reported.
+
+Port widths in an abstract are those of the block's default parameters; an
+instance that overrides a width parameter needs an abstract made with the
+same values (`-G` style overrides on the block run, or a wrapper).
 
 ### State machines (`fsm`)
 
@@ -343,7 +426,11 @@ Severities: an `error` finding makes mlint exit 1; a `warning` does with
 | `name.max_length` | `40` | `NAME010` |
 | `unused.ignore` | `^_?unused\|_unused$\|^_?nc_\|_nc$` (any case) | `UNU001`..`UNU005` |
 | `name.macro` | `^[A-Z_][A-Z0-9_]*$` | `NAME014` |
+| `name.interface` | `_if$` | `NAME015` |
+| `name.constraint` | `_c$` | `NAME016` |
 | `fmt.line_length` | `100` | `FMT001` |
+| `formal.max_bits` | `16` | `FML001`..`FML003`: free bits one question may enumerate |
+| `formal.reg_bits` | `8` | widest register that gets a reachable-value set |
 | `tb.modules` | empty | module names (globs) to treat as testbench code |
 
 Patterns are regular expressions (ECMAScript), matched anywhere in the name
@@ -391,6 +478,17 @@ A waiver that matches nothing is reported, so stale waivers do not pile up.
                "severity": "warning", "text": "...", "waived": false}],
  "summary": {"error": 0, "warning": 1, "info": 0, "waived": 0}}
 ```
+
+Where mlint knows the signal a finding is about, the finding also has
+`"signal"`, its hierarchical path. `mdebug -lint FILE` reads this file and
+shows the findings in its viewer, cross-probing to the source line and the
+signal's drivers, loads and schematic (docs/DEBUG.md, "Lint findings").
+
+`-html FILE` writes one self-contained page (no server, no network) to
+read or pass on: counts by severity and by rule, each finding with the
+source lines around it, a filter box, and clicks on a severity or a rule
+that show only those. Waived findings are hidden until "show waived" is
+ticked, and then carry their reason.
 
 ## Speed
 

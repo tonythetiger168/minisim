@@ -102,8 +102,18 @@ enum : uint32_t {
     MSTATUS_MPP = 3u << 11,
     MSTATUS_MPRV = 1u << 17,
     MSTATUS_TW = 1u << 21,
+    MSTATUS_SIE = 1u << 1,
+    MSTATUS_SPIE = 1u << 5,
+    MSTATUS_SPP = 1u << 8,
+    MSTATUS_SUM = 1u << 18,
+    MSTATUS_MXR = 1u << 19,
+    MSTATUS_TVM = 1u << 20,
+    MSTATUS_TSR = 1u << 22,
+    // The view of mstatus that sstatus is.
+    SSTATUS_MASK = (1u << 1) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19),
 };
-enum : uint32_t { MIP_MSIP = 1u << 3, MIP_MTIP = 1u << 7, MIP_MEIP = 1u << 11 };
+enum : uint32_t { MIP_MSIP = 1u << 3, MIP_MTIP = 1u << 7, MIP_MEIP = 1u << 11,
+                  MIP_SSIP = 1u << 1, MIP_STIP = 1u << 5, MIP_SEIP = 1u << 9 };
 
 struct Hart {
     unsigned id = 0;
@@ -115,6 +125,16 @@ struct Hart {
     uint32_t mstatus = 0, mie = 0, mip = 0, mtvec = 0, mscratch = 0, mepc = 0, mcause = 0,
              mtval = 0, mcounteren = 0, mcountinhibit = 0;
     uint32_t pmpcfg[4] = {}, pmpaddr[16] = {};
+    // Supervisor mode.
+    uint32_t stvec = 0, sscratch = 0, sepc = 0, scause = 0, stval = 0, satp = 0, scounteren = 0;
+    uint32_t medeleg = 0, mideleg = 0;
+    uint32_t mipSw = 0;  // SSIP, STIP, SEIP as software wrote them
+    // Sv32 translations, by virtual page (direct mapped); flushed by
+    // SFENCE.VMA and by a write to satp.
+    struct Tlb { uint32_t vpn, ppn; uint8_t pte; bool valid; };
+    static constexpr unsigned TLB_SIZE = 256;
+    Tlb tlb[TLB_SIZE] = {};
+    void flushTlb() { for (auto& t : tlb) t.valid = false; }
     // The active PMP entries, decoded from the CSRs in priority order
     // (Machine::pmpDecode). pmpLock: some entry binds machine mode too.
     struct PmpRegion { uint64_t lo, hi; uint8_t cfg; };
@@ -142,6 +162,7 @@ struct Hart {
         uint32_t pc, insn, raw;
         int32_t immI;
         uint8_t len, op, rd, f3, rs1, rs2, f7;
+        bool xlat;  // fetched through the MMU (the same pc means another page bare)
     };
     static constexpr unsigned DC_SIZE = 8192;
     std::unique_ptr<Decoded[]> dc{new Decoded[DC_SIZE]};

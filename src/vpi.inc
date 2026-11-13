@@ -129,6 +129,9 @@ struct State {
     struct Put { const Obj* o; Val v; Obj* ev; };
     std::multimap<uint64_t, Put> puts;
     std::vector<Cb*> holdCbs;             // cbForce, cbRelease, cbAssign, cbDeassign (38.36.1)
+    // The force and assign statements in effect (37.16 details 14, 15): by
+    // signal, force or assign, bits (hi -1: all), the statement's source.
+    std::map<std::tuple<int, bool, int, int>, std::pair<uint32_t, uint32_t>> holdSrcs;
     std::map<std::pair<uint32_t, uint32_t>, std::vector<Cb*>> stmtCbs;   // cbStmt: by source file id and line
     std::vector<Cb*> tchkCbs;             // cbTchkViolation (38.36.1)
     std::vector<Cb*> createCbs, sizeCbs;  // cbCreateObj, cbSizeChange (38.36.1)
@@ -1061,6 +1064,12 @@ inline void fire(Cb* c) {
 // unless vpiSuppressVal, its value after the change.
 inline void onHold(int sg, bool force, bool on, int hi, int lo) {
     auto& s = st();
+    if (on) {
+        if (S.holdSrc.line) s.holdSrcs[{sg, force, hi, lo}] = {S.holdSrc.file, S.holdSrc.line};
+        else s.holdSrcs.erase({sg, force, hi, lo});
+    } else
+        for (auto it = s.holdSrcs.lower_bound({sg, force, INT32_MIN, INT32_MIN}); it != s.holdSrcs.end() && std::get<0>(it->first) == sg && std::get<1>(it->first) == force;)
+            it = hi < 0 || (std::get<2>(it->first) == hi && std::get<3>(it->first) == lo) ? s.holdSrcs.erase(it) : std::next(it);
     int reason = force ? (on ? cbForce : cbRelease) : (on ? cbAssign : cbDeassign);
     auto list = s.holdCbs;
     for (Cb* c : list) {
@@ -1937,6 +1946,7 @@ inline void setup(Compilation& comp, const LowerResult& lr) {
     vpiCallHook() = callSite;
     S.vpiChange = onChange;
     S.vpiRegion = onRegion;
+    S.vpiHoldCb = onHold;   // which force / assign statements are in effect (37.16)
     // compiletf runs once per call site, before the simulation (38.37.1).
     for (const auto& site : Lowerer::vpiSites()) {
         const Systf& f = s.systfs[(size_t)site->systf];
@@ -2112,6 +2122,26 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             }
             s.createCbs.push_back(c);
             g_newObjHook = vpi::onNewObj;
+            break;
+        case cbReclaimObj:   // 38.36.1: a class definition (any of its objects) or a class object
+            if (!c->obj || (c->obj->kind != Obj::ClassDefn && c->obj->kind != Obj::ClassObj)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbReclaimObj needs a class definition or class object handle");
+                return nullptr;
+            }
+            c->hasT = false;   // no time is passed (38.36.1)
+            break;   // msim never reclaims a class object, so it does not run
+        case cbEndOfObject:   // 38.36.1: a transient object ends: a thread or frame (as cbEndOfThread / cbEndOfFrame)
+            if (!c->obj || (c->obj->kind != Obj::Thread && c->obj->kind != Obj::Frame && c->obj->kind != Obj::ClassObj)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbEndOfObject needs a thread, frame or class object handle");
+                return nullptr;
+            }
+            c->hasT = false;
+            if (c->obj->kind == Obj::ClassObj) break;   // as cbReclaimObj: never
+            (c->obj->kind == Obj::Frame ? s.frameCbs : s.thrCbs).push_back(c);
+            g_threadHook = vpi::onThread;
+            if (c->obj->kind == Obj::Frame) g_frameHook = vpi::onFrame;
             break;
         case cbSizeChange:   // 38.36.1: a dynamic array, queue or associative array changes size
             if (!c->obj || c->obj->kind != Obj::Dyn) {

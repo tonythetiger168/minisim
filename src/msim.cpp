@@ -385,7 +385,13 @@ static void mergePartialDrivers(LowerResult& lowered) {
 // process (bench/gen_soc.py: 512 such processes were coroutines). The loop
 // variable is automatic and local to the loop (12.7.1); it is kept out of
 // the waveform, which never shows automatic variables (21.7.1.2).
-static void unrollSeqLoops(LowerResult& lowered) {
+//
+// With comb set, the same is done in combinational processes (always_comb,
+// always @*: body; wait; goto 0), before splitCombBlocks: a loop that sets
+// one bit per pass (for (int i = 0; i < 32; i++) r[i] = a[31 - i]) becomes
+// straight code, which runs without the compare and step of each pass and
+// can be split like any other block.
+static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
     std::set<int> lv(loopVarSigs().begin(), loopVarSigs().end());
     if (lv.empty()) return;
     const bool dbg = std::getenv("MSIM_WHYUNROLL") != nullptr;
@@ -427,10 +433,10 @@ static void unrollSeqLoops(LowerResult& lowered) {
         if (lp.program >= 0 || lp.reactive) continue;
         auto& code = lp.prog.code;
         size_t n = code.size();
-        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[0].k != IK::WaitEdge || code[n - 1].k != IK::Jmp ||
-            code[n - 1].target != 0)
+        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[n - 1].k != IK::Jmp || code[n - 1].target != 0)
             continue;
-        for (size_t pc = 1; pc + 3 < code.size(); pc++) {
+        if (comb ? code[n - 2].k != IK::WaitEdge || code[0].k == IK::WaitEdge : code[0].k != IK::WaitEdge) continue;
+        for (size_t pc = comb ? 0 : 1; pc + 3 < code.size(); pc++) {
             // i = c; top: if (!(cond)) goto E; body; step: i = f(i); goto top; E:
             const Instr& a = code[pc];
             if (a.k != IK::Assign || !lv.count(a.sig) || !plainW(a)) continue;
@@ -444,6 +450,8 @@ static void unrollSeqLoops(LowerResult& lowered) {
             for (size_t b = top + 1; b < step && ok; b++) {
                 const Instr& x = code[b];
                 if (x.k == IK::Nba) ok = x.sig != var && x.drv < 0 && x.dyn < 0 && !x.nbaLater && !x.de && !x.delay;
+                else if (x.k == IK::Assign && comb)   // a blocking write of the block's own (not a driver, not of i)
+                    ok = x.sig != var && x.drv < 0 && x.dyn < 0 && x.dsrc < 0 && !x.de && !x.delay && x.dly.empty() && x.gate < 0 && !x.udp;
                 else if (x.k == IK::Jmp || x.k == IK::JmpIfNot)
                     ok = x.target > b && x.target <= E && x.xt == Instr::NOX;   // forward, inside or to the end
                 else ok = false;
@@ -3106,6 +3114,8 @@ int main(int argc, char** argv) {
         mergePartialDrivers(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL"))
+        unrollSeqLoops(lowered, true);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);

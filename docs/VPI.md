@@ -252,10 +252,18 @@ it and the input (or inout) ports of child instances it connects to.
 the hierarchy (the simulated net) and give the continuous assignments of
 every part of it, plus ports whose connection is only part of an
 expression. `vpiPortInst` gives the ports of the instances the signal
-connects to. Procedural assignments are neither drivers nor loads, and the
-signal's own module ports are not local drivers or loads. These rules were
-written from memory of the standard and still need checking against the
-text.
+connects to. Gate, switch and UDP terminals count too: an output terminal
+drives the net it connects to, an input terminal loads it (37.46). The
+ports of the signal's own module are local drivers (input, inout) and
+local loads (output, inout) of it (37.16 detail 17). On a bit or part
+select handle, only the drivers and loads that touch those bits count
+(detail 18); a select with a non-constant index counts as touching every
+bit. A `force` statement in effect drives what it forces, and a
+procedural `assign` statement in effect drives the variable it assigns (a
+net has only force drivers, 37.16 detail 15); both are loads of what
+their right side reads (detail 14); once released or deassigned they are
+neither. Other procedural assignments are neither drivers nor loads.
+Checked against the 1800-2023 text of 37.16, 37.21 and 37.46.
 
 **Processes, statements and expressions (37.32 to 37.51).**
 `vpi_iterate(vpiProcess, module)` gives the `initial`, `always` (with
@@ -410,6 +418,13 @@ registered. `user_data` points to the name (as 38.36.3 says), which is
 also in `cb_data->value` (`vpiStringVal`). It may
 register the name with `vpi_register_systf`; the calls then run as usual.
 
+**End of an object (38.36.1).** `cbEndOfObject` on a thread or frame handle
+runs when that thread or call ends, as `cbEndOfThread` / `cbEndOfFrame` on
+it would, with no time passed. `cbReclaimObj` takes a class definition or
+class object handle, and `cbEndOfObject` also takes a class object; msim
+never reclaims a class object (an object lives to the end of the run), so
+those two do not run.
+
 **Save, restart and reset (38.6, 38.36.3).** `cbStartOfSave` and
 `cbEndOfSave` run around each `$save` / `$incsave`, `cbStartOfRestart`
 before `$restart`, `cbStartOfReset` before `$reset` (annex D.8, D.9). msim
@@ -437,13 +452,11 @@ waveform tools (`mwave`, the FST and VCD readers).
 
 The non-static property
 declarations of a class definition, containers of structs,
-classes or containers, the value of a non-constant expression, drivers and
-loads of a bit or part of a signal and of primitive terminals,
+classes or containers, the value of a non-constant expression,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
-callbacks, `cbReclaimObj` /
-`cbEndOfObject` (msim does not reclaim objects). A call to something not
+callbacks. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 

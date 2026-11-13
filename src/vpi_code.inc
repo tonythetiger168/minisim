@@ -606,7 +606,7 @@ inline int64_t codeGet(int prop, const Obj* o) {
             case vpiSigned: return e.type && e.type->isSigned();
             case vpiIndexedPartSelectType:
                 if (o->type != vpiIndexedPartSelect) return vpiUndefined;
-                return e.as<RangeSelectExpression>().getSelectionKind() == RangeSelectionKind::IndexedUp ? vpiPosIndexed : vpiNegIndexed;
+                return e.as<RangeSelectExpression>().getSelectionKind() == slang::ast::RangeSelectionKind::IndexedUp ? vpiPosIndexed : vpiNegIndexed;
             case vpiFuncType:
                 if (e.kind != ExpressionKind::Call || !e.type) return vpiUndefined;
                 return e.type->isFloating() ? vpiRealFunc : e.type->isSigned() ? vpiSizedSignedFunc : vpiSizedFunc;
@@ -769,6 +769,50 @@ inline bool markStmt(const Obj* o, Cb* c) {
 // module of the signal; vpiDriver / vpiLoad follow port connections through
 // the hierarchy (the whole simulated net) and give the continuous
 // assignments and the ports that are not just a whole-signal connection.
+inline Obj* primObj(const PrimitiveInstanceSymbol& g);
+inline Obj* primTermObj(const Obj* p, int k);
+inline int primTermDir(const PrimitiveInstanceSymbol& g, int k);
+// Which bits of `s` a driver or load must touch to count: all (lo < 0), or
+// bits lo..hi counted from the right end of its declared range (a vpiNetBit
+// or part select handle, 37.16 detail 18).
+struct Bits { int64_t lo = -1, hi = -1; };
+inline std::optional<int64_t> constOf(const Expression& e, const Symbol* s) {
+    slang::ConstantValue cv;
+    if (const slang::ConstantValue* c = e.getConstant()) cv = *c;
+    else {
+        const Scope* sc = s->getParentScope();
+        if (!sc) return std::nullopt;
+        slang::ast::EvalContext ctx(slang::ast::ASTContext(*sc, slang::ast::LookupLocation::max));
+        cv = e.eval(ctx);
+    }
+    if (!cv.isInteger()) return std::nullopt;
+    return cv.integer().as<int64_t>();
+}
+// Does the select `e` (an element or range select straight on `s`) touch
+// bits b? Unknown (a non-constant index, a multi-dimensional select): yes.
+inline bool selTouches(const Expression& e, const Symbol* s, Bits b) {
+    if (b.lo < 0) return true;
+    const Expression& v = e.kind == ExpressionKind::ElementSelect ? e.as<ElementSelectExpression>().value() : e.as<RangeSelectExpression>().value();
+    const Type& t = v.type->getCanonicalType();
+    if (!t.isIntegral() || !t.hasFixedRange() || t.getArrayElementType() && t.getArrayElementType()->getBitstreamWidth() != 1) return true;
+    std::optional<int64_t> a, c;
+    if (e.kind == ExpressionKind::ElementSelect) a = c = constOf(e.as<ElementSelectExpression>().selector(), s);
+    else {
+        const auto& rs = e.as<RangeSelectExpression>();
+        a = constOf(rs.left(), s);
+        c = constOf(rs.right(), s);
+        if (a && c && rs.getSelectionKind() == slang::ast::RangeSelectionKind::IndexedUp) c = *a + *c - 1;
+        else if (a && c && rs.getSelectionKind() == slang::ast::RangeSelectionKind::IndexedDown) c = *a - *c + 1;
+    }
+    if (!a || !c) return true;
+    auto r = t.getFixedRange();
+    auto off = [&](int64_t i) { return r.left >= r.right ? i - r.right : r.right - i; };
+    int64_t x = std::min(off(*a), off(*c)), y = std::max(off(*a), off(*c));
+    return !(y < b.lo || x > b.hi);
+}
+inline bool onSym(const Expression& v, const Symbol* s) {
+    return (v.kind == ExpressionKind::NamedValue || v.kind == ExpressionKind::HierarchicalValue) && &v.as<ValueExpressionBase>().symbol == s;
+}
 inline const Symbol* rootOf(const Expression* e) {
     while (e) {
         switch (e->kind) {
@@ -781,28 +825,49 @@ inline const Symbol* rootOf(const Expression* e) {
     }
     return nullptr;
 }
-// Does the target expression `e` (the left side of an assignment) write `s`?
-inline bool writes(const Expression& e, const Symbol* s) {
+// Does the target expression `e` (the left side of an assignment) write `s`
+// (bits b of it)?
+inline bool writes(const Expression& e, const Symbol* s, Bits b = {}) {
     switch (e.kind) {
         case ExpressionKind::NamedValue:
         case ExpressionKind::HierarchicalValue: return &e.as<ValueExpressionBase>().symbol == s;
-        case ExpressionKind::Conversion: return writes(e.as<ConversionExpression>().operand(), s);
-        case ExpressionKind::Assignment: return writes(e.as<AssignmentExpression>().left(), s);
-        case ExpressionKind::ElementSelect: return writes(e.as<ElementSelectExpression>().value(), s);
-        case ExpressionKind::RangeSelect: return writes(e.as<RangeSelectExpression>().value(), s);
-        case ExpressionKind::MemberAccess: return writes(e.as<MemberAccessExpression>().value(), s);
+        case ExpressionKind::Conversion: return writes(e.as<ConversionExpression>().operand(), s, b);
+        case ExpressionKind::Assignment: return writes(e.as<AssignmentExpression>().left(), s, b);
+        case ExpressionKind::ElementSelect: {
+            const auto& v = e.as<ElementSelectExpression>().value();
+            return onSym(v, s) ? selTouches(e, s, b) : writes(v, s, b);
+        }
+        case ExpressionKind::RangeSelect: {
+            const auto& v = e.as<RangeSelectExpression>().value();
+            return onSym(v, s) ? selTouches(e, s, b) : writes(v, s, b);
+        }
+        case ExpressionKind::MemberAccess: return writes(e.as<MemberAccessExpression>().value(), s, b);
         case ExpressionKind::Concatenation:
             for (auto* x : e.as<ConcatenationExpression>().operands())
-                if (writes(*x, s)) return true;
+                if (writes(*x, s, b)) return true;
             return false;
         default: return false;
     }
 }
-// Does `e` read `s` anywhere?
-inline bool reads(const Expression& e, const Symbol* s) {
+// Does `e` read `s` (bits b of it) anywhere?
+inline bool reads(const Expression& e, const Symbol* s, Bits b = {}) {
     bool hit = false;
-    auto v = slang::ast::makeVisitor([&](auto&, const NamedValueExpression& n) { if (&n.symbol == s) hit = true; },
-                                     [&](auto&, const HierarchicalValueExpression& n) { if (&n.symbol == s) hit = true; });
+    auto v = slang::ast::makeVisitor(
+        [&](auto&, const NamedValueExpression& n) { if (&n.symbol == s) hit = true; },
+        [&](auto&, const HierarchicalValueExpression& n) { if (&n.symbol == s) hit = true; },
+        [&](auto& self, const ElementSelectExpression& x) {
+            if (onSym(x.value(), s)) {
+                if (selTouches(x, s, b)) hit = true;
+                x.selector().visit(self);
+            } else self.visitDefault(x);
+        },
+        [&](auto& self, const RangeSelectExpression& x) {
+            if (onSym(x.value(), s)) {
+                if (selTouches(x, s, b)) hit = true;
+                x.left().visit(self);
+                x.right().visit(self);
+            } else self.visitDefault(x);
+        });
     e.visit(v);
     return hit;
 }
@@ -824,13 +889,22 @@ inline Obj* portOf(const PortSymbol& p) {
 // The continuous assignments and instance ports inside the module of `body`
 // (not inside its child instances) that drive (drv) or load `s`.
 // `skipWhole`: leave out ports whose connection is the whole of `s`.
-inline void localConn(const InstanceBodySymbol& body, const Symbol* s, bool drv, bool skipWhole, std::vector<Obj*>& out) {
+inline void localConn(const InstanceBodySymbol& body, const Symbol* s, bool drv, bool skipWhole, std::vector<Obj*>& out, Bits b = {}) {
     auto v = slang::ast::makeVisitor(
         [&](auto&, const ContinuousAssignSymbol& c) {
             const auto& a = c.getAssignment();
             if (a.kind != ExpressionKind::Assignment) return;
             const auto& ae = a.as<AssignmentExpression>();
-            if (drv ? writes(ae.left(), s) : reads(ae.right(), s)) out.push_back(contAssignObj(c));
+            if (drv ? writes(ae.left(), s, b) : reads(ae.right(), s, b)) out.push_back(contAssignObj(c));
+        },
+        [&](auto&, const PrimitiveInstanceSymbol& g) {   // a gate, switch or UDP terminal (37.46)
+            auto conns = g.getPortConnections();
+            for (size_t k = 0; k < conns.size(); k++) {
+                if (!conns[k]) continue;
+                int dir = primTermDir(g, (int)k);
+                bool in = dir == vpiInput || dir == vpiInout, outp = dir == vpiOutput || dir == vpiInout;
+                if (drv ? outp && writes(*conns[k], s, b) : in && reads(*conns[k], s, b)) out.push_back(primTermObj(primObj(g), (int)k));
+            }
         },
         [&](auto&, const InstanceSymbol& inst) {   // a child instance: its port connections, not its body
             for (const PortConnection* pc : inst.getPortConnections()) {
@@ -840,7 +914,7 @@ inline void localConn(const InstanceBodySymbol& body, const Symbol* s, bool drv,
                 if (!e) continue;
                 bool in = p.direction == ArgumentDirection::In || p.direction == ArgumentDirection::InOut || p.direction == ArgumentDirection::Ref;
                 bool outp = p.direction == ArgumentDirection::Out || p.direction == ArgumentDirection::InOut || p.direction == ArgumentDirection::Ref;
-                bool hit = drv ? outp && writes(*e, s) : in && reads(*e, s);
+                bool hit = drv ? outp && writes(*e, s, b) : in && reads(*e, s, b);
                 if (!hit) continue;
                 if (skipWhole && rootOf(e) == s) continue;
                 out.push_back(portOf(p));
@@ -878,8 +952,57 @@ inline std::vector<const Symbol*> simNet(const Symbol* s) {
     }
     return set;
 }
+// The force and assign statements of the design by source line, with the
+// procedure or task they are in (lazily, once).
+struct HoldStmt { const ProceduralAssignStatement* st; const Symbol* in; };
+inline const std::map<std::pair<uint32_t, uint32_t>, HoldStmt>& holdStmts() {
+    static std::map<std::pair<uint32_t, uint32_t>, HoldStmt> m;
+    static bool built = false;
+    if (built || !st().comp || !srcMgr()) return m;
+    built = true;
+    const Symbol* in = nullptr;
+    auto inner = slang::ast::makeVisitor([&](auto&, const ProceduralAssignStatement& p) {
+        auto ol = srcMgr()->getFullyOriginalLoc(p.sourceRange.start());
+        uint32_t file = covFileId(std::string(srcMgr()->getFullPath(ol.buffer()).string()));
+        m.emplace(std::make_pair(file, (uint32_t)srcMgr()->getLineNumber(ol)), HoldStmt{&p, in});
+    });
+    auto outer = slang::ast::makeVisitor(
+        [&](auto&, const ProceduralBlockSymbol& p) { in = &p; p.getBody().visit(inner); },
+        [&](auto&, const SubroutineSymbol& f) { in = &f; f.getBody().visit(inner); });
+    st().comp->getRoot().visit(outer);
+    return m;
+}
+// The force (and, for a variable, assign) statements in effect on signal
+// `o` that drive it, or (load) that read it, as statement objects.
+inline void holdConn(const Obj* o, bool drv, bool local, Bits bits, std::vector<Obj*>& out) {
+    const InstanceBodySymbol* home = bodyOf(o->sym);
+    bool net = o->sym->kind == SymbolKind::Net;
+    for (auto& [key, src] : st().holdSrcs) {
+        auto [sg, force, hi, lo] = key;
+        auto it = holdStmts().find(src);
+        if (it == holdStmts().end()) continue;
+        const HoldStmt& h = it->second;
+        if (local && bodyOf(h.in) != home) continue;
+        const auto& a = h.st->assignment;
+        if (a.kind != ExpressionKind::Assignment) continue;
+        if (drv) {   // a net: forces only (detail 15); a variable: forces and assigns (37.21)
+            if (sg != o->sig || (net && !force)) continue;
+            if (bits.lo >= 0 && hi >= 0 && (hi < bits.lo || lo > bits.hi)) continue;
+        } else if (!reads(a.as<AssignmentExpression>().right(), o->sym, bits))
+            continue;
+        Obj* so = stmtNode(h.st, h.in->kind == SymbolKind::ProceduralBlock ? processObj(h.in->as<ProceduralBlockSymbol>()) : nullptr);
+        if (so && std::find(out.begin(), out.end(), so) == out.end()) out.push_back(so);
+    }
+}
 inline bool netConn(int type, const Obj* o, std::vector<vpiHandle>& items) {
     if (type != vpiDriver && type != vpiLoad && type != vpiLocalDriver && type != vpiLocalLoad && type != vpiPortInst) return false;
+    // A bit or part select of a vector: the drivers and loads that touch
+    // those bits (37.16 detail 18).
+    Bits bits;
+    if (o->kind == Obj::Bit && o->parent && o->parent->kind == Obj::Signal && type != vpiPortInst) {
+        bits = {o->off, o->off + o->w - 1};
+        o = o->parent;
+    }
     if (o->kind != Obj::Signal || !o->sym || !ValueSymbol::isKind(o->sym->kind)) return false;
     const InstanceBodySymbol* b = bodyOf(o->sym);
     if (!b) return true;
@@ -894,10 +1017,20 @@ inline bool netConn(int type, const Obj* o, std::vector<vpiHandle>& items) {
             [&](auto&, const ProceduralBlockSymbol&) {}, [&](auto&, const SubroutineSymbol&) {});
         b->visit(v);
     } else if (type == vpiLocalDriver || type == vpiLocalLoad) {
-        localConn(*b, o->sym, type == vpiLocalDriver, false, out);
+        // The ports of its own module count (37.16 detail 17): an input or
+        // inout drives it, an output or inout loads it.
+        for (const Symbol* q : b->getPortList()) {
+            if (q->kind != SymbolKind::Port || q->as<PortSymbol>().internalSymbol != o->sym) continue;
+            auto d = q->as<PortSymbol>().direction;
+            bool in = d == ArgumentDirection::In || d == ArgumentDirection::InOut, outp = d == ArgumentDirection::Out || d == ArgumentDirection::InOut;
+            if (type == vpiLocalDriver ? in : outp) out.push_back(portOf(q->as<PortSymbol>()));
+        }
+        localConn(*b, o->sym, type == vpiLocalDriver, false, out, bits);
+        holdConn(o, type == vpiLocalDriver, true, bits, out);
     } else {
+        holdConn(o, type == vpiDriver, false, bits, out);
         for (const Symbol* x : simNet(o->sym))
-            if (const auto* xb = bodyOf(x)) localConn(*xb, x, type == vpiDriver, true, out);
+            if (const auto* xb = bodyOf(x)) localConn(*xb, x, type == vpiDriver, true, out, bits);   // whole connections: the same bits
     }
     for (Obj* x : out)
         if (std::find_if(items.begin(), items.end(), [&](vpiHandle h) { return O(h) == x; }) == items.end()) items.push_back(H(x));
