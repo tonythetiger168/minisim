@@ -3612,6 +3612,10 @@ struct Lowerer {
         const Type& t = t0.getCanonicalType();
         if (t.kind != SymbolKind::FixedSizeUnpackedArrayType) {
             if (t.isUnpackedArray()) unsupported("a container inside a fixed-size array");
+            if ((t.isUnpackedStruct() || t.isUnpackedUnion()) && uWidth(t) > 0) {   // a struct element: its bits (7.2)
+                out.push_back(expr(x0));
+                return;
+            }
             if (!t.isIntegral() && !t.isFloating() && !t.isString()) unsupported("array of this element type");
             int w = (int)t.getBitWidth();
             const Expression& x = peel(x0);
@@ -12342,7 +12346,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 a.uarr = true;
             }
             if (t->isUnpackedStruct()) {
-                if (a.uarr) Lowerer::unsupported("DPI array of unpacked structs");
                 if (f.isExport) Lowerer::unsupported("unpacked struct argument of a DPI export");
                 a.t = DT_STRUCT;
                 a.w = uWidth(*t);
@@ -12350,8 +12353,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 size_t cur = 0;
                 dpiStructFields(*t, 0, cur, a.fields);
                 a.cSize = cur;
-                const Type& named = formal->getType();
-                a.cName = named.name.empty() ? "void" : std::string(named.name);
+                const Type* named = &formal->getType();   // an array of structs: the element's name
+                while (named->getCanonicalType().isUnpackedArray() || named->getCanonicalType().kind == SymbolKind::DPIOpenArrayType)
+                    named = named->getArrayElementType();
+                a.cName = named->name.empty() ? "void" : std::string(named->name);
             } else if (!a.popen)
             a.t = dpiType(*t, a.w, a.sgn);
             if (!a.uarr) {

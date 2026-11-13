@@ -239,7 +239,7 @@ inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<st
     int w = f.popen ? a.pw : f.w;
     b.oa.t = f.t;
     b.oa.w = w;
-    b.oa.elemSize = elemBytes(f.t, w);
+    b.oa.elemSize = f.t == DT_STRUCT ? f.cSize : elemBytes(f.t, w);
     std::vector<Val> vals;
     std::vector<std::pair<int64_t, int64_t>> act;
     if (a.arr) {
@@ -272,11 +272,27 @@ inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<st
     b.bytes.assign(b.oa.count * b.oa.elemSize + 8, 0);
     b.oa.data = b.bytes.data();
     if (f.t == DT_STRING) strs.reserve(strs.size() + vals.size());
-    for (size_t k = 0; k < vals.size(); k++) toC(b.oa.data + k * b.oa.elemSize, f.t, w, vals[map[k]], strs);
+    for (size_t k = 0; k < vals.size(); k++) {
+        char* p = b.oa.data + k * b.oa.elemSize;
+        if (f.t != DT_STRUCT) { toC(p, f.t, w, vals[map[k]], strs); continue; }
+        for (const DpiField& fl : f.fields) {   // an array of structs: each a C struct (35.5.6)
+            Val fv = v_slice(vals[map[k]], fl.lo + fl.w - 1, fl.lo);
+            if (fl.t == DT_REAL || fl.t == DT_SHORTREAL) fv.real = true;
+            toC(p + fl.off, fl.t, fl.w, fv, strs);
+        }
+    }
 }
 inline void arrOut(const ArrBuf& b, const DpiArg& f, const DpiActual& a, const std::vector<size_t>& map) {
     for (size_t k = 0; k < b.oa.count; k++) {
-        Val v = fromC(b.oa.data + k * b.oa.elemSize, f.t, b.oa.w, f.sgn);
+        Val v;
+        if (f.t == DT_STRUCT) {
+            v = make(0, 0, f.w);
+            for (const DpiField& fl : f.fields) {
+                Val fv = fromC(b.oa.data + k * b.oa.elemSize + fl.off, fl.t, fl.w, fl.sgn);
+                fv.real = false;
+                v = v_insert(v, v_resize(fv, fl.w, false), fl.lo + fl.w - 1, fl.lo);
+            }
+        } else v = fromC(b.oa.data + k * b.oa.elemSize, f.t, b.oa.w, f.sgn);
         if (a.arr) {
             if (a.arr->twoState) { v.x = 0; v.z = 0; for (auto& h : v.hi) { h.x = h.z = 0; } }
             S.set(a.arr->base + (int)map[k], v);
@@ -764,8 +780,8 @@ inline std::string cType(DpiType t, bool ptr, bool isConst, bool sgn = true) {
 // The C prototype of an import or export (35.5.6): what -dpiheader writes
 // and what an export stub defines.
 inline std::string cArgType(const DpiArg& a) {
-    if (a.t == DT_STRUCT) return std::string(a.dir == 0 ? "const " : "") + a.cName + "*";
     if (a.uarr && a.open) return a.dir == 0 ? "const svOpenArrayHandle" : "svOpenArrayHandle";
+    if (a.t == DT_STRUCT) return std::string(a.dir == 0 ? "const " : "") + a.cName + "*";
     if (a.uarr) return a.t == DT_STRING ? "const char**" : cType(a.t, true, a.dir == 0, a.sgn);
     if (a.dir == 0) return cType(a.t, false, true, a.sgn);
     return cType(a.t, true, false, a.sgn);
