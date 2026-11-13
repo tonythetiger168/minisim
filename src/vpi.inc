@@ -47,7 +47,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem, Thread, Frame, InstArr } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem, Thread, Frame, InstArr, TypeParam, ParamAssign, DefParam, ListOp } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -2414,7 +2414,8 @@ inline const char* typeName(int type) {
         {vpiPartSelect, "vpiPartSelect"}, {vpiRegArray, "vpiRegArray"}, {vpiNetArray, "vpiNetArray"},
         {vpiRange, "vpiRange"}, {vpiTask, "vpiTask"}, {vpiFunction, "vpiFunction"}, {vpiNamedBegin, "vpiNamedBegin"},
         {vpiNamedFork, "vpiNamedFork"}, {vpiGenScope, "vpiGenScope"}, {vpiGenScopeArray, "vpiGenScopeArray"},
-        {vpiModuleArray, "vpiModuleArray"}, {vpiInterfaceArray, "vpiInterfaceArray"}, {vpiProgramArray, "vpiProgramArray"},
+{vpiTypeParameter, "vpiTypeParameter"}, {vpiParamAssign, "vpiParamAssign"}, {vpiDefParam, "vpiDefParam"},
+                {vpiModuleArray, "vpiModuleArray"}, {vpiInterfaceArray, "vpiInterfaceArray"}, {vpiProgramArray, "vpiProgramArray"},
         {vpiGateArray, "vpiGateArray"}, {vpiSwitchArray, "vpiSwitchArray"}, {vpiUdpArray, "vpiUdpArray"},
         {vpiPackage, "vpiPackage"}, {vpiInterface, "vpiInterface"}, {vpiProgram, "vpiProgram"}, {vpiModport, "vpiModport"},
         {vpiLongIntVar, "vpiLongIntVar"}, {vpiShortIntVar, "vpiShortIntVar"}, {vpiIntVar, "vpiIntVar"},
@@ -2449,6 +2450,7 @@ inline const char* typeName(int type) {
 #include "vpi_tchk.inc"
 #include "vpi_prim.inc"
 #include "vpi_iarr.inc"
+#include "vpi_param.inc"
 #include "vpi_constr.inc"
 #include "vpi_svcb.inc"
 #include "vpi_thread.inc"
@@ -2467,6 +2469,7 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
     if (!o) { vpi::error(vpiError, "vpi_handle: null reference handle"); return nullptr; }
     if (vpi::denied(o, "vpi_handle")) return nullptr;
     using slang::ast::SymbolKind;
+    if (Obj* x = nullptr; vpi::paramHandle(type, o, x)) return H(x);   // parameters, param assigns, def params (37.28)
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
     if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return H(vpi::constrHandle(type, o));   // 37.31
@@ -2634,6 +2637,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     // A protected call still gives its arguments (38.36); nothing else of a
     // protected object can be iterated.
     if (!(type == vpiArgument && o->kind == Obj::Call) && vpi::denied(o, "vpi_iterate")) return nullptr;
+    if (vpi::paramIterate(type, o, items)) return vpi::iter(std::move(items));   // param assigns, def params, list operands
     if (vpi::isCode(o)) return vpi::codeIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
     if (vpi::netConn(type, o, items)) return vpi::iter(std::move(items));
     if (vpi::tchkIterate(type, o, items)) return vpi::iter(std::move(items));   // timing checks
@@ -2775,7 +2779,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     switch (type) {
         case vpiModule: case vpiInterface: case vpiProgram: case vpiInstance: case vpiInternalScope: case vpiGenScope:
         case vpiGenScopeArray: case vpiTask: case vpiFunction: case vpiTaskFunc: case vpiNamedBegin: case vpiNamedFork:
-        case vpiParameter: case vpiTypedef: case vpiModport:
+        case vpiParameter: case vpiTypeParameter: case vpiTypedef: case vpiModport:
             known = true;
             break;
         default: break;
@@ -2817,6 +2821,9 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
             }
             case SymbolKind::Parameter:
                 if (type == vpiParameter) add(vpi::paramObj(&m));
+                break;
+            case SymbolKind::TypeParameter:   // 37.28: the parameters include the type parameters
+                if (type == vpiParameter || type == vpiTypeParameter) add(vpi::typeParamObj(m.as<slang::ast::TypeParameterSymbol>()));
                 break;
             case SymbolKind::TypeAlias:
                 if (type == vpiTypedef) add(vpi::typespecObj(&m.as<slang::ast::TypeAliasType>()));
@@ -3085,6 +3092,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return (PLI_INT32)vpi::pathGet(prop, o);
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return (PLI_INT32)vpi::primGet(prop, o);
     if (o->kind == Obj::InstArr) return (PLI_INT32)vpi::iarrGet(prop, o);
+    if (int64_t r = 0; vpi::paramGet(prop, o, r)) return (PLI_INT32)r;
     if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return (PLI_INT32)vpi::constrGet(prop, o);
     if (o->kind == Obj::Thread || o->kind == Obj::Frame) return (PLI_INT32)vpi::thrGet(prop, o);
     if (prop == vpiVirtual && vpi::isMethod(o))
@@ -3460,7 +3468,8 @@ void vpi_get_value(vpiHandle h, p_vpi_value v) {
         o->kind == Obj::Modport || o->kind == Obj::Port || (o->kind == Obj::Signal && o->arr) || o->kind == Obj::Dyn ||
         o->kind == Obj::ClassObj || o->kind == Obj::ClassDefn || o->kind == Obj::Extends || o->kind == Obj::InterModPath || o->kind == Obj::Tchk || o->kind == Obj::TchkTerm ||
         o->kind == Obj::ModPath || o->kind == Obj::PathTerm || o->kind == Obj::Prim || o->kind == Obj::PrimTerm ||
-        o->kind == Obj::Constraint || o->kind == Obj::ConstrItem || o->kind == Obj::InstArr) {
+        o->kind == Obj::Constraint || o->kind == Obj::ConstrItem || o->kind == Obj::InstArr || o->kind == Obj::TypeParam ||
+        o->kind == Obj::ParamAssign || o->kind == Obj::DefParam || o->kind == Obj::ListOp) {
         vpi::error(vpiError, "vpi_get_value: the object has no value");
         return;
     }

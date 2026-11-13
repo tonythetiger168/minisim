@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI parameters (37.28): type parameters (`vpiTypeParameter`) in
+  `vpi_iterate(vpiParameter, module)`, a parameter's default through
+  `vpiExpr`, param assigns (`vpiParamAssign`: the `#(...)` overrides with
+  `vpiLhs`, `vpiRhs`, `vpiConnByName`) and def params (`vpiDefParam`).
+  An instance array's `vpiExpr` is its connection list (a `vpiListOp`,
+  37.11), and net declaration assignments are `vpiContAssign` objects with
+  `vpiNetDeclAssign` (37.40). `tests/spec/37.28-vpi-param-assign.sv`.
+- mvplat harts are RV32GC / RV64GC: the F and D extensions (IEEE 754 single
+  and double, every rounding mode, `fflags`/`frm`/`fcsr`, NaN boxing,
+  `mstatus.FS`/`SD`, the compressed FP loads and stores). 430 riscv-tests
+  pass (uf and ud added). Linux runs Ubuntu's rv64gc BusyBox; `-input`
+  reaches the shell once the kernel's UART driver is up. Extension ABI 5.
 - `mlint -cdc-formal`: formal proof that the source of each bus synchronized
   bit by bit changes at most one bit per clock, by exhaustive search of its
   reachable states (slang's evaluator, through assigns, ports, functions and
@@ -95,6 +107,10 @@ Spec references are IEEE 1800-2023 clauses.
   off.
 
 ### Fixed
+- mvplat: a CSRRS/CSRRC on `mip` no longer latches the PLIC's SEIP into the
+  software-written bit (privileged ISA 3.1.9). OpenSBI's timer code does such
+  a read-modify-write, after which Linux took the same external interrupt
+  forever.
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
   the reader takes), which failed on correct FIFOs such as common_cells
   `cdc_fifo_gray`.

@@ -62,6 +62,7 @@ set(MINISIM_CORE_HEADERS
     vpi_data.inc
     vpi_prim.inc
     vpi_iarr.inc
+    vpi_param.inc
     vpi_constr.inc
     vpi_svcb.inc
     vpi_thread.inc
@@ -116,6 +117,7 @@ set(MINISIM_CORE_VP_HEADERS
     elf.hpp
     ext.hpp
     fdt.hpp
+    fpu.hpp
     json.hpp
     machine.hpp
     rv32.hpp)
