@@ -12,6 +12,8 @@ msim counter.vhd tb.vhd                         # VHDL only; the top is found li
 msim counter.vhd tb.sv -top tb                  # an SV testbench around a VHDL entity
 msim adder.sv tb.vhd -top tb                    # a VHDL testbench around an SV module
 msim -xrun -v200x rtl.vhd tb.sv                 # the xrun front end passes VHDL files on
+vlib work; vcom -2008 rtl.vhd; vlog tb.sv; vsim -c -do "run -all" tb   # Siemens steps (docs/COMPAT.md)
+vhdlan rtl.vhd; vlogan -sverilog tb.sv; vcs tb; ./simv                   # Synopsys steps
 msim a.vhd -vhdl-sv a.sv                        # also write the SystemVerilog msim simulates
 vhdl2sv a.vhd b.vhd > design.sv                 # the same translation, as a separate program
 mlint a.vhd b.vhd -top top                      # lint the VHDL (docs/LINT.md, "VHDL")
