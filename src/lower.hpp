@@ -1765,6 +1765,92 @@ struct Lowerer {
         return wantValue ? ref(res, sym.getReturnType().isSigned()) : nullptr;
     }
     const slang::ast::SubroutineSymbol* vifTarget = nullptr;
+    E dynGetAt0(int d) {
+        auto g = node(Op::DynGet, {konst(make(0, 0, 32, 0, true))});
+        g->sig = d;
+        return g;
+    }
+    static bool mailboxArrayType(const slang::ast::Type& t) {
+        return t.getCanonicalType().isUnpackedArray();
+    }
+    // put / get / peek and their try_ forms on a mailbox of arrays or
+    // containers (15.4): the method waits and counts, then the message is
+    // copied into the mailbox's queue, or out of its front, here.
+    bool mailboxArrayCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym,
+                          const Subr& sub, bool wantValue, E& result) {
+        using namespace slang::ast;
+        auto n = sym.name;
+        bool isPut = n == "put" || n == "try_put", isGet = n == "get" || n == "try_get";
+        bool isPeek = n == "peek" || n == "try_peek";
+        if (!(isPut || isGet || isPeek) || !call.thisClass() || call.arguments().size() != 1) return false;
+        const ClassInfo* ci = classInfo(*call.thisClass()->type);
+        if (!ci || ci->builtin != 3 || sym.getArguments().empty() || !mailboxArrayType(sym.getArguments()[0]->getType()))
+            return false;
+        const DynObj* shape = nullptr;
+        for (auto& [off, o] : ci->lay->dyn) if (off == ci->bslot) shape = &o;
+        if (!shape) unsupported("mailbox of arrays: queue shape");
+        const Type& T = sym.getArguments()[0]->getType();
+        bool packed = !shape->elem;   // a fixed-size array: one packed element (uWidth)
+        if (packed && uWidth(T) <= 0) unsupported("mailbox of arrays of this element type");
+        int h = fresh(64);
+        { Instr i; i.k = IK::Assign; i.sig = h; i.e = exprH(*call.thisClass()); prog.emit(i); }
+        bool tries = n.starts_with("try_");
+        E r = emitAutoCall(sub, {}, tries, ref(h));
+        size_t skip = 0;
+        if (tries) {
+            Instr j; j.k = IK::JmpIfNot; j.e = r;
+            skip = prog.emit(j);
+        }
+        int q = indSlot(ref(h), ci->bslot);
+        indShape[q] = *shape;
+        const Expression& a = *call.arguments()[0];
+        if (isPut && packed) { Instr i = dynCmd(q, D_PUSH_BACK); i.e = packedValue(T, a); prog.emit(i); }
+        else if (isPut) pushContainer(q, D_PUSH_BACK, a);
+        else if (packed) {
+            const Expression& tgt = peel(outArg(a));
+            auto ts = tgt.kind == ExpressionKind::NamedValue ? arrFind(&tgt.as<ValueExpressionBase>().symbol) : nullptr;
+            if (!ts || ts->dynElem) unsupported("mailbox message into this target");
+            const Type* leaf = &T.getCanonicalType();
+            while (leaf->kind == SymbolKind::FixedSizeUnpackedArrayType)
+                leaf = &leaf->as<FixedSizeUnpackedArrayType>().elementType.getCanonicalType();
+            int lw = uWidth(*leaf);
+            if (lw <= 0 || uWidth(T) / lw != ts->count) unsupported("mailbox message into an array of another shape");
+            int v = fresh(uWidth(T));
+            { Instr i; i.k = IK::Assign; i.sig = v; i.e = dynGetAt0(q); prog.emit(i); }
+            for (int k = 0; k < ts->count; k++) {
+                auto sl = node(Op::Slice, {ref(v)});
+                sl->hi = uWidth(T) - k * lw - 1;
+                sl->lo = sl->hi - lw + 1;
+                Instr i; i.k = IK::Assign; i.sig = ts->base + k;
+                i.e = leaf->isIntegral() ? resize(sl, lw, false, leaf->isSigned()) : E(sl);
+                prog.emit(i);
+            }
+            if (isGet) { Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i); }
+        } else {
+            const Expression& tgt = peel(outArg(a));
+            auto first = node(Op::DynElemRef, {konst(mk(0, 32))});
+            first->sig = q;
+            int e = elemRef(q, first);
+            if (isDynType(*tgt.type)) {
+                int t = dynSig(tgt);
+                if (t < 0) unsupported("mailbox message into this target");
+                Instr i = dynCmd(t, D_COPY); i.dsrc = e; prog.emit(i);
+            } else {
+                auto ts = tgt.kind == ExpressionKind::NamedValue ? arrFind(&tgt.as<ValueExpressionBase>().symbol) : nullptr;
+                if (!ts) unsupported("mailbox message into this target");
+                for (int k = 0; k < ts->count; k++) {
+                    auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                    g->sig = e;
+                    Instr i; i.k = IK::Assign; i.sig = ts->base + k; i.e = g;
+                    prog.emit(i);
+                }
+            }
+            if (isGet) { Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i); }
+        }
+        if (tries) prog.code[skip].target = prog.here();
+        result = wantValue ? r : nullptr;
+        return true;
+    }
     E emitUserCall(const slang::ast::CallExpression& call, bool wantValue) {
         using namespace slang::ast;
         if (call.isSystemCall()) unsupported("system call");
@@ -1812,6 +1898,7 @@ struct Lowerer {
 
         auto args = call.arguments();
         if (args.size() != sub->args.size()) unsupported("subroutine argument count");
+        if (E r; isClassMethod(*sym) && mailboxArrayCall(call, *sym, *sub, wantValue, r)) return r;
         if (isClassMethod(*sym)) {   // 8.6, 8.10, 8.20
             bool isStatic = sym->flags.has(MethodFlags::Static);
             E self;
@@ -2587,10 +2674,18 @@ struct Lowerer {
                     if (isDynType(f.getType()) || f.getType().isUnpackedArray()) unsupported("a mailbox of arrays");
                     return sigAt(&f);
                 };
-                auto push = [&]() { Instr i = dynCmd(q, D_PUSH_BACK); i.e = arg(0); prog.emit(i); bump(chg); };
+                // A mailbox of arrays or containers: the body only waits and
+                // counts; the call site moves the message (mailboxArrayCall).
+                bool arrMsg = !sub.sym->getArguments().empty() && mailboxArrayType(sub.sym->getArguments()[0]->getType());
+                auto push = [&]() {
+                    if (!arrMsg) { Instr i = dynCmd(q, D_PUSH_BACK); i.e = arg(0); prog.emit(i); }
+                    bump(chg);
+                };
                 auto pop = [&]() {
-                    set(msg(), front());
-                    Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i);
+                    if (!arrMsg) {
+                        set(msg(), front());
+                        Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i);
+                    }
                     bump(chg);
                 };
                 if (n == "new") set(thisRel(bound), arg(0));
@@ -2599,8 +2694,8 @@ struct Lowerer {
                 else if (n == "try_put") tryDo(node(Op::LogNot, {full()}), push);
                 else if (n == "get") { waitWhile(empty, chg); pop(); }
                 else if (n == "try_get") tryDo(node(Op::LogNot, {empty()}), pop);
-                else if (n == "peek") { waitWhile(empty, chg); set(msg(), front()); }
-                else if (n == "try_peek") tryDo(node(Op::LogNot, {empty()}), [&]() { set(msg(), front()); });
+                else if (n == "peek") { waitWhile(empty, chg); if (!arrMsg) set(msg(), front()); }
+                else if (n == "try_peek") tryDo(node(Op::LogNot, {empty()}), [&]() { if (!arrMsg) set(msg(), front()); });
                 return;
             }
             case 4: {   // process
