@@ -3940,6 +3940,66 @@ struct Lowerer {
         return bin(Op::LogOr, bin(Op::CaseEq, id, konst(make(0, 0, 64))),
                    bin(Op::CaseEq, node(Op::RedXor, {id}), konst(xfill(1))));
     }
+    // The container a struct member's id names (made empty when it has none
+    // yet), as an indirect id, for reading only.
+    int contOfId(E id, const DynObj& shape) {
+        auto a = node(Op::DynAlloc);
+        a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, shape}});
+        int p1 = fresh(64);
+        Instr i; i.k = IK::Assign; i.sig = p1;
+        i.e = bin(Op::Add, node(Op::Mux, {noCont(id), a, id}), konst(make(1, 0, 64)));
+        prog.emit(i);
+        int d = indThrough(p1);
+        indShape[d] = shape;
+        return d;
+    }
+    // l == r for unpacked structs that hold containers (7.2, 11.4.5): every
+    // member pair equal, containers by their elements.
+    E structContsEq(const slang::ast::Type& t0, const slang::ast::Expression& l, const slang::ast::Expression& r, bool cs) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        int W = uWidth(t);
+        int tl = fresh(W), tr = fresh(W);
+        { Instr i; i.k = IK::Assign; i.sig = tl; i.e = expr(l); prog.emit(i); }
+        { Instr i; i.k = IK::Assign; i.sig = tr; i.e = expr(r); prog.emit(i); }
+        E acc;
+        auto add = [&](E m) { acc = acc ? bin(Op::LogAnd, acc, m) : m; };
+        std::function<void(const Type&, int)> walk = [&](const Type& t1, int base) {
+            const Type& u = t1.getCanonicalType();
+            if (isDynType(u)) {
+                DynObj sh = dynShapeOf(u);
+                int da = contOfId(slice(ref(tl), base + 63, base), sh), db = contOfId(slice(ref(tr), base + 63, base), sh);
+                auto n = node(Op::DynEq);
+                n->sig = da; n->hi = db; n->lo = cs;
+                add(n);
+                return;
+            }
+            if (hasStructConts(u)) {
+                if (u.isUnpackedStruct()) {
+                    for (const auto& f : u.as<Scope>().membersOfType<FieldSymbol>()) walk(f.getType(), base + uField(u, f).first);
+                    return;
+                }
+                const auto& a = u.as<FixedSizeUnpackedArrayType>();
+                int ew = uWidth(a.elementType), n = (int)a.range.width();
+                for (int k = 0; k < n; k++) walk(a.elementType, base + k * ew);
+                return;
+            }
+            int w = uWidth(u);
+            if (u.isFloating()) {
+                add(fcmp(4, slice(ref(tl), base + w - 1, base), slice(ref(tr), base + w - 1, base)));
+                return;
+            }
+            if (u.isString()) {
+                auto n = node(Op::StrCmp, {un(Op::AsStr, slice(ref(tl), base + 63, base)), un(Op::AsStr, slice(ref(tr), base + 63, base))});
+                n->hi = 4;
+                add(n);
+                return;
+            }
+            add(bin(cs ? Op::CaseEq : Op::Eq, slice(ref(tl), base + w - 1, base), slice(ref(tr), base + w - 1, base)));
+        };
+        walk(t, 0);
+        return acc ? acc : konst(mk(1, 1));
+    }
     // s.q, a container member of an unpacked struct (7.2): the container its
     // id names, made (and its id written into s) on first use.
     int structMemberDyn(const slang::ast::MemberAccessExpression& m) {
@@ -5195,8 +5255,12 @@ struct Lowerer {
                 }
                 if ((hasStructConts(*b.left().type) || hasStructConts(*b.right().type)) &&
                     (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
-                     b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality))
-                    unsupported("== on structs that hold containers");
+                     b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
+                    bool cs = b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality;
+                    E acc = structContsEq(*b.left().type, b.left(), b.right(), cs);
+                    if (b.op == BinaryOperator::Inequality || b.op == BinaryOperator::CaseInequality) acc = un(Op::LogNot, acc);
+                    return sized(acc, 1, false, ctx);
+                }
                 if (b.left().type->isUnpackedArray() &&
                     (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
                      b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
@@ -6742,7 +6806,6 @@ struct Lowerer {
         if (ec.isIntegral() && ec.kind != slang::ast::SymbolKind::EnumType && !ec.isStruct()) { fmt += 'd'; out.push_back(h); return; }
         int w = bitsOf(ec);
         if (w <= 0) unsupported("%p of a container of this element type");
-        if (hasStructConts(ec)) unsupported("%p of a container of structs that hold containers");
         int tmp = fresh(w);
         std::string sub;
         std::vector<E> subArgs;
@@ -6761,17 +6824,9 @@ struct Lowerer {
         using namespace slang::ast;
         const Type& ft = t0.getCanonicalType();
         if (isDynType(ft)) {   // a container member of a struct (7.2): the container its id names
-            auto a = node(Op::DynAlloc);
-            a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, dynShapeOf(ft)}});
-            int tmp = fresh(64);
-            Instr i; i.k = IK::Assign; i.sig = tmp;
-            i.e = bin(Op::Add, node(Op::Mux, {noCont(part), a, part}), konst(make(1, 0, 64)));
-            prog.emit(i);
-            int d = indThrough(tmp);
-            indShape[d] = dynShapeOf(ft);
             const Type* et = ft.getArrayElementType();
             while (isDynType(*et)) et = et->getCanonicalType().getArrayElementType();
-            pfmtCont(et->getCanonicalType(), ref(d), fmt, out);
+            pfmtCont(et->getCanonicalType(), node(Op::DynById, {std::move(part)}), fmt, out);
             return;
         }
         int w = uWidth(ft);

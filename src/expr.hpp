@@ -1403,6 +1403,7 @@ enum class Op {
     // with every container copied (a struct is a value). DynAlloc: the id of
     // a new empty container shaped like conts[0].
     StructClone, DynAlloc,
+    DynById,   // %p only: the container whose id kids[0] is (0 or X: an empty one)
     ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
@@ -2752,6 +2753,7 @@ inline Val eval(const E& e, const Reader& rd) {
             if (el.x || !el.v) el = dynNewElem(d);
             return make(el.v + 1, 0, 64);
         }
+        case Op::DynById: return k(0);
         case Op::StructClone: {
             Val v = k(0);
             for (const auto& [off, shape] : *e->conts) {

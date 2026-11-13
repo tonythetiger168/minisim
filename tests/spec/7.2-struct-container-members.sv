@@ -1,6 +1,7 @@
 // IEEE 1800-2023 7.2: an unpacked structure can hold dynamic arrays, queues
 // and associative arrays as members. Struct assignment, argument passing
 // and return copy the members, so each copy owns its own containers.
+// Equality compares member containers by their elements.
 //! icarus-skip: Icarus does not support unpacked structs
 module t;
   typedef struct { int id; byte data[$]; } pkt_t;
@@ -48,6 +49,12 @@ module t;
     $display("class %0d %0d", h.pk.data.size(), b.data.size());
     fill(c, 3);
     $display("out %0d %p", c.id, c.data);
+    // == compares the containers by their elements (11.4.5)
+    b = mk(1, 2); c = mk(1, 2);
+    $display("eq %0d %0d", b == c, b != c);
+    c.data[1] = 0;
+    $display("eq %0d %0d", b == c, b === c);
+    $display("queue %p", qq);
   end
 endmodule
 //> a='{id:10, data:'{10, 11, 12}} b='{id:10, data:'{99, 11, 12}}
@@ -57,3 +64,6 @@ endmodule
 //> pattern '{id:7, data:'{1, 2}}
 //> class 3 2
 //> out 3 '{0, 2, 4}
+//> eq 1 0
+//> eq 0 0
+//> queue '{'{id:10, data:'{10, 11, 12}}, '{id:10, data:'{99, 11, 12}}}
