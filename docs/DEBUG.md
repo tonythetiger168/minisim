@@ -444,42 +444,72 @@ same as the waveform's. In `-script`: `trans [STREAM] [T]`.
 
 ## Interactive simulation (msim -i)
 
-`msim -i` stops before time 0 and reads commands, like VCS UCLI or
-`irun -tcl`. `msim -do FILE` reads them from a file instead; when the
-commands run out, the simulation goes on to its end, so a `-do` file can
-set stops and checks and leave the rest of the run alone.
+`msim -i` (also `-ucli`, and `xrun -tcl`) stops before time 0 and reads
+commands, like VCS UCLI or the xrun Tcl shell. `msim -do FILE` (and `xrun
+-input FILE`) reads them from a file instead; when the commands run out, the
+simulation goes on to its end, so a `-do` file can set stops and checks and
+leave the rest of the run alone.
+
+The commands run on the tool line's Tcl interpreter (`src/tcl.hpp`), so
+`set`, `if`, `foreach`, `while`, `proc`, `expr`, `source`, `puts` and
+`[command]` substitution work around them, and a command's result (`get`,
+`scope`, `describe`, `senv`) can be used in a script:
 
 ```
 msim design.sv -i
-msim> stop tb.cnt == 3
-stop 1 set on tb.cnt
+msim> stop -line 23 -file ucli.sv
+stop 1 set on line ucli.sv:23
 msim> run
-time 35: stop 1: tb.cnt = 8'h3
-msim> print tb.head
-tb.head = item @10 { id = 32'h1, data = 8'h11, tag = "it1", next = big @16 }
+time 12: stop 1: ucli.sv:23  add(3);
+msim(stopped)> next
+time 12: next: ucli.sv:24  #200 $display("q=%0d sum=%0d", q, sum);
+msim(stopped)> step
+time 15: step: ucli.sv:20  always #5 clk = ~clk;
+msim(stopped)> run 3
+time 18: ran to time 18 (next event at 20)
+msim> stop -condition {q == 3 && en}
+msim> run
+time 35: stop 2: {q == 3 && en}
+msim> foreach s {clk en} { puts "$s=[get $s -radix dec]" }
 msim> print tb.head.next.id
 tb.head.next.id = 32'h2
-msim> force tb.en 0
-msim> run 30
-time 75: ran to time 75 (next event at 80)
 ```
 
 | Command | What it does |
 |---|---|
-| `run [T]` | run until a stop, for `T` time units, or to the end |
-| `step [N]` | run `N` time slots (one by default) |
-| `stop SIG [posedge\|negedge\|== VALUE]` | stop when the signal changes, rises, falls, or takes the value; `stop` alone lists stops |
-| `delete N` | remove stop `N` |
-| `print NAME ...` | a signal, a class handle (class name, object id and every property, inherited ones included) or a path through handles such as `tb.head.next.id` |
+| `run [T [unit]] [-absolute]` | run until a stop, for `T` (`100`, `100ns`, `100 ns`), to time `T`, or to the end (`run`, `run -all`) |
+| `run -posedge SIG`, `-negedge SIG`, `-change SIG` | run until the signal rises, falls or changes |
+| `run -slot [N]` | run `N` time slots (one by default) |
+| `step`, `next` (`run -step`, `run -next`) | run to the next statement of any process, or of the process stopped in (a task call is stepped over) |
+| `stop SIG [posedge\|negedge\|== VALUE]`, `stop -posedge/-negedge/-change SIG`, `stop -create -object SIG` | stop when the signal changes, rises, falls, or takes the value |
+| `stop -line N [-file F]` | stop before the statement at the line runs (in any process, and in tasks and functions); the file defaults to the current statement's |
+| `stop -absolute T`, `stop -relative T`, `stop -time T` | stop at a time |
+| `stop -condition {EXPR}` | stop when the condition becomes true; on a signal or line stop, stop only while it holds. Signals are read by name, numbers may be sized (`4'hc`); an `x` makes it false |
+| `... -command {CMDS}`, `-continue`, `-once` | run commands at the stop; go on instead of stopping; delete the stop after it hits |
+| `stop`, `stop -show` | list the stops |
+| `stop -delete/-disable/-enable N ... \| all`, `delete N` | remove, turn off, turn on |
+| `get SIG ... [-radix hex\|dec\|sdec\|bin\|oct]` | the value as the command's result, for scripts |
+| `print NAME ...`, `value NAME` | a signal, a class handle (class name, object id and every property, inherited ones included) or a path through handles such as `tb.head.next.id` |
 | `force SIG VALUE`, `release SIG` | as the `force` and `release` statements |
-| `deposit SIG VALUE` | set the value once; the design's next assignment overwrites it |
-| `signals [TEXT]` | list signals whose name contains `TEXT` |
-| `time`, `help`, `quit` | |
+| `deposit SIG VALUE`, `change SIG VALUE`, `deposit SIG = VALUE` | set the value once; the design's next assignment overwrites it |
+| `scope [PATH]`, `scope -up`, `scope -set PATH` | the current scope: names are looked up there first, then from the top |
+| `show [-scopes\|-signals\|-ports] [-value] [SCOPE]` | the instances, generate blocks, signals or ports of a scope |
+| `describe NAME ...` | kind, type, width, parameter value and where it is declared |
+| `search PATTERN`, `signals [TEXT]` | the signals whose path matches the glob, or contains the text |
+| `where`, `stack` | the statement stopped at (or last run) and its process |
+| `listing [N]`, `listing -file F -line L` | the source around the current statement |
+| `dump -file F`, `dump -add NAMES [-depth N]`, `probe -create NAMES`, `dump -off/-on/-flush/-close` | write a VCD from the next time slot: scopes (everything below, `-depth` levels) and signals, as `$dumpvars` |
+| `senv [time\|scope\|top\|timescale\|file\|line\|stopped]` | the state of the simulation |
+| `alias NAME COMMAND ...` | a new command |
+| `time`, `help`, `quit`, `exit`, `finish` | `quit` ends the simulation now; final blocks still run |
 
 Values are decimal or sized literals (`8'h40`, `4'b10x1`). Names can leave
 out the top module (`cnt` for `tb.cnt`). `-i` and `-do` use the
-interpreter, so they turn off `-compile`. Lines that start with `#` are
-comments.
+interpreter, so they turn off `-compile`, and they run on one thread so that
+a stop can pause a process in the middle. Lines that start with `#` are
+comments. Not here yet: `save` / `restore` (use `$save`, docs/CHECKPOINT.md),
+`call` of a task from the prompt, `drivers` / `loads` (use `mdebug -trace`
+on the waveform), and `restart`.
 
 ## Limits
 

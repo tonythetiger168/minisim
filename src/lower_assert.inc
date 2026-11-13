@@ -343,8 +343,17 @@ E pastOf(const slang::ast::Expression& x, int n, E gate, const std::vector<std::
 }
 // $sampled, $rose, $fell, $stable, $changed, $past (16.9.3). Null if n is
 // none of them.
-E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
+E sampledFn(const slang::ast::CallExpression& call, std::string_view n0) {
     using namespace slang::ast;
+    // $past_gclk(v) is $past(v,,, @$global_clock), and so on (16.9.4).
+    std::string_view n = n0;
+    if (n0 == "$future_gclk" || n0 == "$rising_gclk" || n0 == "$falling_gclk" || n0 == "$steady_gclk" || n0 == "$changing_gclk")
+        return futureFn(call, n0);
+    bool gclk = n0.ends_with("_gclk");
+    if (gclk) {
+        n = n0.substr(0, n0.size() - 5);
+        if (n != "$past" && n != "$rose" && n != "$fell" && n != "$stable" && n != "$changed") return nullptr;
+    }
     bool past = n == "$past";
     if (n != "$sampled" && n != "$rose" && n != "$fell" && n != "$stable" && n != "$changed" && !past) return nullptr;
     auto args = call.arguments();
@@ -352,6 +361,14 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
     if (!mkSig || !tempSeq) unsupported("sampled value function here");
     const Expression& x = *args[0];
     if (n == "$sampled") return sampledE(expr(x));
+    std::vector<std::pair<int, Edge>> gev;
+    if (gclk) collectEvents(globalClocking()->getEvent(), gev);
+    if (gclk) {
+        E cur = sampledE(expr(x));
+        E prev = pastOf(x, 1, nullptr, gev);
+        if (past) return prev;
+        return sampledCompare(n, cur, prev, storeW(*x.type));
+    }
     if (past) {
         int k = 1;
         if (args.size() > 1 && args[1]->kind != ExpressionKind::EmptyArgument) k = (int)constInt(*args[1]);
@@ -362,7 +379,79 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
     }
     E cur = sampledE(expr(x));
     E prev = pastOf(x, 1, nullptr, clockArg(call, 1));
-    int w = storeW(*x.type);
+    return sampledCompare(n, cur, prev, storeW(*x.type));
+}
+// The global clocking future sampled value functions (16.9.4): the value at
+// the next tick of the global clock. The assertion that uses them is checked
+// one global clock tick late (futureShift): then the future value is the
+// sampled value now, and every other value the one sampled a tick before.
+E futureFn(const slang::ast::CallExpression& call, std::string_view n) {
+    auto args = call.arguments();
+    if (args.empty()) unsupported("sampled value function without an argument");
+    if (!svb || !mkSig || !tempSeq) unsupported("a global clocking future sampled value function outside an assertion (16.9.4)");
+    svb->future = true;
+    const slang::ast::Expression& x = *args[0];
+    E cur = sampledE(expr(x));
+    E fut = node(Op::Future, {cur});
+    if (n == "$future_gclk") return fut;
+    std::string_view as = n == "$rising_gclk" ? "$rose" : n == "$falling_gclk" ? "$fell" : n == "$steady_gclk" ? "$stable" : "$changed";
+    return sampledCompare(as, fut, cur, storeW(*x.type));
+}
+// The global clock's sample clock (no gate), made if missing.
+SampleClock& gclkSampler() {
+    std::vector<std::pair<int, Edge>> gev;
+    if (!globalClocking()) unsupported("a global clocking future sampled value function with no global clocking (16.9.4)");
+    collectEvents(globalClocking()->getEvent(), gev);
+    for (auto& c : sampleClocks())
+        if (c.ev == gev && !c.gate) return c;
+    sampleClocks().push_back({gev, nullptr, {}});
+    return sampleClocks().back();
+}
+// Atom e of an assertion that uses future functions, read one global clock
+// tick late: each sampled value is replaced by its copy from the tick before
+// (a $past stage one further back), and a future value by the value now.
+E futureShift(const E& e) {
+    if (!e || e->op == Op::Const) return e;
+    if (e->op == Op::Future) return e->kids[0];
+    auto delay = [&](const E& src, int w) {
+        SampleClock::Line ln;
+        ln.src = src;
+        ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), w, false));
+        int st = ln.stages[0];
+        gclkSampler().lines.push_back(std::move(ln));
+        return ref(st, src->sgn);
+    };
+    if (e->op == Op::Ref) {
+        if (e->at || isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig) || svaLiveSigs().count(e->sig))
+            unsupported("a future sampled value function with automatic, local or class values (16.9.4)");
+        SampleClock& g = gclkSampler();
+        for (auto& c : sampleClocks())
+            for (auto& ln : c.lines)
+                for (size_t j = 0; j < ln.stages.size(); j++)
+                    if (ln.stages[j] == e->sig) {
+                        if (&c != &g) unsupported("a future sampled value function with $past on another clock (16.9.4)");
+                        if (j + 1 == ln.stages.size())
+                            ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), sigInfo()[e->sig].second, false));
+                        auto n = std::make_shared<Expr>(*e);
+                        n->sig = ln.stages[j + 1];
+                        return n;
+                    }
+        return delay(e, sigInfo()[e->sig].second);
+    }
+    if (e->op == Op::ArrRead) return delay(e, e->arr->elemW);
+    if (e->op == Op::DynGet || e->op == Op::DynSize || e->op == Op::DynExists || e->op == Op::DynReduce ||
+        e->op == Op::DynElemRef || e->op == Op::Addr || e->op == Op::AddrOf || e->op == Op::VifSig || e->op == Op::This)
+        unsupported("a future sampled value function with containers or class values (16.9.4)");
+    bool same = true;
+    std::vector<E> kids;
+    for (auto& k : e->kids) { kids.push_back(futureShift(k)); same = same && kids.back() == k; }
+    if (same) return e;
+    auto n = std::make_shared<Expr>(*e);
+    n->kids = std::move(kids);
+    return n;
+}
+// $rose / $fell / $stable / $changed from the current and previous samples.
+E sampledCompare(std::string_view n, E cur, E prev, int w) {
     cur = resize(cur, w, false, false);
     if (n == "$stable" || n == "$changed") {
         E st = bin(Op::CaseEq, cur, prev);
@@ -387,6 +476,7 @@ struct SvaBuild {
     std::unordered_map<const slang::ast::Expression*, int> atomOf;
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
+    bool future = false;   // uses $future_gclk and friends (16.9.4)
 };
 SvaBuild* svb = nullptr;
 
@@ -442,10 +532,23 @@ int svaAtomE(E e) {
 // (declaration initializers and local input arguments, 16.8.2); -1: none.
 int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
     using namespace slang::ast;
-    if (ai.isRecursiveProperty) unsupported("recursive property (16.12.17)");
     if (ai.localVars.empty()) return -1;
     std::vector<ConcAssert::Item> init;
     for (const LocalAssertionVarSymbol* lv : ai.localVars) {
+        if (lv->formalPort && lv->formalPort->direction && *lv->formalPort->direction != ArgumentDirection::In) {
+            // An output or inout local argument (16.8.2) is the caller's
+            // local variable itself: what the instance assigns flows out.
+            const Expression* to = nullptr;
+            for (auto& [port, actual] : ai.arguments)
+                if (port == lv->formalPort)
+                    if (auto* x = std::get_if<const Expression*>(&actual)) to = *x;
+            const Symbol* at = to ? to->getSymbolReference() : nullptr;
+            auto it = at ? sigmap.find(at) : sigmap.end();
+            if (!at || at->kind != SymbolKind::LocalAssertionVar || it == sigmap.end())
+                unsupported("an output or inout local argument whose actual is not a local variable (16.8.2)");
+            sigmap[lv] = it->second;
+            continue;
+        }
         const Type& t = lv->getType();
         if (!t.isIntegral()) unsupported("a local variable that is not integral (16.10)");
         int w = (int)t.getBitWidth();
@@ -457,8 +560,6 @@ int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
         svb->localSigs.push_back(sg);
         const Expression* from = nullptr;
         if (lv->formalPort) {
-            if (lv->formalPort->direction && *lv->formalPort->direction != ArgumentDirection::In)
-                unsupported("a local variable argument that is output or inout (16.8.2)");
             for (auto& [port, actual] : ai.arguments)
                 if (port == lv->formalPort)
                     if (auto* x = std::get_if<const Expression*>(&actual)) from = *x;
@@ -692,12 +793,90 @@ bool isSeq(const slang::ast::AssertionExpr& a) {
     }
 }
 // A property (16.12). `strong`: how a bare sequence is read (16.12.2).
+// Recursive properties (16.12.17): the property instances being built, and
+// the REC term each one became the target of (-1: none).
+struct RecEnt { const slang::ast::AssertionInstanceExpression* ai; int idx; };
+std::vector<RecEnt> recStack;
+// Whether two expressions are the same, as far as can be told without
+// evaluating them (false when unsure).
+static bool sameExpr(const slang::ast::Expression& a, const slang::ast::Expression& b) {
+    using namespace slang::ast;
+    if (&a == &b) return true;
+    if (a.kind != b.kind || !a.type->isMatching(*b.type)) return false;
+    switch (a.kind) {
+        case ExpressionKind::NamedValue: case ExpressionKind::HierarchicalValue:
+            return &a.as<ValueExpressionBase>().symbol == &b.as<ValueExpressionBase>().symbol;
+        case ExpressionKind::IntegerLiteral:
+            return exactlyEqual(a.as<IntegerLiteral>().getValue(), b.as<IntegerLiteral>().getValue());
+        case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+            return exactlyEqual(a.as<UnbasedUnsizedIntegerLiteral>().getValue(), b.as<UnbasedUnsizedIntegerLiteral>().getValue());
+        case ExpressionKind::UnaryOp:
+            return a.as<UnaryExpression>().op == b.as<UnaryExpression>().op &&
+                   sameExpr(a.as<UnaryExpression>().operand(), b.as<UnaryExpression>().operand());
+        case ExpressionKind::BinaryOp: {
+            const auto &x = a.as<BinaryExpression>(), &y = b.as<BinaryExpression>();
+            return x.op == y.op && sameExpr(x.left(), y.left()) && sameExpr(x.right(), y.right());
+        }
+        case ExpressionKind::Conversion:
+            return sameExpr(a.as<ConversionExpression>().operand(), b.as<ConversionExpression>().operand());
+        case ExpressionKind::ElementSelect:
+            return sameExpr(a.as<ElementSelectExpression>().value(), b.as<ElementSelectExpression>().value()) &&
+                   sameExpr(a.as<ElementSelectExpression>().selector(), b.as<ElementSelectExpression>().selector());
+        case ExpressionKind::MemberAccess:
+            return &a.as<MemberAccessExpression>().member == &b.as<MemberAccessExpression>().member &&
+                   sameExpr(a.as<MemberAccessExpression>().value(), b.as<MemberAccessExpression>().value());
+        default: return false;
+    }
+}
+static bool sameArgs(const slang::ast::AssertionInstanceExpression& a, const slang::ast::AssertionInstanceExpression& b) {
+    using namespace slang::ast;
+    if (a.arguments.size() != b.arguments.size()) return false;
+    for (size_t k = 0; k < a.arguments.size(); k++) {
+        const auto& [fa, va] = a.arguments[k];
+        const auto& [fb, vb] = b.arguments[k];
+        if (fa != fb || va.index() != vb.index()) return false;
+        if (auto* x = std::get_if<const Expression*>(&va)) {
+            if (!sameExpr(**x, *std::get<const Expression*>(vb))) return false;
+        } else if (auto* x = std::get_if<const AssertionExpr*>(&va)) {
+            const AssertionExpr* y = std::get<const AssertionExpr*>(vb);
+            if (*x == y) continue;
+            if ((*x)->kind != AssertionExprKind::Simple || y->kind != AssertionExprKind::Simple) return false;
+            const auto &sx = (*x)->as<SimpleAssertionExpr>(), &sy = y->as<SimpleAssertionExpr>();
+            if (sx.repetition || sy.repetition || !sameExpr(sx.expr, sy.expr)) return false;
+        } else if (va != vb) return false;
+    }
+    return true;
+}
 const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
     using namespace slang::ast;
     auto& st = sva::store();
     if (const auto* ai = instanceOf(a); ai && ai->symbol.kind == SymbolKind::Property) {
+        if (ai->isRecursiveProperty) {
+            // slang expands a recursive property twice and leaves a placeholder
+            // for the instance inside the second expansion. With the same
+            // arguments at both levels, the placeholder is the second
+            // expansion again: a REC term for it.
+            std::vector<size_t> same;
+            for (size_t k = recStack.size(); k-- > 0 && same.size() < 2;)
+                if (&recStack[k].ai->symbol == &ai->symbol) same.push_back(k);
+            if (same.size() < 2) unsupported("recursive property (16.12.17)");
+            if (!sameArgs(*recStack[same[0]].ai, *recStack[same[1]].ai))
+                unsupported("a recursive property whose arguments change from one level to the next (16.12.17)");
+            if (svb && !svb->more.empty()) unsupported("a recursive property in a multiclock assertion (16.12.17)");
+            RecEnt& e = recStack[same[0]];
+            if (e.idx < 0) e.idx = st.recNew();
+            return st.rec(e.idx);
+        }
+        recStack.push_back({ai, -1});
         int init = instLocals(*ai);
-        return st.init(init, propTerm(ai->body, strong));
+        const sva::Node* r = st.init(init, propTerm(ai->body, strong));
+        RecEnt e = recStack.back();
+        recStack.pop_back();
+        if (e.idx >= 0) {
+            if (init >= 0) unsupported("a recursive property with local variables (16.12.17)");
+            st.recBody[(size_t)e.idx] = r;
+        }
+        return r;
     }
     if (isSeq(a)) return st.pseq(seqTerm(a), strong);
     switch (a.kind) {
@@ -859,6 +1038,7 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     c.acts = std::move(b.acts);
     c.endSig = sg;
     c.more = std::move(b.more);
+    if (b.future) unsupported("a future sampled value function in a sequence end point (16.9.4)");
     svb = saved;
     sva::store().localAtoms = savedLocal;
     sva::store().clk = savedClk;
@@ -932,6 +1112,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     struct Reset { ~Reset() { sva::store().localAtoms = nullptr; sva::store().clk = 0; } } reset;
     for (;;) {
         if (const auto* ai = instanceOf(*a); ai && ai->symbol.kind == SymbolKind::Property) {
+            recStack.push_back({ai, -1});
             inits.push_back(instLocals(*ai));
             a = &ai->body;
         } else if (a->kind == AssertionExprKind::Clocking) {
@@ -962,7 +1143,15 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         c.root = sva::store().covseq(seqTerm(*a));
     } else
         c.root = propTerm(*a, dir == AD_COVER);
-    for (size_t k = inits.size(); k-- > 0;) c.root = sva::store().init(inits[k], c.root);
+    for (size_t k = inits.size(); k-- > 0;) {
+        c.root = sva::store().init(inits[k], c.root);
+        RecEnt e = recStack.back();   // a leading instance that recurs (16.12.17)
+        recStack.pop_back();
+        if (e.idx >= 0) {
+            if (inits[k] >= 0) unsupported("a recursive property with local variables (16.12.17)");
+            sva::store().recBody[(size_t)e.idx] = c.root;
+        }
+    }
     sva::store().localAtoms = nullptr;
     if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
     std::string name = asserts()[c.id].name;
@@ -981,6 +1170,21 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.clearFlags = std::move(b.matchFlags);
     c.more = std::move(b.more);
     if (!c.more.empty() && !staticAssert) unsupported("a multiclock assertion in a procedure (16.14.6)");
+    if (b.future) {   // checked one global clock tick late (16.9.4)
+        SampleClock& g = gclkSampler();
+        if (c.ev != g.ev) unsupported("a future sampled value function in an assertion not clocked by the global clock (16.9.4)");
+        if (!c.more.empty() || !c.acts.empty() || !c.localSig.empty() || !staticAssert)
+            unsupported("a future sampled value function with local variables, several clocks or in a procedure (16.9.4)");
+        for (auto& at : c.atoms) at = futureShift(at);
+        if (c.clkIff) c.clkIff = futureShift(c.clkIff);
+        // No attempt at the first tick: nothing was sampled before it.
+        SampleClock::Line ln;
+        ln.src = konst(mk(1, 1));
+        ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), 1, false));
+        E started = ref(ln.stages[0]);
+        g.lines.push_back(std::move(ln));
+        c.clkIff = c.clkIff ? bin(Op::LogAnd, c.clkIff, started) : started;
+    }
     if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
         c.procedural = true;
         // Automatic variables are read as they were when the instance was

@@ -35,7 +35,8 @@ options (`-vcd`, `-compile`, `-threads`, `-profile`, ...) work in this mode too.
 | `-timescale u/p`, `-override_timescale u/p` | `--timescale u/p` |
 | `-l file`, `-log file` | stdout and stderr also go to the file; default `xrun.log` (`irun.log` as irun) |
 | `-append_log`, `-nolog` | append to the log; no log |
-| `-input file.tcl` | an msim `-do` script: `run`, `run 100 ns`, `run 100ns`, `run -all`, `value` (as `print`), `force`, `deposit x = v`, `release`, `stop`, `exit`, `quit`, `finish` |
+| `-input file.tcl` | `-do file.tcl`: a Tcl script for msim's interactive shell (docs/DEBUG.md), which takes the xrun forms: `run 100 ns`, `run -step`, `run -next`, `value`, `deposit x = v`, `stop -create -object/-line/-time/-condition`, `scope -set`, `describe`, `probe -create`, `finish`, and Tcl's `set`, `proc`, `foreach`, `source` |
+| `-tcl` | `-i`: stop before time 0 and read commands |
 | `-c`, `-elaborate` | `-elab`: stop after elaboration |
 | `-uvm`, `-uvmhome dir` | `-uvm`, `-uvmhome dir`; a built-in name such as `CDNS-1.2` uses `$UVM_HOME` |
 | `-coverage all`, `-coverage b:e:t:f:u`, `-cov` | `-cov` (every metric is recorded) |
@@ -66,7 +67,7 @@ are always on in msim; coverage files and snapshot names have no counterpart.
 | `.vhd`, `.vhdl`, `-v93` | VHDL is not supported yet |
 | `-R`, `-r snapshot` | msim keeps no snapshot between runs; give the sources again |
 | `-gui` | no GUI; the run goes on, open the waveform with mdebug (docs/DEBUG.md) |
-| Tcl `database`, `probe`, `assertion`, `set`, `source` in `-input` | dropped with a note; use `-vcd` / `-fst` for a waveform |
+| Tcl `database`, `simvision`, `dumptcf`, `assertion` in `-input` | ignored with a note; `probe` writes a VCD (`dump`), not an SHM database |
 
 ## Exit status
 

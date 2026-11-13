@@ -2139,9 +2139,45 @@ struct Checker {
             chain += "]";
             std::string rule;
             if (auto p = c.how.find("(CDC"); p != std::string::npos) rule = c.how.substr(p + 1, 6);
+            // The schematic between them: the nets and logic from the source
+            // to the reader's input (breadth first, nearest way, up to 6).
+            std::string via = "[";
+            {
+                std::unordered_map<Sym, std::pair<Sym, bool>> from;  // node -> (next toward the reader, logic)
+                std::deque<Sym> todo;
+                SymSet starts = f.data;
+                starts.insert(starts.end(), f.ctrl.begin(), f.ctrl.end());
+                for (Sym st : starts)
+                    if (from.emplace(st, std::make_pair(nullptr, false)).second) todo.push_back(st);
+                bool found = from.count(s.self) > 0;
+                for (size_t steps = 0; !found && !todo.empty() && steps < 4000; steps++) {
+                    Sym x = todo.front();
+                    todo.pop_front();
+                    if (m.flopIx.count(x)) continue;
+                    const Comb* n = m.combOf(x);
+                    if (!n) continue;
+                    for (const Edge& e : n->src)
+                        if (from.emplace(e.sym, std::make_pair(x, e.logic)).second) {
+                            if (e.sym == s.self) { found = true; break; }
+                            todo.push_back(e.sym);
+                        }
+                }
+                if (found) {
+                    std::vector<std::string> hops;
+                    bool logic = from[s.self].second;
+                    for (Sym x = from[s.self].first; x && hops.size() < 6; x = from[x].first) {
+                        hops.push_back("{\"n\":" + json(m.name(x)) + ",\"g\":" + (logic ? "1" : "0") + "}");
+                        logic = from[x].second;
+                    }
+                    for (size_t k = 0; k < hops.size(); k++) via += (k ? "," : "") + hops[k];
+                }
+            }
+            via += "]";
+            std::string qual = c.qual ? json(m.name(c.qual)) : "null";
             rows.push_back("{\"src\":" + json(m.name(s)) + ",\"sd\":" + std::to_string(domIx[m.name(s.dom)]) +
                            ",\"dst\":" + json(m.name(f)) + ",\"dd\":" + std::to_string(domIx[m.name(f.dom)]) +
-                           ",\"how\":" + json(c.how) + ",\"rule\":" + json(rule) + ",\"chain\":" + chain + "}");
+                           ",\"how\":" + json(c.how) + ",\"rule\":" + json(rule) + ",\"chain\":" + chain +
+                           ",\"via\":" + via + ",\"qual\":" + qual + "}");
         }
         std::sort(rows.begin(), rows.end());
         std::vector<std::string> rsts;
@@ -2199,13 +2235,14 @@ const lg=document.getElementById('legend');
 DOMS.forEach((d,i)=>lg.append(el('span',{},el('i',{class:'sw',style:'background:'+col(i)}),`${d.name} (${d.flops})`)));
 const sw=i=>el('i',{class:'sw',style:'background:'+col(i)+';margin-right:6px'});
 function show(x,tr){document.querySelectorAll('tr.on').forEach(r=>r.classList.remove('on'));tr.classList.add('on');
- const n=[{t:x.src,d:x.sd}].concat(x.chain.map(t=>({t,d:x.dd})));const W=300,H=46,G=26;
+ const n=[{t:x.src,d:x.sd,k:'source'}].concat(x.via.map(v=>({t:v.n,d:-1,k:v.g?'logic':'net'})),x.chain.map((t,i)=>({t,d:x.dd,k:i?'stage '+(i+1):'reader'})));
+ if(x.qual)n.push({t:x.qual,d:x.dd,k:'qualifier'});const W=300,H=46,G=26;
  const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.setAttribute('width',W+20);s.setAttribute('height',n.length*(H+G)+10);
  n.forEach((b,i)=>{const y=5+i*(H+G);const r=document.createElementNS(s.namespaceURI,'rect');
-  Object.entries({x:10,y,width:W,height:H,rx:6,fill:'none',stroke:col(b.d),'stroke-width':2}).forEach(([k,v])=>r.setAttribute(k,v));s.append(r);
-  const t=document.createElementNS(s.namespaceURI,'text');t.setAttribute('x',20);t.setAttribute('y',y+19);t.textContent=b.t.length>40?'…'+b.t.slice(-39):b.t;s.append(t);
-  const c=document.createElementNS(s.namespaceURI,'text');c.setAttribute('x',20);c.setAttribute('y',y+36);c.setAttribute('fill-opacity','.7');c.textContent=(i==0?'source, ':i==1?'reader, ':'stage '+i+', ')+DOMS[b.d].name;s.append(c);
-  if(i<n.length-1){const l=document.createElementNS(s.namespaceURI,'line');Object.entries({x1:160,y1:y+H,x2:160,y2:y+H+G,stroke:i==0?'currentColor':col(b.d),'stroke-width':2,'stroke-dasharray':i==0?'4 3':''}).forEach(([k,v])=>l.setAttribute(k,v));s.append(l)}});
+  Object.entries({x:b.d<0?40:10,y,width:b.d<0?W-60:W,height:H,rx:b.d<0?(b.k=='logic'?22:2):6,fill:'none',stroke:b.d<0?'currentColor':col(b.d),'stroke-width':b.d<0?1:2,'stroke-dasharray':b.k=='qualifier'?'5 3':''}).forEach(([k,v])=>r.setAttribute(k,v));s.append(r);
+  const t=document.createElementNS(s.namespaceURI,'text');t.setAttribute('x',b.d<0?54:20);t.setAttribute('y',y+19);t.textContent=b.t.length>40?'…'+b.t.slice(-39):b.t;s.append(t);
+  const c=document.createElementNS(s.namespaceURI,'text');c.setAttribute('x',b.d<0?54:20);c.setAttribute('y',y+36);c.setAttribute('fill-opacity','.7');c.textContent=b.k+(b.d<0?'':', '+DOMS[b.d].name);s.append(c);
+  if(i<n.length-1){const l=document.createElementNS(s.namespaceURI,'line');Object.entries({x1:160,y1:y+H,x2:160,y2:y+H+G,stroke:b.d<0||n[i+1].d!=b.d?'currentColor':col(b.d),'stroke-width':2,'stroke-dasharray':n[i+1].d!=b.d&&n[i+1].d>=0&&b.d!=n[i+1].d?'4 3':''}).forEach(([k,v])=>l.setAttribute(k,v));s.append(l)}});
  const p=document.getElementById('path');p.className='';p.replaceChildren(el('div',{class:x.rule?'bad':'mut'},x.how),s)}
 function draw(){const q=document.getElementById('q').value.toLowerCase(),k=document.getElementById('kind').value;const tb=document.getElementById('rows');tb.replaceChildren();
  X.filter(x=>(!q||(x.src+' '+x.dst).toLowerCase().includes(q))&&(!k||(k=='bad')==!!x.rule)).forEach(x=>{
@@ -2361,6 +2398,13 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
                     what = "more than one bit of " + src + " changed at once: " + dst + " can see a value it never had";
                     break;
                 case Qualified: {
+                    // A memory (a FIFO's storage, wider than what the reader
+                    // takes, or an unpacked array) is written one entry at a
+                    // time while the reader takes another: the whole of it is
+                    // not held, so it is not checked as one value.
+                    if (s.bits > f.bits ||
+                        (s.sym && s.sym->isValue() && s.sym->as<ValueSymbol>().getType().isUnpackedArray()))
+                        continue;
                     const Flop* q = c.qual ? m.flopOf(c.qual) : nullptr;
                     if (!q || !ok(m.name(*q))) {
                         skipped++;
@@ -2385,7 +2429,7 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
                 if (!s.plain)
                     for (const Root& r : cones[m.flopIx.at(c.src)].all) {
                         const Flop* af = m.flopOf(r.sym);
-                        if (!af || af->dom != s.dom || r.logic) continue;
+                        if (!af || af->dom != s.dom) continue;
                         const Member& mem = member[af - m.flops.data()];
                         const Flop* from = mem.src ? m.flopOf(mem.src) : nullptr;
                         if (mem.pos < 2 || !from || from->dom != f.dom || mem.pos <= deepest) continue;
@@ -2395,11 +2439,24 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
                 if (ack && ok(m.name(*ack)) && !seen.count("handshake_" + ident(src))) {
                     std::string hl = "handshake_" + ident(src), a = m.name(*ack);
                     seen.insert(hl);
+                    // Each side changes only after the other side's (synchronized)
+                    // signal changed since its own last change; the first change
+                    // after reset may start. That holds for the side that starts
+                    // a transfer and the side that answers, two- or four-phase.
+                    std::string px = "px_" + hl, py = "py_" + hl, sn = "seen_" + hl, fs = "first_" + hl;
+                    std::string rst = s.arst.empty() || !ok(m.name(s.arst[0])) ? std::string("1'b0")
+                                      : std::string(s.arstHigh ? "" : "!") + m.name(s.arst[0]);
                     props.push_back({hl, "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) +
-                                             "): handshake, acknowledged through " + a + "\n" +
-                                             "  cdc_" + hl + ": assert property (" + clocking(s) + " $changed(" + src +
-                                             ") |-> $past(" + a + ") == $past(" + src + "))\n    else $error(\"[mlint cdc] " +
-                                             src + " changed before " + a + " acknowledged its last change\");\n"});
+                                             "): handshake, answered through " + a + "\n" +
+                                             "  logic " + px + ", " + py + ";\n  bit " + sn + " = 0, " + fs + " = 1;\n" +
+                                             "  always @(" + edge(s) + ") begin\n" +
+                                             "    if (" + rst + ") begin " + fs + " <= 1; " + sn + " <= 0; end\n" +
+                                             "    else if (" + src + " != " + px + ") begin\n" +
+                                             "      cdc_" + hl + ": assert (" + sn + " || " + fs + ") else $error(\"[mlint cdc] " +
+                                             src + " changed again before " + a + " answered its last change\");\n" +
+                                             "      " + fs + " <= 0;\n      " + sn + " <= " + a + " != " + py + ";\n" +
+                                             "    end else if (" + a + " != " + py + ") " + sn + " <= 1;\n" +
+                                             "    " + px + " <= " + src + ";\n    " + py + " <= " + a + ";\n  end\n"});
                 }
             }
             std::string t = "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) + "): " +

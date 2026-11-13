@@ -8,6 +8,25 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
+  flop, the nets and logic between it and the reader (a glitch source for
+  CDC003), the synchronizer stages, and the qualifier of an enable-qualified
+  bus.
+- `mlint -cdc-sva`: handshake checks are now an alternation check that
+  holds on both sides (the side that starts a transfer and the side that
+  answers), and an acknowledge read back through logic (an FSM) counts.
+  Checked by simulation on pulp common_cells `cdc_2phase`, `cdc_4phase`,
+  `cdc_fifo_2phase` and `cdc_fifo_gray`: no assertion fails.
+
+### Fixed
+- `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
+  the reader takes), which failed on correct FIFOs such as common_cells
+  `cdc_fifo_gray`.
+- `mlint`: four more rules after Verible's, off by default: `STY013`
+  (explicit-begin: `if`/`else`/loop/`always` bodies without `begin`),
+  `STY014` (proper-parameter-declaration: `parameter` outside `#(...)`),
+  `STY015` (numeric-format-string-style: `"%h"` without `0x`), `SUS004`
+  (plusarg-assignment: `$test$plusargs`).
 - UPF language rules of IEEE 1801-2024 clause 5 and 8.3 in `msim -upf` and
   `mlint -upf`: identifier and name-conflict checks, references to objects
   that do not exist, `-update` refinement of strategies and switches,
@@ -375,6 +394,15 @@ Spec references are IEEE 1800-2023 clauses.
   (next/previous time the selected signal takes it), Del to remove a row,
   Ctrl+arrows to step changes; the view lives in the page address, so a
   reload or a copied link opens on it.
+- `msim -i` / `-do` is a UCLI on the shared Tcl interpreter: `set`, `if`,
+  `foreach`, `proc`, `source` around the commands; stops at a line
+  (`stop -line N -file F`), at a time, on a condition, with `-command`,
+  `-continue` and `-once`, and `-delete/-disable/-enable`; `step` and `next`
+  one statement at a time; `run -posedge/-negedge/-change SIG`, `run -slot N`
+  (was `step N`), `run T -absolute`; `get -radix`, `change`, `scope`, `show`,
+  `describe`, `search`, `where`, `listing`, `dump` / `probe`, `senv`, `alias`.
+  `xrun -input` runs its Tcl file as it is (no translation), and `xrun -tcl`
+  is `-i`.
 - `mdebug -lint FILE`: mlint's findings (`mlint -json`) in the page: a list
   with a severity filter, marks on the source lines, and a click that opens
   the line and selects the signal the finding names; script command `lint`.
@@ -766,6 +794,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: blocking writes to an element of an array of 64 elements or
+  fewer chosen at run time merge exactly: the branch saves, puts back and
+  merges the array's elements like variables, so two branches that write
+  the same element no longer merge with its old value.
 - `-xprop`: `case ... inside` is merged: an item may match when its `==?`
   or range compare is unknown. The merging code of a combinational block
   now writes without change events and publishes each final value once, so
