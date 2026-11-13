@@ -2085,7 +2085,13 @@ struct Sim {
             for (size_t i = from; i < vcdIds.size(); i++) vcdIds[i] = vcdId(i);
         }
         const string& id = vcdIds[s];
-        if (w == 1) {
+        if ((size_t)s < vcdReal.size() && vcdReal[(size_t)s]) {   // r<value> <id> (21.7.2.1)
+            double d;
+            std::memcpy(&d, &val.v, 8);
+            char b[40];
+            int n = (val.x & ~0ull) ? std::snprintf(b, sizeof b, "r0 ") : std::snprintf(b, sizeof b, "r%.16g ", d);
+            vbuf.append(b, (size_t)n);
+        } else if (w == 1) {
             vbuf += (val.x & 1) ? ((val.z & 1) ? 'z' : 'x') : char('0' + (val.v & 1));
         } else {
             size_t at = vbuf.size();
@@ -2099,6 +2105,7 @@ struct Sim {
         vbuf += '\n';
         if (vbuf.size() >= (1u << 16)) flushVcd();
     }
+    std::vector<char> vcdReal;   // VCD signals declared as $var real
     // VCD identifier: base-94 over the printable characters '!'..'~'.
     static string vcdId(size_t i) {
         string id;
@@ -2953,7 +2960,9 @@ struct Sim {
             for (size_t i : sc.vars) {
                 const string& n = sigs[i].name;
                 size_t d = n.rfind('.');
-                vcd << "$var " << (sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << vcdId(i) << " "
+                bool rl = sigs[i].val.real && sigs[i].w == 64;   // a real or shortreal variable (6.12, 21.7.2.1)
+                if (rl) { if (vcdReal.size() <= i) vcdReal.resize(sigs.size()); vcdReal[i] = 1; }
+                vcd << "$var " << (rl ? "real" : sigs[i].net ? "wire" : "reg") << " " << sigs[i].w << " " << vcdId(i) << " "
                     << (d == string::npos ? n : n.substr(d + 1)) << " $end\n";
             }
             for (const Scope& k : sc.kids) emit(k);
