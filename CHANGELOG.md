@@ -19,6 +19,15 @@ Spec references are IEEE 1800-2023 clauses.
   `-top`), configuration specifications, nested block configurations,
   `entity e(a)` and `configuration` instances.
 - msim VHDL: generic types and generic subprograms on entities (6.5.6.1).
+- msim VHDL: range checks on integer assignments; out of range stops the
+  run like GHDL's bound check failure.
+- msim VHDL: conversion functions and type conversions on the formal of an
+  out port in a port map.
+- msim VHDL: blocks with generic and port maps, guarded blocks and guarded
+  assignments (11.2, 11.6).
+- msim VHDL: package instances declared in an architecture (4.9); an array
+  of characters indexes from its own left bound, not from 1.
+- msim VHDL: generic subprograms and subprogram instantiation (4.2.1, 4.4).
 - mvplat: Zbkb, Zbkx, Zabha, Zacas, Zfh (half precision), the CBO.*
   instructions (Zicboz in the device tree) and Svnapot. riscv-tests: 837
   programs (uzbkb, uzbkx, uzabha, uzacas, uzabha_zacas, uzfh, mzicbo and
@@ -193,6 +202,8 @@ Spec references are IEEE 1800-2023 clauses.
 ### Fixed
 - msim VHDL: a process's first run sees its input ports' initial values,
   not `Z` (14.7.5.2).
+- msim VHDL: `real'image` and `to_string` of a real print GHDL's form
+  (`1.0e-1`, `1.23456789e5`).
 - A continuous assignment to part of a variable (a bit, a slice, a member of
   a packed struct, also through an output port) no longer makes the rest of
   the variable z: procedures keep writing the other bits (6.5).

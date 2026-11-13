@@ -155,6 +155,23 @@ public:
         };
         for (auto& u : order)
             if (u->k == Unit::Package || u->k == Unit::PackageInst) emitPkg(u);
+        // package instances declared in an architecture (4.9): a package of their own
+        for (auto& [en, list] : archs)
+            for (auto& a : list)
+                for (auto& d : a->decls) {
+                    if (d->k != DK::PackageInst || !d->cfg) continue;
+                    UP pu = d->cfg;
+                    if (pu->file.empty()) {
+                        pu->file = a->file;
+                        if (auto e = entities.find(en); e != entities.end()) pu->ctx = allCtx(*e->second);
+                        auto ac = allCtx(*a);
+                        pu->ctx.insert(pu->ctx.end(), ac.begin(), ac.end());
+                    }
+                    if (auto it = packages.find(pu->name); it != packages.end() && it->second != pu)
+                        throw Error(a->file + ":" + std::to_string(d->line) + ": package '" + pu->text + "' is already declared; local package instances need distinct names");
+                    packages[pu->name] = pu;
+                    emitPkg(pu);
+                }
         for (auto& u : order)
             if (u->k == Unit::Entity) o << emitEntity(u);
         // a configuration declaration is a module of its own name: the entity with
@@ -635,6 +652,12 @@ private:
         if (x && *x == 0) return b;
         if (y && *y == 0) return a;
         return "(" + a + "+" + b + ")";
+    }
+    // the index of a string's first character: 1, or the left bound of an ascending array of characters
+    static std::string strBase(const TP& t) {
+        if (t && t->k == Type::Array && t->dims.size() == 1 && !t->dims[0].box && !t->dims[0].downto && !t->dims[0].l.empty() && t->dims[0].l != "1")
+            return "(" + t->dims[0].l + ")";
+        return "1";
     }
     static std::string subText(const std::string& a, const std::string& b) {
         auto x = parseInt(a), y = parseInt(b);
@@ -1755,12 +1778,12 @@ private:
             // SV strings are 0-based; VHDL strings start at 'left (1 for literals)
             if (e->args.size() == 1 && e->args[0].actual->k == EK::Range) {
                 Val l = ex(e->args[0].actual->a, bt["integer"]), r = ex(e->args[0].actual->b, bt["integer"]);
-                v.s = p.s + ".substr((" + l.s + ")-1, (" + r.s + ")-1)";
+                v.s = p.s + ".substr((" + l.s + ")-" + strBase(t) + ", (" + r.s + ")-" + strBase(t) + ")";
                 v.t = bt["string"];
                 return v;
             }
             Val i = ex(e->args[0].actual, bt["integer"]);
-            v.s = p.s + "[(" + i.s + ")-1]";
+            v.s = p.s + "[(" + i.s + ")-" + strBase(t) + "]";
             v.t = bt["character"];
             return v;
         }
@@ -2769,16 +2792,25 @@ package vhdl_rt;
     end
     return s.toupper();
   endfunction
-  function automatic string real_image(real r);
-    string s;
-    if (r == 0.0) return "0.0";
-    s = $sformatf("%.15g", r);
-    if (s.len() > 0) begin
-      bit dot = 0;
-      for (int i = 0; i < s.len(); i++) if (s[i] == "." || s[i] == "e") dot = 1;
-      if (!dot) s = {s, ".0"};
-    end
-    return s;
+  function automatic string real_image(real r);   // GHDL's form: 1.5, 1.0e-1, 1.23456789e5
+    string s, m;
+    int i, ep, k;
+    bit neg;
+    if (r == 0.0) return $realtobits(r) >> 63 ? "-0.0" : "0.0";
+    s = $sformatf("%.14e", r);
+    i = 0;
+    while (i < s.len() && s[i] != "e" && s[i] != "E") i++;
+    m = s.substr(0, i - 1);
+    k = m.len() - 1;
+    while (k > 0 && m[k] == "0" && m[k - 1] != ".") k--;
+    m = m.substr(0, k);
+    ep = 0;
+    neg = 0;
+    for (int j = i + 1; j < s.len(); j++)
+      if (s[j] == "-") neg = 1;
+      else if (s[j] >= "0" && s[j] <= "9") ep = ep * 10 + (s[j] - "0");
+    if (ep == 0) return m;
+    return {m, "e", neg ? "-" : "", $sformatf("%0d", ep)};
   endfunction
   function automatic string real_digits(real r, int d);
     if (d == 0) return real_image(r);
@@ -2806,6 +2838,13 @@ package vhdl_rt;
     if (fs % 64'd1000000 == 0) return $sformatf("%0dns", fs / 64'd1000000);
     if (fs % 64'd1000 == 0) return $sformatf("%0dps", fs / 64'd1000);
     return $sformatf("%0dfs", fs);
+  endfunction
+  function automatic int chk_int(longint v, longint lo, longint hi, string loc);   // a range check
+    if (v < lo || v > hi) begin
+      $fdisplay(32'h8000_0002, "%s:@%s:(bound check failure): %0d not in %0d to %0d", loc, at_time(), v, lo, hi);
+      $fatal(0, "VHDL bound check failure");
+    end
+    return int'(v);
   endfunction
   function automatic void report(string msg, int sev, string loc, bit is_assert);
     string sv;
@@ -3128,7 +3167,14 @@ endpackage
             declare(y);
             return;
         }
-        case DK::Subprog: return emitSubprogDecl(o, d, where);
+        case DK::Subprog:
+            if (d->sub && !d->sub->generics.empty()) {   // uninstantiated (4.2.1): emitted per instance
+                auto& slot = genericSubs[d->sub->name];
+                if (!slot || d->sub->hasBody) slot = d;
+                return;
+            }
+            return emitSubprogDecl(o, d, where);
+        case DK::SubInst: return emitSubInst(o, d, where);
         default: return;
         }
     }
@@ -3749,6 +3795,133 @@ endpackage
     }
 
     // ------------------------------------------------------------ subprograms
+    // Subprogram instantiation (4.4): a copy of the uninstantiated subprogram
+    // in which each generic's name is replaced by its actual.
+    std::map<std::string, DP> genericSubs;
+    using SubstMap = std::map<std::string, EP>;
+    static EP substE(const EP& e, const SubstMap& m) {
+        if (!e) return e;
+        if (e->k == EK::Name) {
+            auto it = m.find(e->name);
+            if (it != m.end()) return it->second;
+            return e;
+        }
+        if (e->k == EK::Call && e->a && e->a->k == EK::Name && e->args.size() == 1) {
+            auto it = m.find(e->a->name);
+            if (it != m.end() && it->second->k == EK::Attr && !it->second->b) {   // img => T'image: T'image(x)
+                auto n = std::make_shared<Expr>(*it->second);
+                n->b = substE(e->args[0].actual, m);
+                return n;
+            }
+        }
+        auto n = std::make_shared<Expr>(*e);
+        n->a = substE(e->a, m);
+        n->b = substE(e->b, m);
+        for (auto& x : n->args) x.actual = substE(x.actual, m);
+        for (auto& x : n->agg) { for (auto& c : x.choices) c = substE(c, m); x.value = substE(x.value, m); }
+        return n;
+    }
+    static SubInd substSI(const SubInd& si, const SubstMap& m) {
+        SubInd r = si;
+        if (si.mark && si.mark->k == EK::Name) {
+            auto it = m.find(si.mark->name);
+            if (it != m.end()) {
+                EP a = it->second;
+                if (a->k == EK::Call && r.idx.empty()) { r.mark = a->a; for (auto& x : a->args) r.idx.push_back(x.actual); }
+                else r.mark = a;
+            }
+        }
+        for (auto& x : r.idx) x = substE(x, m);
+        r.range = substE(r.range, m);
+        return r;
+    }
+    static SP substS(const SP& st, const SubstMap& m) {
+        if (!st) return st;
+        auto n = std::make_shared<Stmt>(*st);
+        n->target = substE(st->target, m); n->value = substE(st->value, m); n->cond = substE(st->cond, m);
+        n->range = substE(st->range, m); n->forTime = substE(st->forTime, m); n->report = substE(st->report, m);
+        n->severity = substE(st->severity, m); n->call = substE(st->call, m); n->reject = substE(st->reject, m);
+        for (auto& w : n->waves) { w.val = substE(w.val, m); w.after = substE(w.after, m); }
+        for (auto& a : n->alts) {
+            for (auto& c : a.choices) c = substE(c, m);
+            a.cond = substE(a.cond, m);
+            for (auto& w : a.waves) { w.val = substE(w.val, m); w.after = substE(w.after, m); }
+            for (auto& b : a.body) b = substS(b, m);
+            a.decls = substDs(a.decls, m);
+        }
+        for (auto& x : n->on) x = substE(x, m);
+        for (auto& b : n->body) b = substS(b, m);
+        n->decls = substDs(n->decls, m);
+        return n;
+    }
+    static std::vector<DP> substDs(const std::vector<DP>& ds, const SubstMap& m) {
+        std::vector<DP> r;
+        for (auto& d : ds) {
+            auto n = std::make_shared<Decl>(*d);
+            n->type = substSI(d->type, m);
+            n->init = substE(d->init, m);
+            n->target = substE(d->target, m);
+            if (d->sub) {
+                n->sub = std::make_shared<Subprog>(*d->sub);
+                n->sub->params = substDs(d->sub->params, m);
+                n->sub->ret = substSI(d->sub->ret, m);
+                n->sub->decls = substDs(d->sub->decls, m);
+                for (auto& b : n->sub->body) b = substS(b, m);
+            }
+            if (d->tdef) {
+                n->tdef = std::make_shared<TypeDef>(*d->tdef);
+                n->tdef->range = substE(d->tdef->range, m);
+                for (auto& x : n->tdef->index) x = substE(x, m);
+                n->tdef->elem = substSI(d->tdef->elem, m);
+                n->tdef->fields = substDs(d->tdef->fields, m);
+            }
+            r.push_back(n);
+        }
+        return r;
+    }
+    void emitSubInst(std::ostringstream& o, const DP& d, const std::string& where) {
+        std::string g = d->target ? (d->target->k == EK::Sel || d->target->k == EK::Name ? d->target->name : "") : "";
+        auto it = genericSubs.find(g);
+        if (it == genericSubs.end()) fail(d->line, "no uninstantiated subprogram '" + g + "'");
+        const DP& src = it->second;
+        SubstMap m;
+        size_t pos = 0;
+        for (auto& gd : src->sub->generics)
+            for (size_t k = 0; k < gd->names.size(); ++k, ++pos) {
+                const std::string& n = gd->names[k];
+                EP act;
+                for (size_t i = 0; i < d->genericMap.size(); ++i) {
+                    auto& a = d->genericMap[i];
+                    if (a.formal && a.formal->k == EK::Name && a.formal->name == n) act = a.actual;
+                    if (!a.formal && i == pos) act = a.actual;
+                }
+                if (act && act->k == EK::Open) act = nullptr;
+                if (!act && gd->cls == "subprogram") {
+                    if (gd->target) act = gd->target;
+                    else if (gd->mode == "box") { act = std::make_shared<Expr>(EK::Name, d->line); act->name = n; act->text = gd->texts[k]; }
+                }
+                if (!act) act = gd->init;
+                if (!act) fail(d->line, "no actual for generic '" + gd->texts[k] + "'");
+                if (gd->cls == "subprogram" && act->k == EK::Name && act->name == n) continue;   // the same name: nothing to replace
+                m[n] = act;
+            }
+        auto nd = std::make_shared<Decl>(*src);
+        nd->k = DK::Subprog;
+        nd->line = d->line;
+        auto sp = std::make_shared<Subprog>(*src->sub);
+        sp->generics.clear();
+        sp->name = d->sub->name;
+        sp->text = d->sub->text;
+        sp->params = substDs(src->sub->params, m);
+        sp->ret = substSI(src->sub->ret, m);
+        sp->decls = substDs(src->sub->decls, m);
+        for (auto& b : sp->body) b = substS(b, m);
+        nd->sub = sp;
+        nd->names = d->names;
+        nd->texts = d->texts;
+        emitSubprogDecl(o, nd, where);
+    }
+
     void emitSubprogDecl(std::ostringstream& o, const DP& d, const std::string& where) {
         auto sp = d->sub;
         splitParams(*sp);
@@ -4067,7 +4240,21 @@ endpackage
 
     std::string assignRhs(const EP& val, const TP& tt) {
         Val v = ex(val, tt);
-        return fitTo(v, tt);
+        return rangeCheck(val, v, tt, fitTo(v, tt));
+    }
+    // An integer value assigned to a subtype with a range is checked (5.2.1,
+    // 14.7.4): out of range stops the run like GHDL's bound check failure.
+    int chkLine = 0;
+    bool rangeChecks = true;
+    std::string rangeCheck(const EP& val, const Val& v, const TP& tt, const std::string& s) {
+        if (!rangeChecks || synth || !tt || tt->k != Type::Int || !tt->range || !tt->range->lv || !tt->range->rv) return s;
+        int64_t lo = std::min(*tt->range->lv, *tt->range->rv), hi = std::max(*tt->range->lv, *tt->range->rv);
+        if (lo <= INT32_MIN && hi >= INT32_MAX) return s;
+        if (val && val->k == EK::Int && val->ival >= lo && val->ival <= hi) return s;
+        if (val && val->k == EK::Name && v.t && v.t->k == Type::Int && v.t->range && v.t->range->lv && v.t->range->rv &&
+            std::min(*v.t->range->lv, *v.t->range->rv) >= lo && std::max(*v.t->range->lv, *v.t->range->rv) <= hi) return s;
+        std::string loc = cx ? cx->file : std::string("?");
+        return "vhdl_rt::chk_int(" + s + ", " + std::to_string(lo) + ", " + std::to_string(hi) + ", \"" + loc + ":" + std::to_string(chkLine) + "\")";
     }
     // adapt a value to the target type where SystemVerilog would not do the same thing
     std::string fitTo(const Val& v, const TP& tt) {
@@ -4079,6 +4266,7 @@ endpackage
     }
 
     std::string seqStmt(const Stmt& s) {
+        chkLine = s.line;
         std::string r;
         std::string I = ind();
         switch (s.k) {
@@ -5240,9 +5428,14 @@ endpackage
             cx->indent = 2;
             Stmt q = s;
             q.k = s.k == SK::ConcAssign ? SK::SigAssign : s.k == SK::ConcCond ? SK::CondSigAssign : SK::SelSigAssign;
-            if (q.k == SK::SigAssign && s.guarded) fail(s.line, "guarded assignments are not supported yet");
             std::string body = seqStmt(q);
             std::vector<std::string> sigs;
+            if (s.guarded) {   // 11.6: if GUARD then <assignment> end if
+                const Sym* g = lookup("guard");
+                if (!g || g->k != Sym::Obj) fail(s.line, "a guarded assignment outside a guarded block");
+                body = "    if (" + g->sv + ") begin\n" + body + "    end\n";
+                sigs.push_back(g->sv);
+            }
             std::vector<SP> one{std::make_shared<Stmt>(q)};
             readSignalsStmts(one, sigs);
             if (s.k == SK::ConcSel) readSignals(s.value, sigs);
@@ -5250,7 +5443,7 @@ endpackage
             cx->indent = 1;
             std::string decl = driverDecls(pr);
             // q <= d when rising_edge(clk): a flip-flop
-            if (s.k == SK::ConcCond && s.alts.size() == 1 && s.alts[0].cond && s.alts[0].waves.size() == 1 && !s.alts[0].waves[0].after) {
+            if (!s.guarded && s.k == SK::ConcCond && s.alts.size() == 1 && s.alts[0].cond && s.alts[0].waves.size() == 1 && !s.alts[0].waves[0].after) {
                 std::string e = edgeOf(s.alts[0].cond);
                 if (!e.empty()) {
                     TP tt = targetType(s.target);
@@ -5350,12 +5543,70 @@ endpackage
             return out + "  endcase\n";
         }
         case SK::Block: {
-            if (!s.genericMap.empty() || !s.portMap.empty()) fail(s.line, "blocks with generic or port maps are not supported yet");
-            if (s.cond) fail(s.line, "guarded blocks are not supported yet");
             std::string out = r + "  if (1) begin" + procName(s.label) + "\n";
+            // a block header (11.2): generics are constants with the mapped value,
+            // ports name their actuals (an alias, so no extra delta)
+            std::vector<std::pair<std::string, EP>> gmap, pmap;   // formal (lower) -> actual
+            std::vector<DP> rest;
+            std::vector<std::string> gOrder, pOrder;
+            for (auto& d : s.decls) {
+                if (d->k == DK::Generic) for (auto& n : d->names) gOrder.push_back(n);
+                else if (d->k == DK::Port) for (auto& n : d->names) pOrder.push_back(n);
+            }
+            auto actualFor = [&](const std::vector<Assoc>& m, const std::vector<std::string>& order, const std::string& n) -> EP {
+                for (size_t i = 0; i < m.size(); ++i) {
+                    if (m[i].formal && baseName(m[i].formal) == n) return m[i].actual;
+                    if (!m[i].formal && i < order.size() && order[i] == n) return m[i].actual;
+                }
+                return nullptr;
+            };
+            std::ostringstream hd;
             cx->scopes.push_back(Scope());
+            for (auto& d : s.decls) {
+                if (d->k != DK::Generic && d->k != DK::Port) { rest.push_back(d); continue; }
+                TP t = subtype(d->type);
+                for (size_t k = 0; k < d->names.size(); ++k) {
+                    EP act = actualFor(d->k == DK::Generic ? s.genericMap : s.portMap, d->k == DK::Generic ? gOrder : pOrder, d->names[k]);
+                    if (act && act->k == EK::Open) act = nullptr;
+                    Sym y;
+                    y.name = d->names[k];
+                    y.text = d->texts[k];
+                    if (d->k == DK::Generic) {
+                        EP v = act ? act : d->init;
+                        if (!v) fail(d->line, "no actual for block generic '" + d->texts[k] + "'");
+                        y.k = Sym::Obj;
+                        y.cls = "constant";
+                        y.sv = svId(d->texts[k]);
+                        y.type = t;
+                        hd << "    localparam " << svDecl(t, y.sv) << " = " << ex(v, t).s << ";\n";
+                    } else {
+                        if (!act) fail(d->line, "block port '" + d->texts[k] + "' needs an actual");
+                        Val v = ex(act, t);
+                        y.k = Sym::Alias;
+                        y.aliasSv = v.s;
+                        y.type = isUnconstrained(t) && v.t ? v.t : t;
+                    }
+                    declare(y);
+                }
+            }
+            // a guarded block (11.2): the implicit signal GUARD
+            if (s.cond) {
+                Sym g;
+                g.k = Sym::Obj;
+                g.cls = "signal";
+                g.name = "guard";
+                g.text = "GUARD";
+                g.sv = "GUARD";
+                g.type = bt["boolean"];
+                std::vector<std::string> sigs;
+                readSignals(s.cond, sigs);
+                std::string c = boolOf(ex(s.cond, bt["boolean"])).s;
+                hd << "    bit GUARD;\n    always begin\n" << firstRun() << "      GUARD <= " << c << ";\n      @(" << eventList(sigs) << ");\n    end\n";
+                declare(g);
+            }
             std::ostringstream d;
-            emitDecls(d, s.decls, "module");
+            d << hd.str();
+            emitDecls(d, rest, "module");
             out += d.str();
             for (auto& b : s.body) out += concStmt(*b, "");
             cx->scopes.pop_back();
@@ -5639,6 +5890,7 @@ endpackage
         }
         std::vector<std::string> unconGens;
         std::set<std::string> unconAsc;
+        std::string convPre;   // signals and processes of conversions on formals
         auto mapList = [&](const std::vector<Assoc>& m, const std::vector<std::string>& order, const std::vector<std::string>& lowerNames,
                            const std::vector<TP>& types, const std::vector<std::string>& compOrder, const std::vector<TP>& compTypes, bool isPort) {
             std::vector<std::string> items;
@@ -5655,8 +5907,42 @@ endpackage
                         continue;
                     }
                     if (a.formal->k == EK::Call && a.formal->a->k == EK::Name && lookupFormal(a.formal->a->name, lowerNames) == false) {
-                        // conversion function on the formal: not supported
-                        fail(s.line, "conversion functions in port maps are not supported yet");
+                        // conv(formal) => actual on an out port (6.5.7.3): the port drives a
+                        // signal of its own type, and a process assigns conv() of it to the actual
+                        if (!isPort || a.formal->args.size() != 1 || !a.formal->args[0].actual) fail(s.line, "unsupported formal in an association");
+                        EP fe = a.formal->args[0].actual;
+                        std::string f = baseName(fe);
+                        std::string mode;
+                        if (ent) for (auto& p : ent->ports) for (auto& n : p->names) if (n == f) mode = p->mode;
+                        if (comp && comp->decl) for (auto& p : comp->decl->ports) for (auto& n : p->names) if (n == f) mode = p->mode;
+                        if (mode != "out" && mode != "buffer") fail(s.line, "a conversion on the formal is supported on out ports only");
+                        TP ftc;
+                        for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) ftc = types[i];
+                        if (!ftc) for (size_t i = 0; i < compOrder.size(); ++i) if (compOrder[i] == f && i < compTypes.size()) ftc = compTypes[i];
+                        if (!ftc || isUnconstrained(ftc)) fail(s.line, "a conversion on the formal needs a constrained port type");
+                        std::string fsv;
+                        for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) fsv = order[i];
+                        if (fsv.empty()) fsv = svId(f);
+                        std::string tmp = svId(label) + "__" + fsv + "__c";
+                        Sym y;
+                        y.k = Sym::Obj;
+                        y.cls = "signal";
+                        y.name = lowerStr(tmp);
+                        y.text = tmp;
+                        y.sv = tmp;
+                        y.type = ftc;
+                        declare(y);
+                        auto nm = std::make_shared<Expr>(EK::Name, s.line);
+                        nm->name = y.name;
+                        nm->text = tmp;
+                        auto call = std::make_shared<Expr>(EK::Call, s.line);
+                        call->a = a.formal->a;
+                        call->args.push_back(Assoc{nullptr, nm});
+                        Val cv = ex(call, targetType(a.actual));
+                        convPre += "  " + svDecl(ftc, tmp) + ";\n  always begin\n" + firstRun() + "    " + target(a.actual, true) + " <= " + cv.s + ";\n    @(" + tmp + ");\n  end\n";
+                        items.push_back("." + fsv + "(" + tmp + ")");
+                        ++pos;
+                        continue;
                     }
                 } else {
                     // positional: by the component's (or entity's) order
@@ -5765,7 +6051,7 @@ endpackage
                     }
                 }
         }
-        std::string r = "  " + modName;
+        std::string r = convPre + "  " + modName;
         if (!gens.empty()) {
             r += " #(";
             for (size_t i = 0; i < gens.size(); ++i) r += (i ? ", " : "") + gens[i];

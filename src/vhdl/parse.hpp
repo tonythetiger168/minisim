@@ -479,11 +479,12 @@ private:
             d->names.push_back(d->sub->name);
             d->texts.push_back(d->sub->text);
             if (accept("is")) {
-                if (accept("new")) {   // subprogram instantiation: skip
-                    name();
-                    if (accept("generic")) { expect("map"); assocList(); }
+                if (accept("new")) {   // subprogram instantiation (4.4)
+                    d->target = name();
+                    if (isOp("[")) { while (!isOp("]")) next(); next(); }   // signature
+                    if (accept("generic")) { expect("map"); d->genericMap = assocList(); }
                     expect(";");
-                    d->k = DK::Ignored;
+                    d->k = DK::SubInst;
                     return out;
                 }
                 d->sub->hasBody = true;
@@ -566,7 +567,14 @@ private:
             expect("is");
             if (accept("new")) {
                 d->target = name();
-                if (accept("generic")) { expect("map"); assocList(); }
+                d->cfg = std::make_shared<Unit>();
+                d->cfg->k = Unit::PackageInst;
+                d->cfg->name = l;
+                d->cfg->text = x;
+                d->cfg->of = lastName(d->target);
+                d->cfg->ofText = d->cfg->of;
+                d->cfg->line = d->line;
+                if (accept("generic")) { expect("map"); d->cfg->genericMap = assocList(); }
                 expect(";");
             } else {
                 declarations();
@@ -595,7 +603,7 @@ private:
         for (auto& pd : s->params) {
             if (pd->cls.empty()) pd->cls = (s->isFunc || pd->mode == "in") ? "constant" : "variable";
         }
-        if (s->isFunc) {
+        if (s->isFunc && !(isKw("is") && peekKw(1, "new"))) {   // function f is new g: no return type
             expect("return");
             if (isIdent() && peekKw(1, "of")) { ident(); next(); }   // return identifier of (2019)
             s->ret = subtypeIndication();
