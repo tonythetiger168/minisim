@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- AXI4 VIP (`vip/axi4`) brought to AMBA AXI IHI0022H.c: the full AXI4 signal
+  set (AxQOS, AxREGION, xUSER), configurable widths (`axi4_defines.svh`),
+  a master with several bursts in flight, a slave with an exclusive monitor
+  and out-of-order / interleaved responses, and a protocol checker of 48
+  rules reported as `[<section> <RULE>]`. New benches: exclusive and
+  outstanding tests, a 128-bit bus (`tests/vip/axi4w`) and a negative test
+  of every checker rule (`tests/vip/axi4_sva`). `spec/README.md` maps the
+  specification to the VIP.
 - mvplat: the B extension (Zba, Zbb, Zbs) with Zbc and Zicond on RV32 and
   RV64, in `misa` and the device tree; 588 riscv-tests now (uzba, uzbb, uzbc,
   uzbs, uzicond added, `p` and `v`).
