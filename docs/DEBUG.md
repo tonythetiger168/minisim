@@ -286,6 +286,24 @@ sent the first time the page shows that signal, whole (up to 4 million
 changes per signal, around `-at T` beyond that). Everything else in the page
 is the same: trace, schematic, state diagrams, coverage marks.
 
+mdebug reads a waveform on demand: at start only the list of signals, then
+the changes of a signal the first time a query or the page needs it (one
+pass over the file per request; the page of `-html` reads blocks of 2048
+signals and keeps only the cut waves). So the memory a session needs grows
+with the signals looked at, not with the size of the waveform. Measured on a
+4-core machine with `bench/gen_soc.py 1024 20000` (1024 cores, 2178
+instances, 23305 signals, a 384 MB FST of 200,000 ns):
+
+| | before | now |
+|---|---|---|
+| `-script`: `value`, `active`, `changes` on a few signals | out of memory at 13.6 GB | 1.0 s, 113 MB |
+| `-serve`: page ready / one signal's waves | out of memory | 0.5 s / 0.05 to 0.08 s, 157 MB |
+| `-html` (23305 signals cut to 90 changes each) | out of memory | 13 s, 1.6 GB, 60 MB page |
+
+    python3 bench/gen_soc.py 1024 20000 > soc.sv
+    msim soc.sv -top soc_tb -fst soc.fst
+    mdebug soc.sv -top soc_tb -fst soc.fst -serve
+
 The server listens on 127.0.0.1 only and answers only requests addressed to
 `127.0.0.1` or `localhost`, so another machine, or a web page from another
 site, cannot read the design through it. To look from another machine, use

@@ -85,6 +85,30 @@ what only it covers, what it adds in that order and the running total; the
 tests that add nothing are redundant for coverage. ``-item file:line`` (or a
 signal, FSM, covergroup or assertion name) lists the tests that cover it.
 
+UCIS: a database whose file name ends in .xml is UCIS XML (Accellera Unified
+Coverage Interoperability Standard 1.0, its XML interchange format), the
+open format other simulators' coverage tools import and export. Every
+command reads it, and with JSON databases mixed in; ``mcov merge a.json -o
+a.xml`` writes one. Each module instance becomes an instanceCoverages scope
+with its statements, branches, conditions, toggles, FSMs, assertions and
+covergroups; a reader adds the instances up. Proprietary binary databases
+are not read.
+
+Other vendors' command lines (docs/COMPAT.md): with --compat=synopsys,
+cadence or siemens (or -compat X), or started through a symlink named urg,
+imc or vcover, mcov takes those tools' commands and runs its own engine:
+
+    mcov --compat=synopsys -dir runs -dbname all.json -report urgReport -format both -elfile x.el -grade
+    mcov --compat=cadence -execcmd "merge a.json b.json -out all.json; load all.json; report -detail -out r.txt"
+    mcov --compat=cadence -exec cmds.tcl      # load, merge -out, report [-summary|-detail] [-html] -out, rank, exit
+    mcov --compat=siemens merge all.json a.json b.json       # or merge -out all.json a.json b.json
+    mcov --compat=siemens report -details -output r.txt all.json   # -html [-htmldir d]
+    mcov --compat=siemens ranktest -rankfile rank.txt a.json b.json
+
+Give mcov databases (JSON or UCIS XML, or a directory of them) where those
+tools take their own binary databases, which are not read. Licence-queue
+and 64-bit options are ignored, with a note.
+
 Exit status: 0, or 1 when a -min-* threshold is not met (or -el-strict finds
 an exclusion to review), 2 on bad usage.
 """
@@ -110,6 +134,10 @@ if hasattr(int, "bit_count"):           # Python 3.10+
 
 def load_into(db, path):
     """Add one database file into db (as merge() would), without a copy."""
+    if not os.path.isfile(path):
+        raise SystemExit(f"mcov: {path}: no such database")
+    if is_ucis(path):
+        return load_ucis_into(db, path)
     with open(path, "rb") as f:
         d = json.loads(f.read())
     if d.get("format") != "msim-cov":
@@ -324,7 +352,20 @@ def load_all(paths, jobs=0):
     return out
 
 
+def is_ucis(path):
+    """A UCIS XML database: named .xml, or a file that starts as XML."""
+    if path.lower().endswith(".xml"):
+        return True
+    try:
+        with open(path, "rb") as f:
+            return f.read(64).lstrip().startswith(b"<")
+    except OSError:
+        return False
+
+
 def save(db, path):
+    if path.lower().endswith(".xml"):
+        return save_ucis(db, path)
     files = sorted({k[0] for k in db["lines"]} | {k[0] for k in db["branches"]} | {k[0] for k in db["conds"]} |
                    {m["file"] for m in db["fsms"].values()} |
                    {k[0] for it in db["insts"].values() for part in ("lines", "branches") for k in it[part]})
@@ -364,6 +405,450 @@ def save(db, path):
                               [[b, h] for b, h in v[5].items() if h or v[0] != "cross"]] for i, v in items.items()]]
             for name, (w, goal, items) in sorted(db["cgs"].items())) + "\n],\n")
         f.write('"assertions": [\n' + rows([name] + list(a) for name, a in sorted(db["asserts"].items())) + "\n]\n}\n")
+
+
+# ---------------------------------------------------------------------------
+# UCIS XML (Accellera Unified Coverage Interoperability Standard 1.0, the XML
+# interchange format of its chapter 9): the open format other tools' coverage
+# databases read and write. A database file whose name ends in .xml is UCIS:
+# every command reads it, and merge -o x.xml writes one.
+
+UCIS_NS = "http://www.ucis.org/ucis/1.0"
+_UCIS_RESIDUAL = "$unit"   # lines / decisions / conditions that no instance owns
+
+
+def _xa(v):
+    """An XML attribute value, quoted."""
+    return '"' + str(v).replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;").replace(
+        "\n", "&#10;").replace("\t", "&#9;") + '"'
+
+
+def _xt(v):
+    return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ucis_time():
+    import datetime
+    sde = os.environ.get("SOURCE_DATE_EPOCH")
+    t = (datetime.datetime.fromtimestamp(int(sde), datetime.timezone.utc) if sde
+         else datetime.datetime.now(datetime.timezone.utc))
+    return t.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _ucis_scopes(db):
+    """{instance path: module} for every scope the database names, with their parents."""
+    mods = {name: it["module"] for name, it in db["insts"].items()}
+    known = set(mods)
+    owner = lambda name: inst_of(name, known) or (name.rsplit(".", 1)[0] if "." in name else name)
+    for name in db["toggles"]:
+        mods.setdefault(owner(name), "")
+    for (mod, inst, _n) in db["fsms"]:
+        if not mods.get(inst):
+            mods[inst] = mod
+    for name in list(db["asserts"]) + list(db["cgs"]):
+        mods.setdefault(owner(name), "")
+    for p in list(mods):
+        while "." in p:
+            p = p.rsplit(".", 1)[0]
+            mods.setdefault(p, "")
+    return mods, owner
+
+
+def _ucis_residual(db):
+    """The lines, decisions and conditions no instance holds (code outside
+    modules, or all of it in a database without instances). The rest is
+    written per instance only; a reader adds the instances up."""
+    insts = db["insts"].values()
+    owned = lambda part: set().union(*(it[part] for it in insts)) if db["insts"] else set()
+    ol, ob, oc = owned("lines"), owned("branches"), owned("conds")
+    return ({k: h for k, h in db["lines"].items() if k not in ol},
+            {k: v for k, v in db["branches"].items() if k not in ob},
+            {k: list(v[2]) for k, v in db["conds"].items() if k not in oc})
+
+
+def save_ucis(db, out_path):
+    """Write db as UCIS XML: one instanceCoverages per instance with its own
+    statements, branches, conditions, toggles, FSMs, assertions and covergroups."""
+    files = sorted({k[0] for k in db["lines"]} | {k[0] for k in db["branches"]} | {k[0] for k in db["conds"]} |
+                   {m["file"] for m in db["fsms"].values()}) or ["<none>"]
+    fid = {f: i + 1 for i, f in enumerate(files)}
+    mods, owner = _ucis_scopes(db)
+    res_lines, res_branches, res_conds = _ucis_residual(db)
+    order = sorted(mods)
+    iid = {p: i for i, p in enumerate(order)}
+    if res_lines or res_branches or res_conds:
+        iid[_UCIS_RESIDUAL] = len(order)
+        order.append(_UCIS_RESIDUAL)
+    tog, fsm, asr, cgs = {}, {}, {}, {}
+    for name, v in db["toggles"].items():
+        tog.setdefault(owner(name), []).append((name, v))
+    for (mod, inst, name), m in db["fsms"].items():
+        fsm.setdefault(inst, []).append((name, m))
+    for name, a in db["asserts"].items():
+        asr.setdefault(owner(name), []).append((name, a))
+    for name, g in db["cgs"].items():
+        cgs.setdefault(owner(name), []).append((name, g))
+    when = _ucis_time()
+    out = []
+    w = out.append
+    sid = lambda f, l, n=1: f'<id file="{fid[f]}" line="{max(1, l)}" inlineCount="{max(1, n)}"/>'
+    cnt = lambda h: f'<contents coverageCount="{max(0, h)}"/>'
+    ua = lambda k, t, v: f'<userAttr key={_xa(k)} type="{t}">{_xt(v)}</userAttr>'
+    w('<?xml version="1.0" encoding="UTF-8"?>\n')
+    w(f'<ucis:UCIS xmlns:ucis="{UCIS_NS}" ucisVersion="1.0" writtenBy="mcov {VERSION}" writtenTime="{when}">\n')
+    for f in files:
+        w(f'<sourceFiles fileName={_xa(f)} id="{fid[f]}"/>\n')
+    for i, t in enumerate(db["tests"] or ["mcov"]):
+        w(f'<historyNodes historyNodeId="{i}" logicalName={_xa(t)} kind="test" testStatus="true" date="{when}" '
+          f'toolCategory="UCIS:simulator" ucisVersion="1.0" vendorId="minisim" vendorTool="msim" '
+          f'vendorToolVersion="{VERSION}"/>\n')
+    for path in order:
+        resid = path == _UCIS_RESIDUAL
+        it = {"lines": res_lines, "branches": res_branches, "conds": res_conds} if resid else \
+            db["insts"].get(path, {"lines": {}, "branches": {}, "conds": {}})
+        parent = None if resid or "." not in path else path.rsplit(".", 1)[0]
+        local = path if resid or parent is None else path[len(parent) + 1:]
+        attrs = f'name={_xa(local)} key="{iid[path]}" instanceId="{iid[path]}"'
+        if parent is not None:
+            attrs += f' parentInstanceId="{iid[parent]}"'
+        attrs += f' moduleName={_xa(_UCIS_RESIDUAL if resid else mods.get(path, ""))}'
+        w(f"<instanceCoverages {attrs}>\n")
+        first = min(it["lines"]) if it["lines"] else (files[0], 1)
+        w(sid(*first) + "\n")
+        if path in tog:
+            w('<toggleCoverage metricMode="2SToggle">\n')
+            for k, (name, (wd, rise, fall)) in enumerate(sorted(tog[path])):
+                local_s = name[len(path) + 1:] if name.startswith(path + ".") else name
+                w(f'<toggleObject name={_xa(local_s)} key="{k}">' + sid(*first))
+                for b in range(wd):
+                    bn = f"{local_s}[{b}]" if wd > 1 else local_s
+                    w(f'<toggleBit name={_xa(bn)} key="{b}">' + (f"<index>{b}</index>" if wd > 1 else "")
+                      + f'<toggle from="0" to="1"><bin>{cnt(rise >> b & 1)}</bin></toggle>'
+                      + f'<toggle from="1" to="0"><bin>{cnt(fall >> b & 1)}</bin></toggle></toggleBit>')
+                w(ua("minisim.width", "int", wd) + "</toggleObject>\n")
+            w("</toggleCoverage>\n")
+        if it["lines"]:
+            w('<blockCoverage metricMode="statement">\n')
+            for (f, l), h in sorted(it["lines"].items()):
+                w(f"<statement>{sid(f, l)}<bin>{cnt(h)}</bin></statement>\n")
+            w("</blockCoverage>\n")
+        if it["conds"]:
+            w('<conditionCoverage metricMode="condition">\n')
+            for k, (key, h) in enumerate(sorted(it["conds"].items())):
+                f, l, col, text = key
+                op, terms, _ = db["conds"].get(key, ("&&", tuple(f"t{i + 1}" for i in range(max(1, len(h) - 1))), h))
+                w(f'<expr name={_xa(text)} key="{k}" exprString={_xa(text)} index="{max(0, col)}" '
+                  f'width="{len(terms)}">' + sid(f, l) + "".join(f"<subExpr>{_xt(t)}</subExpr>" for t in terms))
+                for vals, hv in cond_rows(op, terms, h):
+                    w(f'<bin alias={_xa(" ".join(vals))}>{cnt(hv)}</bin>')
+                w(ua("minisim.op", "str", op) + "</expr>\n")
+            w("</conditionCoverage>\n")
+        if it["branches"]:
+            w('<branchCoverage metricMode="branch">\n')
+            for (f, l, n), (t, fa) in sorted(it["branches"].items()):
+                w(f'<statement statementType="if">{sid(f, l, n + 1)}'
+                  f'<branch>{sid(f, l, n + 1)}<branchBin alias="true">{cnt(t)}</branchBin></branch>'
+                  f'<branch>{sid(f, l, n + 1)}<branchBin alias="false">{cnt(fa)}</branchBin></branch></statement>\n')
+            w("</branchCoverage>\n")
+        if path in fsm:
+            w('<fsmCoverage metricMode="fsm">\n')
+            for name, m in sorted(fsm[path], key=lambda x: x[0]):
+                sn = {v: n for v, (n, _h) in m["states"].items()}
+                w(f'<fsm name={_xa(name)} type="state" width="{max(1, m["width"])}">\n')
+                for v, (n, h) in sorted(m["states"].items()):
+                    w(f'<state stateName={_xa(n)} stateValue="{v}"><stateBin>{cnt(h)}</stateBin></state>\n')
+                trs = [(a, b, h, r, 0) for (a, b), (h, r) in sorted(m["trans"].items())] + \
+                      [(a, b, h, 0, 1) for (a, b), h in sorted(m["extra"].items())]
+                for a, b, h, r, x in trs:
+                    w(f"<stateTransition><state>{_xt(sn.get(a, a))}</state><state>{_xt(sn.get(b, b))}</state>"
+                      f'<transitionBin alias="{a}->{b}">{cnt(h)}</transitionBin>'
+                      + (ua("minisim.reset", "int", 1) if r else "") + (ua("minisim.extra", "int", 1) if x else "")
+                      + "</stateTransition>\n")
+                w(ua("minisim.file", "str", m["file"]) + ua("minisim.line", "int", m["line"]) + "</fsm>\n")
+            w("</fsmCoverage>\n")
+        if path in asr:
+            w('<assertionCoverage metricMode="assertion">\n')
+            for name, (kind, evals, passes, fails) in sorted(asr[path]):
+                ln = name[len(path) + 1:] if name.startswith(path + ".") else name
+                hitbin = "coverBin" if kind == "cover" else "passBin"
+                w(f"<assertion name={_xa(ln)} assertionKind={_xa(kind)}>"
+                  f"<{hitbin}>{cnt(passes)}</{hitbin}><failBin>{cnt(fails)}</failBin>"
+                  f"<attemptBin>{cnt(evals)}</attemptBin></assertion>\n")
+            w("</assertionCoverage>\n")
+        if path in cgs:
+            w('<covergroupCoverage metricMode="functional">\n')
+            for name, (wt, goal, items) in sorted(cgs[path], key=lambda x: x[0]):
+                ln = name[len(path) + 1:] if name.startswith(path + ".") else name
+                w(f'<cgInstance name={_xa(ln)} key="0"><options weight="{max(0, wt)}" goal="{max(0, goal)}"/>'
+                  f'<cgId cgName={_xa(ln)} moduleName={_xa(mods.get(path, ""))}>'
+                  f'<cginstSourceId file="1" line="1" inlineCount="1"/><cgSourceId file="1" line="1" inlineCount="1"/></cgId>\n')
+                pts = [(i, v) for i, v in items.items() if v[0] != "cross" and v[5]]
+                crs = [(i, v) for i, v in items.items() if v[0] == "cross"]
+                for i, (kind, iw, ig, al, tot, bins) in pts:
+                    w(f'<coverpoint name={_xa(i)} key="0"><options weight="{max(0, iw)}" goal="{max(0, ig)}" '
+                      f'at_least="{max(0, al)}"/>')
+                    for k, (b, h) in enumerate(bins.items()):
+                        w(f'<coverpointBin name={_xa(b)} key="{k}" type="bins"><range from="{k}" to="{k}">'
+                          f"{cnt(h)}</range></coverpointBin>")
+                    w(ua("minisim.bins", "int", tot) + ua("minisim.kind", "str", kind) + "</coverpoint>\n")
+                for i, (kind, iw, ig, al, tot, bins) in crs:
+                    w(f'<cross name={_xa(i)} key="0"><options weight="{max(0, iw)}" goal="{max(0, ig)}" '
+                      f'at_least="{max(0, al)}"/>')
+                    for k, (b, h) in enumerate(bins.items()):
+                        w(f'<crossBin name={_xa(b)} key="{k}"><index>{k}</index>{cnt(h)}</crossBin>')
+                    w(ua("minisim.bins", "int", tot) + "</cross>\n")
+                w("</cgInstance>\n")
+            w("</covergroupCoverage>\n")
+        w("</instanceCoverages>\n")
+    w("</ucis:UCIS>\n")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("".join(out))
+
+
+def _uattrs(el):
+    return {u.get("key"): (u.text or "") for u in el if _tag(u) == "userAttr"}
+
+
+def _tag(el):
+    t = el.tag
+    return t[t.index("}") + 1:] if t[:1] == "{" else t
+
+
+def _kids(el, name):
+    return [c for c in el if _tag(c) == name]
+
+
+def _kid(el, name):
+    for c in el:
+        if _tag(c) == name:
+            return c
+    return None
+
+
+def _count(binel):
+    """coverageCount of a BIN (its contents) or of a BIN_CONTENTS holder."""
+    if binel is None:
+        return 0
+    c = _kid(binel, "contents")
+    c = binel if c is None else c
+    try:
+        return int(c.get("coverageCount", "0"))
+    except ValueError:
+        return 0
+
+
+def load_ucis_into(db, path):
+    """Add a UCIS XML file into db (as load_into does a JSON database)."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as e:
+        raise SystemExit(f"mcov: {path}: not well-formed XML: {e}")
+    if _tag(root) != "UCIS":
+        raise SystemExit(f"mcov: {path} is not a UCIS XML database (root element <{_tag(root)}>)")
+    files = {s.get("id"): s.get("fileName") for s in _kids(root, "sourceFiles")}
+    db["tests"] += [h.get("logicalName") for h in _kids(root, "historyNodes")
+                    if h.get("parentId") is None or not _kids(root, "historyNodes")] or [os.path.basename(path)]
+    insts = _kids(root, "instanceCoverages")
+    by_id = {i.get("instanceId", i.get("key")): i for i in insts}
+    paths = {}
+
+    def full(i):
+        k = id(i)
+        if k not in paths:
+            p = by_id.get(i.get("parentInstanceId")) if i.get("parentInstanceId") is not None else None
+            paths[k] = (full(p) + "." if p is not None and p is not i else "") + i.get("name", "")
+        return paths[k]
+
+    loc = lambda s: (files.get(s.get("file"), s.get("file")), int(s.get("line", "1")), int(s.get("inlineCount", "1")))
+    lines, branches = db["lines"], db["branches"]
+    for inst in insts:
+        p = full(inst)
+        module = inst.get("moduleName", "")
+        resid = module == _UCIS_RESIDUAL and inst.get("parentInstanceId") is None
+        il = ib = ic = None
+        if not resid:
+            it = db["insts"].get(p)
+            if it is None:
+                it = db["insts"][p] = {"module": module, "lines": {}, "branches": {}, "conds": {}}
+            il, ib, ic = it["lines"], it["branches"], it["conds"]
+
+        def add_line(f, l, h):
+            lines[(f, l)] = lines.get((f, l), 0) + h
+            if il is not None:
+                il[(f, l)] = il.get((f, l), 0) + h
+
+        def add_branch(f, l, n, t, fa):
+            for d in (branches, ib):
+                if d is None:
+                    continue
+                o = d.get((f, l, n))
+                d[(f, l, n)] = (o[0] + t, o[1] + fa) if o else (t, fa)
+
+        for bc in _kids(inst, "blockCoverage"):
+            for c in bc:
+                tg = _tag(c)
+                if tg == "statement":
+                    f, l, _n = loc(_kid(c, "id"))
+                    add_line(f, l, _count(_kid(c, "bin")))
+                elif tg == "block":
+                    _walk_block(c, loc, add_line)
+                elif tg == "process":
+                    for b in _kids(c, "block"):
+                        _walk_block(b, loc, add_line)
+
+        for cc in _kids(inst, "conditionCoverage"):
+            for e in _kids(cc, "expr"):
+                f, l, _n = loc(_kid(e, "id"))
+                terms = tuple((s.text or "") for s in _kids(e, "subExpr"))
+                hits = [_count(b) for b in _kids(e, "bin")]
+                n = len(terms)
+                op = _uattrs(e).get("minisim.op") or ("&&f" if len(hits) == 1 << n and n > 1 else
+                                                       "?:" if n == 1 and len(hits) == 2 else "&&")
+                key = (f, l, int(e.get("index", "0")), e.get("exprString", e.get("name", "")))
+                add_cond(db["conds"], key, op, terms, hits)
+                if ic is not None:
+                    add_inst_cond(ic, key, hits)
+
+        for bc in _kids(inst, "branchCoverage"):
+            seen = {}
+            for st in _kids(bc, "statement"):
+                _branch_statement(st, loc, add_branch, seen)
+
+        for tc in _kids(inst, "toggleCoverage"):
+            for o in _kids(tc, "toggleObject"):
+                name = (p + "." if p else "") + o.get("name", "")
+                rise = fall = 0
+                width = 0
+                for k, b in enumerate(_kids(o, "toggleBit")):
+                    ix = _kid(b, "index")
+                    bit = int(ix.text) if ix is not None and (ix.text or "").strip().isdigit() else k
+                    width = max(width, bit + 1)
+                    for t in _kids(b, "toggle"):
+                        if _count(_kid(t, "bin")) > 0:
+                            if (t.get("from"), t.get("to")) == ("0", "1"):
+                                rise |= 1 << bit
+                            elif (t.get("from"), t.get("to")) == ("1", "0"):
+                                fall |= 1 << bit
+                width = int(_uattrs(o).get("minisim.width", width) or width)
+                old = db["toggles"].get(name)
+                db["toggles"][name] = (max(width, old[0]), rise | old[1], fall | old[2]) if old else (width, rise, fall)
+
+        for fc in _kids(inst, "fsmCoverage"):
+            for m in _kids(fc, "fsm"):
+                ua_ = _uattrs(m)
+                states, byname = {}, {}
+                for k, s in enumerate(_kids(m, "state")):
+                    sv = s.get("stateValue")
+                    v = _ucis_int(sv, k)
+                    nm = s.get("stateName") or str(sv if sv is not None else v)
+                    states[v] = [nm, _count(_kid(s, "stateBin"))]
+                    byname[nm] = v
+                trans, extra = {}, {}
+                for t in _kids(m, "stateTransition"):
+                    ss = [(x.text or "") for x in _kids(t, "state")]
+                    tb = _kid(t, "transitionBin")
+                    al = (tb.get("alias") or "") if tb is not None else ""
+                    if "->" in al and all(_ucis_int(x, None) is not None for x in al.split("->", 1)):
+                        a, b = (_ucis_int(x, 0) for x in al.split("->", 1))
+                    else:
+                        a, b = (byname.get(x, _ucis_int(x, 0)) for x in (ss[0], ss[-1]))
+                    tu = _uattrs(t)
+                    if tu.get("minisim.extra"):
+                        extra[(a, b)] = extra.get((a, b), 0) + _count(tb)
+                    else:
+                        trans[(a, b)] = [_count(tb), 1 if tu.get("minisim.reset") else 0]
+                add_fsm(db["fsms"], (module, p, m.get("name", "")),
+                        {"file": ua_.get("minisim.file", ""), "line": int(ua_.get("minisim.line", "0") or 0),
+                         "width": int(m.get("width", "1")), "states": states, "trans": trans, "extra": extra})
+
+        for ac in _kids(inst, "assertionCoverage"):
+            asserts = {}
+            for a_ in _kids(ac, "assertion"):
+                kind = a_.get("assertionKind", "assert")
+                hit = _kid(a_, "coverBin") if kind == "cover" else _kid(a_, "passBin")
+                if hit is None:
+                    hit = _kid(a_, "passBin") if kind == "cover" else _kid(a_, "coverBin")
+                asserts[(p + "." if p else "") + a_.get("name", "")] = [
+                    kind, _count(_kid(a_, "attemptBin")), _count(hit), _count(_kid(a_, "failBin"))]
+            merge_asserts(db["asserts"], asserts)
+
+        for gc in _kids(inst, "covergroupCoverage"):
+            groups = {}
+            for g in _kids(gc, "cgInstance"):
+                cid = _kid(g, "cgId")
+                gname = (p + "." if p else "") + (cid.get("cgName") if cid is not None else g.get("name", ""))
+                op_ = _kid(g, "options")
+                gw = int(op_.get("weight", "1")) if op_ is not None else 1
+                gg = int(op_.get("goal", "100")) if op_ is not None else 100
+                items = {}
+                for c in _kids(g, "coverpoint") + _kids(g, "cross"):
+                    o = _kid(c, "options")
+                    cross = _tag(c) == "cross"
+                    bins = {}
+                    for b in _kids(c, "crossBin" if cross else "coverpointBin"):
+                        if not cross and b.get("type", "bins") != "bins":
+                            continue
+                        h = _count(b) if cross else sum(_count(r) for r in _kids(b, "range") + _kids(b, "sequence"))
+                        bins[b.get("name", "")] = bins.get(b.get("name", ""), 0) + h
+                    u = _uattrs(c)
+                    items[c.get("name", "")] = [u.get("minisim.kind", "cross" if cross else "point"),
+                                                int(o.get("weight", "1")) if o is not None else 1,
+                                                int(o.get("goal", "100")) if o is not None else 100,
+                                                int(o.get("at_least", "1")) if o is not None else 1,
+                                                int(u.get("minisim.bins", len(bins)) or len(bins)), bins]
+                old = groups.get(gname)
+                if old is None:
+                    groups[gname] = [gw, gg, items]
+                else:
+                    merge_cgs({gname: old}, {gname: [gw, gg, items]})
+            merge_cgs(db["cgs"], groups)
+    return db
+
+
+def _ucis_int(s, default):
+    if s is None:
+        return default
+    s = s.strip()
+    try:
+        if "'" in s:   # a SystemVerilog literal, as another tool may write stateValue
+            base = s.split("'", 1)[1].lstrip("sS")
+            r = {"b": 2, "o": 8, "d": 10, "h": 16}.get(base[:1].lower(), 10)
+            return int(base[1:].replace("_", ""), r)
+        return int(s, 0)
+    except ValueError:
+        return default
+
+
+def _walk_block(b, loc, add_line):
+    bid = _kid(b, "blockId")
+    if bid is not None:
+        f, l, _n = loc(bid)
+        add_line(f, l, _count(_kid(b, "blockBin")))
+    for h in _kids(b, "hierarchicalBlock"):
+        _walk_block(h, loc, add_line)
+
+
+def _branch_statement(st, loc, add_branch, seen):
+    """A BRANCH_STATEMENT as msim's decisions: two arms are its true and false
+    outcomes; n arms (a case) are n decisions, arm k taken or another taken."""
+    f, l, n = loc(_kid(st, "id"))
+    arms = _kids(st, "branch")
+    counts = [_count(_kid(b, "branchBin")) for b in arms]
+    k0 = max(n - 1, seen.get((f, l), 0))
+    if len(arms) == 2 and (_kid(arms[0], "branchBin").get("alias") if _kid(arms[0], "branchBin") is not None else "") \
+            in ("true", "false", None, "") and st.get("statementType", "if") == "if":
+        add_branch(f, l, k0, counts[0], counts[1])
+        seen[(f, l)] = k0 + 1
+    else:
+        tot = sum(counts)
+        for k, c in enumerate(counts):
+            add_branch(f, l, k0 + k, c, tot - c)
+        seen[(f, l)] = k0 + len(counts)
+    for b in arms:
+        for nb in _kids(b, "nestedBranch"):
+            _branch_statement(nb, loc, add_branch, seen)
+
 
 
 def by_file(db):
@@ -1384,7 +1869,309 @@ def rank_main(a):
     return 0
 
 
-def main(argv=None):
+# ---------------------------------------------------------------------------
+# Other vendors' coverage command lines (docs/COMPAT.md): one engine, these
+# only translate. --compat=synopsys|cadence|siemens (or -compat X) anywhere,
+# or the name mcov was started as (a symlink the user makes) picks the
+# vendor. Their binary databases are not read: give mcov databases (JSON or
+# UCIS XML) where those tools take theirs.
+
+COMPAT_ALIASES = {"urg": "synopsys", "imc": "cadence", "vcover": "siemens"}
+COMPAT_NAMES = {"synopsys": "synopsys", "snps": "synopsys", "cadence": "cadence", "cdns": "cadence",
+                "siemens": "siemens", "mentor": "siemens"}
+# Options with no meaning here, for every vendor (licence queues, 32/64 bit).
+COMPAT_IGNORED = {"-full64", "-licqueue", "-64bit", "-64", "-32", "-nocopyright", "-batch", "-nolog", "-nostdout"}
+
+
+class CompatError(Exception):
+    pass
+
+
+def compat_detect(argv0, args):
+    """(vendor or None, args without the -compat option)."""
+    vendor, rest, i = None, [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--compat=") or a.startswith("-compat="):
+            vendor = a.split("=", 1)[1]
+        elif a in ("-compat", "--compat") and i + 1 < len(args):
+            vendor = args[i + 1]
+            i += 1
+        else:
+            rest.append(a)
+        i += 1
+    if vendor is not None:
+        v = COMPAT_NAMES.get(vendor.lower())
+        if v is None:
+            raise CompatError(f"unknown vendor '{vendor}' (synopsys, cadence, siemens)")
+        return v, rest
+    base = os.path.basename(argv0 or "")
+    for ext in (".py", ".exe"):
+        if base.endswith(ext):
+            base = base[:-len(ext)]
+    return COMPAT_ALIASES.get(base), rest
+
+
+def _note(msg):
+    print(f"mcov: {msg}", file=sys.stderr)
+
+
+def _db_paths(items):
+    """Databases named on another tool's command line: files, or every .json / .xml database in a directory."""
+    out = []
+    for p in items:
+        if os.path.isdir(p):
+            found = sorted(q for q in (os.path.join(p, f) for f in os.listdir(p)) if _is_db(q))
+            if not found:
+                raise CompatError(f"{p}: a directory with no mcov database (.json or .xml) in it; "
+                                  "vendor binary databases are not read")
+            out += found
+        elif not os.path.isfile(p):
+            raise CompatError(f"{p}: no such database")
+        else:
+            out.append(p)
+    return out
+
+
+def _is_db(path):
+    """An mcov database by its first bytes: msim-cov JSON or UCIS XML."""
+    if not path.endswith((".json", ".xml")) or not os.path.isfile(path):
+        return False
+    with open(path, "rb") as f:
+        head = f.read(512)
+    return b'"msim-cov"' in head or b"UCIS" in head
+
+
+def _read_list(path):
+    with open(path, encoding="utf-8") as f:
+        return [t for line in f for t in line.split("#", 1)[0].split()]
+
+
+def _run(argv, out=None):
+    """Run a native mcov command; its output to the file out if given."""
+    if out is None:
+        return main(argv, compat=False)
+    import contextlib
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f, contextlib.redirect_stdout(f):
+        return main(argv, compat=False)
+
+
+def compat_urg(args):
+    """URG: urg -dir a -dir b [-f list] [-dbname merged] [-report dir] [-format text|html|both]
+    [-elfile x.el] [-grade] [-show tests]"""
+    dirs, el, report, fmt, dbname, grade, i = [], [], "urgReport", "html", None, False, 0
+    while i < len(args):
+        a = args[i]
+        val = lambda: args[i + 1] if i + 1 < len(args) else (_ for _ in ()).throw(CompatError(f"{a} needs a value"))
+        if a == "-dir":
+            dirs.append(val()); i += 1
+        elif a == "-f":
+            dirs += _read_list(val()); i += 1
+        elif a == "-elfile":
+            el.append(val()); i += 1
+        elif a == "-report":
+            report = val(); i += 1
+        elif a == "-format":
+            fmt = val().lower(); i += 1
+        elif a == "-dbname":
+            dbname = val(); i += 1
+        elif a in ("-grade", "-grade_tests"):
+            grade = True
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                i += 1       # the grading goal ("index", "quick", ...): ranking here is always greedy
+        elif a in ("-metric", "-show", "-log", "-plan", "-hvp_no_score_missing", "-parallel", "-lca"):
+            _note(f"ignored synopsys option {a} {val()}"); i += 1
+        elif a in COMPAT_IGNORED or a in ("-noreport", "-warn"):
+            if a == "-noreport":
+                report = None
+            else:
+                _note(f"ignored synopsys option {a}")
+        elif a.startswith("-"):
+            raise CompatError(f"unknown urg option {a}")
+        else:
+            dirs.append(a)
+        i += 1
+    dbs = _db_paths(dirs)
+    if not dbs:
+        raise CompatError("no database: give -dir <database>")
+    rc = 0
+    if dbname:
+        rc |= _run(["merge"] + dbs + ["-o", dbname])
+    if grade:
+        rc |= _run(["rank"] + dbs, os.path.join(report, "grades.txt") if report else None)
+    if report:
+        els = sum((["-elfile", e] for e in el), [])
+        rc |= _run(["report"] + dbs + els + ["-detail", "-instances"], os.path.join(report, "dashboard.txt"))
+        if fmt in ("html", "both"):
+            rc |= _run(["report"] + dbs + els + ["-html", report], os.devnull)
+        print(f"mcov: report in {report}")
+    return rc
+
+
+def _tcl_words(cmd):
+    import shlex
+    try:
+        return shlex.split(cmd.replace("{", '"').replace("}", '"'))
+    except ValueError as e:
+        raise CompatError(f"cannot read command '{cmd}': {e}")
+
+
+def compat_imc(args):
+    """IMC batch: imc [-load db] -exec file.tcl | -execcmd "cmd; cmd"; commands load, merge, report, rank, exit."""
+    cmds, loaded, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-exec", "-execcmd", "-load", "-init") and i + 1 < len(args):
+            v = args[i + 1]
+            if a == "-exec":
+                with open(v, encoding="utf-8") as f:
+                    cmds += f.read().splitlines()
+            elif a == "-execcmd":
+                cmds += v.split(";")
+            elif a == "-load":
+                loaded += _db_paths([v])
+            i += 1
+        elif a.lower() in COMPAT_IGNORED or a.lower() in ("-gui", "-nogui"):
+            _note(f"ignored cadence option {a}")
+        else:
+            raise CompatError(f"unknown imc option {a}")
+        i += 1
+    rc = 0
+    for raw in cmds:
+        for cmd in raw.split(";"):
+            w = _tcl_words(cmd.split("#", 1)[0] if cmd.lstrip().startswith("#") else cmd)
+            if not w:
+                continue
+            op, rest = w[0], w[1:]
+            flags = lambda names: [x for x in rest if x in names]
+            if op == "load":
+                loaded = _db_paths([x for x in rest if not x.startswith("-")])
+            elif op == "merge":
+                out = None
+                ins = []
+                k = 0
+                while k < len(rest):
+                    if rest[k] == "-out" and k + 1 < len(rest):
+                        out = rest[k + 1]; k += 1
+                    elif rest[k] in ("-run_file", "-runfile") and k + 1 < len(rest):
+                        ins += _read_list(rest[k + 1]); k += 1
+                    elif rest[k].startswith("-"):
+                        _note(f"ignored imc merge option {rest[k]}")
+                    else:
+                        ins.append(rest[k])
+                    k += 1
+                if not out:
+                    raise CompatError("merge needs -out <database>")
+                rc |= _run(["merge"] + _db_paths(ins or loaded) + ["-o", out])
+                loaded = [out]
+            elif op == "report":
+                out, html_, k, extra = None, False, 0, []
+                while k < len(rest):
+                    x = rest[k]
+                    if x == "-out" and k + 1 < len(rest):
+                        out = rest[k + 1]; k += 1
+                    elif x == "-html":
+                        html_ = True
+                    elif x in ("-detail", "-details"):
+                        extra = ["-detail", "-instances"]
+                    elif x == "-summary":
+                        pass
+                    elif x in ("-metrics", "-inst", "-type", "-grading") and k + 1 < len(rest):
+                        _note(f"ignored imc report option {x} {rest[k + 1]}"); k += 1
+                    else:
+                        _note(f"ignored imc report option {x}")
+                    k += 1
+                if not loaded:
+                    raise CompatError("report: no database loaded (load <database>)")
+                if html_:
+                    rc |= _run(["report"] + loaded + extra + ["-html", out or "imc_report"])
+                else:
+                    rc |= _run(["report"] + loaded + extra, out)
+            elif op == "rank":
+                out, ins, k = None, [], 0
+                while k < len(rest):
+                    if rest[k] == "-out" and k + 1 < len(rest):
+                        out = rest[k + 1]; k += 1
+                    elif rest[k] in ("-run_file", "-runfile") and k + 1 < len(rest):
+                        ins += _read_list(rest[k + 1]); k += 1
+                    elif rest[k].startswith("-"):
+                        _note(f"ignored imc rank option {rest[k]}")
+                    else:
+                        ins.append(rest[k])
+                    k += 1
+                rc |= _run(["rank"] + _db_paths(ins or loaded) + (["-o", out] if out else []))
+            elif op in ("exit", "quit"):
+                return rc
+            elif op in ("config", "set_message", "puts"):
+                pass
+            else:
+                raise CompatError(f"imc command '{op}' is not supported")
+    return rc
+
+
+def compat_vcover(args):
+    """vcover merge [-out out] out in... | report [-details] [-html] [-output out] db... | ranktest [-rankfile f] db..."""
+    if not args:
+        raise CompatError("vcover: give merge, report or ranktest")
+    op, rest = args[0], args[1:]
+    opts, pos, k = {}, [], 0
+    takes = {"-out", "-output", "-outputstore", "-rankfile", "-testassociated", "-inputs", "-du", "-instance",
+             "-htmldir", "-elfile"}
+    while k < len(rest):
+        x = rest[k]
+        if x in takes and k + 1 < len(rest):
+            opts.setdefault(x, []).append(rest[k + 1]); k += 1
+        elif x.startswith("-"):
+            opts[x] = [True]
+        else:
+            pos.append(x)
+        k += 1
+    for x in opts.get("-inputs", []):
+        pos += _read_list(x)
+    if op == "merge":
+        out = (opts.get("-out") or [None])[0]
+        if out is None:
+            if len(pos) < 2:
+                raise CompatError("vcover merge: give the output then the inputs, or -out")
+            out, pos = pos[0], pos[1:]
+        return _run(["merge"] + _db_paths(pos) + ["-o", out])
+    if op == "report":
+        extra = ["-detail", "-instances"] if "-details" in opts or "-detail" in opts else []
+        els = sum((["-elfile", e] for e in opts.get("-elfile", [])), [])
+        if "-html" in opts:
+            d = (opts.get("-htmldir") or opts.get("-output") or ["covhtmlreport"])[0]
+            return _run(["report"] + _db_paths(pos) + els + extra + ["-html", d])
+        return _run(["report"] + _db_paths(pos) + els + extra, (opts.get("-output") or [None])[0])
+    if op == "ranktest":
+        rf = (opts.get("-rankfile") or [None])[0]
+        return _run(["rank"] + _db_paths(pos), rf)
+    raise CompatError(f"vcover {op} is not supported (merge, report, ranktest)")
+
+
+def compat_main(vendor, args):
+    try:
+        if vendor == "synopsys":
+            return compat_urg(args)
+        if vendor == "cadence":
+            return compat_imc(args)
+        return compat_vcover(args)
+    except CompatError as e:
+        print(f"mcov: {e}", file=sys.stderr)
+        return 2
+
+
+def main(argv=None, compat=True):
+    if compat:
+        args = sys.argv[1:] if argv is None else list(argv)
+        try:
+            vendor, args = compat_detect(sys.argv[0] if argv is None else "mcov", args)
+        except CompatError as e:
+            print(f"mcov: {e}", file=sys.stderr)
+            return 2
+        if vendor:
+            return compat_main(vendor, args)
+        argv = args
     ap = argparse.ArgumentParser(prog="mcov", description="Merge and report msim coverage (see module docstring).")
     ap.add_argument("-version", action="version", version=f"mcov {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)

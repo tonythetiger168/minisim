@@ -18,6 +18,7 @@
 set(MINISIM_CORE_HEADERS
     annexd.inc
     clocking.hpp
+    compat.hpp
     cover.hpp
     cover_rt.inc
     cpu.hpp
@@ -61,6 +62,7 @@ set(MINISIM_CORE_HEADERS
     vpi_prim.inc
     vpi_constr.inc
     vpi_svcb.inc
+    vpi_thread.inc
     vpi_tchk.inc
     wave_reader.hpp)
 

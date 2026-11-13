@@ -2704,8 +2704,7 @@ struct Tool {
                << ",\"file\":" << sw[i].file << ",\"line\":" << sw[i].line << "}";
         }
         for (auto& [p, h] : objs) {   // object views: "of" is the handle, where the page shows them
-            const Wave* w = vcd.find(p);
-            os << ",\n{\"path\":" << js(p) << ",\"width\":" << (w ? w->width : 0) << ",\"type\":\"property\",\"file\":"
+            os << ",\n{\"path\":" << js(p) << ",\"width\":" << vcd.widthOf(p) << ",\"type\":\"property\",\"file\":"
                << sw[(size_t)h].file << ",\"line\":" << sw[(size_t)h].line << ",\"of\":" << h << "}";
         }
         os << "],\n\"drivers\":[";
@@ -2756,38 +2755,53 @@ struct Tool {
             const size_t nSig = db.signals.size() + objs.size();
             std::vector<std::string> part(nSig);
             std::vector<const Wave*> wv(nSig);
-            for (size_t i = 0; i < nSig; i++) wv[i] = vcd.find(wavePath(i));
+            std::vector<std::string> names(nSig);
+            for (size_t i = 0; i < nSig; i++) names[i] = wavePath(i);
             // A page a browser can open: a budget of changes over all signals.
             size_t waved = 0, cutSigs = 0;
-            for (const Wave* w : wv) waved += w != nullptr;
+            for (auto& n : names) waved += vcd.widthOf(n) > 0;
             maxChanges = std::min(maxChanges, std::max<size_t>(64, kPageChanges / std::max<size_t>(waved, 1)));
-            for (const Wave* w : wv) cutSigs += w && w->ch.size() > maxChanges;
+            // The waveform is read a block of signals at a time (one pass over
+            // the file each), cut to the budget, and let go: a large design's
+            // waves do not have to fit in memory at once.
+            constexpr size_t kBlock = 2048;
+            for (size_t c0 = 0; c0 < nSig; c0 += kBlock) {
+                const size_t c1 = std::min(nSig, c0 + kBlock);
+                std::vector<std::string> blk(names.begin() + (long)c0, names.begin() + (long)c1);
+                vcd.fetch(blk);
+                for (size_t i = c0; i < c1; i++) {
+                    wv[i] = vcd.find(names[i]);
+                    cutSigs += wv[i] && wv[i]->ch.size() > maxChanges;
+                }
+                parallelFor(c1 - c0, threads, [&](size_t j) {
+                    const size_t i = c0 + j;
+                    const Wave* w = wv[i];
+                    if (!w) return;
+                    std::string& o = part[i];
+                    o = "\"" + std::to_string(i) + "\":[";
+                    // Cut waves keep the window around -at T (else the start).
+                    size_t n = std::min(w->ch.size(), maxChanges), k0 = 0;
+                    if (center && n < w->ch.size()) {
+                        int c = w->at(*center);
+                        k0 = (size_t)std::max(0, c - (int)(n / 2));
+                        k0 = std::min(k0, w->ch.size() - n);
+                    }
+                    for (size_t k = k0; k < k0 + n; k++) {
+                        if (k > k0) o += ',';
+                        o += '[';
+                        o += std::to_string(w->ch[k].t);
+                        o += ",\"";
+                        o += w->bits((int)k);
+                        o += "\"]";
+                    }
+                    o += ']';
+                });
+                if (nSig > kBlock) vcd.release(blk);
+            }
             if (cutSigs)
                 std::cerr << "mdebug: the waves of " << cutSigs << " signals are cut to " << maxChanges << " changes each in the page, "
                           << (center ? "around -at" : "from the start; -at T keeps the changes around T")
                           << " (-max-changes N for more per signal; -serve sends every signal whole, on demand)\n";
-            parallelFor(nSig, threads, [&](size_t i) {
-                const Wave* w = wv[i];
-                if (!w) return;
-                std::string& o = part[i];
-                o = "\"" + std::to_string(i) + "\":[";
-                // Cut waves keep the window around -at T (else the start).
-                size_t n = std::min(w->ch.size(), maxChanges), k0 = 0;
-                if (center && n < w->ch.size()) {
-                    int c = w->at(*center);
-                    k0 = (size_t)std::max(0, c - (int)(n / 2));
-                    k0 = std::min(k0, w->ch.size() - n);
-                }
-                for (size_t k = k0; k < k0 + n; k++) {
-                    if (k > k0) o += ',';
-                    o += '[';
-                    o += std::to_string(w->ch[k].t);
-                    o += ",\"";
-                    o += w->bits((int)k);
-                    o += "\"]";
-                }
-                o += ']';
-            });
             for (size_t i = 0; i < part.size(); i++) {
                 if (!wv[i]) continue;
                 os << (first ? "" : ",\n") << part[i];
@@ -3078,6 +3092,7 @@ int main(int argc, char** argv) {
     if (!logPath.empty()) tool.readPowerLog(logPath);
     if (!vcdPath.empty()) {
         std::string err;
+        tool.vcd.lazy = true;   // a signal's changes are read when a query or the page first needs them
         if (!tool.vcd.open(vcdPath, threads, err)) { std::cerr << "mdebug: " << err << "\n"; return 2; }
         tool.haveVcd = true;
         tool.findObjs();
@@ -3104,7 +3119,7 @@ int main(int argc, char** argv) {
                           << tool.db.src.at(tool.db.src.where(s->location)) << "\n";
             for (auto& [p, h] : tool.objs)
                 std::cout << p << "  property of the object " << path(*tool.db.signals[(size_t)h]) << " points to  ("
-                          << tool.vcd.find(p)->width << " bits, from the waveform)\n";
+                          << tool.vcd.widthOf(p) << " bits, from the waveform)\n";
         }
     }
 

@@ -17,6 +17,25 @@ module cdc_sva(input logic fclk, sclk, rst_n, output logic [3:0] g_s, output log
   logic req, r1;
   always_ff @(posedge fclk or negedge rst_n) if (!rst_n) req <= 0; else if (bin == 4'hf) req <= ~req;
   always_ff @(posedge sclk) begin r1 <= req; r_s <= r1; end
+
+  // A two-phase handshake: hreq toggles once the acknowledge has come back.
+  logic hreq, ha1, ha2, hr1, hr2, hack;
+  always_ff @(posedge fclk or negedge rst_n)
+    if (!rst_n) hreq <= 0; else if (hreq == ha2) hreq <= ~hreq;
+  always_ff @(posedge sclk or negedge rst_n)
+    if (!rst_n) begin hr1 <= 0; hr2 <= 0; hack <= 0; end else begin hr1 <= hreq; hr2 <= hr1; hack <= hr2; end
+  always_ff @(posedge fclk or negedge rst_n)
+    if (!rst_n) begin ha1 <= 0; ha2 <= 0; end else begin ha1 <= hack; ha2 <= ha1; end
+
+  // An impatient one: breq also toggles every 16 fast cycles, acknowledged
+  // or not.
+  logic breq, ba1, ba2, br1, br2, back;
+  always_ff @(posedge fclk or negedge rst_n)
+    if (!rst_n) breq <= 0; else if (breq == ba2 || bin == 4'h7) breq <= ~breq;
+  always_ff @(posedge sclk or negedge rst_n)
+    if (!rst_n) begin br1 <= 0; br2 <= 0; back <= 0; end else begin br1 <= breq; br2 <= br1; back <= br2; end
+  always_ff @(posedge fclk or negedge rst_n)
+    if (!rst_n) begin ba1 <= 0; ba2 <= 0; end else begin ba1 <= back; ba2 <= ba1; end
 endmodule
 
 module cdc_sva_tb;

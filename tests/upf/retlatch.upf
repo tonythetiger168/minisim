@@ -1,0 +1,19 @@
+# Power intent for retlatch.sv: retention strategies for flip-flops only
+# and for latches only (set_retention -applies_to, 6.54).
+create_supply_port VDD
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSS
+connect_supply_net VDD -ports VDD
+connect_supply_net VSS -ports VSS
+create_supply_set SS_AON -function {power VDD} -function {ground VSS}
+
+create_power_domain PD_A -elements {u_a}
+create_supply_net VA
+create_power_switch SW_A -output_supply_port {o VA} -input_supply_port {i VDD} -control_port {c on} -on_state {on i {c}}
+set_domain_supply_net PD_A -primary_power_net VA -primary_ground_net VSS
+
+set_retention RET_F -domain PD_A -applies_to flop -retention_supply SS_AON \
+    -save_signal {sf high} -restore_signal {sf low}
+set_retention RET_L -domain PD_A -applies_to latch -retention_supply SS_AON \
+    -save_signal {sl high} -restore_signal {sl low}

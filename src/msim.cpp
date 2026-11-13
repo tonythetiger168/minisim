@@ -1,3 +1,5 @@
+#include <condition_variable>
+#include <mutex>
 #include <csignal>
 #include <unistd.h>
 // msim.cpp - one-step compile, elaborate and simulate, in the style of
@@ -90,6 +92,7 @@
 //                    the simulation top (u_dut, or tb/u_dut); default: the
 //                    UPF's set_design_top, else the simulation top
 //   -upf_verbose     print supply, power state and simstate changes
+//   -upf_cov <file>  low-power coverage: power states, transitions, isolation, retention
 //
 // DPI-C (IEEE 1800-2023 clause 35, annex J):
 //   <file>.c / .cc / .cpp / .cxx, .o, .a   C or C++ for DPI imports; msim builds
@@ -470,6 +473,7 @@ static void unrollSeqLoops(LowerResult& lowered) {
                     Instr x = code[b];
                     x.e = sub(x.e, var, v);
                     for (auto& ai : x.aidx) ai = sub(ai, var, v);
+                    x.bidx = sub(x.bidx, var, v);   // v[i*8 +: 8] <= ...: the bit index too
                     if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
                         if (x.target == E) breaks.push_back(out.size());
                         else x.target = base + (x.target - (top + 1));   // the step: the end of this copy
@@ -1500,6 +1504,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
         std::filesystem::remove(dir + "/simv.stamp", ec);
         std::vector<std::string> jobs, objs;
+        std::vector<double> jobMB;   // the compiler's estimated memory for each job
         for (auto& [name, text] : files) {
             std::string path = dir + "/" + name;
             bool same = slurp(path) == text;
@@ -1514,6 +1519,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             if (same && hdrSame && sameFlags && std::filesystem::exists(obj, ec)) continue;
             std::filesystem::remove(obj, ec);
             jobs.push_back(shq(cc) + cflags + " -c " + shq(path) + " -o " + shq(obj));
+            jobMB.push_back(300 + 600.0 * (text.size() + files[0].second.size()) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
         }
         // Remove parts left from an earlier, larger split.
         for (int k = (int)files.size() - 2;; k++) {
@@ -1522,13 +1528,43 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             std::filesystem::remove(old + ".cpp", ec);
             std::filesystem::remove(old + ".o", ec);
         }
+        // The compiler takes about 0.6 GB per MB of a large generated file:
+        // four of them at once ran a 16 GB machine out of memory (16 Ibex
+        // cores). Jobs start while their estimates fit in the memory free
+        // now; one always runs.
+        double budget = 0;
+        {
+            std::ifstream mi("/proc/meminfo");
+            std::string k;
+            double kb;
+            std::string unit;
+            while (mi >> k >> kb >> unit)
+                if (k == "MemAvailable:") { budget = kb / 1024 * 0.85; break; }
+        }
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::vector<std::thread> pool;
+        std::mutex memMu;
+        std::condition_variable memCv;
+        double inUse = 0;
+        int running = 0;
         for (int t = 0; t < std::min<int>(maxThreads(), (int)jobs.size()); t++)
             pool.emplace_back([&] {
-                for (size_t j; (j = next++) < jobs.size();)
+                for (size_t j; (j = next++) < jobs.size();) {
+                    {
+                        std::unique_lock<std::mutex> lk(memMu);
+                        memCv.wait(lk, [&] { return budget <= 0 || running == 0 || inUse + jobMB[j] <= budget; });
+                        inUse += jobMB[j];
+                        running++;
+                    }
                     if (std::system(jobs[j].c_str()) != 0) { failed = true; std::cerr << "msim: -compile: C++ build failed: " << jobs[j] << "\n"; }
+                    {
+                        std::lock_guard<std::mutex> lk(memMu);
+                        inUse -= jobMB[j];
+                        running--;
+                    }
+                    memCv.notify_all();
+                }
             });
         for (auto& t : pool) t.join();
         if (failed) return 1;
@@ -2301,6 +2337,7 @@ static void usage() {
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  -upf_verbose   print supply, power state and simstate changes\n"
+                 "  -upf_cov <file>  low-power coverage report: power states, transitions, isolation, retention\n"
                  "  <file>.c       C or C++ for DPI-C imports; also -sv_lib / -sv_root / -dpiheader\n"
                  "  -mvp           add the virtual prototype layer (mvp_axil_slave and its runtime)\n"
                  "  -uvm           compile the Accellera UVM library from $UVM_HOME, with its C code\n"
@@ -2360,6 +2397,7 @@ int main(int argc, char** argv) {
     std::string upfPath, powerTop;
     std::string xpropReport;
     bool powerTopSet = false, upfVerbose = false;
+    std::string upfCov;   // -upf_cov: the low-power coverage report
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
@@ -2427,6 +2465,7 @@ int main(int argc, char** argv) {
         if (a == "-upf") { upfPath = next("a UPF file"); continue; }
         if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
         if (a == "-upf_verbose" || a == "+upf_verbose") { upfVerbose = true; continue; }
+        if (a == "-upf_cov") { upfCov = next("a coverage report file"); continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a == "-cfiles") { g_cfiles = std::max(1, std::atoi(next("a file count").c_str())); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
@@ -2806,6 +2845,10 @@ int main(int argc, char** argv) {
                 for (auto& b : rt.m.bindCheckers) checkers.insert(b.module);
                 for (auto& [n, v] : rt.m.vcms)   // and so is a model VCM's module (6.30.9)
                     if (v.kind == upf::Vcm::Model) checkers.insert(v.model.substr(v.model.rfind('.') == std::string::npos ? 0 : v.model.rfind('.') + 1));
+                for (auto& rm : rt.m.retModels)   // and a retention model (6.39)
+                    checkers.insert(rm.model.substr(rm.model.rfind('.') == std::string::npos ? 0 : rm.model.rfind('.') + 1));
+                for (auto& im : rt.m.ifcModels)   // and an isolation model (6.62)
+                    checkers.insert(im.model.substr(im.model.rfind('.') == std::string::npos ? 0 : im.model.rfind('.') + 1));
                 std::vector<std::string> real;
                 for (auto* t : comp->getRoot().topInstances)
                     if (!checkers.count(std::string(t->getDefinition().name))) real.push_back(std::string(t->name));
@@ -2813,6 +2856,8 @@ int main(int argc, char** argv) {
             }
             // function and model VCMs (6.30.8, 6.30.9) are placed in the design too
             std::string vcmText = rt.m.connectVcm.empty() ? std::string() : rt.vcmSource(*comp, simTop);
+            vcmText += rt.m.retModels.empty() ? std::string() : rt.retModelSource(*comp, simTop);   // map_retention_cell -lib_model_name (6.39)
+            vcmText += rt.m.ifcModels.empty() ? std::string() : rt.ifcModelSource(*comp, simTop);   // use_interface_cell -force_function (6.62)
             if (!rt.m.bindCheckers.empty() || !vcmText.empty()) {
                 static std::string bindText;
                 bindText = (rt.m.bindCheckers.empty() ? std::string() : rt.m.bindSource(simTop)) + vcmText;
@@ -2863,6 +2908,7 @@ int main(int argc, char** argv) {
     if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
+        rt.covPath = upfCov;
         try {
             rt.m.resolveApplies([](const std::string& mod) {   // apply_power_model without -elements (6.9)
                 std::vector<std::string> r;
@@ -3183,6 +3229,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!writeSaif()) return 1;
+    if (upfrt::rt().on && !upfrt::rt().covPath.empty() && !upfrt::rt().writeCoverage()) {
+        std::cerr << "msim: cannot write " << upfrt::rt().covPath << "\n";
+        return 1;
+    }
     if (prof::P().on && !prof::P().write(S.now, S.timescale)) {
         std::cerr << "msim: cannot write " << prof::P().path << "\n";
         return 1;
