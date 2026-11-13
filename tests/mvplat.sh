@@ -104,6 +104,31 @@ fi
 "$MVPLAT" "$E/virtio.elf" -disk no_such.img -q > p.out 2>&1; rc=$?
 expect "-disk with a missing image" 2 p.out "cannot open the disk image"
 
+# virtio-net (-net): a bare-metal driver asks the built-in gateway for its
+# MAC address and pings it; -net-pcap records the four frames. Over -net
+# dgram a peer on the host sends the frame back.
+"$MVPLAT" "$E/vnet.elf" -net user -net-pcap vnet.pcap -q > vnet.out 2>&1; rc=$?
+expect "virtio-net: ARP and ping to the built-in gateway" 0 vnet.out "vnet: gateway answered ARP and ping"
+if command -v python3 > /dev/null 2>&1; then
+  n=$(python3 -c "
+import struct, sys
+d = open('vnet.pcap', 'rb').read()
+assert struct.unpack_from('<I', d)[0] == 0xa1b2c3d4
+o, n = 24, 0
+while o < len(d):
+    o += 16 + struct.unpack_from('<I', d, o + 8)[0]; n += 1
+print(n)" 2> /dev/null)
+  [ "$n" = 4 ] && ok "-net-pcap records the frames both ways" || bad "-net-pcap: $n frames, expected 4"
+  rm -f peer.sock vm.sock
+  python3 "$T/echo_peer.py" "$PWD/peer.sock" "$PWD/vm.sock" > peer.out 2>&1 &
+  for i in $(seq 50); do [ -S peer.sock ] && break; sleep 0.1; done
+  "$MVPLAT" "$E/vnet.elf" -net "dgram:$PWD/vm.sock,$PWD/peer.sock" -q > dgram.out 2>&1; rc=$?
+  wait
+  expect "virtio-net over -net dgram to a peer on the host" 0 dgram.out "vnet: echo peer ok"
+fi
+"$MVPLAT" "$E/vnet.elf" -net tap0 -q > p.out 2>&1; rc=$?
+expect "-net with an unknown back end" 2 p.out "unknown back end 'tap0'"
+
 # Platform files that are wrong say what is wrong.
 platform_err() {
   local name=$1 json=$2 pat=$3
@@ -129,7 +154,7 @@ J
 [ $rc -ne 0 ] && ok "a program with no CLINT does not hang (exit $rc)" || bad "wfi with no interrupt source"
 
 # The device tree made from the platform, as firmware and Linux read it.
-"$MVPLAT" "$E/hello.elf" -harts 2 -disk "$E/hello.elf" -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
+"$MVPLAT" "$E/hello.elf" -harts 2 -disk "$E/hello.elf" -net user -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
 if [ $rc = 0 ] && [ "$(od -An -tx1 -N4 board.dtb | tr -d ' ')" = d00dfeed ]; then ok "-dump-dtb writes a device tree blob"
 else bad "-dump-dtb (exit $rc)"; fi
 if command -v dtc > /dev/null 2>&1; then
@@ -202,6 +227,13 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
     else
       echo "skip  ext4 disk: no mkfs.ext4 and debugfs (e2fsprogs)"
     fi
+    # A network: Linux's virtio-net driver brings eth0 up and pings the
+    # built-in gateway.
+    "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio -q \
+      -append "console=ttyS0 rdinit=/init quiet" -net user \
+      -input "ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up; ping -c 2 10.0.2.2; poweroff -f
+" > net.out 2>&1; rc=$?
+    expect "Linux pings the gateway over virtio-net" 0 net.out "2 packets transmitted, 2 packets received"
   else
     echo "skip  BusyBox: set MVPLAT_BUSYBOX (tests/vplat/get-linux.sh fetches it)"
   fi

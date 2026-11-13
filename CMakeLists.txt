@@ -251,6 +251,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xrun
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_xrun.cmake)
+  # VCS partition compile spellings (-partcomp, -partcomp_dir, -Mdir).
+  add_test(NAME msim_partcomp
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_partcomp
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_partcomp.cmake)
   # Simulation profile (msim -profile): processes, instances, kinds.
   add_test(NAME msim_profile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}

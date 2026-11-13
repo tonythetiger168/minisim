@@ -51,6 +51,15 @@ const char* kBuiltin = R"({
 })";
 
 Ext* loadExt(int argc, char** argv, const char* why);
+
+// "52:54:00:12:34:56" into a virtio-net device's address.
+void setMac(VirtioNet& v, const std::string& t, const std::string& where) {
+    unsigned b[6];
+    char tail;
+    if (sscanf(t.c_str(), "%x:%x:%x:%x:%x:%x%c", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &tail) != 6)
+        throw std::runtime_error(where + "\"mac\" is not six hex bytes with colons: '" + t + "'");
+    for (int i = 0; i < 6; i++) v.mac[i] = (uint8_t)b[i];
+}
 Ext* g_ext = nullptr;
 
 void usage() {
@@ -74,6 +83,11 @@ void usage() {
         "  -disk FILE         a raw disk image on a virtio-blk device (/dev/vda); writes stay in\n"
         "                     the run unless -disk-write (repeat for vdb, vdc, ...)\n"
         "  -disk-write        let writes reach the image files\n"
+        "  -net user          a virtio-net interface whose built-in gateway 10.0.2.2 answers\n"
+        "                     ARP and ping (repeat for eth1, ...)\n"
+        "  -net dgram:LOCAL,REMOTE  a virtio-net interface on Unix datagram sockets: frames\n"
+        "                     go to REMOTE, and come in on LOCAL (another platform's link)\n"
+        "  -net-pcap FILE     write the first interface's frames to a pcap file\n"
         "  -dump-dtb FILE     write the platform's device tree blob and exit\n"
         "  -map               print the memory map\n"
         "  -q                 no summary line on stderr\n"
@@ -86,7 +100,8 @@ void usage() {
 struct Options {
     std::string platform, elf, trace, input;
     std::string bios, kernel, initrd, append, dtb, dumpDtb;
-    std::vector<std::string> disks;
+    std::vector<std::string> disks, nets;
+    std::string netPcap;
     bool diskWrite = false;
     bool haveAppend = false;
     int harts = -1;
@@ -206,11 +221,27 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             bool ro = d.get("readonly") && d.get("readonly")->b;
             v->open(rel(d.get("file")->str()), w || o.diskWrite, ro);
             dev = std::move(v);
+        } else if (type == "virtio-net") {
+            auto v = std::make_unique<VirtioNet>();
+            v->name = name;
+            v->base = base();
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (d.get("mac")) setMac(*v, d.get("mac")->str(), d.where());
+            std::string be = d.get("backend") ? d.get("backend")->str() : "user";
+            if (be == "dgram") {
+                if (!d.get("local") || !d.get("remote"))
+                    throw std::runtime_error(d.where() + "'" + name + "': the dgram back end needs \"local\" and \"remote\"");
+                v->useDgram(rel(d.get("local")->str()), rel(d.get("remote")->str()));
+            } else if (be != "user") {
+                throw std::runtime_error(d.where() + "'" + name + "': unknown back end '" + be + "' (user, dgram)");
+            }
+            if (d.get("pcap")) v->capture(rel(d.get("pcap")->str()));
+            dev = std::move(v);
         } else {
             Ext* x = loadExt(g_argc, g_argv, ("device type '" + type + "'").c_str());
             if (x && x->device(m, d, type, name, dir)) continue;
             throw std::runtime_error(d.where() + "unknown device type '" + type +
-                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk" +
+                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net" +
                                      (x ? "" : "; mvp and rtl need the mvplat extension library") + ")");
         }
         m.bus.add(std::move(dev));
@@ -230,6 +261,30 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
         v->open(img, o.diskWrite, false);
         m.bus.add(std::move(v));
     }
+    // -net: virtio-net devices in the next slots.
+    unsigned nic = 0;
+    for (const std::string& spec : o.nets) {
+        uint64_t b;
+        do b = 0x10001000ull + 0x1000ull * slot++; while (m.bus.find(b) && slot < 64);
+        auto v = std::make_unique<VirtioNet>();
+        v->name = "net" + std::to_string(nic);
+        v->base = b;
+        v->irq = slot;
+        v->mac[5] = (uint8_t)(0x56 + nic);
+        if (m.plic && v->irq > m.plic->nsrc) throw std::runtime_error("-net: no PLIC source left");
+        if (spec.rfind("dgram:", 0) == 0) {
+            std::string rest = spec.substr(6);
+            size_t c = rest.find(',');
+            if (c == std::string::npos) throw std::runtime_error("-net dgram:LOCAL,REMOTE: no comma in '" + spec + "'");
+            v->useDgram(rest.substr(0, c), rest.substr(c + 1));
+        } else if (spec != "user") {
+            throw std::runtime_error("-net: unknown back end '" + spec + "' (user, dgram:LOCAL,REMOTE)");
+        }
+        if (nic == 0 && !o.netPcap.empty()) v->capture(o.netPcap);
+        m.bus.add(std::move(v));
+        nic++;
+    }
+    if (!o.netPcap.empty() && !nic) throw std::runtime_error("-net-pcap needs -net");
 }
 
 std::vector<uint8_t> readFile(const std::string& path) {
@@ -414,6 +469,8 @@ int main(int argc, char** argv) {
         else if (s == "-dump-dtb") o.dumpDtb = next("a file");
         else if (s == "-disk") o.disks.push_back(next("a disk image"));
         else if (s == "-disk-write") o.diskWrite = true;
+        else if (s == "-net") o.nets.push_back(next("user or dgram:LOCAL,REMOTE"));
+        else if (s == "-net-pcap") o.netPcap = next("a file");
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
         else if (!s.empty() && s[0] == '-') {

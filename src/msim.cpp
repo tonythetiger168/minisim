@@ -57,6 +57,8 @@
 //                    unchanged design reuses the simv already in <dir>; seeds
 //                    and plusargs are passed to it at run time.
 //   -o <dir>         build directory for -compile (default msim.d)
+//   -partcomp[=...], -fastpartcomp[=j<n>], -partcomp_dir=<dir>, -Mdir=<dir>
+//                    VCS partition compile spellings: -compile, -cfiles n, -o dir
 //   -no-static-comb  run continuous assigns and always_comb as ordinary
 //                    event-driven processes instead of one levelized schedule
 //   -no-static-seq   run NBA-only always @(edge) blocks as ordinary processes
@@ -2552,6 +2554,7 @@ int main(int argc, char** argv) {
     std::string uvmHome;    // -uvm / -uvmhome: a uvm-core checkout
     bool uvmWanted = false, uvmNoDpi = false;
     bool buildDirGiven = false;
+    bool partcompNoted = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -2615,6 +2618,25 @@ int main(int argc, char** argv) {
         if (a == "-upf_verbose" || a == "+upf_verbose") { upfVerbose = true; continue; }
         if (a == "-upf_cov") { upfCov = next("a coverage report file"); continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
+        // VCS partition compile (docs/COMPAT.md): compiled mode. msim chooses
+        // its own parts, the generated C++ files; an unchanged one is not
+        // rebuilt, and the build directory keeps them between runs.
+        if (a == "-partcomp" || startsWith(a, "-partcomp=") || a == "-fastpartcomp" || startsWith(a, "-fastpartcomp=")) {
+            compiled = true;
+            if (startsWith(a, "-fastpartcomp=j") && std::isdigit((unsigned char)a[15]))
+                g_cfiles = std::max(1, std::atoi(a.c_str() + 15));
+            if (!partcompNoted) {
+                std::cerr << "msim: " << a << ": compiled mode; msim chooses its own parts, and an unchanged part is not rebuilt\n";
+                partcompNoted = true;
+            }
+            continue;
+        }
+        if (startsWith(a, "-partcomp_dir=") || startsWith(a, "-Mdir=")) {
+            buildDir = a.substr(a.find('=') + 1);
+            buildDirGiven = true;
+            continue;
+        }
+        if (a == "-partcomp_sharedlib" || a == "-pcmakeprof") continue;   // msim's parts are always linked into one simv
         if (a == "-cfiles") { g_cfiles = std::max(1, std::atoi(next("a file count").c_str())); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (prot.take(argc, argv, i)) continue;

@@ -13,6 +13,11 @@ Spec references are IEEE 1800-2023 clauses.
   `$fsdbTrans_begin`, `$fsdbTrans_add_attribute`, `$fsdbTrans_end` write
   the text format of UVM's `uvm_text_tr_database` (`transactions.log`,
   `msim -tr FILE`), which `mdebug -tr` reads. `tests/msim_tr.cmake`.
+- mvplat: virtio-net over virtio-mmio (VIRTIO 1.2, 5.1). `-net user` gives a
+  built-in gateway at 10.0.2.2 that answers ARP and ping; `-net
+  dgram:LOCAL,REMOTE` links platforms (or a host program) over Unix datagram
+  sockets; `-net-pcap FILE` records the frames. Linux brings eth0 up and
+  pings the gateway. Platform files take `"type": "virtio-net"`.
 - mvplat: virtio-blk over virtio-mmio (VIRTIO 1.2, 4.2 and 5.2). `-disk FILE`
   puts a raw image on `/dev/vda` (repeat for more), `-disk-write` lets the
   guest's writes reach the file; platform files take `"type": "virtio-blk"`.
