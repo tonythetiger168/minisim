@@ -154,7 +154,8 @@ rose and fell), `vpiFsmStateCoverage` (FSM states entered) and
 `vpiAssertCoverage` (assertions that succeeded, or covers that matched;
 counted with or without `-cov`). Items in instances below it are not
 included. `vpiCovered`, `vpiCoveredCount` and `vpiCoveredMax` read an
-assertion (succeeded, successes, 1), an FSM (states entered, entries, states),
+assertion (attempted, succeeded at least once and never failed, as 40.5.2
+says, a cover only the first two; successes; 1), an FSM (states entered, entries, states),
 an FSM state, or a net, variable, word or bit (bits toggled both ways, bits
 toggled, width). An assertion also gives `vpiAssertAttemptCovered`,
 `vpiAssertSuccessCovered`, `vpiAssertFailureCovered`,
@@ -165,8 +166,7 @@ found (`vpiFsm` objects with `vpiName`, `vpiFullName`, `vpiFile`,
 `vpi_iterate(vpiFsmStates, fsm)` its states (`vpiFsmHandle` objects whose
 `vpi_get_value` is the state's value and `vpiName` its name).
 `vpi_control(op, type, handle)` takes `vpiCoverageStart`, `vpiCoverageStop`,
-`vpiCoverageReset` and `vpiCoverageCheck` (1 when every item of the type is
-covered) with an instance, an assertion (for `vpiAssertCoverage`) or NULL
+`vpiCoverageReset` and `vpiCoverageCheck` with an instance, an assertion (for `vpiAssertCoverage`) or NULL
 (the whole design); `vpi_control(vpiCoverageSave, type, name)` writes the
 coverage database (the `-cov` JSON) to `name` now, and
 `vpi_control(vpiCoverageMerge, type, name)` reads such a database and adds
@@ -179,6 +179,12 @@ the top freezes that instance's counts (only its own items, not those of
 the instances inside it) until `vpiCoverageStart`; other instances keep
 counting. A `vpiCoverageReset` of a stopped instance zeroes it and leaves
 it stopped. On a top instance or NULL the stop is for the whole design.
+The results are those of the system functions (40.5.3, 40.3.2):
+`SV_COV_OK` (1), `SV_COV_NOCOV` (0) and `SV_COV_ERROR` (-1). Check and
+start give 1 when there is coverage of that type there (whether or not it
+is all covered) and 0 when there is none (statement, toggle and FSM
+coverage without `msim -cov`); save gives 0 when there is nothing to save;
+merge gives -1 when the database is missing or not msim's.
 
 **Structs, containers and classes (37.17, 37.18, 37.29).** An unpacked
 struct or union variable is a `vpiStructVar` / `vpiUnionVar` (its value is

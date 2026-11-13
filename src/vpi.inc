@@ -1568,7 +1568,9 @@ inline int64_t covGet(int prop, const Obj* o) {
     if (o->kind == Obj::Assertion) {
         const auto& c = s.assertCov[(size_t)o->idx];
         switch (prop) {
-            case vpiCovered: return c[1] > 0;
+            case vpiCovered:   // 40.5.2: attempted, succeeded at least once and never failed;
+                               // a cover has no failures (a non-match is not one, 16.14.3)
+                return c[0] > 0 && c[1] > 0 && (c[2] == 0 || asserts()[(size_t)o->idx].dir == AD_COVER);
             case vpiCoveredCount: return (int64_t)c[1];
             case vpiCoveredMax: return 1;
             case vpiAssertAttemptCovered: return (int64_t)c[0];
@@ -1678,41 +1680,42 @@ inline void covFreeze(int type, const InstanceSymbol* inst, bool stop) {
 // Check with a coverage type and an instance or assertion handle (null: the
 // whole design); vpiCoverageSave / Merge with a coverage type and a name.
 inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
-    if (op < vpiCoverageStart || op > vpiCoverageSave) return -1;
+    if (op < vpiCoverageStart || op > vpiCoverageSave) return INT32_MIN;   // not a coverage operation
     auto& s = st();
     int type = va_arg(ap, PLI_INT32);
     if (!isCovType(type)) {
         error(vpiError, "vpi_control: " + std::to_string(type) + " is not a coverage type (40.5.1)");
-        return 0;
+        return -1;   // SV_COV_ERROR
     }
-    if (type != vpiAssertCoverage && !g_cov) {
-        error(vpiWarning, "vpi_control: statement, toggle and FSM coverage are collected only with msim -cov");
-        return 0;
-    }
+    // The results are those of the system functions (40.5.3, 40.3.2):
+    // SV_COV_OK 1, SV_COV_NOCOV 0, SV_COV_ERROR -1.
+    constexpr PLI_INT32 OK = 1, NOCOV = 0, ERR = -1;
+    bool avail = type == vpiAssertCoverage || g_cov;   // statement, toggle and FSM coverage need msim -cov
     covThaw();
     if (op == vpiCoverageSave || op == vpiCoverageMerge) {
         const char* name = va_arg(ap, const char*);
-        if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return 0; }
-        if (op == vpiCoverageMerge) return covMerge(type, name) ? 1 : 0;
-        if (!covSaveHook() || !covSaveHook()(name)) { error(vpiError, std::string("vpi_control: cannot write coverage to ") + name); return 0; }
-        return 1;
+        if (!name || !*name) { error(vpiError, "vpi_control: coverage save / merge needs a database name"); return ERR; }
+        if (!avail) return NOCOV;   // nothing saved; nothing of that type to merge into
+        if (op == vpiCoverageMerge) return covMerge(type, name) ? OK : ERR;
+        if (!covSaveHook() || !covSaveHook()(name)) { error(vpiError, std::string("vpi_control: cannot write coverage to ") + name); return ERR; }
+        return OK;
     }
     Obj* o = O(va_arg(ap, vpiHandle));
     if (o && o->kind != Obj::Module && o->kind != Obj::Assertion) {
         error(vpiError, "vpi_control: a coverage operation needs an instance or assertion handle (or null)");
-        return 0;
+        return ERR;
     }
     if (o && o->kind == Obj::Assertion && type != vpiAssertCoverage) {
         error(vpiError, "vpi_control: an assertion handle goes with vpiAssertCoverage");
-        return 0;
+        return ERR;
     }
-    if (o && denied(o, "vpi_control")) return 0;
+    if (o && denied(o, "vpi_control")) return ERR;
     const InstanceSymbol* inst = o && o->kind == Obj::Module ? &o->sym->as<InstanceSymbol>() : nullptr;
-    if (op == vpiCoverageCheck) {   // TRUE when every item of the type is covered
-        if (o && o->kind == Obj::Assertion) return s.assertCov[(size_t)o->idx][1] > 0;
-        auto [n, m] = covOf(type, inst);
-        return n == m ? 1 : 0;
-    }
+    // Check and start: whether there is coverage of that type there at all
+    // (not whether it is all covered); stop and reset of nothing succeed.
+    if (!avail) return op == vpiCoverageStop || op == vpiCoverageReset ? OK : NOCOV;
+    bool any = (o && o->kind == Obj::Assertion) || covOf(type, inst).second > 0;
+    if (op == vpiCoverageCheck) return any ? OK : NOCOV;
     if (op == vpiCoverageReset) {
         // A frozen instance (stopped below the top) stays stopped, from 0.
         std::vector<const InstanceSymbol*> refreeze;
@@ -1730,16 +1733,16 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap) {
         for (size_t k = 0; k < s.assertCovOff.size(); k++)
             if (o && (o->kind == Obj::Assertion ? (int)k == o->idx : assertIn(k, inst))) s.assertCovOff[k] = stop;
             else if (!o) s.assertCovOff[k] = 0;
-        return 1;
+        return stop || any ? OK : NOCOV;
     }
     // Below the top: that instance's counts freeze until vpiCoverageStart.
     if (inst && inst->getParentScope() != &s.comp->getRoot()) {
         covFreeze(type, inst, stop);
-        return 1;
+        return stop || any ? OK : NOCOV;
     }
     int bit = type == vpiStatementCoverage ? 1 : type == vpiToggleCoverage ? 2 : 4;
     g_covStop = stop ? (g_covStop | bit) : (g_covStop & ~bit);
-    return 1;
+    return stop || any ? OK : NOCOV;
 }
 
 // ---- set-up from msim ----
@@ -3660,7 +3663,7 @@ inline PLI_INT32 covControlOp(PLI_INT32 op, va_list ap);
 inline PLI_INT32 control(PLI_INT32 op, va_list ap) {
     clearErr();
     if (PLI_INT32 r = assertControlOp(op, ap); r >= 0) return r;
-    if (PLI_INT32 r = covControlOp(op, ap); r >= 0) return r;
+    if (PLI_INT32 r = covControlOp(op, ap); r != INT32_MIN) return r;
     if (op == vpiFinish || op == vpiStop) {
         S.finished = true;
         return 1;

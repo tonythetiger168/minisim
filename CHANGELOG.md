@@ -52,6 +52,10 @@ Spec references are IEEE 1800-2023 clauses.
   unknown system task or function name, which the callback may register.
 - VPI coverage stop and start on one instance below the top (40.5.1):
   its statement, toggle or FSM counts freeze until `vpiCoverageStart`.
+- VPI coverage control as 40.5 reads: `vpi_control` returns the
+  `SV_COV_*` codes of the system functions (`vpiCoverageCheck` is 1 when
+  coverage is available, not when all is covered; errors are -1), and
+  `vpiCovered` of an assertion needs an attempt, a success and no failure.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
