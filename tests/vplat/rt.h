@@ -27,6 +27,9 @@ __attribute__((noreturn)) static inline void exit_(int code) {
     REG32(FINISH) = code ? (0x3333u | (uint32_t)code << 16) : 0x5555u;
     for (;;) {}
 }
-#define csr_read(r) ({ uint32_t _v; __asm__ volatile("csrr %0, " #r : "=r"(_v)); _v; })
-#define csr_write(r, v) __asm__ volatile("csrw " #r ", %0" ::"r"((uint32_t)(v)))
-#define csr_set(r, v) __asm__ volatile("csrs " #r ", %0" ::"r"((uint32_t)(v)))
+// CSRs are XLEN wide, so these work on RV32 and RV64 alike.
+#define csr_read(r) ({ uintptr_t _v; __asm__ volatile("csrr %0, " #r : "=r"(_v)); _v; })
+#define csr_write(r, v) __asm__ volatile("csrw " #r ", %0" ::"r"((uintptr_t)(v)))
+#define csr_set(r, v) __asm__ volatile("csrs " #r ", %0" ::"r"((uintptr_t)(v)))
+// mcause of an interrupt: the top bit, and the cause.
+#define MCAUSE_INT(c) (((uintptr_t)1 << (8 * sizeof(uintptr_t) - 1)) | (c))
