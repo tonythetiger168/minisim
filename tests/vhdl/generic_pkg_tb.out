@@ -1,0 +1,3 @@
+generic_pkg.vhd:92:5:@0ms:(report note): int got=100 count=2 dump=200..300
+generic_pkg.vhd:95:5:@0ms:(report note): bool count=2 first=true dump=F..F
+generic_pkg.vhd:96:5:@0ms:(report note): min=-3 max=12

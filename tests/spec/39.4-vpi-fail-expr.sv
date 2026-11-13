@@ -1,7 +1,7 @@
 // IEEE 1800-2023 39.4.2: on cbAssertionFailure, info->detail.failExpr is
 // the expression that failed: an immediate assertion's condition, or the
-// boolean of a concurrent property that is a single expression. A property
-// with sequence operators gives NULL (msim does not keep which part failed).
+// boolean of a single-expression property, or with sequence operators the
+// boolean that did not hold in the failing step (c in b |-> ##1 c).
 //! icarus-skip: Icarus 13 has no assertion API
 //! args: data/vpi/failexpr.c
 module top;
@@ -23,5 +23,5 @@ endmodule
 //> Error: "39.4-vpi-fail-expr.sv", 10: top.p_simple: at time 15
 //> im failed at 22: vpiOperation c == 1
 //> Error: "39.4-vpi-fail-expr.sv", 17: top.blk.im: at time 22
-//> p_seq failed at 25: NULL
+//> p_seq failed at 25: vpiReg c
 //> Error: "39.4-vpi-fail-expr.sv", 11: top.p_seq: at time 25

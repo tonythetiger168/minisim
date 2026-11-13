@@ -1194,17 +1194,22 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     }
     if (!(ticked & 1)) {
     } else if (c.procedural) {   // instances queued by the procedure in this step, or matured earlier
-        for (auto& p : c.matured) { c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait, S.now}); a.evals++; assertEvent(c.id, AE_START, S.now); }
+        vector<ConcAssert::Attempt> starting;
+        for (auto& p : c.matured) starting.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, p.wait, S.now});
         c.matured.clear();
         for (auto& p : c.pending) {
             auto* pc = static_cast<ProcCtl*>(p.ctl.get());
-            if (!pc->killed && pc->epoch == p.epoch) {
-                c.att.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, nullptr, S.now});
-                a.evals++;
-                assertEvent(c.id, AE_START, S.now);
-            }
+            if (!pc->killed && pc->epoch == p.epoch) starting.push_back({c.root, false, 1, a.killGen, p.caps, nullptr, nullptr, S.now});
         }
         c.pending.clear();
+        if (c.future) std::swap(starting, c.delayed);   // the ones of the tick before start now (16.9.4)
+        for (auto& at : starting) {
+            if (at.killGen != a.killGen) continue;   // killed while it waited
+            at.killGen = a.killGen;
+            c.att.push_back(std::move(at));
+            a.evals++;
+            assertEvent(c.id, AE_START, c.att.back().start);
+        }
     } else if (a.on) {
         c.att.push_back({c.root, false, 1, a.killGen, nullptr, nullptr, nullptr, S.now});
         a.evals++;
@@ -1237,8 +1242,15 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     }
     vector<ConcAssert::Attempt> next;
     bool ended = false;   // a match of an end point tracker
+    // With VPI callbacks: the atoms each step reads, for matched_exprs and
+    // failExpr (39.4.2, 39.5.2).
+    vector<std::pair<int, bool>> seen;
+    bool track = assertHook() && !a.hidden && !c.atomSrc.empty();
+    auto srcOf = [&](int k) { return (size_t)k < c.atomSrc.size() ? c.atomSrc[(size_t)k] : nullptr; };
     for (auto& at : c.att) {
         values(at.caps);
+        seen.clear();
+        dv.seen = track ? &seen : nullptr;
         if (lenv) { lenv->start(at.envs); lenv->count = at.count; }
         dv.env = 0;
         dv.memo.clear();
@@ -1247,8 +1259,19 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
         const sva::Node* t = dv.d(at.t);
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
+        dv.seen = nullptr;
+        const void* failed = nullptr;   // the last atom that did not hold
+        if (track && t->k == sva::PFALSE)
+            for (auto it = seen.rbegin(); it != seen.rend() && !failed; ++it)
+                if (!it->second) failed = srcOf(it->first);
         if (!a.stepAt.empty() && a.stepAt.count(at.start) && assertHook() && !a.hidden) {   // VPI stepping (39.5.2): this attempt's step
-            assertStep() = {at.t, t};
+            AssertStep& s = assertStep();
+            s.from = at.t;
+            s.to = t;
+            s.failed = failed;
+            s.matched.clear();
+            for (auto [k, ok] : seen)
+                if (const void* x = srcOf(k); ok && x && std::find(s.matched.begin(), s.matched.end(), x) == s.matched.end()) s.matched.push_back(x);
             for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, t->k == sva::PFALSE ? AE_STEP_FAIL : AE_STEP_OK, at.start);
         }
         if (c.coverSeq) {   // every match counts (16.14.3)
@@ -1267,7 +1290,9 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
             continue;
         } else if (t->k == sva::PFALSE) {
             a.fails += at.count;
+            assertStep().failed = failed;
             for (uint64_t n = 0; assertHook() && n < at.count; n++) assertEvent(c.id, AE_FAILURE, at.start);
+            assertStep().failed = nullptr;
             expectDone(at.wait, 0);
             if (a.failOn) runAction(c.fail, at.count, &c.capSlot, at.caps.get());
             continue;
@@ -1605,7 +1630,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 std::string str;
                 int64_t num = -1;
                 if (!i.args.empty()) {
-                    if (i.dcmd == DC_FILE) { a.str = true; str = v_str(a); }
+                    if (i.dcmd == DC_FILE || i.dcmd == DC_VFILE) { a.str = true; str = v_str(a); }
                     else if (!a.x) num = v_to_i64(a);
                 }
                 S.dumpTask(i.dcmd, str, num, i.dsel);

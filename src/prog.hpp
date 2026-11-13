@@ -87,6 +87,9 @@ struct UdpRow { std::vector<std::string> in; char state = 0, out = 'x'; int edge
 struct UdpTable { int nin = 0; bool seq = false; bool edges = false; std::vector<UdpRow> rows; };
 // IK::Dump commands, one per VCD task (21.7.1).
 enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT,
+               // The other simulators' tasks (vendor_tasks.hpp): a file whose name says FSDB, VPD or
+               // SHM (written as FST, or VCD), and memories in the dump ($fsdbDumpMDA, +mda).
+               DC_VFILE, DC_ARRAYS, DC_VVARS,
                // Extended VCD (21.7.3): args hold [size,] file name; dsel the ports of $dumpports.
                DC_PORTS, DC_POFF, DC_PON, DC_PALL, DC_PFLUSH, DC_PLIMIT };
 

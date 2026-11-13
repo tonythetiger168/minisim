@@ -25,6 +25,7 @@ struct Rng {
     std::optional<int64_t> lv, rv;
     bool box = false;   // unconstrained (range <>)
     TP idx;             // index type (integer, an enumeration, ...)
+    std::optional<int64_t> len;   // constant length of a range whose bounds are not constant
 };
 
 struct Type {
@@ -119,6 +120,8 @@ struct Sym {
     std::shared_ptr<vhdl::Unit> unit;
     bool deferred = false;
     std::string pkgOfSub;   // subprogram declared in this package
+    bool member = false;    // a method or variable of a protected type
+    TP owner;               // method: its protected type
 };
 
 using Scope = std::map<std::string, std::vector<Sym>>;

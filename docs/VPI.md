@@ -149,13 +149,15 @@ of the attempt that starts at `start` (it may not have started yet) call
 `detail.step` giving `stateFrom` and `stateTo`: the engine's states for the
 attempt, numbered per assertion in the order they are first seen (two
 attempts in the same state have the same number).
-`vpiAssertionDisableStep` (h, start) turns it off. Not supported: the matched
-expressions of a step (`matched_expression_count` is 0). On
-`cbAssertionFailure`, `info->detail.failExpr` is the failing expression: an
-immediate assertion's condition, or the boolean of a concurrent property
-that is a single expression (under its clock and `disable iff`); it is NULL
-for a property with sequence or property operators, because msim's engine
-does not keep which part of such a property failed.
+`detail.step` also lists the expressions that matched in the step
+(`matched_expression_count`, `matched_exprs`): each boolean of the property
+the engine read in that step and found true, once, in the order read.
+`vpiAssertionDisableStep` (h, start) turns it off. On `cbAssertionFailure`,
+`info->detail.failExpr` is the failing expression: an immediate assertion's
+condition; for a concurrent property, the boolean that did not hold in the
+step that failed (`c` in `b |-> ##1 c`; the whole boolean of a
+single-expression property). It is NULL only when no boolean failed, such as
+a strong property still pending at the end of the simulation.
 
 **Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
 instance)` gives the covered items of that instance: `vpiStatementCoverage`
@@ -339,9 +341,11 @@ inout) port of another that are connected to the same net, in either order,
 and gives the same path object each time. `vpi_iterate(vpiPort, path)` gives
 the two ports. `vpi_get_delays` / `vpi_put_delays` read and write its delay
 (1, 2, 3, 6 or 12 values, with `pulsere_flag` pulse limits and
-`append_flag`), which is the interconnect delay of the load port from every
-source on the net, the same as an SDF `PORT` or `INTERCONNECT` delay
-(32.4.4). The load port has to be a net.
+`append_flag`). On a net with one source it is the interconnect delay of the
+load port, as an SDF `PORT` delay; on a net with several sources it is the
+delay from that path's source alone, as an SDF `INTERCONNECT` delay
+(32.4.4), so each source port can have its own. The load port has to be a
+net.
 
 **Timing checks (37, 38.10, 38.36.1).** `vpi_iterate(vpiTchk, module)`
 gives the timing checks of a module instance's specify blocks
@@ -488,8 +492,14 @@ start of simulation callbacks and before any procedure, and
 `cbEndOfRestart` once the run is back at the checkpoint. They run each
 time, with only `reason`, `cb_rtn` and `user_data` set.
 `vpi_control(vpiReset, stop_value, reset_value, diagnostics_value)` runs
-`$reset` when the calling routine returns (stop_value is ignored: msim has
-no interactive mode).
+`$reset` when the calling routine returns (stop_value is ignored).
+
+**Interactive mode (38.36.3).** With `msim -i` or `-do FILE`,
+`cbEnterInteractive` runs when msim starts reading commands: at time 0, at
+each stop, and when a statement stop or step pauses a process.
+`cbExitInteractive` runs when a `run`, `step` or `next` goes on and when the
+commands end. `cbInteractiveScopeChange` runs after the `scope` command
+changes the scope, with `obj` the new scope. Each has `time` set.
 
 **Signals (38.36.3).** `cbSignal` with the signal number in `index` traps
 that signal (not `SIGKILL` or `SIGSTOP`). The handler only notes it; the
@@ -504,10 +514,7 @@ waveform tools (`mwave`, the FST and VCD readers).
 
 ## Not yet
 
-The per-source
-delay of an inter-module path on a net with several sources,
-interactive mode
-callbacks. A call to something not
+Nothing in clauses 36 to 41 or annexes K, L and M. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 

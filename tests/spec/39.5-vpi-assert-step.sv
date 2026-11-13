@@ -2,7 +2,9 @@
 // attempt start time, vpiAssertionClockSteps) makes each clock step of
 // that attempt call cbAssertionStepSuccess (the attempt goes on or
 // matches) or cbAssertionStepFailure (it fails), with the attempt's start
-// time and the states it went from and to. It may name an attempt that has
+// time, the states it went from and to, and the expressions that matched in
+// the step (matched_exprs); on the failure, failExpr is the expression that
+// did not hold. It may name an attempt that has
 // not started yet. vpiAssertionDisableStep (assertion, start time) stops
 // it. vpiAssertionKill (assertion, start time) discards that attempt only:
 // no outcome, cbAssertionKill with no attempt information, and the
@@ -37,12 +39,16 @@ endmodule
 //> no step control: vpi_control: vpiAssertionEnableStep needs vpiAssertionClockSteps
 //> system control on an assertion: vpi_control: assertion system control takes a scope handle or NULL
 //> 5: step success, attempt from 5, state 0 -> 1
+//>   matched req
 //> 15: step success, attempt from 5, state 1 -> 2
+//>   matched ack
 //> 15: success, attempt from 5
 //> 25: step success, attempt from 25, state 0 -> 1
+//>   matched req
 //> 35: step success, attempt from 25, state 1 -> 3
 //> 45: step failure, attempt from 25, state 3 -> 4
 //> 45: failure, attempt from 25
+//>   failExpr ack
 //> 45: p failed
 //> disable step 65: 1
 //> 70: kill

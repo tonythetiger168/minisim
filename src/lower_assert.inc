@@ -53,6 +53,7 @@ int newAssert(int type, int dir, const slang::ast::Statement& st) {
     a.dir = dir;
     a.inst = instPath(scope);
     a.prot = hideLocIf() && hideLocIf()(st.sourceRange.start());   // the coverage right (1735)
+    a.msgProt = hideMsgIf() && hideMsgIf()(st.sourceRange.start());   // may a message name it (9.2.1)
     a.stmt = &st;
     a.scope = labelSym && labelOf == &st && labelSym->getParentScope() ? labelSym->getParentScope() : scope;
     std::tie(a.file, a.line) = fileLine(st.sourceRange.start());
@@ -410,6 +411,7 @@ SampleClock& gclkSampler() {
 // Atom e of an assertion that uses future functions, read one global clock
 // tick late: each sampled value is replaced by its copy from the tick before
 // (a $past stage one further back), and a future value by the value now.
+bool futureProc = false;   // shifting a procedural assertion (16.14.6)
 E futureShift(const E& e) {
     if (!e || e->op == Op::Const) return e;
     if (e->op == Op::Future) return e->kids[0];
@@ -425,6 +427,9 @@ E futureShift(const E& e) {
         // A local variable is assigned from shifted values too (16.10), so
         // it is read as it is.
         if (svaLocalSigs().count(e->sig) && !e->at) return e;
+        // In a procedure, an automatic variable is captured per instance when
+        // it is queued (16.14.6.1): a constant of the attempt.
+        if (futureProc && !e->at && (isRel(e->sig) || automaticSigs().count(e->sig))) return e;
         if (e->at || isRel(e->sig) || automaticSigs().count(e->sig) || svaLiveSigs().count(e->sig))
             unsupported("a future sampled value function with automatic, local or class values (16.9.4)");
         SampleClock& g = gclkSampler();
@@ -480,6 +485,7 @@ struct SvaBuild {
     std::vector<std::pair<int, Edge>> clk;
     E clkIff;
     bool future = false;   // uses $future_gclk and friends (16.9.4)
+    bool matchItems = false;   // has sequence match items (16.10, 16.11)
 };
 SvaBuild* svb = nullptr;
 
@@ -574,6 +580,73 @@ int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
     svb->acts.push_back(std::move(init));
     return (int)svb->acts.size() - 1;
 }
+// The recursive instance `ai` of a property whose level `lvl` recurs
+// (16.12.17): the level's local variables take their new values, as an act
+// run before the level's body is entered again. Local formals take the
+// actual arguments and declared locals their initializers, all read at the
+// current level, through temporaries (the new values must not see each
+// other). -1: nothing to set.
+int recLocals(const slang::ast::AssertionInstanceExpression& ai, const slang::ast::AssertionInstanceExpression& lvl,
+              const slang::ast::AssertionInstanceExpression& outer) {
+    using namespace slang::ast;
+    if (lvl.localVars.empty()) return -1;
+    // slang leaves the recursive instance unbound. Its actual arguments are
+    // the level's own, written the same way one level further in: lowered
+    // with the outer level's local variables standing for this level's.
+    if (!ai.syntax || !lvl.syntax || ai.syntax->toString() != lvl.syntax->toString() ||
+        outer.localVars.size() != lvl.localVars.size())
+        unsupported("a recursive property with local variables, instanced in more than one way (16.12.17)");
+    std::vector<ConcAssert::Item> act, copy;
+    std::vector<std::pair<const Symbol*, std::optional<int>>> saved;
+    for (const LocalAssertionVarSymbol* ov : outer.localVars) {   // matched by name: the order may differ
+        const LocalAssertionVarSymbol* lv = nullptr;
+        for (const LocalAssertionVarSymbol* x : lvl.localVars)
+            if (x->name == ov->name) lv = x;
+        auto it = lv ? sigmap.find(lv) : sigmap.end();
+        if (it == sigmap.end()) unsupported("a recursive property with local variables (16.12.17)");
+        auto o = sigmap.find(ov);
+        saved.push_back({ov, o == sigmap.end() ? std::nullopt : std::optional<int>(o->second)});
+        sigmap[ov] = it->second;
+    }
+    for (const LocalAssertionVarSymbol* lv : lvl.localVars) {
+        int sg = sigmap[lv];
+        int k = (int)(std::find(svb->localSigs.begin(), svb->localSigs.end(), sg) - svb->localSigs.begin());
+        if (k == (int)svb->localSigs.size())
+            unsupported("a recursive property with output or inout local arguments (16.12.17)");
+        int w = sigInfo()[sg].second;
+        if (lv->formalPort) {
+            const Expression* from = nullptr;
+            for (auto& [port, actual] : lvl.arguments)
+                if (port == lv->formalPort)
+                    if (auto* x = std::get_if<const Expression*>(&actual)) from = *x;
+            if (!from) continue;
+            int tmp = mkSig(scopePath(scope) + ".$lvt" + std::to_string(tempSeq ? (*tempSeq)++ : 0), w, false);
+            svaLocalSigs().insert(tmp);
+            int kt = (int)svb->localSigs.size();
+            svb->localSigs.push_back(tmp);
+            act.push_back({kt, resize(sampledE(expr(*from)), w, from->type->isSigned(), false)});
+            copy.push_back({k, ref(tmp)});
+        } else if (const DeclaredType* dt = lv->getDeclaredType(); dt && dt->getInitializer()) {
+            // slang binds the initializer with the actual arguments in place
+            // of the formals: it reads the current level's values too.
+            const Expression* from = dt->getInitializer();
+            int tmp = mkSig(scopePath(scope) + ".$lvt" + std::to_string(tempSeq ? (*tempSeq)++ : 0), w, false);
+            svaLocalSigs().insert(tmp);
+            int kt = (int)svb->localSigs.size();
+            svb->localSigs.push_back(tmp);
+            act.push_back({kt, resize(sampledE(expr(*from)), w, from->type->isSigned(), false)});
+            copy.push_back({k, ref(tmp)});
+        }
+    }
+    for (auto& [sym, v] : saved) {
+        if (v) sigmap[sym] = *v;
+        else sigmap.erase(sym);
+    }
+    for (auto& c : copy) act.push_back(std::move(c));
+    if (act.empty()) return -1;
+    svb->acts.push_back(std::move(act));
+    return (int)svb->acts.size() - 1;
+}
 // A subroutine call in a match item (16.11) as a process. Its arguments are
 // evaluated at the match, on sampled values and the local variables' values
 // then: each becomes a constant slot, as in actionProg.
@@ -607,6 +680,7 @@ const Prog* callProg(const slang::ast::CallExpression& call, std::vector<E>& cap
 int matchAct(std::span<const slang::ast::Expression* const> items) {
     using namespace slang::ast;
     if (items.empty()) return -1;
+    if (svb) svb->matchItems = true;
     std::vector<ConcAssert::Item> act;
     auto localOf = [&](const Expression& x) -> int {
         const Expression& t = peel(x);
@@ -831,13 +905,17 @@ static bool sameExpr(const slang::ast::Expression& a, const slang::ast::Expressi
         default: return false;
     }
 }
-static bool sameArgs(const slang::ast::AssertionInstanceExpression& a, const slang::ast::AssertionInstanceExpression& b) {
+// localOk: an argument bound to a local variable formal may differ (16.12.17:
+// each level gets its own copy, recLocals).
+static bool sameArgs(const slang::ast::AssertionInstanceExpression& a, const slang::ast::AssertionInstanceExpression& b,
+                     bool localOk = false) {
     using namespace slang::ast;
     if (a.arguments.size() != b.arguments.size()) return false;
     for (size_t k = 0; k < a.arguments.size(); k++) {
         const auto& [fa, va] = a.arguments[k];
         const auto& [fb, vb] = b.arguments[k];
         if (fa != fb || va.index() != vb.index()) return false;
+        if (localOk && fa->isLocalVar()) continue;
         if (auto* x = std::get_if<const Expression*>(&va)) {
             if (!sameExpr(**x, *std::get<const Expression*>(vb))) return false;
         } else if (auto* x = std::get_if<const AssertionExpr*>(&va)) {
@@ -863,22 +941,19 @@ const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
             for (size_t k = recStack.size(); k-- > 0 && same.size() < 2;)
                 if (&recStack[k].ai->symbol == &ai->symbol) same.push_back(k);
             if (same.size() < 2) unsupported("recursive property (16.12.17)");
-            if (!sameArgs(*recStack[same[0]].ai, *recStack[same[1]].ai))
+            if (!sameArgs(*recStack[same[0]].ai, *recStack[same[1]].ai, true))
                 unsupported("a recursive property whose arguments change from one level to the next (16.12.17)");
-            if (svb && !svb->more.empty()) unsupported("a recursive property in a multiclock assertion (16.12.17)");
             RecEnt& e = recStack[same[0]];
             if (e.idx < 0) e.idx = st.recNew();
-            return st.rec(e.idx);
+            return st.init(recLocals(*ai, *e.ai, *recStack[same[1]].ai), st.rec(e.idx));
         }
         recStack.push_back({ai, -1});
         int init = instLocals(*ai);
-        const sva::Node* r = st.init(init, propTerm(ai->body, strong));
+        const sva::Node* body = propTerm(ai->body, strong);
+        const sva::Node* r = st.init(init, body);
         RecEnt e = recStack.back();
         recStack.pop_back();
-        if (e.idx >= 0) {
-            if (init >= 0) unsupported("a recursive property with local variables (16.12.17)");
-            st.recBody[(size_t)e.idx] = r;
-        }
+        if (e.idx >= 0) st.recBody[(size_t)e.idx] = body;   // each level sets its locals before it (recLocals)
         return r;
     }
     if (isSeq(a)) return st.pseq(seqTerm(a), strong);
@@ -1036,6 +1111,9 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
+    c.atomSrc.assign(c.atoms.size(), nullptr);
+    for (const auto& [x, id] : b.atomOf)
+        if ((size_t)id < c.atomSrc.size()) c.atomSrc[(size_t)id] = x;
     c.pre = std::move(b.pre);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
@@ -1147,13 +1225,11 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     } else
         c.root = propTerm(*a, dir == AD_COVER);
     for (size_t k = inits.size(); k-- > 0;) {
+        const sva::Node* body = c.root;
         c.root = sva::store().init(inits[k], c.root);
         RecEnt e = recStack.back();   // a leading instance that recurs (16.12.17)
         recStack.pop_back();
-        if (e.idx >= 0) {
-            if (inits[k] >= 0) unsupported("a recursive property with local variables (16.12.17)");
-            sva::store().recBody[(size_t)e.idx] = c.root;
-        }
+        if (e.idx >= 0) sva::store().recBody[(size_t)e.idx] = body;
     }
     sva::store().localAtoms = nullptr;
     if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
@@ -1167,6 +1243,9 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
+    c.atomSrc.assign(c.atoms.size(), nullptr);
+    for (const auto& [x, id] : b.atomOf)
+        if ((size_t)id < c.atomSrc.size()) c.atomSrc[(size_t)id] = x;
     c.pre = std::move(b.pre);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
@@ -1176,15 +1255,20 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     if (b.future) {   // checked one global clock tick late (16.9.4)
         SampleClock& g = gclkSampler();
         if (c.ev != g.ev) unsupported("a future sampled value function in an assertion not clocked by the global clock (16.9.4)");
-        if (!c.more.empty() || !staticAssert)
-            unsupported("a future sampled value function with several clocks or in a procedure (16.9.4)");
+        if (b.matchItems)   // 16.9.4: not allowed at all (local formals and initializers are)
+            throw std::runtime_error(whereStr() + "lower: a global clocking future sampled value function shall not be used "
+                                                  "in an assertion with sequence match items (16.9.4)");
+        if (!c.more.empty())
+            unsupported("a future sampled value function with several clocks (16.9.4)");
+        c.future = !staticAssert;
+        futureProc = !staticAssert;
         for (auto& act : c.acts)
             for (auto& item : act) {
-                if (item.call) unsupported("a future sampled value function with a subroutine call match item (16.9.4)");
                 item.rhs = futureShift(item.rhs);
             }
         for (auto& at : c.atoms) at = futureShift(at);
         if (c.clkIff) c.clkIff = futureShift(c.clkIff);
+        futureProc = false;
         // No attempt at the first tick: nothing was sampled before it.
         SampleClock::Line ln;
         ln.src = konst(mk(1, 1));

@@ -443,11 +443,13 @@ struct Session {
         curProg = p;
         nest++;
         resume = false;
+        vpi::interactiveCb(cbEnterInteractive, "");
         std::string buf;
         while (!resume && !S.finished && !quitNow) {
             if (!read(buf)) { rest(); break; }
             run(buf);
         }
+        vpi::interactiveCb(cbExitInteractive, "");
         nest--;
         resume = false;
     }
@@ -594,8 +596,10 @@ struct Session {
     // Starts the run asked for, or lets a paused one go on.
     void go() {
         if (nest) { resume = true; return; }
+        vpi::interactiveCb(cbExitInteractive, "");   // 38.36.3: the run goes on, then stops again
         if (!advance()) { ended = true; std::cout << "simulation ended at time " << S.now << "\n"; return; }
         if (why != "-") std::cout << "time " << S.now << ": " << why << "\n";
+        vpi::interactiveCb(cbEnterInteractive, "");
     }
     // A value written from here takes effect in a slot at the current time.
     void settle() {
@@ -799,6 +803,11 @@ struct Session {
 
     std::string cmdScope(const W& a) {
         if (a.size() == 1 || (a.size() == 2 && flag(a[1], {"-show", "-get"}))) return scopeShown();
+        std::string r = setScope(a);
+        vpi::interactiveCb(cbInteractiveScopeChange, scopeShown());   // 38.36.3
+        return r;
+    }
+    std::string setScope(const W& a) {
         std::string to = a.back();
         if (a[1] == "-up" || to == "..") {
             size_t d = scope.rfind('.');
@@ -1004,6 +1013,45 @@ struct Session {
         }
         if (add) {
             if (S.waving()) throw tcl::Error("the dump has started: signals can only be added before it (21.7.1.2)");
+            if (sel.empty()) sel.push_back({scope.empty() ? "" : scope + ".", false});
+            S.dumpTask(DC_VARS, "", depth, sel);
+            std::cout << "dumping to " << S.dumpFile << " from the next time slot\n";
+        }
+        return "";
+    }
+
+    // Verdi's UCLI commands (the FSDB PLI adds them to VCS and Xcelium):
+    // fsdbDumpfile NAME, fsdbDumpvars [DEPTH] [SCOPE ...] [+OPTION ...],
+    // fsdbDumpon / off / flush / Finish, fsdbDumpMDA. As the system tasks,
+    // they write FST (vendor_tasks.hpp).
+    std::string cmdFsdb(const W& a) {
+        const std::string& c = a[0];
+        if (c == "fsdbDumpfile") {
+            if (a.size() < 2) throw tcl::Error("fsdbDumpfile NAME");
+            S.dumpTask(DC_VFILE, a[1], 0, {});
+            std::cout << "dump file " << S.dumpFile << "\n";
+        } else if (c == "fsdbDumpon") S.dumpTask(DC_ON, "", 0, {});
+        else if (c == "fsdbDumpoff") S.dumpTask(DC_OFF, "", 0, {});
+        else if (c == "fsdbDumpflush") S.dumpTask(DC_FLUSH, "", 0, {});
+        else if (c == "fsdbDumpFinish") { S.dumpTask(DC_FLUSH, "", 0, {}); S.dumpTask(DC_OFF, "", 0, {}); }
+        else if (c == "fsdbDumpMDA") S.dumpTask(DC_ARRAYS, "", 0, {});
+        else {   // fsdbDumpvars
+            std::vector<std::pair<std::string, bool>> sel;
+            int64_t depth = 0;
+            bool arrays = false;
+            for (size_t i = 1; i < a.size(); i++) {
+                const std::string& o = a[i];
+                if (o.rfind("+fsdbfile+", 0) == 0) { S.dumpTask(DC_VFILE, o.substr(10), 0, {}); continue; }
+                if (o == "+mda" || o == "+all") { arrays = true; continue; }
+                if (!o.empty() && o[0] == '+') continue;
+                if (i == 1 && !o.empty() && std::isdigit((unsigned char)o[0])) { depth = std::atoll(o.c_str()); continue; }
+                if (auto sc = scopeName(o)) sel.push_back({sc->empty() ? "" : *sc + ".", false});
+                else if (int s = find(o); s >= 0) sel.push_back({S.sigs[s].name, true});
+                else throw tcl::Error("no scope or signal '" + o + "'");
+            }
+            if (S.waving()) throw tcl::Error("the dump has started: signals can only be added before it (21.7.1.2)");
+            S.dumpTask(DC_VFILE, "?novas.fsdb", 0, {});
+            if (arrays) S.dumpTask(DC_ARRAYS, "", 0, {});
             if (sel.empty()) sel.push_back({scope.empty() ? "" : scope + ".", false});
             S.dumpTask(DC_VARS, "", depth, sel);
             std::cout << "dumping to " << S.dumpFile << " from the next time slot\n";
@@ -1303,6 +1351,7 @@ struct Session {
             "force SIG VALUE | release SIG | deposit/change SIG VALUE\n"
             "scope [PATH|-up] | show [-scopes|-signals|-ports] [-value] [SCOPE] | search PATTERN | signals [TEXT]\n"
             "where/stack | listing [N] | dump -file F | dump -add NAMES [-depth N] | probe NAMES | dump -off/-on/-flush/-close\n"
+            "fsdbDumpfile F | fsdbDumpvars [DEPTH] [SCOPES] [+all] | fsdbDumpon/off/flush/Finish (written as FST)\n"
             "drivers SIG | loads SIG | call TASK(ARGS) | save FILE | restore FILE | restart\n"
             "senv [NAME] | alias NAME COMMAND | time | help | quit/exit/finish\n"
             "Tcl: set, if, foreach, while, proc, expr, source, [command] ...\n";
@@ -1371,6 +1420,8 @@ struct Session {
         tcl.addCommand("listing", [this](const W& a) { return cmdListing(a); });
         for (const char* s : {"search", "signals"}) tcl.addCommand(s, [this](const W& a) { return cmdSearch(a); });
         for (const char* d : {"dump", "probe"}) tcl.addCommand(d, [this](const W& a) { return cmdDump(a); });
+        for (const char* d : {"fsdbDumpfile", "fsdbDumpvars", "fsdbDumpon", "fsdbDumpoff", "fsdbDumpflush", "fsdbDumpFinish", "fsdbDumpMDA"})
+            tcl.addCommand(d, [this](const W& a) { return cmdFsdb(a); });
         tcl.addCommand("senv", [this](const W& a) { return cmdSenv(a); });
         for (const char* d : {"drivers", "loads"}) tcl.addCommand(d, [this](const W& a) { return cmdDrivers(a); });
         tcl.addCommand("call", [this](const W& a) { return cmdCall(a); });
@@ -1402,11 +1453,13 @@ struct Session {
         g_ses = this;
         commands();
         startReplay();
+        vpi::interactiveCb(cbEnterInteractive, "");   // 38.36.3
         std::string buf;
         while (!ended && !quitNow && !S.finished) {
             if (!read(buf)) break;
             run(buf);
         }
+        if (!ended) vpi::interactiveCb(cbExitInteractive, "");
         if (quitNow || ended) return;
         // No more commands: the rest of the run.
         rest();

@@ -13,6 +13,21 @@ Spec references are IEEE 1800-2023 clauses.
   guest's writes reach the file; platform files take `"type": "virtio-blk"`.
   Linux mounts an ext4 disk and boots with its root file system on it.
   Extension ABI 7.
+- VPI inter-module paths on a net with several sources each have their own
+  delay (`vpi_put_delays` / `vpi_get_delays`, 38.21), and `msim -i` / `-do`
+  runs `cbEnterInteractive`, `cbExitInteractive` and
+  `cbInteractiveScopeChange` (38.36.3).
+- Verdi, VCS and Xcelium waveform tasks: `$fsdbDumpfile`, `$fsdbDumpvars`,
+  `$fsdbDumpon` / `off`, `$fsdbDumpMDA`, `$vcdpluson`, `$vcdplusfile`,
+  `$vcdplusmemon`, `$shm_open`, `$shm_probe`, `$recordvars` and the rest
+  compile on msim and write FST under the same name (the vendor formats are
+  closed); msim, mdebug and mlint all accept them, and `msim -i` takes the
+  UCLI commands `fsdbDumpfile` / `fsdbDumpvars` / `fsdbDumpoff`.
+  `docs/DEBUG.md`, `tests/msim_vendor_dump.cmake`.
+- VPI assertion steps list their matched expressions
+  (`matched_expression_count`, `matched_exprs`, 39.5.2), and `failExpr` of a
+  concurrent assertion with sequence operators is the boolean that did not
+  hold (39.4.2). `vpiDecompile` of a net, variable or parameter is its name.
 - VPI parameters (37.28): type parameters (`vpiTypeParameter`) in
   `vpi_iterate(vpiParameter, module)`, a parameter's default through
   `vpiExpr`, param assigns (`vpiParamAssign`: the `#(...)` overrides with
@@ -45,6 +60,12 @@ Spec references are IEEE 1800-2023 clauses.
   riscv64 kernel boot to user space on 1 to 4 harts. Instruction fetch with
   paging on keeps the last page translated, and loads and stores keep the
   last 64 pages each: 25 to 50 MIPS under Linux. Extension ABI 6.
+- msim VHDL: protected types (classes), access types (`new`, `null`,
+  `.all`, `deallocate`, linked lists through incomplete types, growable
+  arrays), generic packages and package instantiation, VHDL-2019
+  `std.env` queries, enumeration literals overloaded with functions, and
+  procedures as void functions so VHDL functions can call them.
+  `tests/vhdl/protected.vhd`, `access.vhd`, `generic_pkg.vhd` (GHDL goldens).
 - VPI class definitions (37.31): `vpiVariables` of a class defn gives its
   automatic properties too (before only static ones), as declarations
   with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);

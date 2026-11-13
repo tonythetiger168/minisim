@@ -8,15 +8,21 @@
 static vpiHandle a;
 static PLI_INT32 cb(PLI_INT32 reason, p_vpi_time t, vpiHandle h, p_vpi_attempt_info info, PLI_BYTE8* u) {
     (void)h; (void)u;
-    if (reason == cbAssertionStepSuccess || reason == cbAssertionStepFailure)
+    if (reason == cbAssertionStepSuccess || reason == cbAssertionStepFailure) {
+        int k;
         vpi_printf("%u: step %s, attempt from %u, state %d -> %d\n", t->low,
                    reason == cbAssertionStepSuccess ? "success" : "failure", info->attemptStartTime.low,
                    info->detail.step->stateFrom, info->detail.step->stateTo);
-    else if (reason == cbAssertionKill)
+        for (k = 0; k < info->detail.step->matched_expression_count; k++)   /* the expressions that matched */
+            vpi_printf("  matched %s\n", vpi_get_str(vpiDecompile, info->detail.step->matched_exprs[k]));
+    } else if (reason == cbAssertionKill)
         vpi_printf("%u: kill%s\n", t->low, info ? " (with info)" : "");
-    else
+    else {
         vpi_printf("%u: %s, attempt from %u\n", t->low, reason == cbAssertionSuccess ? "success" : "failure",
                    info->attemptStartTime.low);
+        if (reason == cbAssertionFailure && info->detail.failExpr)   /* the expression that failed */
+            vpi_printf("  failExpr %s\n", vpi_get_str(vpiDecompile, info->detail.failExpr));
+    }
     return 0;
 }
 static s_vpi_time at(PLI_UINT32 t) {
