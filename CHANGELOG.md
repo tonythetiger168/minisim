@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: Zbkb, Zbkx, Zabha, Zacas, Zfh (half precision), the CBO.*
+  instructions (Zicboz in the device tree) and Svnapot. riscv-tests: 837
+  programs (uzbkb, uzbkx, uzabha, uzacas, uzabha_zacas, uzfh, mzicbo and
+  ssvnapot added).
 - mvplat: Sv48 and Sv57 paging on RV64. `-mmu sv48|sv57` (or the platform's
   `"mmu"`) offers them in the device tree; Linux runs with Sv48. riscv-tests
   run RV64's ui, um, ua and uc under Sv48 too: 675 programs.
