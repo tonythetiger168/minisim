@@ -1,9 +1,9 @@
 #!/bin/bash
 # mvplat_isa.sh - the RISC-V architecture tests (riscv-tests, BSD-3-Clause:
-# github.com/riscv-software-src/riscv-tests) on mvplat: every rv32ui, rv32um,
-# rv32ua, rv32uc, rv32si and rv32mi test in its "p" environment (physical
-# memory), and the user-level ones again in the "v" environment, which runs
-# them in user mode under Sv32 paging with a small supervisor that maps pages
+# github.com/riscv-software-src/riscv-tests) on mvplat: every ui, um, ua, uc,
+# si and mi test, for RV32 and RV64, in its "p" environment (physical memory),
+# and the user-level ones again in the "v" environment, which runs them in
+# user mode under Sv32 or Sv39 paging with a small supervisor that maps pages
 # on demand. A test ends through HTIF tohost with the number of the first
 # failing case.
 #
@@ -46,46 +46,53 @@ run() {  # run TEST
   local rc=$?
   if [ $rc = 0 ]; then pass=$((pass + 1)); else failed="$failed $1(case $rc)"; fi
 }
-for suite in rv32ui rv32um rv32ua rv32uc rv32si rv32mi; do
-  for f in "$RT"/isa/$suite/*.S; do
-    t=$suite-p-$(basename "$f" .S)
-    $CL -E -I"$RT/env/p" -I"$RT/isa/macros/scalar" "$f" -o $t.s
-    unweak $t.s
-    sed -i 's/\btcontrol\b/0x7a5/g' $t.s   # a CSR name clang 18 does not know
-    if ! $CL -nostdlib -static -fuse-ld=lld -T"$RT/env/p/link.ld" -x assembler $t.s -o $t 2> $t.err; then
-      failed="$failed $t(build)"; continue
-    fi
-    run $t
-  done
-done
-# The "v" environment: the supervisor (env/v/vm.c) is C, built once. It
-# includes three C library headers for a few declarations; with no RISC-V C
-# library installed, these stand in for them.
+# The "v" environment's supervisor (env/v/vm.c) is C. It includes three C
+# library headers for a few declarations; with no RISC-V C library installed,
+# these stand in for them.
 mkdir -p libc
 printf '#include <stddef.h>\nvoid *memcpy(void *, const void *, size_t);\nvoid *memset(void *, int, size_t);\nsize_t strlen(const char *);\nint strcmp(const char *, const char *);\nint memcmp(const void *, const void *, size_t);\nchar *strcpy(char *, const char *);\nlong atol(const char *);\n' > libc/string.h
 : > libc/stdio.h
 : > libc/ctype.h
-VCC="$CL -O2 -mcmodel=medany -fvisibility=hidden -nostdlib -ffreestanding -fno-builtin -Ilibc -I$RT/env/v -I$RT/isa/macros/scalar"
 # The supervisor's small variables go in .sbss, which the linker script does
 # not place. GNU ld puts it after .bss; lld puts it after .data, in the
 # test's data page, which the supervisor then finds changed on exit with no
 # store to it. Place it after .bss as GNU ld does.
 sed 's/^  \.bss : { \*(\.bss) }/  .bss : { *(.bss) }\n  .sbss : { *(.sbss) }/' "$RT/env/v/link.ld" > v-link.ld
-$VCC -c "$RT/env/v/string.c" -o v-string.o 2> v-string.err || failed="$failed v-string(build)"
-$VCC -c "$RT/env/v/entry.S" -o v-entry.o 2> v-entry.err || failed="$failed v-entry(build)"
-for suite in rv32ui rv32um rv32ua rv32uc; do
-  for f in "$RT"/isa/$suite/*.S; do
-    t=$suite-v-$(basename "$f" .S)
-    $CL -E -I"$RT/env/v" -I"$RT/isa/macros/scalar" "$f" -o $t.s
-    unweak $t.s
-    # As upstream: the supervisor's page placement is seeded from the test name.
-    entropy=0x$(echo $t | md5sum | cut -c 1-7)
-    if ! $VCC -c -x assembler $t.s -o $t.o 2> $t.err ||
-       ! $VCC -march=rv32imafc_zicsr_zifencei -DENTROPY=$entropy -c "$RT/env/v/vm.c" -o $t.vm.o 2>> $t.err ||
-       ! $VCC -static -fuse-ld=lld -Tv-link.ld v-entry.o $t.vm.o v-string.o $t.o -o $t 2>> $t.err; then
-      failed="$failed $t(build)"; continue
-    fi
-    run $t
+
+for X in 32 64; do
+  if [ $X = 32 ]; then CL="$CLANG --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32"; VM=rv32imafc_zicsr_zifencei
+  else CL="$CLANG --target=riscv64-unknown-elf -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany"; VM=rv64imafc_zicsr_zifencei; fi
+  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}si rv${X}mi; do
+    for f in "$RT"/isa/$suite/*.S; do
+      t=$suite-p-$(basename "$f" .S)
+      $CL -E -I"$RT/env/p" -I"$RT/isa/macros/scalar" "$f" -o $t.s
+      unweak $t.s
+      sed -i 's/\btcontrol\b/0x7a5/g' $t.s   # a CSR name clang 18 does not know
+      if ! $CL -nostdlib -static -fuse-ld=lld -T"$RT/env/p/link.ld" -x assembler $t.s -o $t 2> $t.err; then
+        failed="$failed $t(build)"; continue
+      fi
+      run $t
+    done
+  done
+  # The "v" environment: the user-level tests in user mode, under Sv32 or
+  # Sv39 paging, with a supervisor that maps pages on demand.
+  VCC="$CL -O2 -mcmodel=medany -fvisibility=hidden -nostdlib -ffreestanding -fno-builtin -Ilibc -I$RT/env/v -I$RT/isa/macros/scalar"
+  $VCC -c "$RT/env/v/string.c" -o v$X-string.o 2> v$X-string.err || failed="$failed v$X-string(build)"
+  $VCC -c "$RT/env/v/entry.S" -o v$X-entry.o 2> v$X-entry.err || failed="$failed v$X-entry(build)"
+  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc; do
+    for f in "$RT"/isa/$suite/*.S; do
+      t=$suite-v-$(basename "$f" .S)
+      $CL -E -I"$RT/env/v" -I"$RT/isa/macros/scalar" "$f" -o $t.s
+      unweak $t.s
+      # As upstream: the supervisor's page placement is seeded from the test name.
+      entropy=0x$(echo $t | md5sum | cut -c 1-7)
+      if ! $VCC -c -x assembler $t.s -o $t.o 2> $t.err ||
+         ! $VCC -march=$VM -DENTROPY=$entropy -c "$RT/env/v/vm.c" -o $t.vm.o 2>> $t.err ||
+         ! $VCC -static -fuse-ld=lld -Tv-link.ld v$X-entry.o $t.vm.o v$X-string.o $t.o -o $t 2>> $t.err; then
+        failed="$failed $t(build)"; continue
+      fi
+      run $t
+    done
   done
 done
 echo "riscv-tests: $pass passed"

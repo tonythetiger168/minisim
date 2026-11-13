@@ -77,6 +77,10 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` runs RV64: RV64IMAC harts (chosen by the program's ELF class),
+  the W instructions, LD/SD/LWU, 64-bit atomics, RV64C and Sv39 paging. The
+  riscv-tests run grows to 342 programs, RV32 and RV64, all passing. The
+  extension ABI is 3.
 - `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
   `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
   TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
