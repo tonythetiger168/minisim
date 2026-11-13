@@ -40,7 +40,13 @@ names what is missing. Sections marked *(extension)* describe these parts.
 ## What it simulates
 
 **Harts.** RV32GCB or RV64GCB (IMAFDC with Zicsr and Zifencei, the B
-extension's Zba, Zbb and Zbs, and Zbc and Zicond), in machine,
+extension's Zba, Zbb and Zbs, Zbc, Zicond, the scalar-crypto bit
+manipulation Zbkb and Zbkx, the byte and halfword atomics Zabha, compare and
+swap Zacas (AMOCAS.W/D, AMOCAS.Q on RV64 and AMOCAS.D on RV32 with register
+pairs, AMOCAS.B/H), half-precision floating point Zfh (every operation,
+rounding mode and flag, NaN-boxed in the F registers), and the cache-block operations CBO.ZERO, CBO.CLEAN,
+CBO.FLUSH and CBO.INVAL with 64-byte blocks; there are no caches, so the
+last three only check privilege), in machine,
 supervisor and user mode. The program's ELF class picks the width: a 64-bit
 ELF file runs on RV64 harts (`misa.MXL` 2, `UXL` and `SXL` fixed at 64), with
 the W instructions, LD/SD/LWU, 64-bit atomics (`.D`) and RV64C. Single and
@@ -64,18 +70,22 @@ specification says. `satp` selects Sv32 paging on RV32 (two levels, 4 MiB
 megapages) and Sv39, Sv48 or Sv57 on RV64 (three, four or five levels, with
 superpages at every level; a virtual address not sign-extended from bit 38,
 47 or 56 faults), with a 256-entry TLB per hart
-and page faults (causes 12, 13 and 15). No ASIDs (`satp.ASID` reads 0), no
-Svnapot or Svpbmt (those PTE bits fault). Accessed and dirty bits follow Svade: a page whose A bit is clear,
+and page faults (causes 12, 13 and 15). No ASIDs (`satp.ASID` reads 0). Svnapot
+64 KiB pages on RV64 (`N` on a level-0 leaf whose PPN ends in `1000`);
+no Svpbmt (the PBMT bits fault). `menvcfg.CBZE` and `senvcfg.CBZE` read 1,
+so CBO.ZERO works in every mode; CBCFE and CBIE are 0, so the others are
+machine-mode only. Accessed and dirty bits follow Svade: a page whose A bit is clear,
 or a store to a page whose D bit is clear, faults and the supervisor sets
 them, as spike and QEMU do by default. The page walk is checked by PMP.
 The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
 interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
 (SEIP).
 
-The RISC-V architecture tests all pass, 675 programs: ui, um, ua, uc, uf,
-ud, uzba, uzbb, uzbc, uzbs and uzicond for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
+The RISC-V architecture tests all pass, 837 programs: ui, um, ua, uc, uf,
+ud, uzba, uzbb, uzbc, uzbs, uzicond, uzbkb, uzbkx, uzabha, uzacas,
+uzabha_zacas and uzfh for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
 paging on (`v`, Sv32 and Sv39, and RV64's ui, um, ua and uc under Sv48
-too), and mi and si for both. `tests/mvplat_isa.sh`
+too), mi and si for both, and RV64's mzicbo and ssvnapot. `tests/mvplat_isa.sh`
 runs them.
 
 **Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000) on

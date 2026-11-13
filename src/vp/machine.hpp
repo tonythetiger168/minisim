@@ -360,9 +360,28 @@ public:
                         if (f3 == 1) { r = a & ~(1ull << (b & (xl - 1))); return true; }
                         if (f3 == 5) { r = (a >> (b & (xl - 1))) & 1; return true; }
                         return false;
-                    case 0x14: if (f3 == 1) { r = a | (1ull << (b & (xl - 1))); return true; } return false;
+                    case 0x14:
+                        if (f3 == 1) { r = a | (1ull << (b & (xl - 1))); return true; }
+                        if (f3 == 2 || f3 == 4) {                          // xperm4, xperm8 (Zbkx)
+                            const unsigned e = f3 == 2 ? 4 : 8;
+                            const uint64_t em = (1ull << e) - 1;
+                            uint64_t o = 0;
+                            for (unsigned i = 0; i < xl; i += e) {
+                                uint64_t idx = (b >> i) & em;
+                                if (idx * e < xl) o |= ((a >> (idx * e)) & em) << i;
+                            }
+                            r = o;
+                            return true;
+                        }
+                        return false;
                     case 0x34: if (f3 == 1) { r = a ^ (1ull << (b & (xl - 1))); return true; } return false;
-                    case 0x04: if (!rv64 && f3 == 4 && rs2 == 0) { r = a & 0xffff; return true; } return false;  // zext.h
+                    case 0x04: {  // pack, packh (Zbkb); RV32 zext.h is pack with rs2 = x0
+                        const unsigned hx = xl / 2;
+                        const uint64_t hm = (1ull << hx) - 1;
+                        if (f3 == 4) { r = ((a & hm) | ((b & hm) << hx)) & m; return true; }
+                        if (f3 == 7) { r = (a & 0xff) | ((b & 0xff) << 8); return true; }
+                        return false;
+                    }
                     case 0x07:
                         if (f3 == 5) { r = b == 0 ? 0 : a; return true; }   // czero.eqz
                         if (f3 == 7) { r = b != 0 ? 0 : a; return true; }   // czero.nez
@@ -376,6 +395,12 @@ public:
                     if (f12 == 0x602) { r = (uint64_t)__builtin_popcountll(a); return true; }
                     if (f12 == 0x604) { r = sext(a, 8); return true; }
                     if (f12 == 0x605) { r = sext(a, 16); return true; }
+                    if (!rv64 && f12 == 0x08f) {  // zip (Zbkb, RV32)
+                        uint64_t o = 0;
+                        for (unsigned i = 0; i < 16; i++) o |= ((a >> i) & 1) << (2 * i) | ((a >> (i + 16)) & 1) << (2 * i + 1);
+                        r = o;
+                        return true;
+                    }
                     unsigned hi = rv64 ? f6 << 1 : f7;  // funct7 with RV64's shamt[5] cleared
                     if (hi == 0x14) { r = a | (1ull << sh); return true; }   // bseti
                     if (hi == 0x24) { r = a & ~(1ull << sh); return true; }  // bclri
@@ -386,6 +411,18 @@ public:
                     if (f12 == 0x287) {  // orc.b
                         uint64_t o = 0;
                         for (unsigned i = 0; i < xl; i += 8) if ((a >> i) & 0xff) o |= 0xffull << i;
+                        r = o;
+                        return true;
+                    }
+                    if (f12 == 0x687) {  // brev8 (Zbkb)
+                        uint64_t o = 0;
+                        for (unsigned i = 0; i < xl; i++) if ((a >> i) & 1) o |= 1ull << ((i & ~7u) | (7 - (i & 7)));
+                        r = o;
+                        return true;
+                    }
+                    if (!rv64 && f12 == 0x08f) {  // unzip (Zbkb, RV32)
+                        uint64_t o = 0;
+                        for (unsigned i = 0; i < 16; i++) o |= ((a >> (2 * i)) & 1) << i | ((a >> (2 * i + 1)) & 1) << (i + 16);
                         r = o;
                         return true;
                     }
@@ -415,7 +452,7 @@ public:
             case 0x3b: {  // RV64 only
                 uint32_t wa = (uint32_t)a;
                 if (f7 == 0x04 && f3 == 0) { r = (a & 0xffffffffull) + b; return true; }       // add.uw
-                if (f7 == 0x04 && f3 == 4 && rs2 == 0) { r = a & 0xffff; return true; }      // zext.h
+                if (f7 == 0x04 && f3 == 4) { r = (uint64_t)(int64_t)(int32_t)(uint32_t)((a & 0xffff) | ((b & 0xffff) << 16)); return true; }  // packw; zext.h when rs2 = x0
                 if (f7 == 0x10 && (f3 == 2 || f3 == 4 || f3 == 6)) {                         // shNadd.uw
                     r = ((a & 0xffffffffull) << (f3 >> 1)) + b;
                     return true;
@@ -458,7 +495,7 @@ public:
             case 0x104: v = h.mie & h.mideleg; return true;
             case 0x105: v = h.stvec; return true;
             case 0x106: v = h.scounteren; return true;
-            case 0x10a: v = 0; return true;  // senvcfg
+            case 0x10a: v = 0x80; return true;  // senvcfg: CBZE
             case 0x140: v = h.sscratch; return true;
             case 0x141: v = h.sepc; return true;
             case 0x142: v = h.scause; return true;
@@ -475,7 +512,7 @@ public:
             case 0x342: v = h.mcause; return true;
             case 0x343: v = h.mtval; return true;
             case 0x344: v = h.mip; return true;
-            case 0x30a: v = 0; return true;  // menvcfg
+            case 0x30a: v = 0x80; return true;  // menvcfg: CBZE (CBO.ZERO below M)
             case 0x31a: v = 0; return true;  // menvcfgh
             case 0x747: case 0x757: v = 0; return true;  // mseccfg
             // Sdtrig with no triggers: tselect is hard-wired to 0 and tdata1 says
@@ -749,13 +786,18 @@ public:
                     if (!pmpAllows(h, pteA, pteN, PMP_R, 1)) return Acc::Fault;
                     if (physReadPte(h, pteA, pteN, pte) != Acc::Ok) return Acc::Fault;
                     if (!(pte & 1) || ((pte & 6) == 4)) return Acc::PageFault;  // invalid, or W without R
-                    if (w && (pte >> 54)) return Acc::PageFault;                // reserved, PBMT, N: none here
+                    if (w && ((pte >> 54) & 0x1ff)) return Acc::PageFault;      // reserved, PBMT: none here
                     if (pte & 0xa) break;                                         // R or X: a leaf
                     if (pte & 0xd0) return Acc::PageFault;                        // D, A, U on a pointer
+                    if (w && (pte >> 63)) return Acc::PageFault;                  // N on a pointer
                     if (i == 0) return Acc::PageFault;
                     a = ((pte >> 10) & ppnMask) << 12;
                 }
                 uint64_t ppn = (pte >> 10) & ppnMask;
+                if (w && (pte >> 63)) {                                           // Svnapot: a 64 KiB page
+                    if (i != 0 || (ppn & 0xf) != 8) return Acc::PageFault;
+                    ppn = (ppn & ~0xfull) | (vpn & 0xf);
+                }
                 if (i > 0) {
                     uint64_t low = (1ull << (ib * i)) - 1;
                     if (ppn & low) return Acc::PageFault;  // misaligned superpage
@@ -1522,19 +1564,66 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 break;
             }
             case 0x0f:                                                 // FENCE, FENCE.I
+                if (f3 == 2) {                                         // Zicbom, Zicboz: CBO.*
+                    const uint32_t op = insn >> 20;
+                    if (rd || op > 4 || op == 3) ILLEGAL();
+                    if (op != 4) {                                     // clean, flush, inval: no caches here
+                        if (h.priv != 3) ILLEGAL();                    // menvcfg.CBCFE = CBIE = 0
+                        cls = C_FENCE;
+                        break;
+                    }
+                    uint64_t a = h.ax(x[rs1] & ~63ull);                // CBO.ZERO, 64-byte blocks
+                    const unsigned sw = rv64 ? 8 : 4;
+                    for (unsigned o = 0; o < 64; o += sw) {
+                        Acc r = store(h, h.ax(a + o), sw, 0);
+                        if (r != Acc::Ok) MEMFAIL(r, 7, h.ax(x[rs1]));
+                    }
+                    cls = C_STORE;
+                    break;
+                }
                 if (f3 != 0 && f3 != 1) ILLEGAL();
                 cls = C_FENCE;
                 if (f3 == 1) h.flushDecoded();
                 break;
             case 0x2f: {                                               // A
-                if (f3 != 2 && !(f3 == 3 && rv64)) ILLEGAL();
-                const unsigned n = f3 == 3 ? 8 : 4;
                 uint32_t f5 = insn >> 27;
+                // Zabha: byte and halfword AMOs (and AMOCAS.B/H); Zacas:
+                // AMOCAS.W/D/Q, the double-width one on a register pair.
+                const bool cas = f5 == 0x05;
+                const bool lrsc = f5 == 2 || f5 == 3;
+                if (f3 > 4 || (f3 == 4 && (!rv64 || !cas)) || (f3 == 3 && !rv64 && !cas) || (f3 < 2 && lrsc)) ILLEGAL();
+                const unsigned n = 1u << f3;
                 uint64_t a = h.ax(x[rs1]), v;
                 cls = C_AMO;
                 if (h.par) return Stop::Pending;
                 if (a & (n - 1)) TRAP(f5 == 2 ? 4 : 6, a);  // atomics must be aligned
-                auto ext = [&](uint64_t t) { return n == 4 ? W(t) : t; };
+                auto ext = [&](uint64_t t) {
+                    return n == 1 ? (uint64_t)(int64_t)(int8_t)t : n == 2 ? (uint64_t)(int64_t)(int16_t)t : n == 4 ? W(t) : t;
+                };
+                const unsigned xw = rv64 ? 8 : 4;
+                if (cas && n > xw) {                                   // AMOCAS on a register pair
+                    if ((rd & 1) || (rs2 & 1)) ILLEGAL();
+                    Acc r = amoCheck(h, a);
+                    if (r != Acc::Ok) MEMFAIL(r, 7, a);
+                    uint64_t lo, hi;
+                    r = load(h, a, xw, lo);
+                    if (r == Acc::Ok) r = load(h, a + xw, xw, hi);
+                    if (r != Acc::Ok) MEMFAIL(r, 7, a);
+                    lo = h.sx(lo); hi = h.sx(hi);
+                    uint64_t elo = rd ? x[rd] : 0, ehi = rd ? x[rd + 1] : 0;
+                    uint64_t nlo = rs2 ? x[rs2] : 0, nhi = rs2 ? x[rs2 + 1] : 0;
+                    uint64_t mk = rv64 ? ~0ull : 0xffffffffull;
+                    if (((lo ^ elo) & mk) == 0 && ((hi ^ ehi) & mk) == 0) {
+                        r = store(h, a, xw, nlo);
+                        if (r == Acc::Ok) r = store(h, a + xw, xw, nhi);
+                        if (r != Acc::Ok) MEMFAIL(r, 7, a);
+                        breakReservations(h, a);
+                        breakReservations(h, a + xw);
+                    }
+                    if (rd) { x[rd] = lo; x[rd + 1] = hi; wrd = (int)rd; wval = lo; }
+                    memAcc = true; memA = a; memN = xw;
+                    break;
+                }
                 if (f5 == 2) {                                         // LR
                     if (rs2) ILLEGAL();
                     Acc r = load(h, a, n, v);
@@ -1566,6 +1655,7 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 v = ext(v);
                 uint64_t b = ext(x[rs2]), w;
                 switch (f5) {
+                    case 0x05: w = v == ext(x[rd]) ? b : v; break;             // AMOCAS (Zacas)
                     case 0x01: w = b; break;                                   // AMOSWAP
                     case 0x00: w = v + b; break;                               // AMOADD
                     case 0x04: w = v ^ b; break;                               // AMOXOR
@@ -1581,23 +1671,23 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 if (r != Acc::Ok) MEMFAIL(r, 7, a);
                 breakReservations(h, a);
                 RD(v);
-                memAcc = true; memW = true; memA = a; memN = n; memV = n == 4 ? (uint32_t)w : w;
+                memAcc = true; memW = true; memA = a; memN = n; memV = n == 8 ? w : w & ((1ull << (8 * n)) - 1);
                 break;
             }
             case 0x07:                                                 // FLW, FLD
             case 0x27: {                                               // FSW, FSD
-                if (!(h.mstatus & MSTATUS_FS) || (f3 != 2 && f3 != 3)) ILLEGAL();
-                unsigned n = f3 == 2 ? 4 : 8;
+                if (!(h.mstatus & MSTATUS_FS) || f3 < 1 || f3 > 3) ILLEGAL();  // FLH, FSH (Zfh) too
+                unsigned n = 1u << f3;
                 if (op == 0x07) {
                     uint64_t a = h.ax(x[rs1] + immI), v;
                     Acc r = load(h, a, n, v);
                     if (r != Acc::Ok) MEMFAIL(r, 5, a);
-                    FD(n == 4 ? fpu::box((uint32_t)v) : v);
+                    FD(n == 2 ? fpu::box16((uint16_t)v) : n == 4 ? fpu::box((uint32_t)v) : v);
                     cls = C_LOAD;
                     memAcc = true; memA = a; memN = n;
                 } else {
                     int64_t imm = (int32_t)(((insn >> 25) << 5) | ((insn >> 7) & 31)) << 20 >> 20;
-                    uint64_t a = h.ax(x[rs1] + imm), v = n == 4 ? (uint32_t)h.f[rs2] : h.f[rs2];
+                    uint64_t a = h.ax(x[rs1] + imm), v = n == 2 ? (uint16_t)h.f[rs2] : n == 4 ? (uint32_t)h.f[rs2] : h.f[rs2];
                     Acc r = store(h, a, n, v);
                     if (r != Acc::Ok) MEMFAIL(r, 7, a);
                     cls = C_STORE;
@@ -1609,7 +1699,70 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             case 0x53: {                                               // OP-FP
                 if (!(h.mstatus & MSTATUS_FS)) ILLEGAL();
                 const unsigned fmt = (insn >> 25) & 3;
-                if (fmt > 1) ILLEGAL();                                // H and Q: not here
+                if (fmt == 3) ILLEGAL();                               // Q: not here
+                if (fmt == 2) {                                        // Zfh
+                    const unsigned hrm = f3 == 7 ? (h.fcsr >> 5) & 7 : f3;
+                    const uint16_t ha = fpu::unbox16(h.f[rs1]), hb = fpu::unbox16(h.f[rs2]);
+                    uint32_t hfl = 0;
+                    cls = C_ALU;
+                    if (op != 0x53) {
+                        static const fpu::Op fused[4] = {fpu::Op::Madd, fpu::Op::Msub, fpu::Op::Nmsub, fpu::Op::Nmadd};
+                        if (hrm > 4) ILLEGAL();
+                        FD(fpu::box16(fpu::harith(fused[(op >> 2) & 3], ha, hb, fpu::unbox16(h.f[(insn >> 27) & 31]), hrm, hfl)));
+                    } else {
+                        const unsigned f5 = insn >> 27;
+                        static const fpu::Op ops[4] = {fpu::Op::Add, fpu::Op::Sub, fpu::Op::Mul, fpu::Op::Div};
+                        switch (f5) {
+                            case 0x00: case 0x01: case 0x02: case 0x03:
+                                if (hrm > 4) ILLEGAL();
+                                FD(fpu::box16(fpu::harith(ops[f5], ha, hb, 0, hrm, hfl)));
+                                break;
+                            case 0x0b:
+                                if (hrm > 4 || rs2) ILLEGAL();
+                                FD(fpu::box16(fpu::harith(fpu::Op::Sqrt, ha, 0, 0, hrm, hfl)));
+                                break;
+                            case 0x04:
+                                if (f3 > 2) ILLEGAL();
+                                FD(fpu::box16(fpu::sgnj<uint16_t>(ha, hb, f3)));
+                                break;
+                            case 0x05:
+                                if (f3 > 1) ILLEGAL();
+                                FD(fpu::box16(fpu::hminmax(ha, hb, f3, hfl)));
+                                break;
+                            case 0x08:                                 // FCVT.H.S, FCVT.H.D
+                                if (hrm > 4 || rs2 > 1) ILLEGAL();
+                                FD(fpu::box16(fpu::d2h(rs2 ? h.f[rs1] : fpu::sToD(fpu::unbox(h.f[rs1]), hfl), hrm, hfl)));
+                                break;
+                            case 0x14:
+                                if (f3 > 2) ILLEGAL();
+                                RD(fpu::compare<double>(fpu::h2d(ha), fpu::h2d(hb), f3, hfl));
+                                break;
+                            case 0x18: {                               // FCVT.W/WU/L/LU.H
+                                if (hrm > 4 || rs2 > 3 || (rs2 > 1 && !rv64)) ILLEGAL();
+                                RD(fpu::toInt<double>(fpu::h2d(ha), hrm, !(rs2 & 1), rs2 > 1 ? 64 : 32, hfl));
+                                break;
+                            }
+                            case 0x1a: {                               // FCVT.H.W/WU/L/LU
+                                if (hrm > 4 || rs2 > 3 || (rs2 > 1 && !rv64)) ILLEGAL();
+                                FD(fpu::box16(fpu::hFromInt(x[rs1], !(rs2 & 1), rs2 > 1 ? 64 : 32, hrm, hfl)));
+                                break;
+                            }
+                            case 0x1c:                                 // FMV.X.H, FCLASS.H
+                                if (rs2) ILLEGAL();
+                                if (f3 == 0) RD((uint64_t)(int64_t)(int16_t)(uint16_t)h.f[rs1]);
+                                else if (f3 == 1) RD(fpu::hclassify(ha));
+                                else ILLEGAL();
+                                break;
+                            case 0x1e:                                 // FMV.H.X
+                                if (rs2 || f3) ILLEGAL();
+                                FD(fpu::box16((uint16_t)x[rs1]));
+                                break;
+                            default: ILLEGAL();
+                        }
+                    }
+                    if (hfl) { h.fcsr |= hfl; h.mstatus |= MSTATUS_FS; }
+                    break;
+                }
                 const bool dbl = fmt == 1;
                 unsigned rm = f3 == 7 ? (h.fcsr >> 5) & 7 : f3;
                 uint32_t fl = 0;
@@ -1643,8 +1796,17 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                             if (dbl) FD(fpu::minmax<double>(ra, rb, f3, fl));
                             else FD(fpu::box(fpu::minmax<float>((uint32_t)sa, (uint32_t)sb, f3, fl)));
                             break;
-                        case 0x08:                                     // FCVT.S.D, FCVT.D.S
-                            if (rm > 4 || rs2 != (dbl ? 0u : 1u)) ILLEGAL();
+                        case 0x08:                                     // FCVT.S.D, FCVT.D.S, FCVT.S/D.H
+                            if (rm > 4) ILLEGAL();
+                            if (rs2 == 2) {                            // from half, exact
+                                uint64_t d = fpu::h2d(fpu::unbox16(ra));
+                                if (dbl) {
+                                    if (fpu::snan64(d)) fl |= fpu::NV;
+                                    FD(std::isnan(fpu::f64(d)) ? fpu::QNAN64 : d);
+                                } else FD(fpu::box(fpu::dToS(d, rm, fl)));
+                                break;
+                            }
+                            if (rs2 != (dbl ? 0u : 1u)) ILLEGAL();
                             if (dbl) FD(fpu::sToD((uint32_t)sa, fl));
                             else FD(fpu::box(fpu::dToS(ra, rm, fl)));
                             break;
