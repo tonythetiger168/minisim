@@ -134,18 +134,28 @@ pass, fail and vacuous action ones; `vpi_remove_cb` removes it.
 `SysKill`, `SysLock`, `SysUnlock`, `SysReset`, `SysEnd` (also at the end of
 simulation) and the action ones. `vpi_control` (39.5) takes every assertion
 operation of annex M, on one assertion (`vpi_control(vpiAssertionDisable,
-h)`) or the system (`vpi_control(vpiAssertionSysOff)`). The system tasks of
+h)`) or the system (`vpi_control(vpiAssertionSysOff, scope)`: the
+assertions in that scope and below, or all of them with NULL, 39.5.1).
+`vpiAssertionSysReset` also removes the step callbacks, and
+`vpiAssertionSysEnd` every assertion callback. `vpiAssertionKill` takes the
+attempt's start time and discards that attempt only: it has no outcome,
+`cbAssertionKill` runs, and the assertion stays enabled. The system tasks of
 20.11 (`$assertoff`, `$assertcontrol`, ...) call the same callbacks.
-Stepping (39.5.2): `vpi_control(vpiAssertionEnableStep, h)` on a
-concurrent assertion makes every clock step of each of its attempts call
+Stepping (39.5.2): `vpi_control(vpiAssertionEnableStep, h, start,
+vpiAssertionClockSteps)` on a concurrent assertion makes every clock step
+of the attempt that starts at `start` (it may not have started yet) call
 `cbAssertionStepSuccess` (the attempt goes on or matches) or
 `cbAssertionStepFailure` (it fails), with the attempt's start time and
 `detail.step` giving `stateFrom` and `stateTo`: the engine's states for the
 attempt, numbered per assertion in the order they are first seen (two
-attempts in the same state have the same number). `vpiAssertionDisableStep`
-turns it off. Not supported: `vpiAssertionClockSteps`, the matched
-expressions of a step (`matched_expression_count` is 0), and `failExpr` of
-a failure is NULL.
+attempts in the same state have the same number).
+`vpiAssertionDisableStep` (h, start) turns it off. Not supported: the matched
+expressions of a step (`matched_expression_count` is 0). On
+`cbAssertionFailure`, `info->detail.failExpr` is the failing expression: an
+immediate assertion's condition, or the boolean of a concurrent property
+that is a single expression (under its clock and `disable iff`); it is NULL
+for a property with sequence or property operators, because msim's engine
+does not keep which part of such a property failed.
 
 **Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
 instance)` gives the covered items of that instance: `vpiStatementCoverage`
@@ -154,7 +164,8 @@ rose and fell), `vpiFsmStateCoverage` (FSM states entered) and
 `vpiAssertCoverage` (assertions that succeeded, or covers that matched;
 counted with or without `-cov`). Items in instances below it are not
 included. `vpiCovered`, `vpiCoveredCount` and `vpiCoveredMax` read an
-assertion (succeeded, successes, 1), an FSM (states entered, entries, states),
+assertion (attempted, succeeded at least once and never failed, as 40.5.2
+says, a cover only the first two; successes; 1), an FSM (states entered, entries, states),
 an FSM state, or a net, variable, word or bit (bits toggled both ways, bits
 toggled, width). An assertion also gives `vpiAssertAttemptCovered`,
 `vpiAssertSuccessCovered`, `vpiAssertFailureCovered`,
@@ -165,17 +176,25 @@ found (`vpiFsm` objects with `vpiName`, `vpiFullName`, `vpiFile`,
 `vpi_iterate(vpiFsmStates, fsm)` its states (`vpiFsmHandle` objects whose
 `vpi_get_value` is the state's value and `vpiName` its name).
 `vpi_control(op, type, handle)` takes `vpiCoverageStart`, `vpiCoverageStop`,
-`vpiCoverageReset` and `vpiCoverageCheck` (1 when every item of the type is
-covered) with an instance, an assertion (for `vpiAssertCoverage`) or NULL
+`vpiCoverageReset` and `vpiCoverageCheck` with an instance, an assertion (for `vpiAssertCoverage`) or NULL
 (the whole design); `vpi_control(vpiCoverageSave, type, name)` writes the
 coverage database (the `-cov` JSON) to `name` now, and
 `vpi_control(vpiCoverageMerge, type, name)` reads such a database and adds
 its counts of that type to the current ones: statement hits by source line,
 toggled bits by signal name and width, FSM state and transition counts by
 instance and register, assertion attempts, successes and failures by
-assertion name (items the design does not have are skipped). Not
-supported: starting or stopping statement, toggle or FSM coverage for an
-instance below the top (it is for the whole design).
+assertion name (items the design does not have are skipped).
+`vpiCoverageStop` of statement, toggle or FSM coverage on an instance below
+the top freezes that instance's counts (only its own items, not those of
+the instances inside it) until `vpiCoverageStart`; other instances keep
+counting. A `vpiCoverageReset` of a stopped instance zeroes it and leaves
+it stopped. On a top instance or NULL the stop is for the whole design.
+The results are those of the system functions (40.5.3, 40.3.2):
+`SV_COV_OK` (1), `SV_COV_NOCOV` (0) and `SV_COV_ERROR` (-1). Check and
+start give 1 when there is coverage of that type there (whether or not it
+is all covered) and 0 when there is none (statement, toggle and FSM
+coverage without `msim -cov`); save gives 0 when there is nothing to save;
+merge gives -1 when the database is missing or not msim's.
 
 **Structs, containers and classes (37.17, 37.18, 37.29).** An unpacked
 struct or union variable is a `vpiStructVar` / `vpiUnionVar` (its value is
@@ -387,7 +406,8 @@ callback or handle was asked for are not reported as starting.
 **Unresolved system tasks and functions (38.36.3).** A `cbUnresolvedSystf`
 callback registered at startup runs before elaboration, once for each
 system task or function name in the source that is neither built in nor
-registered, with the name in `cb_data->value` (`vpiStringVal`). It may
+registered. `user_data` points to the name (as 38.36.3 says), which is
+also in `cb_data->value` (`vpiStringVal`). It may
 register the name with `vpi_register_systf`; the calls then run as usual.
 
 **End of an object (38.36.1).** `cbEndOfObject` on a thread or frame handle
@@ -397,9 +417,28 @@ class object handle, and `cbEndOfObject` also takes a class object; msim
 never reclaims a class object (an object lives to the end of the run), so
 those two do not run.
 
-**Save, restart and reset (38.36.2).** msim has no save, restart or reset,
-so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
-`cbStartOfReset` and `cbEndOfReset` register (with a handle) and never run.
+**Save, restart and reset (38.6, 38.36.3).** `cbStartOfSave` and
+`cbEndOfSave` run around each `$save` / `$incsave`, `cbStartOfRestart`
+before `$restart`, `cbStartOfReset` before `$reset` (annex D.8, D.9). msim
+does a reset or restart by running the simulation again, so the VPI
+library starts again too: `cbEndOfReset` runs in the new run after the
+start of simulation callbacks and before any procedure, and
+`cbEndOfRestart` once the run is back at the checkpoint. They run each
+time, with only `reason`, `cb_rtn` and `user_data` set.
+`vpi_control(vpiReset, stop_value, reset_value, diagnostics_value)` runs
+`$reset` when the calling routine returns (stop_value is ignored: msim has
+no interactive mode).
+
+**Signals (38.36.3).** `cbSignal` with the signal number in `index` traps
+that signal (not `SIGKILL` or `SIGSTOP`). The handler only notes it; the
+callbacks run at the next safe point, the start of the next time slot (or
+the end of the run), with the signal in `index`.
+
+**Data read API (41).** The clause is deprecated: 1800-2023 says only
+"This clause has been deprecated. See IEEE Std 1800-2005 for the contents of
+this clause." Annex M declares no data read routines or
+constants, so there is nothing to implement; recorded data is read with the
+waveform tools (`mwave`, the FST and VCD readers).
 
 ## Not yet
 
@@ -410,13 +449,13 @@ loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
-callbacks, `cbSignal` and `vpi_control(vpiReset)`. A call to something not
+callbacks. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

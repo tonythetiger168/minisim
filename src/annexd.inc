@@ -24,6 +24,11 @@
 inline void annexEnd();
 namespace annexd {
 
+// VPI simulation feature callbacks (38.36.3): msim.cpp's VPI sets this.
+enum Feature { StartOfSave, EndOfSave, StartOfRestart, EndOfRestart, StartOfReset };
+inline void (*featureHook)(Feature) = nullptr;
+inline void feature(Feature f) { if (featureHook) featureHook(f); }
+
 inline std::vector<std::string>& argv0() { static std::vector<std::string> v; return v; }
 inline int counts[5];   // the last $countdrivers: 01x, 0, 1, x drivers; [4] forced
 
@@ -93,6 +98,16 @@ inline void unmute() {
     std::exit(1);
 }
 
+// $reset (D.8), also vpi_control(vpiReset) (38.6): start again from time 0.
+[[noreturn]] inline void reset(long value, long diag) {
+    feature(StartOfReset);
+    if (diag > 0) std::cerr << "msim: $reset at time " << S.now << "\n";
+    setenv("MSIM_RESET_COUNT", std::to_string(envLong("MSIM_RESET_COUNT") + 1).c_str(), 1);
+    setenv("MSIM_RESET_VALUE", std::to_string(value).c_str(), 1);
+    unsetenv("MSIM_RESTORE_AT");
+    again();
+}
+
 inline std::string str(const Val& v) { Val t = v; t.str = true; return v_str(t); }
 
 inline Val countDrivers(int s, int bit) {
@@ -150,13 +165,7 @@ inline Val hook(int op, const std::vector<Val>& a) {
             return i32(0);
         case AD_RESET_COUNT: return i32(envLong("MSIM_RESET_COUNT"));
         case AD_RESET_VALUE: return i32(envLong("MSIM_RESET_VALUE"));
-        case AD_RESET: {
-            if (num(2, 0) > 0) std::cerr << "msim: $reset at time " << S.now << "\n";
-            setenv("MSIM_RESET_COUNT", std::to_string(envLong("MSIM_RESET_COUNT") + 1).c_str(), 1);
-            setenv("MSIM_RESET_VALUE", std::to_string(num(1, 0)).c_str(), 1);
-            unsetenv("MSIM_RESTORE_AT");
-            again();
-        }
+        case AD_RESET: reset(num(1, 0), num(2, 0));
         case AD_SAVE:
         case AD_INCSAVE: {
             ++saveSeq;
@@ -169,18 +178,22 @@ inline Val hook(int op, const std::vector<Val>& a) {
                                  "not repeatable (it reads the clock, the environment or a DPI model?)\n";
                 else if (want && *want) std::cerr << "msim: restored the checkpoint at time " << S.now << "\n";
                 unsetenv("MSIM_RESTORE_STATE");
+                feature(EndOfRestart);
                 return i32(0);
             }
             if (savedOut >= 0) return i32(0);   // running again: the checkpoint files are already there
+            feature(StartOfSave);
             std::string f = a.empty() ? std::string() : str(a[0]);
             std::ofstream o(f);
-            if (!o) { std::cerr << (op == AD_SAVE ? "$save" : "$incsave") << ": cannot write " << f << "\n"; return i32(0); }
+            if (!o) { std::cerr << (op == AD_SAVE ? "$save" : "$incsave") << ": cannot write " << f << "\n"; feature(EndOfSave); return i32(0); }
             // What msim -restore needs to run the same simulation again: the
             // directory and the command line, and the state to compare.
             char cwd[4096];
             o << "msim checkpoint\nsave " << saveSeq << "\ntime " << S.now << "\nstate " << stateDigest() << "\n";
             if (getcwd(cwd, sizeof cwd)) o << "cwd " << cwd << "\n";
             for (auto& x : argv0()) o << "arg " << x << "\n";
+            o.close();
+            feature(EndOfSave);
             return i32(0);
         }
         case AD_RESTART: {
@@ -198,6 +211,7 @@ inline Val hook(int op, const std::vector<Val>& a) {
             setenv("MSIM_RESTORE_AT", std::to_string(seq).c_str(), 1);
             for (std::string ln; std::getline(in, ln);)
                 if (ln.rfind("state ", 0) == 0) setenv("MSIM_RESTORE_STATE", ln.c_str() + 6, 1);
+            feature(StartOfRestart);
             again();
         }
     }

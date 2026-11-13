@@ -59,7 +59,7 @@ turned on.
 | power-up (9.6.7) | the holds are released; combinational logic (`assign`, `always_comb`, `always @*`) re-evaluates; flops stay `x` until their next clock or reset edge |
 | `set_isolation` (9.8) | on each port connection that crosses the domain boundary: `-applies_to`, `-applies_to_boundary`, `-elements`, `-exclude_elements`, `-source`, `-sink`, `-diff_supply_only`, `-no_isolation`; `-clamp_value 0`, `1`, `Z`, `latch`; one or more `-isolation_signal`s with `-isolation_sense`; `x` when the isolation supply is not `NORMAL` or the control is unknown |
 | `set_level_shifter` (9.9) | `x` when its input or output supply (by default the two domains' primary supplies) is not `NORMAL` |
-| `set_retention` (9.7) | single control (`{ret high}` / `{ret low}`: saved on entry, held through power-down, shown again at power-up, released when the control falls), or separate save and restore signals (edge or level), `-save_event_condition`, `-restore_event_condition`, `-restore_period_condition`, `-powerdown_period_condition`, `-retention_supply` with `RET_SUP_COR` / `NO_RET_SUP_COR`, `SAV_RES_COR`, `-use_retention_as_primary` |
+| `set_retention` (9.7) | single control (`{ret high}` / `{ret low}`: saved on entry, held through power-down, shown again at power-up, released when the control falls), or separate save and restore signals (edge or level), `-save_event_condition`, `-restore_event_condition`, `-restore_period_condition`, `-powerdown_period_condition`, `-retention_supply` with `RET_SUP_COR` / `NO_RET_SUP_COR`, `SAV_RES_COR`, `-use_retention_as_primary`, `-applies_to flop | latch | any` (a latch: `always_latch`, or a variable a level-sensitive `always` leaves unassigned on some path) |
 | `set_repeater` (6.52, 9.10) | a buffer on each port connection the strategy applies to (`-applies_to`, `-applies_to_boundary`, `-elements`, `-exclude_elements`, `-source`, `-sink`, `-update`): its output is `x` while `-repeater_supply` is not `NORMAL` |
 | `create_logic_net`, `create_logic_port`, `connect_logic_net` (6.13, 6.19, 6.20) | one-bit nets and ports made by the power intent, and their connections to HDL ports (`-reconnect` replaces a constant on an input). The net can be an isolation, retention or switch control |
 | `add_state_transition` (6.7, 9.4) | named transitions of a supply set, domain or group (`-from` / `-to`, `-paired`, `-update`): an `-illegal` transition is an error, and with `-complete` so is one that is not named; `UNDEFINED` is passed through; `-upf_verbose` prints each named transition |
@@ -84,15 +84,24 @@ turned on.
 | `create_pst`, `add_port_state`, `add_pst_state` (legacy) | when a time step settles, the supplies must match a row of every PST |
 | Implementation commands: `map_power_switch` (6.37), `map_repeater_cell` (6.38), `map_retention_cell` (6.39), `map_retention_clamp_cell` (6.40), `name_format` (6.41), `set_correlated` (6.43), `set_variation` (6.57), `use_interface_cell` (6.62), `define_always_on_cell`, `define_diode_clamp`, `define_isolation_cell`, `define_level_shifter_cell`, `define_power_switch_cell`, `define_retention_cell` (7.2 to 7.7) | they choose library cells and names for implementation, so the simulation does not change. Each is read and checked against the errors its clause lists, with file, line and clause: unknown options, missing required options, an empty list, a domain, switch or strategy that does not exist (a strategy of another domain too), an element outside the strategy's elements, more than one isolation or level-shifter strategy in `use_interface_cell`, `-lib_model_name` without `-port_map`, an affix given twice, `-nets` with `-sets`, a `-range` whose low factor is above the high one, different variations on electrically equivalent supplies, `-pin_groups` that repeat a pin, input and output voltage range lists of different lengths, a supply pin a clamp or shifting cell cannot have, a footer switch with `-power_switchable`, save and restore functions on the same pin and edge, and `-hold_check` pins that the save, restore and retention checks need at different values |
 | `map_retention_cell -lib_model_name` (6.39) | each mapped register (a variable, or every register an instance's clocked blocks assign) is simulated by the model: its canonical interface is inferred from the always block that assigns it (`UPF_GENERIC_CLOCK` from the clock edge, `UPF_GENERIC_DATA` from the clocked branch, with `if` conditions as `?:`, `UPF_GENERIC_ASYNC_SET_RESET` / `_ASYNC_LOAD` from the edges the `if` chain tests, `UPF_GENERIC_OUTPUT`, `~` to invert), and `-port_map` also takes `save_signal`, `restore_signal`, logic nets and supplies (`retention_supply.f`, `primary_supply.f`, a supply net or port, converted as `connect_supply_net` would). The register follows the model's output; neither corruption nor the strategy's retention applies to it. An unmapped input, a missing module or port, a port mapped twice and a block whose interface cannot be inferred (two clocks, a `case`) are errors |
+| `use_interface_cell -force_function` (6.62) | each port the isolation strategy isolates (narrowed by `-elements`, `-exclude_elements` and `-applies_to_clamp`) is simulated by the first of `-lib_cells`, an HDL module: its one input and one output that `-port_map` leaves open are the data input and output, and `-port_map` connects `isolation_signal`, `isolation_signal[i]` (with `~` to invert), `isolation_supply.f`, `input_supply.f` / `output_supply.f` of the level-shifter strategy, supply nets and logic nets. A one-bit model is used once for each bit of a wider port. The strategy's `-isolation_sense` does not apply; the output is still corrupted while the isolation supply is not NORMAL. A cell with no HDL module (`define_isolation_cell` or Liberty only) is simulated as 9.8 describes, with a warning. Errors: a model that clamps (`define_isolation_cell -clamp_cell`) to another value than the strategy, an input left open beside the data input, an output in `-port_map`, a port mapped twice or missing, `~` on anything but the isolation signal, an index past the strategy's signals, a supply reference the strategies do not have |
 | `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
-| Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
+| Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `upvar`, `uplevel`, `namespace eval` and `variable`, `regexp` / `regsub`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
 
 `initial` blocks are never gated, so testbench and model initialization code
 keeps running in a powered-off domain (9.2.1). Errors print as
 `UPF error: <time>: <text>` and the simulation goes on.
 
-Power-aware runs use the interpreter on one thread: `-compile`, the static
-schedules and `-threads` are turned off with `-upf`.
+With `-upf`, the processes power can gate (those in a power domain), those
+that run UPF code (isolation and level-shifter cells on port connections,
+calls of the UPF package) and those that write a signal the UPF runtime
+watches stay coroutines on the interpreter. The rest of the design (the
+testbench and always-on logic) is planned as without `-upf`: static
+combinational and clocked schedules, partitions and `-threads`. Results do
+not depend on the thread count. `MSIM_UPF_SERIAL=1` runs everything on the
+interpreter on one thread. `-compile` is not used with `-upf` yet, and the
+schedule rewrites that move code between processes (merged drivers, split
+or inlined blocks, unrolled loops) stay off.
 
 ### Forward SAIF (Annex J)
 
@@ -121,19 +130,36 @@ and library files are both given, the RTL mapping is written.
 
 ### Not yet
 
-The implementation commands are checked and do not change the simulation:
-the function of a `use_interface_cell -force_function` cell is not simulated
-in place of the strategy, and a library cell is not checked against a Liberty
-file. `map_retention_cell -lib_model_name` is simulated (see the table).
+The implementation commands are checked and do not change the simulation,
+and a library cell is not checked against a Liberty file.
+`map_retention_cell -lib_model_name` and `use_interface_cell -force_function`
+with an HDL model are simulated (see the table).
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a
-hierarchical reference, has no cell. `-applies_to flop` / `latch` of a
-retention strategy are not told apart. A supply net driven from a one-bit HDL
+hierarchical reference, has no cell. A latch inferred from a level-sensitive
+`always` is found per process (a variable not assigned on some path from one
+wait to the next); one inside a called task or function is not. A supply net driven from a one-bit HDL
 port through a table has a state and no voltage.
 `create_upf_library` makes no Tcl namespace. `find_objects -object_type process` is not supported (msim does not name
 processes), and `mdebug -upf` reads files without a design, so it does not
 run `find_objects` on HDL objects. Tcl
-has no `namespace`, `upvar`, `regexp` or file I/O.
+has `namespace eval`, `variable`, `upvar`, `uplevel`, `regexp` and `regsub`
+(ECMAScript regular expressions), and no file I/O.
+
+## Low-power coverage: `msim -upf_cov <file>`
+
+At the end of the run msim writes a report of the low-power bins and how
+often each was hit, with the bins not hit marked:
+
+- each power state of a power domain, a power state group, and a supply set
+  that has power states or named transitions (`ON` and `OFF` included), as
+  entered (illegal states are not bins);
+- each named, legal transition of `add_state_transition`;
+- each isolation cell, as the times it began to isolate;
+- each retention strategy's saves and restores.
+
+The first line gives the bins hit of all bins. `tests/upf/lpcov.cov` is an
+example.
 
 ## Static checks: `mlint -upf`
 
