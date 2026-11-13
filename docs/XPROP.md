@@ -82,7 +82,8 @@ tmerge and `4'bxxxx` under xmerge.
   label match anything). In a plain `case` whose labels are distinct known
   constants, the default is left out when the items that may match already
   cover every value the selector could have: `2'b0x` above merges `a` and
-  `b` only.
+  `b` only. In `case ... inside` an item may match when its `==?` or range
+  compare (`[lo:hi]`) gives `x`; the default is then always merged in.
 - **Clock and reset edges** of `always @(posedge clk ...)` and `always_ff`.
   An edge from or to `x` / `z` (`0 -> x`, `x -> 1` for posedge) may or may
   not have happened: the block's assignments are merged with "nothing
@@ -120,6 +121,12 @@ tmerge and `4'bxxxx` under xmerge.
   dimensions (`m[r][c] <= d`) the element must match in every dimension, so
   a known index limits the others; every index must be given.
 
+In a combinational block, the writes made while the branches are tried
+and merged cause no change events: each variable is published once, with
+its final value, when the block ends. So two blocks that read each other
+(a decoder and a controller) settle as they do without `-xprop`, instead of
+waking each other with values that are only passing.
+
 Only `always`, `always_comb`, `always_ff` and `always_latch` are affected
 (with the tasks and functions they call). `initial` and `final` blocks,
 classes, programs, checkers
@@ -154,8 +161,9 @@ dut.sv:44: case: merged
   `disable` of a block outside the branch;
 - a blocking assignment to a queue, dynamic or associative array, a real, a
   string or a class property;
-- `case ... inside`, `case ... matches`, `if ... matches`, and `casez` /
-  `casex` with a label that is not constant.
+- `case ... matches`, `if ... matches`, a `case ... inside` item with a
+  tolerance range (`[a +/- b]`) or an unpacked array, and `casez` / `casex`
+  with a label that is not constant.
 
 Some assignments are merged pessimistically: in a possible branch they
 make their target `x` instead of merging values.

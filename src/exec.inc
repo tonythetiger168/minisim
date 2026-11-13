@@ -1514,7 +1514,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Assign:
             case IK::Nba: {
                 Val v = eval(i.e, rd);
-                if (i.tmp) { pokeTmp(i, v); pc++; break; }   // a temporary of its own (msim -xprop, localizeSeqBlocking)
+                if (i.tmp || i.xq) { pokeTmp(i, v); pc++; break; }   // a temporary of its own (msim -xprop, localizeSeqBlocking)
                 if (__builtin_expect(g_upf, 0) && entry->pd >= 0 && g_pdMode[(size_t)entry->pd] > 0 && i.sig >= 0 && !isRel(i.sig) && !i.arr)
                     v = upfWrite(entry, i.sig, i.hi, i.lo, v);
                 if (i.drv >= 0) {
@@ -1977,7 +1977,7 @@ static void execComb(const void* ctx) {
         pc++;
         if (g_cov) covHit(i.hits);
         Val v = eval(i.e, rd);
-        if (i.tmp) { pokeTmp(i, v); continue; }   // a temporary of its own
+        if (i.tmp || i.xq) { pokeTmp(i, v); continue; }   // a temporary of its own
         if (i.bidx) {   // v[i] = ...: the bits are chosen now; an invalid index writes nothing
             int sg = i.sig, hi = i.hi, lo = i.lo;
             if (target(i, sg, hi, lo, v)) S.set(sg, hi >= 0 ? v_insert(S.get(sg), v, hi, lo) : v);
