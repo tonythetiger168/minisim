@@ -1,0 +1,6 @@
+sim_order.vhd:84:5:@400ns:(report note): at 400 ns: clk='0' rst='1'
+sim_order.vhd:86:5:@402ns:(report note): at 402 ns: clk='0'
+sim_order.vhd:88:5:@405ns:(report note): at 405 ns: clk='1'
+sim_order.vhd:89:5:@405ns:(report note): version v01.13.01130707 cfg 5a addr 58
+sim_order.vhd:90:5:@405ns:(report note): rom: f140200000 down: 7611
+sim_order.vhd:92:5:@405ns:(report note): lookup: two  |four |none |
