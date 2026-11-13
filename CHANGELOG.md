@@ -8,6 +8,20 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI expression values (37.35, 38.15): `vpi_get_value` on an expression
+  object gives its value now, not only for a constant expression. The nets
+  and variables it reads (memories too) take their current values, so
+  operations, variable selects, conditionals, concatenations and calls of
+  the design's functions have a value. `tests/spec/37.35-vpi-expr-values.sv`.
+- `msim -upf` with VHDL: the VHDL value conversion tables of IEEE 1801-2024
+  Annex B (`VHDL_SL2UPF`, `UPF2VHDL_SL`, the `_GNDZERO` ones, `VHDL_TIED_HI`,
+  `VHDL_TIED_LO`) connect `std_logic` ports of VHDL entities to supply nets.
+- mvplat boots Linux: `-bios`, `-kernel`, `-initrd`, `-append`, `-dtb` as on
+  QEMU's virt board, a device tree made from the platform (`-dump-dtb`), and
+  OpenSBI's `fw_dynamic` hand-off. OpenSBI 1.7 and Ubuntu 24.04's stock
+  riscv64 kernel boot to user space on 1 to 4 harts. Instruction fetch with
+  paging on keeps the last page translated: 25 to 43 MIPS under Linux.
+  Extension ABI 4.
 - VPI class definitions (37.31): `vpiVariables` of a class defn gives its
   automatic properties too (before only static ones), as declarations
   with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);
@@ -20,6 +34,9 @@ Spec references are IEEE 1800-2023 clauses.
   kept field by field, so one field's crossing no longer spreads to every
   register. A clock behind a scan mux is the functional clock. `-static`
   takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
+- `include/msim_upf.h`: C and C++ (SystemC, TLM) models called through
+  DPI-C read the current power state and simstate of a power domain or
+  supply set under `msim -upf` (IEEE 1801-2024 5.14).
 - VPI containers of structs, classes and containers (37.18): an element of
   a queue, dynamic or associative array of unpacked structs is a
   `vpiStructVar` whose members read and write the element; one of class
@@ -63,6 +80,13 @@ Spec references are IEEE 1800-2023 clauses.
   puts a `` `line `` before each port and signal declaration. The lint rules
   read `always begin ... @(list); end` (how a VHDL process arrives) as a
   combinational block, and a reset tested with `===`.
+
+### Changed
+- `msim -compile` builds the kernel once into a cached object
+  (`$MSIM_KCACHE`, default `~/.cache/msim`) that every `simv` links, instead
+  of compiling it into each design: a small design's C++ build goes from
+  21 s to 8 s and OpenTitan Ibex from 68 s to 50 s. `MSIM_NOKOBJ=1` turns it
+  off.
 
 ### Fixed
 - `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what

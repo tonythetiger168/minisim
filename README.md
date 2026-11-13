@@ -443,7 +443,13 @@ VM, g++ 13, seconds of run time, build time not included):
 | `bench/chain.sv` (8-deep assign chain, 1M cycles) | 1.35 | 0.74 | 0.20 | 7.82 |
 | `bench/counter.sv` (one counter, 1M cycles) | 0.22 | 0.14 | 0.19 | 0.31 |
 
-The C++ build adds 2 to 4 seconds per design.
+The kernel itself is compiled once into an object that every `simv` links:
+it is kept in `$MSIM_KCACHE` (default `$XDG_CACHE_HOME/msim` or
+`~/.cache/msim`), one per compiler, flags and kernel version, so the first
+`-compile` after installing or updating msim takes about 20 s longer and a
+small design then builds in about 8 s (it was 21 s when every design
+compiled the kernel again; OpenTitan Ibex 68 -> 50 s). `MSIM_NOKOBJ=1`
+compiles the kernel into the design as before.
 
 ### Static combinational schedule
 
