@@ -3037,6 +3037,10 @@ struct Lowerer {
                 if (!c.isSystemCall() || n == "pop_front" || n == "pop_back") found = true;
                 else visitDefault(c);
             }
+            void handle(const AssignmentExpression&) { found = true; }   // c ? i = 1 : 0
+            void handle(const UnaryExpression& u) {   // c ? i++ : i
+                if (OpInfo::isLValue(u.op)) found = true; else visitDefault(u);
+            }
             void handle(const NewClassExpression&) { found = true; }
             void handle(const CopyClassExpression&) { found = true; }
         } v;

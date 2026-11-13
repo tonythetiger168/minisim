@@ -256,6 +256,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_compile_vcd -DPY=${Python3_EXECUTABLE}
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_compile_vcd.cmake)
+    # mdebug on about 6000 signals: on-demand waveform reading, VCD = FST.
+    add_test(NAME mdebug_large
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_large -DPY=${Python3_EXECUTABLE} -DFST=$<BOOL:${MINISIM_WITH_FST}>
+                     -P ${CMAKE_SOURCE_DIR}/tests/mdebug_large.cmake)
     add_test(NAME msim_fuzz
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}
