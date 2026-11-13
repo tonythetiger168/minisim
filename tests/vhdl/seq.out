@@ -1,0 +1,13 @@
+seq.vhd:35:5:@0ms:(report note): i0 default=-2147483648
+seq.vhd:38:5:@6ns:(report note): d=11 q=00 hi=0001
+seq.vhd:40:5:@15ns:(report note): q=11 at 15000000 fs
+seq.vhd:43:5:@15ns:(report note): s8=106 abs=7
+seq.vhd:45:5:@15ns:(report note): sll=02 srl=10 rol=03 ror=C0
+seq.vhd:46:5:@15ns:(report note): shr=FC shl=10 rsz=FD
+seq.vhd:54:5:@15ns:(report note): k=20
+seq.vhd:58:5:@15ns:(report note): k=2 mod=2 rem=-1 pow=1024
+seq.vhd:59:5:@15ns:(report note): sat=15 0
+seq.vhd:61:5:@15ns:(report note): r=7 t=12000000 fs div=3000
+seq.vhd:62:5:@15ns:(report note): attr 7 0 8 false 2147483647 0
+line: 42 00010001 true
+seq.vhd:73:5:@38ns:(report note): woke at 38000000 fs

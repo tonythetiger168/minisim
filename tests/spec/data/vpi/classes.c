@@ -26,7 +26,7 @@ static void defn(vpiHandle d) {
     it = vpi_iterate(vpiDerivedClasses, d);
     while (it && (m = vpi_scan(it))) vpi_printf("  derived %s\n", s(vpiName, m));
     it = vpi_iterate(vpiVariables, d);
-    while (it && (m = vpi_scan(it))) vpi_printf("  static %s\n", s(vpiName, m));
+    while (it && (m = vpi_scan(it))) vpi_printf("  variable %s automatic %d\n", s(vpiName, m), vpi_get(vpiAutomatic, m));
 }
 static PLI_INT32 run(PLI_BYTE8* u) {
     vpiHandle v = vpi_handle_by_name((PLI_BYTE8*)"top.h", NULL), o, it, p;

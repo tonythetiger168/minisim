@@ -513,7 +513,16 @@ struct Model {
     // A clock through buffers, inverters and clock gates is still that clock:
     // follow a combinational node with one source, or with one source that no
     // logic drives (clk & en_latched: the latch has inputs, the clock has none).
-    Sym clockRoot(Sym c) const {
+    // scan_clk_i, scanmode_i, test_clk, mbist_en: design-for-test inputs,
+    // off in functional mode.
+    static bool testSignal(Sym s) {
+        std::string n(s->name);
+        for (char& ch : n) ch = (char)std::tolower((unsigned char)ch);
+        for (const char* k : {"scan", "test", "dft", "mbist", "bist"})
+            if (n.find(k) != std::string::npos) return true;
+        return false;
+    }
+    Sym clockRoot(Sym c, int depth = 0) const {
         for (int guard = 0; guard < 32; guard++) {
             if (sdc.on && sdc.at.count(c)) return c;  // a clock is defined here
             if (flopIx.count(c) || bitNodes.count(c)) return c;
@@ -521,10 +530,19 @@ struct Model {
             if (!n) return c;
             Sym next = n->sole();
             int free = next ? 1 : 0;
+            Sym found = nullptr;
             if (!next)
                 for (const Edge& e : n->src) {
-                    const Comb* sc = combOf(e.sym);
-                    if (!flopIx.count(e.sym) && (!sc || sc->src.empty())) { next = e.sym; free++; }
+                    // A source that buffers lead back to a free signal; a
+                    // scan or test clock (behind a DFT mux) is not the
+                    // functional clock.
+                    Sym r = depth < 6 ? clockRoot(e.sym, depth + 1) : e.sym;
+                    const Comb* sc = combOf(r);
+                    if (flopIx.count(r) || (sc && !sc->src.empty()) || testSignal(r)) continue;
+                    if (next && found == r) continue;  // clk and ~clk behind a scan bypass mux
+                    next = e.sym;
+                    found = r;
+                    free++;
                 }
             if (free != 1) return c;
             c = next;
@@ -795,6 +813,20 @@ struct Walk {
         Sym real = baseOf(lhs);
         if (!real || !isSignal(*real)) return;
         if (const auto* sl = m.slicesOf(real)) {
+            // a = b, both cut into the same pieces: piece by piece.
+            const Expression& r = strip(rhs);
+            if (!seq && whole && ctrl0.empty() && (r.kind == ExpressionKind::NamedValue || r.kind == ExpressionKind::HierarchicalValue) &&
+                (strip(lhs).kind == ExpressionKind::NamedValue || strip(lhs).kind == ExpressionKind::HierarchicalValue)) {
+                Sym rb = baseOf(r);
+                const auto* rs = rb && rb != real ? m.slicesOf(rb) : nullptr;
+                bool same = rs && rs->size() == sl->size();
+                for (size_t i = 0; same && i < sl->size(); i++)
+                    same = (*sl)[i].lo == (*rs)[i].lo && (*sl)[i].hi == (*rs)[i].hi;
+                if (same) {
+                    for (size_t i = 0; i < sl->size(); i++) m.addComb((*sl)[i].node, {m.canon((*rs)[i].node)}, true, nullptr);
+                    return;
+                }
+            }
             // Each piece the left-hand side touches is assigned; it is a
             // whole assignment when that is exactly one piece.
             SymSet hit, own;
@@ -957,7 +989,24 @@ struct Slicer : ASTVisitor<Slicer> {
     };
     std::unordered_map<Sym, Var> vars;
     std::vector<Sym> order;
+    // A port connected to a whole variable of the same packed type (a
+    // register struct passed down): the two are one wire, so they are cut
+    // into the same pieces, and joined piece by piece (Ports).
+    std::unordered_map<Sym, Sym> alias;  // union-find parent
+    Sym root(Sym s) {
+        while (true) {
+            auto it = alias.find(s);
+            if (it == alias.end() || it->second == s) return s;
+            s = it->second;
+        }
+    }
     Slicer(Model& mm, Compilation& c) : m(mm), comp(c) {}
+    static bool samePacked(Sym a, Sym b) {
+        const Type& x = a->as<ValueSymbol>().getType().getCanonicalType();
+        const Type& y = b->as<ValueSymbol>().getType().getCanonicalType();
+        return x.isIntegral() && y.isIntegral() && !x.isPackedUnion() && !y.isPackedUnion() &&
+               x.getBitstreamWidth() == y.getBitstreamWidth() && x.getBitstreamWidth() > 1;
+    }
 
     Var& var(Sym s) {
         auto [it, fresh] = vars.try_emplace(s);
@@ -1004,11 +1053,51 @@ struct Slicer : ASTVisitor<Slicer> {
         for (const PortConnection* conn : inst.getPortConnections()) {
             if (!conn || conn->port.kind != SymbolKind::Port) continue;
             const auto& port = conn->port.as<PortSymbol>();
-            if (port.internalSymbol && isSignal(*port.internalSymbol)) var(port.internalSymbol).whole = true;
+            Sym in = port.internalSymbol && isSignal(*port.internalSymbol) ? port.internalSymbol : nullptr;
             const Expression* ext = conn->getExpression();
-            if (!ext) continue;
             const Expression* outer = ext;
-            if (outer->kind == ExpressionKind::Assignment) outer = &outer->as<AssignmentExpression>().left();
+            if (outer && outer->kind == ExpressionKind::Assignment) outer = &outer->as<AssignmentExpression>().left();
+            if (outer && in) {
+                const Expression& o = strip(*outer);
+                Sym b = baseOf(o);
+                if (b && isSignal(*b) && (o.kind == ExpressionKind::NamedValue || o.kind == ExpressionKind::HierarchicalValue) &&
+                    samePacked(b, in)) {
+                    var(b);
+                    var(in);
+                    Sym ra = root(b), rb = root(in);
+                    if (ra != rb) alias[rb] = ra;
+                    alias.try_emplace(ra, ra);
+                    continue;
+                }
+            }
+            if (in) var(in).whole = true;
+            if (!ext) continue;
+            // A port on one field or part of a variable (a register struct
+            // filled by sub-register instances): an output writes that part,
+            // an input reads it.
+            if (outer && outer->kind != ExpressionKind::Concatenation) {
+                const Expression& o = strip(*outer);
+                Sel r;
+                if (o.kind != ExpressionKind::NamedValue && o.kind != ExpressionKind::HierarchicalValue &&
+                    bitRange(o, r) && r.exact && r.base && isSignal(*r.base)) {
+                    if (port.direction != ArgumentDirection::In) var(r.base).writes.push_back({r.lo, r.hi});
+                    continue;
+                }
+            }
+            // An output on a concatenation of fields writes each of them.
+            if (outer && outer->kind == ExpressionKind::Concatenation) {
+                if (port.direction == ArgumentDirection::In) continue;
+                for (const Expression* op : outer->as<ConcatenationExpression>().operands()) {
+                    const Expression& o = strip(*op);
+                    Sel r;
+                    if (o.kind != ExpressionKind::NamedValue && o.kind != ExpressionKind::HierarchicalValue &&
+                        bitRange(o, r) && r.exact && r.base && isSignal(*r.base))
+                        var(r.base).writes.push_back({r.lo, r.hi});
+                    else
+                        keepWhole(o);
+                }
+                continue;
+            }
             // An input fed an expression only reads; anything else ties the
             // variable to the port.
             if (port.direction != ArgumentDirection::In || baseOf(*outer)) keepWhole(*outer);
@@ -1018,7 +1107,29 @@ struct Slicer : ASTVisitor<Slicer> {
     void handle(const NetSymbol& n) {
         if (const Expression* init = n.getInitializer(); init && !constant(*init)) var(&n).whole = true;
     }
-    void handle(const ContinuousAssignSymbol& ca) { assignment(ca.getAssignment()); }
+    // assign a = b of the same packed type: one wire under two names, cut
+    // into the same pieces (a register struct copied to the register block).
+    void handle(const ContinuousAssignSymbol& ca) {
+        const Expression& e = ca.getAssignment();
+        if (e.kind == ExpressionKind::Assignment) {
+            const auto& a = e.as<AssignmentExpression>();
+            const Expression& l = strip(a.left());
+            const Expression& r = strip(a.right());
+            auto plainName = [](const Expression& x) {
+                return x.kind == ExpressionKind::NamedValue || x.kind == ExpressionKind::HierarchicalValue;
+            };
+            Sym lb = plainName(l) ? baseOf(l) : nullptr, rb = plainName(r) ? baseOf(r) : nullptr;
+            if (lb && rb && lb != rb && isSignal(*lb) && isSignal(*rb) && samePacked(lb, rb)) {
+                var(lb);
+                var(rb);
+                Sym ra = root(rb), rl = root(lb);
+                if (ra != rl) alias[rl] = ra;
+                alias.try_emplace(ra, ra);
+                return;
+            }
+        }
+        assignment(e);
+    }
     void handle(const ProceduralBlockSymbol& p) {
         if (p.procedureKind == ProceduralBlockKind::Initial || p.procedureKind == ProceduralBlockKind::Final)
             return;
@@ -1029,8 +1140,17 @@ struct Slicer : ASTVisitor<Slicer> {
     }
 
     void finish() {
+        // Aliased variables share their writes, and are whole together.
+        std::unordered_map<Sym, Var> group;
         for (Sym s : order) {
-            Var& v = vars[s];
+            if (!alias.count(s)) continue;
+            Var& g = group[root(s)];
+            const Var& v = vars[s];
+            g.whole = g.whole || v.whole;
+            g.writes.insert(g.writes.end(), v.writes.begin(), v.writes.end());
+        }
+        for (Sym s : order) {
+            Var v = alias.count(s) ? group[root(s)] : vars[s];
             if (v.whole || v.writes.size() < 2) continue;
             const Scope* sc = s->getParentScope();
             if (!sc || sc->asSymbol().kind == SymbolKind::StatementBlock) continue;  // a local of a block
@@ -1096,6 +1216,7 @@ struct Ports : ASTVisitor<Ports> {
         SymSet from;
         bool plain;
         const Expression* rhs;
+        const Expression* sel = nullptr;  // the variable side of the port, for its pieces
     };
     std::vector<Wire> wires;
     struct Bit {
@@ -1135,6 +1256,11 @@ struct Ports : ASTVisitor<Ports> {
             Sym base = baseOf(o);
             if (base && !isSignal(*base)) base = nullptr;
             if (base && (o.kind == ExpressionKind::NamedValue || o.kind == ExpressionKind::HierarchicalValue)) {
+                auto a = m.sliced.find(base), b = m.sliced.find(in);
+                if (a != m.sliced.end() && b != m.sliced.end() && a->second.size() == b->second.size()) {
+                    for (size_t k = 0; k < a->second.size(); k++) m.join.join(a->second[k].node, b->second[k].node);
+                    continue;  // the same wire, piece by piece
+                }
                 m.join.join(base, in);  // the same wire
                 continue;
             }
@@ -1162,13 +1288,29 @@ struct Ports : ASTVisitor<Ports> {
                     }
                 }
             }
+            // A concatenation: each part is its own wire, so a field of a
+            // sliced variable is that piece only.
+            if (o.kind == ExpressionKind::Concatenation) {
+                for (const Expression* op : o.as<ConcatenationExpression>().operands()) {
+                    const Expression& p = strip(*op);
+                    SymSet n;
+                    names(p, n);
+                    if (n.empty()) continue;
+                    Sym pb = baseOf(p);
+                    if (input)
+                        wires.push_back({in, n, false, nullptr, pb ? &p : nullptr});
+                    else
+                        for (Sym t : n) wires.push_back({t, {in}, false, nullptr, t == pb ? &p : nullptr});
+                }
+                continue;
+            }
             SymSet n;
             names(*outer, n);
             if (n.empty()) continue;
             if (input)
-                wires.push_back({in, n, base != nullptr, ext});  // a part select is still a wire
+                wires.push_back({in, n, base != nullptr, ext, base ? &o : nullptr});  // a part select is still a wire
             else
-                for (Sym t : n) wires.push_back({t, {in}, base != nullptr, nullptr});
+                for (Sym t : n) wires.push_back({t, {in}, base != nullptr, nullptr, t == base ? &o : nullptr});
         }
         if (m.isModeled(inst)) {
             m.modeled.push_back(&inst);
@@ -1191,11 +1333,22 @@ struct Ports : ASTVisitor<Ports> {
             bool plain = w.plain;
             for (Sym s : w.from) {
                 if (const auto* sl = m.slicesOf(s)) {
-                    for (const Model::Slice& x : *sl) from.push_back(m.canon(x.node));
-                    plain = false;
+                    // Only the pieces the port is on.
+                    bool one = w.sel && baseOf(*w.sel) == s ? m.pieces(*w.sel, *sl, from) : false;
+                    if (!w.sel || baseOf(*w.sel) != s)
+                        for (const Model::Slice& x : *sl) from.push_back(m.canon(x.node));
+                    plain = plain && one;
                 } else {
                     from.push_back(m.canon(s));
                 }
+            }
+            if (const auto* sl = m.slicesOf(w.to)) {
+                SymSet to;
+                bool one = false;
+                if (w.sel && baseOf(*w.sel) == w.to) one = m.pieces(*w.sel, *sl, to);
+                else for (const Model::Slice& x : *sl) to.push_back(x.node);
+                for (Sym t : to) m.addComb(t, from, plain && one, nullptr);
+                continue;
             }
             m.addComb(w.to, from, plain, plain ? w.rhs : nullptr);
         }
@@ -2562,8 +2715,40 @@ inline void constrain(Model& m, const Options& opt) {
             m.group[c] = head;
         }
     }
-    for (auto& n : opt.statics)
-        if (Sym c = find(n, "-static")) m.statics.insert(c);
+    // u_reg.u_cfg_*.q: every signal whose path matches (* is any run of
+    // characters, dots included), as SpyGlass quasi_static takes patterns.
+    auto glob = [](const char* p, const char* t) {
+        const char *star = nullptr, *back = nullptr;
+        while (*t) {
+            if (*p == '?' || *p == *t) { p++; t++; }
+            else if (*p == '*') { star = p++; back = t; }
+            else if (star) { p = star + 1; t = ++back; }
+            else return false;
+        }
+        while (*p == '*') p++;
+        return !*p;
+    };
+    for (auto& n : opt.statics) {
+        if (n.find_first_of("*?") == std::string::npos) {
+            if (Sym c = find(n, "-static")) m.statics.insert(c);
+            continue;
+        }
+        size_t hits = 0;
+        auto offer = [&](Sym s, const std::string& p) {
+            size_t dot = p.find('.');
+            if (glob(n.c_str(), p.c_str()) || (dot != std::string::npos && glob(n.c_str(), p.c_str() + dot + 1))) {
+                m.statics.insert(m.join.find(s));
+                hits++;
+            }
+        };
+        std::vector<Sym> all;
+        for (auto& [s, up] : m.join.up) all.push_back(s);
+        for (Sym s : all)
+            if (isSignal(*s)) offer(s, m.pathOf(s));
+        for (auto& [s, label] : m.sliceLabel) offer(s, *label);
+        for (auto& [s, label] : m.labels) offer(s, label);
+        if (!hits) std::cerr << "mlint: -static " << n << ": no such signal\n";
+    }
 }
 
 // ------------------------------------------------------------------ -sdc
