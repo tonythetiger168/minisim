@@ -8041,6 +8041,25 @@ struct Lowerer {
         }
         for (size_t k : toEnd) prog.code[k].target = prog.here();
     }
+    // An expression that reads signals and computes, with no side effect and
+    // nothing that depends on how often it runs: a case selector that may be
+    // evaluated once instead of once per label.
+    static bool pureSel(const E& e) {
+        if (!e) return true;
+        switch (e->op) {
+            case Op::Const: case Op::Ref: case Op::Not: case Op::And: case Op::Or: case Op::Xor:
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Eq: case Op::Ne: case Op::CaseEq:
+            case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Shl: case Op::Shr: case Op::Asr:
+            case Op::Resize: case Op::LogNot: case Op::LogAnd: case Op::LogOr: case Op::RedAnd: case Op::RedOr:
+            case Op::RedXor: case Op::Slice: case Op::Index: case Op::Concat: case Op::Mux: case Op::ArrRead:
+                break;
+            default: return false;
+        }
+        if (!pureSel(e->at)) return false;
+        for (const auto& k : e->kids) if (!pureSel(k)) return false;
+        return true;
+    }
+    inline static int caseIds = 0;   // the last Instr::caseId given out
     static int caseMayOverlap(const slang::ast::CaseStatement& c) {
         using namespace slang::ast;
         using slang::logic_t;
@@ -9369,11 +9388,16 @@ struct Lowerer {
                          : c.condition == CaseStatementCondition::WildcardJustZ ? Op::CaseZEq
                                                                                 : Op::CaseXEq;
                 std::vector<E> conds;
+                // A selector without side effects is lowered once and shared by
+                // every compare, so the interpreter can find the item through a
+                // table (Instr::caseId) instead of comparing label by label.
+                E sel1 = c.condition == CaseStatementCondition::Normal ? expr(c.expr) : nullptr;
+                if (sel1 && !pureSel(sel1)) sel1 = nullptr;
                 for (const auto& item : c.items) {
                     E cond;   // OR of (selector === item_expr) over this item's labels
                     for (const Expression* x : item.expressions) {
                         E m = c.condition == CaseStatementCondition::Inside ? insideItem(c.expr, *x)
-                                                                             : bin(cmp, expr(c.expr), expr(*x));
+                                                                             : bin(cmp, sel1 ? sel1 : expr(c.expr), expr(*x));
                         cond = cond ? bin(Op::LogOr, cond, m) : m;
                     }
                     conds.push_back(cond);
@@ -9384,6 +9408,14 @@ struct Lowerer {
                 bool uniq = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Unique0;
                 bool needAll = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority;
                 int ov = uniq ? caseMayOverlap(c) : 0;
+                if (ov == 2 && sel1) {   // labels slang did not fold, such as enum names: compare the lowered constants
+                    E sel;
+                    std::vector<uint64_t> keys;
+                    bool known = true;
+                    for (const E& cd : conds) known = known && caseLabels(cd, sel, keys);
+                    std::sort(keys.begin(), keys.end());
+                    if (known && std::adjacent_find(keys.begin(), keys.end()) == keys.end()) ov = 0;
+                }
                 bool mayOverlap = ov > 0;
                 E selUnknown;   // casez / casex labels that never overlap can still
                                 // both match a selector with z (or x) bits
@@ -9394,8 +9426,11 @@ struct Lowerer {
                     uniqueCaseLinear(s, c, conds, selUnknown);
                     break;
                 }
+                bool table = sel1 && !mayOverlap && c.items.size() >= 4 && !g_cov;
+                if (table) caseIds++;
                 for (size_t k = 0; k < c.items.size(); k++) {
                     Instr j; j.k = IK::JmpIfNot; j.e = conds[k];
+                    if (table) { j.caseId = caseIds; j.caseItem = (int)k + 1; }
                     size_t jf = prog.emit(j);
                     if (mayOverlap && k + 1 < c.items.size()) {
                         E more;

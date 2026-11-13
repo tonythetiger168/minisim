@@ -82,6 +82,11 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- The interpreter finds the matching item of a case statement with constant
+  labels through a table instead of comparing label by label, and a `unique
+  case` whose labels are enum names is no longer treated as possibly
+  overlapping. OpenTitan Ibex runs in 15.7 s instead of 20.8 s on one thread
+  (`tests/spec/12.5-case-many-items.sv`).
 - VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
   `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
   one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and

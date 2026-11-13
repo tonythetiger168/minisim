@@ -4,6 +4,21 @@
 // and the return address is still on `rets` when the process resumes.
 static Val rd(int s) { return S.get(s); }
 
+// A case statement with a jump table (Instr::caseId at pc): evaluate the
+// selector once and go to the matching item, or the default. false: run the
+// item compares one by one instead (coverage counts each compare, and a
+// selector with x / z bits or wider than 64 bits needs the full compare).
+static bool caseJump(const std::vector<Instr>& code, size_t& pc) {
+    if (g_cov) return false;
+    const CaseTable* t = caseTable(code, pc);
+    if (!t->ok) return false;
+    Val s = eval(t->sel, rd);
+    if (s.x || s.z || !s.hi.empty() || s.real || s.str) return false;
+    auto it = std::lower_bound(t->to.begin(), t->to.end(), s.v, [](const auto& a, uint64_t v) { return a.first < v; });
+    pc = it != t->to.end() && it->first == s.v ? it->second : t->dflt;
+    return true;
+}
+
 struct RetFrame { const Prog* prog; size_t pc; FrameP fr; };
 
 // Resolve a run-time array index and bit index. false: no write happens.
@@ -1650,6 +1665,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++; break;
             }
             case IK::JmpIfNot:
+                if (i.caseId && caseJump(p->code, pc)) break;
                 if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
                 break;
@@ -1902,6 +1918,7 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
                 break;
             }
             case IK::JmpIfNot:
+                if (i.caseId && caseJump(p->code, pc)) break;
                 if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
                 break;
@@ -1927,6 +1944,7 @@ static void execComb(const void* ctx) {
         }
         if (i.k == IK::JmpIfNot) {
             if (g_cov) covHit(i.hits);
+            else if (i.caseId && caseJump(p->code, pc)) continue;
             if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
             else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
             continue;
