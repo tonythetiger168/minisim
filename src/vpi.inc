@@ -1284,6 +1284,32 @@ inline void fireSys(int reason) {
         d.cb_rtn(&d);
     }
 }
+
+// The failing expression of a failed attempt (39.4.2, failExpr): an
+// immediate assertion's condition; for a concurrent one, the expression
+// of a property that is a single boolean. NULL when the property has
+// sequence or property operators (msim's engine does not keep which part
+// of such a property failed).
+inline Obj* exprNode(const slang::ast::Expression* e, const Obj* parent);   // vpi_code.inc
+inline Obj* failExprOf(int id, const Obj* a) {
+    using namespace slang::ast;
+    const auto* st = static_cast<const Statement*>(asserts()[(size_t)id].stmt);
+    if (!st) return nullptr;
+    if (st->kind == StatementKind::ImmediateAssertion) return exprNode(&st->as<ImmediateAssertionStatement>().cond, a);
+    if (st->kind == StatementKind::ConcurrentAssertion) {
+        const AssertionExpr* p = &st->as<ConcurrentAssertionStatement>().propertySpec;
+        while (p->kind == AssertionExprKind::Clocking) p = &p->as<ClockingAssertionExpr>().expr;
+        if (p->kind == AssertionExprKind::DisableIff) {
+            p = &p->as<DisableIffAssertionExpr>().expr;
+            while (p->kind == AssertionExprKind::Clocking) p = &p->as<ClockingAssertionExpr>().expr;
+        }
+        if (p->kind == AssertionExprKind::Simple) {
+            const auto& sp = p->as<SimpleAssertionExpr>();
+            if (!sp.repetition) return exprNode(&sp.expr, a);
+        }
+    }
+    return nullptr;
+}
 inline void onAssert(int id, int ev, uint64_t start) {
     auto& s = st();
     if (id < 0) {   // the assertion system
@@ -1318,7 +1344,7 @@ inline void onAssert(int id, int ev, uint64_t start) {
         s_vpi_time t{vpiSimTime, (PLI_UINT32)(S.now >> 32), (PLI_UINT32)S.now, (double)S.now};
         s_vpi_attempt_info info{};
         info.attemptStartTime = s_vpi_time{vpiSimTime, (PLI_UINT32)(start >> 32), (PLI_UINT32)start, (double)start};
-        info.detail.failExpr = nullptr;
+        info.detail.failExpr = ev == AE_FAILURE ? H(failExprOf(id, a)) : nullptr;
         s_vpi_assertion_step_info step{};
         if (ev == AE_STEP_OK || ev == AE_STEP_FAIL) {   // 39.5.2: the states are the engine's, numbered per assertion as first seen
             auto num = [&](const void* n) {
