@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI containers of structs, classes and containers (37.18): an element of
+  a queue, dynamic or associative array of unpacked structs is a
+  `vpiStructVar` whose members read and write the element; one of class
+  handles gives its object through `vpiClassObj`; one that is itself a
+  container is a `vpiArrayVar` with its own size and elements.
+  `tests/spec/37.18-vpi-nested-containers.sv`.
 - VPI instance arrays (37.11): `vpi_iterate(vpiModuleArray /
   vpiInterfaceArray / vpiProgramArray / vpiPrimitiveArray /
   vpiInstanceArray, module)`, an array's name, size, ranges and elements,
