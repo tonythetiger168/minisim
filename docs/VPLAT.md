@@ -132,6 +132,7 @@ it). It is the address map most RISC-V bare-metal software already targets.
 | `plic` | priorities, pending, per-hart enables, threshold, claim/complete | one M-mode context per hart; level-triggered sources |
 | `finisher` | `0x5555` passes, `0x3333 \| code << 16` fails with `code` | the SiFive test device |
 | `virtio-blk` | virtio over MMIO, version 2 (VIRTIO 1.2, 4.2), one queue | a disk: `file` is a raw image, `irq` its PLIC source; writes stay in the run unless `"write": true`, `"readonly": true` refuses them. See "Disks" |
+| `virtio-net` | virtio over MMIO, version 2, a receive and a transmit queue | an Ethernet interface: `mac`, `irq`, `backend` (`user` or `dgram` with `local` and `remote` socket paths), `pcap`. See "Networks" |
 | `mvp` | the library's own map (`mvp_add_device`) | see below |
 | `rtl` | whatever the RTL decodes | see below |
 
@@ -310,6 +311,36 @@ with its root file system on the disk and no initramfs.
 reads, a two-sector read, a write read back, flush, `GET_ID`, a read past the
 end (`IOERR`), an unknown request (`UNSUPP`) and the interrupt.
 
+### Networks
+
+`-net user` puts a `virtio-net` interface (Linux's `eth0`; repeat for
+`eth1`, ...) in the next virtio-mmio slot, with MAC `52:54:00:12:34:56` (the
+last byte counts up). Its back end is a built-in gateway at `10.0.2.2`
+(`52:54:00:12:35:02`) that answers ARP and ICMP echo: enough to bring an
+interface up and ping, with nothing on the host and the same result every
+run. It forwards nothing beyond that (no TCP/UDP to the host or the internet
+yet).
+
+`-net dgram:LOCAL,REMOTE` connects the interface to Unix datagram sockets,
+one Ethernet frame per datagram: it binds `LOCAL` and sends to `REMOTE`. Two
+platforms given each other's paths share a link; a program on the host can
+be the other end (`tests/vplat/echo_peer.py` is the one the test uses).
+Frames that arrive are taken every 100 us of simulated time. `-net-pcap FILE`
+records the first interface's frames, both ways, for Wireshark or tcpdump.
+
+```
+mvplat -platform linux.json -bios fw_dynamic.elf -kernel Image -initrd rootfs.cpio -net user \
+       -append "console=ttyS0" -input "ifconfig eth0 10.0.2.15 up; ping -c 2 10.0.2.2"
+```
+
+(Ubuntu's kernel has no `ip=` autoconfiguration built in, so the address is
+set from user space.)
+
+Checked: Ubuntu 24.04's kernel brings `eth0` up and BusyBox's `ping`
+reaches the gateway. `tests/vplat/vnet.c` is a bare-metal driver that
+checks the device itself (ARP, ICMP checksums, the interrupt, the dgram
+link). A platform with a `dgram` interface cannot be checkpointed.
+
 ## Options
 
 | Option | |
@@ -326,6 +357,7 @@ end (`IOERR`), an unknown request (`UNSUPP`) and the interrupt.
 | `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
 | `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |
 | `-disk FILE`, `-disk-write` | a raw disk image on virtio-blk; let writes reach the file (see "Disks") |
+| `-net user`, `-net dgram:LOCAL,REMOTE`, `-net-pcap FILE` | a virtio-net interface and its back end; record its frames (see "Networks") |
 | `-profile FILE` | profile (`-`: stdout) *(extension)* |
 | `-gdb PORT`, `-gdb-portfile FILE` | gdb server *(extension)* |
 | `-save FILE`, `-restore FILE` | checkpoints *(extension)* |
@@ -369,9 +401,10 @@ simulation time.
   to integers; other RMM results round as ties-to-even (differs only for a
   value exactly half way). Bare-metal software, RTOSes (FreeRTOS, Zephyr),
   OpenSBI, Linux with an rv64gc user space and the architecture tests run.
-- Of virtio, only the block device: no virtio network, console, entropy or
-  9p yet, and no indirect descriptors or `EVENT_IDX`. Disk images are raw
-  (no qcow2).
+- Of virtio, the block and network devices: no virtio console, entropy or
+  9p yet, and no indirect descriptors, `EVENT_IDX`, checksum or segmentation
+  offload, or multiqueue. Disk images are raw (no qcow2). The `user` network
+  answers ARP and ping only; there is no NAT to the host or a TAP back end.
 - No hardware triggers, no Smepmp (`mseccfg`).
 - One instruction per cycle: no pipeline or cache timing model.
 - No Spike or QEMU back end yet (Spike is BSD-licensed and could be linked;
