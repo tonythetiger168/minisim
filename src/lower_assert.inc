@@ -378,6 +378,7 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n) {
 // The terms of one assertion while it is built (sva_engine.hpp).
 struct SvaBuild {
     std::vector<E> atoms;
+    std::vector<const Prog*> pre;    // function calls of the atoms, run before them
     std::vector<char> atomLocal;     // the atom reads a local variable
     std::vector<int> localSigs;      // local variables (16.10), as hidden signals
     std::vector<std::vector<ConcAssert::Item>> acts;   // match items and initializers
@@ -399,7 +400,35 @@ static bool readsLocal(const E& e) {
 }
 int svaAtom(const slang::ast::Expression& x) {
     if (auto it = svb->atomOf.find(&x); it != svb->atomOf.end()) return it->second;
-    int id = svaAtomE(sampledE(expr(x)));
+    // A user function called in the boolean (16.6) needs a program of its
+    // own: run at each tick before the atoms are read, on sampled values,
+    // leaving its result in a signal the atom reads as it is.
+    E v;
+    if (frames.empty() && store && mkSig && !consDepth) {
+        Prog saved = std::move(prog);
+        prog = Prog{};
+        // Hidden ('$'): the marker and the result stay out of waveforms and
+        // toggle coverage.
+        auto hidden = [&](int w) { return mkSig("_sva$" + std::to_string(tempSeq ? (*tempSeq)++ : 0), w, false); };
+        int below = hidden(1);
+        v = expr(x);
+        if (prog.code.empty()) v = sampledE(v);
+        else {
+            int w = storeW(*x.type);
+            needWidth(w);
+            int t = hidden(w);
+            Instr i; i.k = IK::Assign; i.sig = t; i.e = std::move(v);
+            prog.emit(i);
+            finishImplicit();
+            sampleProg(below);
+            store->push_back(std::make_unique<Prog>(std::move(prog)));
+            svb->pre.push_back(store->back().get());
+            svaLiveSigs().insert(t);
+            v = ref(t, x.type->isSigned());
+        }
+        prog = std::move(saved);
+    } else v = sampledE(expr(x));
+    int id = svaAtomE(std::move(v));
     svb->atomOf[&x] = id;
     return id;
 }
@@ -825,6 +854,7 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
+    c.pre = std::move(b.pre);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
     c.endSig = sg;
@@ -945,6 +975,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     c.ev = b.clk;
     c.clkIff = b.clkIff;
     c.atoms = std::move(b.atoms);
+    c.pre = std::move(b.pre);
     c.localSig = std::move(b.localSigs);
     c.acts = std::move(b.acts);
     c.clearFlags = std::move(b.matchFlags);

@@ -1,0 +1,149 @@
+vip,test,kind,result,checks,detail
+ACE-UVM-VIP,ace_func_test,checked,PASS,217,
+ACE_Lite-UVM-VIP,ace_lite_func_test,checked,PASS,118,
+AHB-VIP,amba_ral_test,checked,PASS,1586,
+APB-VIP,amba_ral_test,checked,FAIL,0,rc=0 UVM_ERROR=26415 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR rtl/amba_vip_if.sv(181) @ 105000: reporter [AMBA_IF] AHB HTRANS invalid
+ATB-UVM-VIP,atb_func_test,checked,PASS,92,
+AVSBus-VIP,avsbus_random_test,smoke,PASS,0,
+AXI-VIP,amba_ral_test,checked,FAIL,0,rc=0 UVM_ERROR=13052 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR rtl/amba_vip_if.sv(189) @ 105000: reporter [AMBA_IF] AHB HTRANS invalid
+AXI4_Lite-UVM-VIP,axi4_lite_func_test,checked,PASS,142,
+AXI_Stream-UVM-VIP,axi_stream_func_test,checked,PASS,122,
+Avalon_MM-UVM-VIP,avalon_mm_func_test,checked,PASS,112,
+Avalon_MM-UVM-VIP,avalon_mm_ral_test,checked,PASS,16896,
+Avalon_ST-UVM-VIP,avalon_st_func_test,checked,PASS,80,
+Bluetooth5-VIP,bt5_adv_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=3074: UVM_WARNING regression/sva/bluetooth5_compliance_checker.sv(59) @ 343750: reporter [BLUETOOTH5_L2] RX CRC OK failed
+CAN-VIP,can_2_0_test,smoke,FAIL,0,rc=0 UVM_ERROR=5 UVM_FATAL=0 VIP_WARNINGS=82572: UVM_ERROR env/can_env.sv(62) @ 20905000: uvm_test_top.env.sb [SB] mismatch exp{CAN: type=CAN_2_0 frame=DATA_FRAME id=0x0 ide=0 dlc=0 len=0 rtr=0 fdf=0 brs=0 esi=0 tt=0 err=0} obs{CAN: type=CAN_2_0 frame=DATA_FRAME id=0x7de7518 ide=1 dlc=8 len=8 rtr=0 
+CAN_FD-UVM-VIP,can_fd_func_test,checked,PASS,76,
+CAN_XL-UVM-VIP,can_xl_func_test,checked,PASS,92,
+CCIX-VIP,ccix_random_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=3: UVM_WARNING ccix/ccix_driver.svh(59) @ 3365000: uvm_test_top.env.agt.drv [DRV] credit pool did not drain; injecting overflow anyway
+CHI-UVM-VIP,chi_func_test,checked,PASS,76,
+CI_CAM-UVM-VIP,cam_func_test,checked,PASS,150,
+CPRI-VIP,cpri_random_test,smoke,PASS,0,
+CSE-VIP,mipi_cse_test,smoke,PASS,0,
+CSI2_Sensor-UVM-VIP,csis_func_test,checked,FAIL,0,rc=124 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=0 timeout
+CSI_2-VIP,mipi_csi2_test,smoke,FAIL,0,rc=0 UVM_ERROR=18 UVM_FATAL=0 VIP_WARNINGS=31896: UVM_ERROR vip/base/mipi_vip_pkg.sv(576) @ 12506000: uvm_test_top.env.sb [SB] mismatch exp{MIPI_CSI2 pkt=PKT_FS vc=0 wc=2316} obs{MIPI_CSI2 pkt=PKT_FS vc=0 wc=2316} ecc_err=0 crc_err=1
+CXL-VIP,mp_cxl_test,smoke,FAIL,0,"rc=1 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=3931: UVM_WARNING vip/base/mp_driver.sv(42) @ 0: uvm_test_top.env.cxl20_agent.drv [CONFIG] Protocol config not found, using defaults"
+CXS-VIP,cxs_random_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=3: UVM_WARNING tb/top_tb.sv(84) @ 195000: reporter [DUT] cxs receiver: packet abandoned without cxs_last
+C_PHY-VIP,mipi_cphy_test,smoke,FAIL,0,rc=0 UVM_ERROR=21 UVM_FATAL=0 VIP_WARNINGS=75202: UVM_ERROR vip/base/mipi_vip_pkg.sv(584) @ 12482000: uvm_test_top.env.sb [SB] mismatch exp{MIPI_CPHY pkt=PKT_FS vc=0 wc=2316} obs{MIPI_CPHY pkt=PKT_FS vc=0 wc=2316} ecc_err=0 crc_err=1
+DBI-VIP,dbi_random_test,smoke,FAIL,0,"rc=0 UVM_ERROR=34 UVM_FATAL=0 VIP_WARNINGS=1: UVM_ERROR env/dbi_env.sv(45) @ 145000: uvm_test_top.env.sb [SB] short WRX not flagged, obs{DBI DBI_CMD_WRITE cmd=0x11 len=0}"
+DDR-VIP,memory_directed_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=1124: UVM_WARNING env/vip/ddr/ddr_protocol_checker.sv(19) @ 155000: reporter [DDR_CHK] CKE high for active commands failed
+DDR5-VIP,ddr5_func_test,checked,ERROR,0,msim: tests/ddr5_tests.sv:76: lower: unsupported rand variable wider than 64 bits
+DFI-VIP,dfi_random_test,smoke,PASS,0,
+DPI-VIP,dpi_random_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=17: UVM_WARNING dpi/dpi_monitor.svh(60) @ 765000: uvm_test_top.env.agt.mon [MON] DE in blanking (line=2 cnt=16)
+DSI-VIP,mipi_dsi_test,smoke,FAIL,0,rc=0 UVM_ERROR=18 UVM_FATAL=0 VIP_WARNINGS=11174: UVM_ERROR vip/base/mipi_vip_pkg.sv(576) @ 12506000: uvm_test_top.env.sb [SB] mismatch exp{MIPI_DSI pkt=PKT_FS vc=0 wc=2316} obs{MIPI_DSI pkt=PKT_FS vc=0 wc=2316} ecc_err=0 crc_err=1
+D_PHY-VIP,mipi_dphy_test,smoke,FAIL,0,rc=0 UVM_ERROR=18 UVM_FATAL=0 VIP_WARNINGS=25730: UVM_ERROR vip/base/mipi_vip_pkg.sv(576) @ 12506000: uvm_test_top.env.sb [SB] mismatch exp{MIPI_DPHY pkt=PKT_FS vc=0 wc=2316} obs{MIPI_DPHY pkt=PKT_FS vc=0 wc=2316} ecc_err=0 crc_err=1
+DigRF-VIP,mipi_digrf_test,smoke,FAIL,0,rc=0 UVM_ERROR=30 UVM_FATAL=0 VIP_WARNINGS=74: UVM_ERROR vip/digrf/digrf_protocol_checker.sv(47) @ 106000: reporter [DIGRF_CHK] DigRF I/Q unknown
+DisplayPort2-VIP,sata_random_test,smoke,WARN,0,"rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=1541: UVM_WARNING displayport2/displayport2_driver.svh(26) @ 0: uvm_test_top.env.dp2_agt.drv [CONFIG] displayport2 driver: cfg not found, using defaults"
+ETH800G-VIP,eth800g_func_test,checked,PASS,76,
+EtherCAT-VIP,ethercat_func_test,checked,PASS,76,
+Ethernet-VIP,net_ethernet_100g_test,smoke,FAIL,0,rc=-9 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=76451: UVM_ERROR vip/base/net_vip_pkg.sv(760) @ 866000: uvm_test_top.env.sb [SCOREBOARD] end-to-end mismatch
+Ethernet_AVB_TSN-VIP,avb_stream_test,smoke,FAIL,0,"rc=125 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=60827 log flood (>512 MB, killed): UVM_ERROR common/common_pkg.sv(72) @ 852000: uvm_test_top.env.agt.chk [PROTOCOL_CHK] [ERROR] Source address is multicast (total=1)"
+FC-VIP,net_fc_test,smoke,FAIL,0,rc=-9 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=85837: UVM_WARNING rtl/sva/fc_compliance_checker.sv(56) @ 102000: reporter [FC_L1] Speed valid failed
+FlexRay-VIP,random_test,smoke,FAIL,0,rc=0 UVM_ERROR=510 UVM_FATAL=0 VIP_WARNINGS=17812: UVM_ERROR flexray/sva/flexray_compliance_checker.sv(102) @ 11255000: reporter [SVA_L4] flexray: frame without valid TSS
+GMII-UVM-VIP,gmii_func_test,checked,PASS,76,
+GMII_PHY-UVM-VIP,gphy_func_test,checked,PASS,128,
+GPIO-UVM-VIP,gpio_func_test,checked,PASS,102,
+HBM-VIP,memory_directed_test,smoke,ERROR,0,msim: tb_top.sv:124: lower: unsupported rand variable wider than 64 bits
+HBM3E-VIP,hbm3e_func_test,checked,ERROR,0,msim: tests/hbm3e_tests.sv:76: lower: unsupported rand variable wider than 64 bits
+HBM5-VIP,hbm5_directed_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=28482: UVM_WARNING hbm5_vip/vip/hbm5/hbm5_protocol_checker.sv(22) @ 105000: reporter [HBM5] Pseudo channel 0-7 failed
+HDCP-VIP,hdcp_random_test,smoke,FAIL,0,rc=0 UVM_ERROR=15 UVM_FATAL=0 VIP_WARNINGS=11: UVM_ERROR env/hdcp_env.sv(66) @ 22455000: uvm_test_top.env.sb [SB] mismatch exp{HDCP aksv=bfa6873980 bksv=a5c3f01234 riv=2f12bee6b07a3ce8 enc=1 frames=3 err=HDCP_ERR_NONE} obs{HDCP aksv=0 bksv=a5c3f01234 riv=0 enc=1 frames=3 err=HDCP_ERR_NONE}
+HDMI-VIP,hdmi_random_test,smoke,ERROR,0,msim: unordered_map::at
+HDMI_CEC-UVM-VIP,cec_func_test,checked,PASS,122,
+HDMI_Source-UVM-VIP,hdmisrc_func_test,checked,PASS,104,
+HSI-VIP,mipi_hsi_test,smoke,FAIL,0,rc=0 UVM_ERROR=29 UVM_FATAL=0 VIP_WARNINGS=10: UVM_ERROR vip/base/mipi_vip_pkg.sv(608) @ 4726000: uvm_test_top.env.sb [SCOREBOARD] end-to-end mismatch
+HyperBus-UVM-VIP,hyperbus_func_test,checked,PASS,136,
+I2C-VIP,i2c_random_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=50: UVM_WARNING i2c/i2c_driver.svh(81) @ 935000: uvm_test_top.env.agt.drv [DRV] addr 0x10 NACKed
+I2S-VIP,i2s_random_test,smoke,PASS,0,
+I2S_Codec-UVM-VIP,i2sc_func_test,checked,FAIL,0,rc=0 UVM_ERROR=2 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR i2sc/i2sc_checker.svh(37) @ 381935000: uvm_test_top.env.chk [CHK] I2SC: burst shorter than one stereo frame: I2SC{tag=30 rises=[27]{ 0 1 0 1 0 1 0 0 ... } dout=[27]{ 0 1 1 0 0 0 1 0 ... }}
+I3C-VIP,i3c_random_test,smoke,ERROR,0,msim: i3c/i3c_sequences.svh:38: lower: unsupported an array or container of the caller in with {...}
+IO_Link-VIP,io_link_func_test,checked,PASS,84,
+IR_Remote-UVM-VIP,ir_func_test,checked,PASS,124,
+Interlaken-VIP,intlkn_random_test,smoke,PASS,0,
+JESD204-VIP,jesd204_random_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=6: UVM_WARNING jesd204/jesd204_monitor.svh(75) @ 655000: uvm_test_top.env.agt.mon [MON] ILAS order error: DID in multiframe 3
+JTAG-VIP,jtag_random_test,smoke,ERROR,0,msim: regression/vip/jtag/jtag_timing_checker.sv:43: lower: unsupported rand variable wider than 64 bits
+LIN-VIP,random_test,smoke,FAIL,0,"rc=0 UVM_ERROR=35 UVM_FATAL=0 VIP_WARNINGS=75336: UVM_ERROR common/common_pkg.sv(63) @ 10335000: uvm_test_top.env.agt.chk [PROTOCOL_CHK] [ERROR] PID parity mismatch: expected 01, got 10 (total=1)"
+LPDDR-VIP,memory_directed_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=584: UVM_WARNING lpddr/sva/lpddr_compliance_checker.sv(26) @ 155000: reporter [LPDDR_L1] Address valid failed
+LPDDR6-VIP,lpddr6_func_test,checked,PASS,112,
+LPI-VIP,lpi_random_test,smoke,FAIL,0,rc=0 UVM_ERROR=38 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR env/lpi_env.sv(63) @ 295000: uvm_test_top.env.sb [SB] mismatch exp{LPI request deny=1 -> PENDING (stop=14)} obs{LPI request deny=0 -> ACCEPTED (stop=3)}
+LTI-VIP,lti_random_test,smoke,PASS,0,
+MACsec-UVM-VIP,macsec_func_test,checked,PASS,114,
+MCTP-UVM-VIP,mctp_func_test,checked,PASS,90,
+MDIO-UVM-VIP,mdio_func_test,checked,FAIL,0,rc=0 UVM_ERROR=2 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR env/mdio_env.sv(103) @ 50605000: uvm_test_top.env.sb [SB] 37 driven / 0 observed items left unmatched at end of test
+MIL_STD_1553-VIP,mil_std_1553_func_test,checked,PASS,76,
+MPEG_TS-UVM-VIP,tsi_func_test,checked,PASS,164,
+M_PHY-VIP,mipi_mphy_test,smoke,FAIL,0,rc=0 UVM_ERROR=18 UVM_FATAL=0 VIP_WARNINGS=74311: UVM_ERROR vip/base/mipi_vip_pkg.sv(576) @ 12470000: uvm_test_top.env.sb [SB] mismatch exp{MIPI_MPHY pkt=PKT_FS vc=0 wc=2316} obs{MIPI_MPHY pkt=PKT_FS vc=0 wc=2316} ecc_err=0 crc_err=1
+NC-SI-UVM-VIP,ncsi_func_test,checked,PASS,122,
+NVMe-VIP,,smoke,NONE,0,no UVM test
+OBI-UVM-VIP,obi_func_test,checked,PASS,102,
+OCP-VIP,ocp_ral_test,checked,PASS,1538,
+ONFI-VIP,onfi_deep_test,smoke,FAIL,0,rc=0 UVM_ERROR=56 UVM_FATAL=1 VIP_WARNINGS=0: UVM_ERROR env/vip/onfi/onfi_data_integrity_checker.sv(43) @ 150000: reporter [ONFI_DI] X on IO at WE# rising edge
+OneWire-UVM-VIP,onewire_func_test,checked,FAIL,0,rc=0 UVM_ERROR=47 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR onewire/onewire_checker.svh(37) @ 405000: uvm_test_top.env.chk [CHK] 1-Wire: no presence pulse after reset: 1-Wire{tag=0 is_reset=0x1 wdata=0x0 presence=0x0 rdata=0x0}
+PCIe-VIP,mp_pcie_gen5_test,smoke,FAIL,0,"rc=1 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=1350: UVM_WARNING vip/base/mp_driver.sv(42) @ 0: uvm_test_top.env.pcie_gen5_agent.drv [CONFIG] Protocol config not found, using defaults"
+PCIe_IDE-UVM-VIP,ide_func_test,checked,PASS,136,
+PTP-VIP,ptp_func_test,checked,PASS,74,
+PWM-UVM-VIP,pwm_func_test,checked,PASS,78,
+RFFE-VIP,rffe_random_test,smoke,PASS,0,
+RGMII-UVM-VIP,rgmii_func_test,checked,PASS,74,
+RVFI-UVM-VIP,rvfi_func_test,checked,PASS,124,
+RapidIO-VIP,rapidio_func_test,checked,PASS,74,
+SAS-VIP,sas_random_test,smoke,FAIL,0,rc=124 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=0 timeout
+SATA-VIP,,smoke,NONE,0,no UVM test
+SCCB_Sensor-UVM-VIP,sccb_func_test,checked,PASS,104,
+SD-VIP,sd_regression_test,smoke,FAIL,0,rc=-9 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=8: UVM_ERROR env/memory_env_pkg.sv(129) @ 2420000: uvm_test_top.env.sb [MEM_SB] SD mismatch exp{SD GO_IDLE: idx=0 arg=0x0 bl=1024 bw=1 acmd=0 resp=0x0} obs{SD GO_IDLE: idx=0 arg=0x0 bl=512 bw=0 acmd=0 resp=0x0}
+SDIO-UVM-VIP,sdio_func_test,checked,PASS,76,
+SDMMC_Card-UVM-VIP,sdm_func_test,checked,PASS,176,
+SD_Card-UVM-VIP,sdc_func_test,checked,PASS,162,
+SENT-VIP,sent_func_test,checked,PASS,72,
+SGMII-UVM-VIP,sgmii_func_test,checked,PASS,82,
+SLIMbus-VIP,slimbus_random_test,smoke,FAIL,0,rc=0 UVM_ERROR=50 UVM_FATAL=0 VIP_WARNINGS=3: UVM_ERROR env/slimbus_env.sv(54) @ 1540000: uvm_test_top.env.sb [SB] mismatch exp{SLIMbus SB_CHAN_SETUP la=0x79 ch=14} obs{SLIMbus SB_CHAN_SETUP la=0x0 ch=14}
+SMBus-UVM-VIP,smbus_func_test,checked,PASS,108,
+SPDIF-UVM-VIP,spdif_func_test,checked,PASS,132,
+SPI-VIP,spi_random_test,smoke,PASS,0,
+SPI_NOR-UVM-VIP,snor_func_test,checked,PASS,132,
+SPMI-VIP,spmi_random_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=28: UVM_WARNING spmi/spmi_driver.svh(89) @ 1235000: uvm_test_top.env.agt.drv [DRV] sa 0x1 NACKed command frame
+SUE-UVM-VIP,sue_func_test,checked,PASS,114,
+SWD-VIP,swd_random_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=40: UVM_ERROR env/swd_env.sv(106) @ 1275000: uvm_test_top.env.sb [SB] mismatch exp{SWD AP RD a=0 data=0x889b6cac ack=FAULT rdata=0x0} obs{SWD AP RD a=0 data=0x0 ack=OK rdata=0xX7XXXX1} (predicted ack=1)
+Security-VIP,security_random_test,smoke,FAIL,0,rc=124 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=0 timeout
+Smartcard_ISO7816-UVM-VIP,scd_func_test,checked,PASS,132,
+SoundWire-VIP,soundwire_random_test,smoke,FAIL,0,rc=0 UVM_ERROR=26 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR soundwire/soundwire_sequences.svh(18) @ 3860000: uvm_test_top.env.agt.sqr@@seq [RANDFAIL] randomize() failed
+SpaceWire-UVM-VIP,spacewire_func_test,checked,PASS,102,
+T1S_PLCA-UVM-VIP,t1s_plca_func_test,checked,PASS,84,
+TDM-UVM-VIP,tdm_func_test,checked,PASS,82,
+TileLink-VIP,tilelink_ral_test,checked,PASS,1600,
+ToggleNAND-VIP,tnand_random_test,smoke,FAIL,0,rc=0 UVM_ERROR=35 UVM_FATAL=0 VIP_WARNINGS=6: UVM_ERROR env/tnand_env.sv(61) @ 1245000: uvm_test_top.env.sb [SB] mismatch exp{TNAND PROG cmd=0x80 addr=0xb43be60b70 len=19 status=0x40 err=TNAND_ERR_NONE} obs{TNAND PROG cmd=0x80 addr=0xb43be60b70 len=0 status=0x40 err=TNAND_ERR_NONE}
+TypeC-VIP,typec_random_test,smoke,FAIL,0,rc=124 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=0 timeout
+UALink-VIP,ualink_func_test,checked,PASS,106,
+UART-VIP,uart_random_test,smoke,FAIL,0,rc=0 UVM_ERROR=1 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR env/uart_env.sv(100) @ 128735000: uvm_test_top.env.sb [SB] missing loopback echo for last error-free frame
+UCIe-VIP,ucie_func_test,checked,PASS,72,
+UEC-VIP,uec_func_test,checked,PASS,80,
+UFS-VIP,ufs_regression_test,smoke,FAIL,0,rc=0 UVM_ERROR=41 UVM_FATAL=0 VIP_WARNINGS=59: UVM_ERROR ufs/ufs_pkg.sv(495) @ 630000: uvm_test_top.env.ufs_ag.sqr@@q [ufs_query_seq] Rand failed
+USB-VIP,usb_random_regression_test,smoke,FAIL,0,rc=0 UVM_ERROR=726 UVM_FATAL=0 VIP_WARNINGS=4058 timeout: UVM_ERROR vip/base/usb_vip_pkg.sv(898) @ 142000: uvm_test_top.env.sb [SCOREBOARD] MISMATCH exp{USB USB4 | HS_ACK | Dev=0x1e EP=1 len=3025 status=XFER_OK lat=38ns} obs{USB USB_HS | DATA_MDATA | Dev=0x20 EP=13 len=0 status=XFER_OK lat=20ns}
+USB2-VIP,usb_eusb2_test,smoke,FAIL,0,"rc=125 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=22371 timeout log flood (>512 MB, killed): UVM_ERROR rtl/usb_vip_if.sv(313) @ 102000: reporter [USB_IF] Invalid USB device state"
+USB3-VIP,usb_random_regression_test,smoke,FAIL,0,rc=0 UVM_ERROR=726 UVM_FATAL=0 VIP_WARNINGS=19766 timeout: UVM_ERROR vip/base/usb_vip_pkg.sv(898) @ 142000: uvm_test_top.env.sb [SCOREBOARD] MISMATCH exp{USB USB4 | HS_ACK | Dev=0x1e EP=1 len=3025 status=XFER_OK lat=38ns} obs{USB USB_HS | DATA_MDATA | Dev=0x20 EP=13 len=0 status=XFER_OK lat=20ns}
+USB4-VIP,usb4_test,smoke,FAIL,0,rc=124 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=35 timeout: UVM_ERROR rtl/usb_vip_if.sv(313) @ 102000: reporter [USB_IF] Invalid USB device state
+USB_PD-VIP,usb_pd_test,smoke,FAIL,0,rc=-9 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=7647: UVM_ERROR rtl/usb_vip_if.sv(313) @ 102000: reporter [USB_IF] Invalid USB device state
+USXGMII-UVM-VIP,usxgmii_func_test,checked,PASS,120,
+UniPro-VIP,mipi_unipro_test,smoke,FAIL,0,rc=0 UVM_ERROR=18 UVM_FATAL=0 VIP_WARNINGS=81463: UVM_ERROR vip/base/mipi_vip_pkg.sv(568) @ 12470000: uvm_test_top.env.sb [SB] mismatch exp{MIPI_UNIPRO pkt=PKT_FS vc=0 wc=2316} obs{MIPI_UNIPRO pkt=PKT_FS vc=0 wc=2316} ecc_err=0 crc_err=1
+UniPro_Mem-VIP,memory_coverage_regression_test,smoke,FAIL,0,rc=0 UVM_ERROR=116 UVM_FATAL=0 VIP_WARNINGS=1440: UVM_ERROR env/memory_env_pkg.sv(86) @ 24610000: uvm_test_top.env.sb [MEM_SB] unipro mismatch exp{UniPro NOP: cport=14 data=0xdd} obs{UniPro DATA: cport=30 data=0xf}
+VbyOne_HS-UVM-VIP,vbo_func_test,checked,PASS,92,
+WTB-UVM-VIP,wtb_func_test,checked,PASS,92,
+Wishbone-UVM-VIP,wishbone_func_test,checked,PASS,136,
+Wishbone-UVM-VIP,wishbone_ral_test,checked,PASS,4224,
+XGMII-UVM-VIP,xgmii_func_test,checked,PASS,76,
+ddr6-VIP,ddr6_directed_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=27461: UVM_WARNING ddr6_vip/vip/ddr6/ddr6_protocol_checker.sv(22) @ 105000: reporter [DDR6_L1] Bank group 0-7 failed
+ddr7-VIP,ddr7_directed_test,smoke,WARN,0,rc=0 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=28438: UVM_WARNING ddr7_vip/vip/ddr7/ddr7_protocol_checker.sv(22) @ 105000: reporter [DDR7] Bank group 0-7 failed
+eCPRI-VIP,ecpri_random_test,smoke,PASS,0,
+eMMC-VIP,emmc_regression_test,smoke,FAIL,0,rc=-9 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=15: UVM_ERROR emmc/emmc_pkg.sv(529) @ 2580000: uvm_test_top.env.emmc_ag.sqr@@i [emmc_init_seq] Rand failed
+eMMC_Device-UVM-VIP,emd_func_test,checked,PASS,160,
+eSPI-UVM-VIP,espi_func_test,checked,PASS,144,
+eUSB2-VIP,usb_eusb2_test,smoke,FAIL,0,"rc=125 UVM_ERROR=0 UVM_FATAL=0 VIP_WARNINGS=22250 timeout log flood (>512 MB, killed): UVM_ERROR rtl/usb_vip_if.sv(313) @ 102000: reporter [USB_IF] Invalid USB device state"
+gddr5-VIP,gddr5_write_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR gddr5_vip/vip/gddr5/gddr5_compliance_checker.sv(123) @ 135000: reporter [SVA_L4] gddr5: ACT issued to an already-active bank
+gddr6-VIP,gddr6_write_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=494: UVM_ERROR gddr6_vip/vip/gddr6/gddr6_compliance_checker.sv(129) @ 135000: reporter [SVA_L4] gddr6: ACT issued to an already-active bank
+gddr7-VIP,gddr7_write_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=430: UVM_ERROR gddr7_vip/vip/gddr7/gddr7_compliance_checker.sv(135) @ 135000: reporter [SVA_L4] gddr7: ACT issued to an already-active bank
+hbm2-VIP,hbm2_write_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR hbm2_vip/vip/hbm2/hbm2_compliance_checker.sv(123) @ 135000: reporter [SVA_L4] hbm2: ACT issued to an already-active bank
+hbm3-VIP,hbm3_write_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=0: UVM_ERROR hbm3_vip/vip/hbm3/hbm3_compliance_checker.sv(129) @ 135000: reporter [SVA_L4] hbm3: ACT issued to an already-active bank
+hbm4-VIP,hbm4_write_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=494: UVM_ERROR hbm4_vip/vip/hbm4/hbm4_compliance_checker.sv(135) @ 135000: reporter [SVA_L4] hbm4: ACT issued to an already-active bank
+lpddr5-VIP,lpddr5_write_test,smoke,FAIL,0,rc=0 UVM_ERROR=32 UVM_FATAL=0 VIP_WARNINGS=558: UVM_ERROR lpddr5_vip/vip/lpddr5/lpddr5_compliance_checker.sv(123) @ 135000: reporter [SVA_L4] lpddr5: ACT issued to an already-active bank
+lpddr5x-VIP,lpddr5x_rw_test,smoke,FAIL,0,rc=0 UVM_ERROR=251 UVM_FATAL=0 VIP_WARNINGS=9378: UVM_ERROR lpddr5x_vip/sva/lpddr5x_compliance_checker.sv(126) @ 215000: reporter [SVA_L3] lpddr5x: DQ not driven inside write burst window
+lpddr7-VIP,lpddr7_rw_test,smoke,FAIL,0,rc=0 UVM_ERROR=251 UVM_FATAL=0 VIP_WARNINGS=14556: UVM_ERROR lpddr7_vip/sva/lpddr7_compliance_checker.sv(126) @ 215000: reporter [SVA_L3] lpddr7: DQ not driven inside write burst window
+xSPI-UVM-VIP,xspi_func_test,checked,PASS,146,
