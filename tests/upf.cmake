@@ -412,3 +412,12 @@ upf_error_in(isomodel e_ifc6 "${uic} -lib_cells iso_and -port_map {{VDD input_su
 upf_error_in(isomodel e_ifc7 "${uic} -lib_cells iso_and -port_map {{XX isolation_signal}}" "iso_and has no port XX (6.62)")
 upf_error_in(isomodel e_ifc8 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal} {EN isolation_signal}}" "-port_map maps model port EN twice (6.62)")
 upf_error_in(retlatch e_rl1 "set_retention RET_X -domain PD_A -applies_to flops -save_signal {sf high} -restore_signal {sf low}" "-applies_to flops is not flop, latch or any (6.54)")
+# Low-power coverage (msim -upf_cov): power states, named transitions,
+# isolation enables, retention saves and restores; bins not hit are marked.
+execute_process(COMMAND ${MSIM} ${D}/retlatch.sv -upf ${D}/lpcov.upf -upf_cov ${CMAKE_CURRENT_BINARY_DIR}/lpcov.cov
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ ${D}/lpcov.cov want)
+file(READ ${CMAKE_CURRENT_BINARY_DIR}/lpcov.cov got)
+if(NOT rc EQUAL 0 OR NOT got STREQUAL want)
+  message(FATAL_ERROR "lpcov: ${rc}\n--- got\n${got}${err}--- want\n${want}")
+endif()

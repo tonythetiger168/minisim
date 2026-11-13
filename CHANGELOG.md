@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -upf_cov <file>`: a low-power coverage report of power states,
+  named state transitions, isolation enables and retention saves and
+  restores, with the bins not hit marked.
 - UPF `set_retention -applies_to flop | latch` (IEEE 1801-2024 6.54) selects
   flip-flops or latches: `always_latch` and latches inferred from a
   level-sensitive `always` that leaves a variable unassigned on some path.

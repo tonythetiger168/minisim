@@ -137,6 +137,21 @@ processes), and `mdebug -upf` reads files without a design, so it does not
 run `find_objects` on HDL objects. Tcl
 has no `namespace`, `upvar`, `regexp` or file I/O.
 
+## Low-power coverage: `msim -upf_cov <file>`
+
+At the end of the run msim writes a report of the low-power bins and how
+often each was hit, with the bins not hit marked:
+
+- each power state of a power domain, a power state group, and a supply set
+  that has power states or named transitions (`ON` and `OFF` included), as
+  entered (illegal states are not bins);
+- each named, legal transition of `add_state_transition`;
+- each isolation cell, as the times it began to isolate;
+- each retention strategy's saves and restores.
+
+The first line gives the bins hit of all bins. `tests/upf/lpcov.cov` is an
+example.
+
 ## Static checks: `mlint -upf`
 
 | Rule | What it finds |

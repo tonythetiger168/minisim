@@ -18,6 +18,7 @@
 //   * retention (9.7): save and restore of the domain's flops;
 //   * domain power states, -illegal states, and legacy PSTs, reported as
 //     errors when the simulation reaches a state that is not legal.
+#include <iomanip>
 #include "upf.hpp"
 
 namespace upfrt {
@@ -51,6 +52,8 @@ struct Cell {               // an isolation or level-shifter cell on a port conn
     bool latched = false;
     std::string port;
     int model = -1;         // isolation: use_interface_cell -force_function model (Rt::ifcEls), or -1
+    long enables = 0;       // isolation: times it began to isolate (msim -upf_cov)
+    bool isolating = false;
 };
 struct RetEl { int sig; Val saved; bool have = false; };
 struct RetRt {
@@ -549,6 +552,54 @@ struct Rt {
         for (int s : w) watch.push_back({s, ANY});
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
+    }
+    // Low-power coverage (msim -upf_cov): power states and named transitions
+    // reached, isolation cells enabled, retention saves and restores.
+    std::string covPath;
+    std::map<std::string, std::map<std::string, long>> stateHits;   // object -> state -> times entered
+    std::map<std::string, std::map<std::string, long>> transHits;   // object -> transition name -> times
+    std::map<std::string, std::pair<long, long>> retHits;           // strategy -> {saves, restores}
+    bool writeCoverage() const {
+        std::ofstream f(covPath);
+        if (!f) return false;
+        int bins = 0, hit = 0;
+        std::ostringstream body;
+        auto row = [&](const std::string& what, long n) {
+            bins++;
+            if (n > 0) hit++;
+            body << "  " << std::left << std::setw(56) << what << " " << std::right << std::setw(6) << n << (n ? "" : "  <- not hit") << "\n";
+        };
+        auto states = [&](const char* kind, const std::string& obj, const std::vector<PowerState>& ps, bool onOff) {
+            std::vector<std::string> names;
+            if (onOff) names = {"ON", "OFF"};
+            for (auto& p : ps)
+                if (!p.illegal && std::find(names.begin(), names.end(), p.name) == names.end()) names.push_back(p.name);
+            auto it = stateHits.find(obj);
+            for (auto& n : names) row(std::string(kind) + " " + obj + " " + n, it == stateHits.end() || !it->second.count(n) ? 0 : it->second.at(n));
+        };
+        body << "power states\n";
+        for (auto& [n, ss] : m.sets) if (!ss.states.empty() || m.transitions.count(n)) states("supply set", n, ss.states, true);
+        for (auto& dn : m.domainOrder) states("power domain", dn, m.domains.at(dn).states, false);
+        for (auto& [n, g] : m.groups) states("power state group", n, g.states, false);
+        body << "state transitions\n";
+        for (auto& [obj, ts] : m.transitions)
+            for (auto& t : ts.tr) {
+                if (t.illegal) continue;
+                auto it = transHits.find(obj);
+                row(obj + " " + t.name, it == transHits.end() || !it->second.count(t.name) ? 0 : it->second.at(t.name));
+            }
+        body << "isolation enables\n";
+        for (auto& c : cells) if (c.kind == 0) row(c.iso->name + " " + c.port, c.enables);
+        body << "retention\n";
+        for (auto& r : rets) {
+            auto it = retHits.find(r.r->name);
+            row(r.r->name + " save", it == retHits.end() ? 0 : it->second.first);
+            row(r.r->name + " restore", it == retHits.end() ? 0 : it->second.second);
+        }
+        f << "UPF low-power coverage: " << hit << " of " << bins << " bins";
+        if (bins) f << " (" << std::fixed << std::setprecision(1) << 100.0 * hit / bins << "%)";
+        f << "\n" << body.str();
+        return true;
     }
     std::vector<std::set<int>> stateSigs;
     std::set<int> latchSigs;   // the state elements that are latches
@@ -2507,6 +2558,7 @@ struct Rt {
         auto prev = lastState.find(obj);
         std::string from = prev == lastState.end() ? "" : prev->second;
         lastState[obj] = to;
+        if (from != to) stateHits[obj][to]++;
         if (from.empty() || from == to || from == "UNDEFINED") return;
         auto it = m.transitions.find(obj);
         if (it == m.transitions.end()) return;
@@ -2514,6 +2566,7 @@ struct Rt {
         const Transition* illegal = nullptr;
         for (auto& t : it->second.tr)
             if (t.matches(from, to)) (t.illegal ? illegal : legal) = &t;
+        if (legal && !illegal) transHits[obj][legal->name]++;
         if (illegal)
             error(std::string(what) + " " + obj + ": illegal state transition " + illegal->name + " (" + from + " -> " + to + ")");
         else if (legal)
@@ -2594,6 +2647,7 @@ struct Rt {
                     e.have = true;
                 }
                 if (!powered) error("retention " + R.name + ": save while " + doms[(size_t)r.dom].name + " is off");
+                else retHits[R.name].first++;
                 note("retention " + R.name + ": saved" + (ok ? "" : " (corrupt)"));
             };
             auto doRestore = [&](bool keepHeld) {
@@ -2603,6 +2657,7 @@ struct Rt {
                     return;
                 }
                 bool ok = condOk(R.restoreCond, sc) && condOk(R.restorePeriodCond, sc);
+                retHits[R.name].second++;
                 for (auto& e : r.els) {
                     Val v = e.have && ok ? e.saved : allx(S.sigs[(size_t)e.sig].w);
                     if (keepHeld) hold(e.sig, v, 1);
@@ -2626,6 +2681,7 @@ struct Rt {
                 } else if (!in && was) {
                     r.inRet = false;
                     if (powered) {
+                        retHits[R.name].second++;
                         bool ok = condOk(R.restoreCond, sc) && condOk(R.restorePeriodCond, sc);
                         for (auto& e : r.els) {
                             release(e.sig);
@@ -2898,6 +2954,8 @@ struct Rt {
             if (latch) { c.latch = allx(d.w); c.latched = true; }
             return allx(d.w);
         }
+        if (act == 1 && !c.isolating) c.enables++;
+        c.isolating = act == 1;
         if (act == 0) {
             if (latch) { c.latch = d; c.latched = true; }
             return d;

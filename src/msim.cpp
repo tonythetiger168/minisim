@@ -90,6 +90,7 @@
 //                    the simulation top (u_dut, or tb/u_dut); default: the
 //                    UPF's set_design_top, else the simulation top
 //   -upf_verbose     print supply, power state and simstate changes
+//   -upf_cov <file>  low-power coverage: power states, transitions, isolation, retention
 //
 // DPI-C (IEEE 1800-2023 clause 35, annex J):
 //   <file>.c / .cc / .cpp / .cxx, .o, .a   C or C++ for DPI imports; msim builds
@@ -2301,6 +2302,7 @@ static void usage() {
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  -upf_verbose   print supply, power state and simstate changes\n"
+                 "  -upf_cov <file>  low-power coverage report: power states, transitions, isolation, retention\n"
                  "  <file>.c       C or C++ for DPI-C imports; also -sv_lib / -sv_root / -dpiheader\n"
                  "  -mvp           add the virtual prototype layer (mvp_axil_slave and its runtime)\n"
                  "  -uvm           compile the Accellera UVM library from $UVM_HOME, with its C code\n"
@@ -2360,6 +2362,7 @@ int main(int argc, char** argv) {
     std::string upfPath, powerTop;
     std::string xpropReport;
     bool powerTopSet = false, upfVerbose = false;
+    std::string upfCov;   // -upf_cov: the low-power coverage report
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
@@ -2427,6 +2430,7 @@ int main(int argc, char** argv) {
         if (a == "-upf") { upfPath = next("a UPF file"); continue; }
         if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
         if (a == "-upf_verbose" || a == "+upf_verbose") { upfVerbose = true; continue; }
+        if (a == "-upf_cov") { upfCov = next("a coverage report file"); continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a == "-cfiles") { g_cfiles = std::max(1, std::atoi(next("a file count").c_str())); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
@@ -2869,6 +2873,7 @@ int main(int argc, char** argv) {
     if (!upfPath.empty()) {   // power-aware simulation (IEEE 1801-2024 9)
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
+        rt.covPath = upfCov;
         try {
             rt.m.resolveApplies([](const std::string& mod) {   // apply_power_model without -elements (6.9)
                 std::vector<std::string> r;
@@ -3189,6 +3194,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!writeSaif()) return 1;
+    if (upfrt::rt().on && !upfrt::rt().covPath.empty() && !upfrt::rt().writeCoverage()) {
+        std::cerr << "msim: cannot write " << upfrt::rt().covPath << "\n";
+        return 1;
+    }
     if (prof::P().on && !prof::P().write(S.now, S.timescale)) {
         std::cerr << "msim: cannot write " << prof::P().path << "\n";
         return 1;
