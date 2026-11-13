@@ -1,7 +1,7 @@
 #!/bin/bash
 # mvplat_isa.sh - the RISC-V architecture tests (riscv-tests, BSD-3-Clause:
 # github.com/riscv-software-src/riscv-tests) on mvplat: every ui, um, ua, uc,
-# uf, ud, si and mi test, for RV32 and RV64, in its "p" environment (physical memory),
+# uf, ud, uzba, uzbb, uzbc, uzbs, uzicond, si and mi test, for RV32 and RV64, in its "p" environment (physical memory),
 # and the user-level ones again in the "v" environment, which runs them in
 # user mode under Sv32 or Sv39 paging with a small supervisor that maps pages
 # on demand. A test ends through HTIF tohost with the number of the first
@@ -47,6 +47,12 @@ unweak() {
     if grep -q "$h:" "$1"; then sed -i -E "s/\\.weak $h;?//g" "$1"; fi
   done
 }
+# Some rv32 tests reuse the rv64 sources, whose constants are 64-bit; the GNU
+# assembler keeps the low 32 bits of such an li, clang refuses it. Keep the
+# low 32 bits as GNU as does.
+rv32li() {
+  perl -pi -e 's/\bli (\w+), 0x([0-9a-fA-F]{9,16})\b/"li $1, 0x" . substr($2, -8)/ge' "$1"
+}
 run() {  # run TEST
   timeout 60 "$MVPLAT" $1 -q -max-cycles 20000000 > $1.out 2>&1
   local rc=$?
@@ -66,15 +72,18 @@ printf '#include <stddef.h>\nvoid *memcpy(void *, const void *, size_t);\nvoid *
 sed 's/^  \.bss : { \*(\.bss) }/  .bss : { *(.bss) }\n  .sbss : { *(.sbss) }/' "$RT/env/v/link.ld" > v-link.ld
 
 for X in 32 64; do
-  if [ $X = 32 ]; then CL="$CLANG --target=riscv32-unknown-elf -march=rv32imafdc_zicsr_zifencei -mabi=ilp32"; VM=rv32imafdc_zicsr_zifencei
-  else CL="$CLANG --target=riscv64-unknown-elf -march=rv64imafdc_zicsr_zifencei -mabi=lp64 -mcmodel=medany"; VM=rv64imafdc_zicsr_zifencei; fi
-  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}uf rv${X}ud rv${X}si rv${X}mi; do
+  B=_zba_zbb_zbc_zbs_zicond
+  if [ $X = 32 ]; then CL="$CLANG --target=riscv32-unknown-elf -march=rv32imafdc_zicsr_zifencei$B -mabi=ilp32"; VM=rv32imafdc_zicsr_zifencei
+  else CL="$CLANG --target=riscv64-unknown-elf -march=rv64imafdc_zicsr_zifencei$B -mabi=lp64 -mcmodel=medany"; VM=rv64imafdc_zicsr_zifencei; fi
+  BSUITES="rv${X}uzba rv${X}uzbb rv${X}uzbc rv${X}uzbs rv${X}uzicond"
+  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}uf rv${X}ud $BSUITES rv${X}si rv${X}mi; do
     for n in $(tests_of $suite); do
       f=$RT/isa/$suite/$n.S
       t=$suite-p-$n
       $CL -E -I"$RT/env/p" -I"$RT/isa/macros/scalar" "$f" -o $t.s
       unweak $t.s
       sed -i 's/\btcontrol\b/0x7a5/g' $t.s   # a CSR name clang 18 does not know
+      [ $X = 32 ] && rv32li $t.s
       if ! $CL -nostdlib -static -fuse-ld=lld -T"$RT/env/p/link.ld" -x assembler $t.s -o $t 2> $t.err; then
         failed="$failed $t(build)"; continue
       fi
@@ -86,12 +95,13 @@ for X in 32 64; do
   VCC="$CL -O2 -mcmodel=medany -fvisibility=hidden -nostdlib -ffreestanding -fno-builtin -Ilibc -I$RT/env/v -I$RT/isa/macros/scalar"
   $VCC -c "$RT/env/v/string.c" -o v$X-string.o 2> v$X-string.err || failed="$failed v$X-string(build)"
   $VCC -c "$RT/env/v/entry.S" -o v$X-entry.o 2> v$X-entry.err || failed="$failed v$X-entry(build)"
-  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}uf rv${X}ud; do
+  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}uf rv${X}ud $BSUITES; do
     for n in $(tests_of $suite); do
       f=$RT/isa/$suite/$n.S
       t=$suite-v-$n
       $CL -E -I"$RT/env/v" -I"$RT/isa/macros/scalar" "$f" -o $t.s
       unweak $t.s
+      [ $X = 32 ] && rv32li $t.s
       # As upstream: the supervisor's page placement is seeded from the test name.
       entropy=0x$(echo $t | md5sum | cut -c 1-7)
       if ! $VCC -c -x assembler $t.s -o $t.o 2> $t.err ||

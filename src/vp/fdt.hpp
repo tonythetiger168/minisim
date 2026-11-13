@@ -148,9 +148,10 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
         f.propU32("reg", {h});
         f.propStr("status", {"okay"});
         f.propStr("compatible", {"riscv"});
-        f.propStr("riscv,isa", {xl + "imafdc_zicntr_zicsr_zifencei"});
+        f.propStr("riscv,isa", {xl + "imafdc_zicntr_zicond_zicsr_zifencei_zba_zbb_zbc_zbs"});
         f.propStr("riscv,isa-base", {xl + "i"});
-        f.propStr("riscv,isa-extensions", {"i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei"});
+        f.propStr("riscv,isa-extensions", {"i", "m", "a", "f", "d", "c", "b", "zicntr", "zicond", "zicsr", "zifencei",
+                                            "zba", "zbb", "zbc", "zbs"});
         f.propStr("mmu-type", {rv64 ? "riscv,sv39" : "riscv,sv32"});
         f.propU32("clock-frequency", {(uint32_t)cpuHz});
         f.begin("interrupt-controller");
