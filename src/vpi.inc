@@ -1910,6 +1910,26 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             s.createCbs.push_back(c);
             g_newObjHook = vpi::onNewObj;
             break;
+        case cbReclaimObj:   // 38.36.1: a class definition (any of its objects) or a class object
+            if (!c->obj || (c->obj->kind != Obj::ClassDefn && c->obj->kind != Obj::ClassObj)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbReclaimObj needs a class definition or class object handle");
+                return nullptr;
+            }
+            c->hasT = false;   // no time is passed (38.36.1)
+            break;   // msim never reclaims a class object, so it does not run
+        case cbEndOfObject:   // 38.36.1: a transient object ends: a thread or frame (as cbEndOfThread / cbEndOfFrame)
+            if (!c->obj || (c->obj->kind != Obj::Thread && c->obj->kind != Obj::Frame && c->obj->kind != Obj::ClassObj)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: cbEndOfObject needs a thread, frame or class object handle");
+                return nullptr;
+            }
+            c->hasT = false;
+            if (c->obj->kind == Obj::ClassObj) break;   // as cbReclaimObj: never
+            (c->obj->kind == Obj::Frame ? s.frameCbs : s.thrCbs).push_back(c);
+            g_threadHook = vpi::onThread;
+            if (c->obj->kind == Obj::Frame) g_frameHook = vpi::onFrame;
+            break;
         case cbSizeChange:   // 38.36.1: a dynamic array, queue or associative array changes size
             if (!c->obj || c->obj->kind != Obj::Dyn) {
                 s.cbs.pop_back();

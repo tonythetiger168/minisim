@@ -390,6 +390,13 @@ system task or function name in the source that is neither built in nor
 registered, with the name in `cb_data->value` (`vpiStringVal`). It may
 register the name with `vpi_register_systf`; the calls then run as usual.
 
+**End of an object (38.36.1).** `cbEndOfObject` on a thread or frame handle
+runs when that thread or call ends, as `cbEndOfThread` / `cbEndOfFrame` on
+it would, with no time passed. `cbReclaimObj` takes a class definition or
+class object handle, and `cbEndOfObject` also takes a class object; msim
+never reclaims a class object (an object lives to the end of the run), so
+those two do not run.
+
 **Save, restart and reset (38.36.2).** msim has no save, restart or reset,
 so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
 `cbStartOfReset` and `cbEndOfReset` register (with a handle) and never run.
@@ -403,8 +410,7 @@ loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
-callbacks, `cbReclaimObj` /
-`cbEndOfObject` (msim does not reclaim objects), `cbSignal` and `vpi_control(vpiReset)`. A call to something not
+callbacks, `cbSignal` and `vpi_control(vpiReset)`. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
