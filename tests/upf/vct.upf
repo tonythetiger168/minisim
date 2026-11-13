@@ -1,0 +1,27 @@
+# Power intent for vct.sv: supply nets connected to HDL ports (4.10).
+upf_version 4.0
+set_design_top dut
+
+create_power_domain PD_TOP -include_scope
+create_power_domain PD_CORE -elements {u_core}
+
+foreach s {VDD VSS} {
+    create_supply_port $s
+    create_supply_net $s
+    connect_supply_net $s -ports $s
+}
+create_supply_net VREG
+
+# A table of this power intent: power-good is 1 only when fully on.
+create_upf2hdl_vct PG -hdl_type {sv logic} \
+    -table {{OFF 0} {PARTIAL_ON 0} {FULL_ON 1} {UNDETERMINED 0}}
+
+# no -vct: an output port drives the net (SV_LOGIC2UPF), an input port is driven (UPF2SV_LOGIC)
+connect_supply_net VREG -ports {u_ldo/vout u_mac/VDD}
+connect_supply_net VREG -ports {u_mac/PGOOD} -vct PG
+connect_supply_net VSS -ports {u_mac/VSSN} -vct UPF_GNDZERO2SV_LOGIC
+
+create_supply_set SS_TOP -function {power VDD} -function {ground VSS}
+create_supply_set SS_CORE -function {power VREG} -function {ground VSS}
+associate_supply_set SS_TOP -handle PD_TOP.primary
+associate_supply_set SS_CORE -handle PD_CORE.primary

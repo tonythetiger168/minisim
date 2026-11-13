@@ -22,12 +22,33 @@ msim tb.sv dut.sv -top tb -xprop -xprop-report xprop.log
 | `-xprop`, `-xprop=tmerge` | Bits on which all the possible branches agree keep their value; the others become `x`. This is what a real mux or flop could output. |
 | `-xprop=xmerge` | Every variable (or part of one) assigned in a possible branch becomes `x`. More pessimistic than hardware. |
 | `-xprop=off` | Standard behavior (the default). |
+| `-xprop=<file>`, `-xprop-config <file>` | A configuration file: X-propagation on or off per instance, subtree or module, and the merge mode (below). |
 | `-xprop-report <file>` | Lists every `if`, `case` and clock edge with its source line, whether it is merged and, if not, why. |
 
 It works the same in the interpreter and with `-compile`, and for every
 `-threads` setting: the merge is ordinary code made when the design is
 lowered. While no control is unknown the results are those of a run
 without `-xprop`.
+
+## Configuration file
+
+As VCS's: statements end with `;`, and `//` or `#` starts a comment.
+
+```
+merge = tmerge;                  // or xmerge, or vmerge (off)
+tree     {top}        {xpropOn};   // an instance and everything below it
+tree     {top.tb_mem} {xpropOff};
+instance {top.dut.u_rf} {xpropOff}; // that instance only
+module   {sync_fifo cdc_*} {xpropOff}; // every instance of these modules
+```
+
+Names are hierarchical instance paths (`instance`, `tree`) or module names
+(`module`); `*` and `?` match any text and any one character. Several names
+may share one statement. For each `always` block, the rules for its
+instance decide: an `instance` rule wins over a `module` rule, which wins
+over `tree` rules; among `tree` rules the deepest matching instance wins,
+and among equal rules the last one in the file. An instance that no rule
+names is on.
 
 ## What is merged
 
@@ -72,9 +93,30 @@ tmerge and `4'bxxxx` under xmerge.
 - **Blocking and nonblocking assignments**, to whole variables, constant
   part selects and struct members, nested to any depth, in loops, with
   temporaries and function calls in the expressions.
+- **Task and function calls** in a branch, when the task or function (and
+  every one it calls) assigns only with `=`: the static variables it writes
+  are merged like the block's own.
+- **`break` and `continue`** in `for`, `foreach`, `repeat`, `while`,
+  `do ... while` and `forever` loops. Under an unknown condition the rest
+  of the loop merges with "not run". This is pessimistic: each unknown
+  step merges with the state before it, so values that every path agrees
+  on can still come out `x`. A `while`, `do` or `forever` loop has no
+  bound, so once a `break` is unknown (or the loop condition is), the loop
+  may run any number of further passes: everything its body assigns
+  becomes `x` and the loop ends. Such a loop must not hold a nonblocking
+  assignment or an array element write (it then keeps the standard
+  behavior).
+- **Array elements chosen at run time** (`mem[addr] = d`,
+  `mem[addr] <= d`). In a possible branch the element takes the merge of
+  its present value and the new one. An index with an unknown bit, inside
+  a branch or not, names every element it may match (a bit known in both
+  must agree), and each takes that merge (`x` under xmerge); without
+  `-xprop` such a write is skipped (7.4.6). This needs a one-dimensional
+  array.
 
-Only `always`, `always_comb`, `always_ff` and `always_latch` are affected.
-`initial` and `final` blocks, tasks, functions, classes, programs, checkers
+Only `always`, `always_comb`, `always_ff` and `always_latch` are affected
+(with the tasks and functions they call). `initial` and `final` blocks,
+classes, programs, checkers
 and continuous assignments keep the standard behavior (the `?:` operator
 already merges on an unknown condition, 11.4.11).
 
@@ -90,15 +132,20 @@ A construct that cannot run speculatively keeps the standard behavior
 report names each one:
 
 ```
-xprop tmerge: 10 of 12 if / case / edge constructs merged
-dut.sv:25: if: not merged, it holds a jump out of the branch (break, continue, return or disable)
-dut.sv:29: if: not merged, it holds a task or function call statement
-dut.sv:32: case: merged
+xprop tmerge: 16 of 19 if / case / edge constructs merged
+dut.sv:27: loop body: merged
+dut.sv:57: if: not merged, it holds a jump out of the branch (break, continue, return or disable)
+dut.sv:61: if: not merged, it holds a task or function call statement
+dut.sv:44: case: merged
 ```
 
 - a delay, event control, `wait` or `fork` in a branch;
-- a call of a task or of a function as a statement;
-- `break`, `continue`, `return` or `disable` that leaves the branch;
+- a call of a task or function that has a nonblocking assignment, a delay,
+  an event control or a `fork`, or that writes an array element, a
+  container or a net;
+- `break` or `continue` out of a `while`, `do ... while` or `forever` loop
+  whose body has a nonblocking assignment or writes an array element, and
+  `disable` of a block outside the branch;
 - a blocking assignment to a queue, dynamic or associative array, a real, a
   string or a class property;
 - `case ... inside`, `case ... matches`, `if ... matches`, and `casez` /
@@ -114,29 +161,36 @@ make their target `x` instead of merging values.
 - a nonblocking assignment to a variable that one pass over the block can
   assign more than once, when the block also has a delay or an event
   control past the first;
-- every nonblocking assignment of a block that calls a task or has a
-  `fork`.
+- every nonblocking assignment of a block that calls a task that is not
+  merged (above), or has a `fork`.
 
-An assignment to an array element chosen at run time (`mem[addr] = d`,
-`mem[addr] <= d`) in a possible branch stores the merge of the element's
-present value and the new one. That is exact for one write, such as
-`if (we) mem[addr] <= d;`. When several possible branches write the same
-element, or a branch reads back an element it wrote, the result has x
-where the present value differs, even if every branch agrees. A write
-whose index is unknown is skipped, as the standard says (7.4.6).
+An array element merges with its present value, which is exact for one
+write such as `if (we) mem[addr] <= d;`. When several possible branches
+write the same element, or a branch reads back an element it wrote, the
+result has `x` where the present value differs, even if every branch
+agrees. An unknown index of a multidimensional array keeps the standard
+behavior (the write is skipped).
 
-Known limits: two signals of one event list that change in the same time
+Known limit: two signals of one event list that change in the same time
 step but in different delta cycles, the first with a clean edge and the
-second from or to `x`, are taken as one clean edge. A function called from
-a merged branch runs for every possible branch; its writes to variables
-outside the function are not merged.
+second from or to `x`, are taken as one clean edge.
 
 ## Cost
 
-A run with `-xprop` does more work per `if` and `case`. An `if` tests its
-condition once, with a jump that has a third target for an unknown value.
+While every condition is known, `-xprop` should cost close to nothing. So
+a block made of plain assignments, `if` and `case` is lowered twice: a
+clean copy, as without `-xprop`, and a merging copy. The clean copy runs
+first. When an `if` condition or a `case` selector is unknown, a jump with
+a third target for an unknown value moves to the same place in the merging
+copy, which finishes the pass. An ambiguous clock edge starts in the
+merging copy; a clocked function skips that test in a time step where no
+signal has changed from or to x. A `case` in the clean copy is the standard
+one, after one test of its selector. A block that assigns a variable with `<=` more than once in
+a pass, or that holds other statements (tasks, messages, delays), has only
+the merging copy, which tests after each branch whether a merge is running.
+
 The temporaries of the merge are stored without going through the
 scheduler, so clocked blocks still run as parallel clocked functions and
 combinational blocks stay in the static schedule. On Ibex (lowRISC,
-118 745 cycles) the interpreter takes 26 s with `-xprop` and 19 s without
-(31 s with `-threads 1`); with `-compile` a run with `-xprop` takes 7 s.
+118 745 cycles) the interpreter takes 25 s with `-xprop` and 22.5 s
+without.

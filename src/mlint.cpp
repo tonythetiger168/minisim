@@ -15,7 +15,8 @@
 //   L003  a non-blocking assignment in an always_comb.
 //   L004  one variable or net is assigned by more than one process.
 //   CDC001..CDC005, RDC001..RDC004  clock- and reset-domain crossings (cdc.hpp).
-//   UPF001..UPF006  with -upf: power intent checks (upf.hpp check()).
+//   UPF001..UPF007  with -upf: power intent checks (upf.hpp check()).
+#include "upf_hdl.hpp"
 #include <unistd.h>
 
 #include <chrono>
@@ -33,6 +34,7 @@
 #endif
 #include "parallel.hpp"
 #include "upf.hpp"
+#include "upf_design.hpp"
 #include "version.hpp"
 
 using namespace lintir;
@@ -74,83 +76,17 @@ void checkDrivers(const std::map<const Symbol*, std::vector<SourceLocation>>& dr
 }
 
 // ------------------------------------------------------------- UPF (1801)
-// The design as UPF sees it: instance paths and signal names as msim names
-// them (relative to the top, '.' between levels, generate blocks as
-// "gen[1]"), and every port connection of a child instance.
-void upfWalk(const Scope& sc, const std::string& path, upf::DesignView& dv, const SourceManager& sm) {
-    auto in = [&](const std::string& n) { return path.empty() ? n : path + "." + n; };
-    auto loc = [&](SourceLocation l) {
-        if (!l) return std::string("?");
-        auto f = sm.getFullyOriginalLoc(l);
-        return std::string(sm.getFileName(f)) + ":" + std::to_string(sm.getLineNumber(f));
-    };
-    for (const Symbol& m : sc.members()) {
-        if (m.kind == SymbolKind::Variable || m.kind == SymbolKind::Net) dv.signals.insert(in(std::string(m.name)));
-        if (m.kind == SymbolKind::Instance) {
-            const auto& ch = m.as<InstanceSymbol>();
-            std::string p = in(std::string(ch.name));
-            dv.instances.insert(p);
-            for (const PortConnection* c : ch.getPortConnections()) {
-                if (!c || c->port.kind != SymbolKind::Port) continue;
-                const auto& ps = c->port.as<PortSymbol>();
-                upf::PortSite site;
-                site.inst = p;
-                site.port = std::string(ps.name);
-                site.dir = ps.direction == ArgumentDirection::In ? 0 : ps.direction == ArgumentDirection::Out ? 1 : 2;
-                site.width = (int)ps.getType().getBitWidth();
-                const Expression* x = c->getExpression();
-                site.where = loc(x && x->sourceRange.start() ? x->sourceRange.start() : ch.location);
-                if (x) dv.ports.push_back(site);
-            }
-            upfWalk(ch.body, p, dv, sm);
-        } else if (m.kind == SymbolKind::GenerateBlock) {
-            const auto& g = m.as<GenerateBlockSymbol>();
-            if (g.isUninstantiated) continue;
-            std::string p = in(g.getExternalName());
-            dv.instances.insert(p);
-            upfWalk(g, p, dv, sm);
-        } else if (m.kind == SymbolKind::GenerateBlockArray) {
-            const auto& ga = m.as<GenerateBlockArraySymbol>();
-            std::string an = ga.name.empty() ? std::string("genblk") : std::string(ga.name);
-            for (const auto* e : ga.entries) {
-                if (e->isUninstantiated) continue;
-                std::string p = in(an + "[" + (e->getArrayIndex() ? e->getArrayIndex()->toString() : std::string("?")) + "]");
-                dv.instances.insert(p);
-                upfWalk(*e, p, dv, sm);
-            }
-        }
-    }
-}
-
+// The design as UPF sees it is built by upf::designView (upf_design.hpp).
 void checkUpf(Compilation& comp, const std::string& upfPath, std::string powerTop, bool powerTopSet, Report& rep) {
     upf::Model m;
-    m.load(upfPath, "");
-    upf::DesignView dv;
-    auto tops = comp.getRoot().topInstances;
-    for (auto* t : tops) upfWalk(t->body, "", dv, *comp.getSourceManager());
-    std::string top = powerTopSet ? powerTop : m.designTop;
-    for (char& c : top) if (c == '/') c = '.';
-    while (!top.empty() && top[0] == '.') top.erase(0, 1);
-    if (tops.size() == 1 && (top == tops[0]->name || top.starts_with(std::string(tops[0]->name) + ".")))
-        top = top.substr(std::min(top.size(), tops[0]->name.size() + 1));
-    if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {   // a module name
-        std::string found;
-        std::function<void(const InstanceSymbol&, const std::string&)> walk = [&](const InstanceSymbol& in, const std::string& path) {
-            if (!found.empty()) return;
-            if (in.getDefinition().name == top && !path.empty()) { found = path; return; }
-            for (auto& mm : in.body.members())
-                if (mm.kind == SymbolKind::Instance) {
-                    auto& ch = mm.as<InstanceSymbol>();
-                    walk(ch, path.empty() ? std::string(ch.name) : path + "." + std::string(ch.name));
-                }
-        };
-        for (auto* t : tops) {
-            if (t->getDefinition().name == top) { found = "."; break; }
-            walk(*t, "");
-        }
-        top = found == "." ? "" : found.empty() ? top : found;
-    }
-    m.top = top;
+    upf::DesignView dv = upf::designView(comp);
+    upf::loadWithDesign(m, upfPath, comp, dv, powerTop, powerTopSet);
+    m.addHdlAttrs(upfHdlAttrs(comp));   // (* UPF_... *) in the HDL (5.6)
+    m.resolveApplies([&](const std::string& mod) {   // apply_power_model without -elements (6.9)
+        std::vector<std::string> r;
+        for (auto& [p, md] : dv.models) if (md == mod) r.push_back(p);
+        return r;
+    });
     for (auto& w : m.warnings) std::cerr << "mlint: UPF: " << w << "\n";
     for (auto& f : upf::check(m, dv)) {
         if (!rep.rules.enabled(f.rule)) continue;

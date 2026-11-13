@@ -266,6 +266,10 @@ it. One-hot registers tested bit by bit are followed too.
 | `CDC003` | warning | on | Combinational logic in front of a synchronizer (a glitch can be captured) |
 | `CDC004` | warning | on | Separately synchronized signals of one domain meet again (reconvergence) |
 | `CDC005` | warning | on | One signal synchronized more than once into the same domain |
+| `CDC006` | warning | on | With `-sdc`: a flop's clock is not a clock in the SDC file |
+| `CDC007` | warning | on | A clock read as data by logic |
+| `CDC008` | warning | on | A clock made by combinational logic of a clock and other signals (glitch) |
+| `CDC009` | warning | on | A one-cycle pulse from a faster clock into a slower one through a plain synchronizer (SDC periods) |
 
 ### Reset-domain crossings (`rdc`)
 
@@ -275,11 +279,13 @@ it. One-hot registers tested bit by bit are followed too.
 | `RDC002` | warning | on | One asynchronous reset used directly in several clock domains |
 | `RDC003` | warning | on | A flop feeds a flop with a different asynchronous reset, in one clock domain |
 | `RDC004` | warning | off | A reset flop feeds a flop with no asynchronous reset |
+| `RDC005` | warning | on | A reset synchronizer of one flop |
+| `RDC006` | warning | on | An asynchronous reset made by combinational logic of several flops |
 
 How domains and synchronizers are recognized, and the options `-cdc-report`,
 `-clock-group` and `-static`, are in [CDC.md](CDC.md).
 
-The UPF rules (`UPF001`..`UPF006`, with `-upf`) are in `docs/LOWPOWER.md`.
+The UPF rules (`UPF001`..`UPF007`, with `-upf`) are in `docs/LOWPOWER.md`.
 Design-for-test rules (gated clocks, logic-driven resets, divided clocks,
 both clock edges) are `mdft`'s.
 

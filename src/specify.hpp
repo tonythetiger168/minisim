@@ -65,6 +65,8 @@ struct PathRec {
     uint64_t unit = 1;           // ticks per time unit of the module
     bool annotated = false;
     bool dstVar = false;         // the output is a variable: its port connection is delayed
+    const void* sym = nullptr;   // its TimingPathSymbol (VPI: path type, polarity, condition)
+    bool dstIface = false;       // the output is a variable of an interface port (25.6): its writes are delayed
 };
 inline std::vector<PathRec>& pathRecs() { static std::vector<PathRec> v; return v; }
 
@@ -106,6 +108,9 @@ struct GateRec {
     bool annotated = false;
 };
 inline std::vector<GateRec>& gateRecs() { static std::vector<GateRec> v; return v; }
+// A continuous assignment with a delay: its gateRecs() entry, so VPI can
+// read and change the delay (38.10). Keyed by its ContinuousAssignSymbol.
+inline std::map<const void*, int>& assignGates() { static std::map<const void*, int> m; return m; }
 
 // Port connections, for INTERCONNECT between one source and one load of a
 // net with several sources (32.4.4): an output or inout formal drives its

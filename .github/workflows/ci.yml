@@ -1,8 +1,19 @@
 name: CI
 
 on:
+  # Branch pushes are already covered by the pull_request run of their PR, so
+  # only main runs on push. Running both doubled every PR's CI and left PR runs
+  # queued for hours behind the hosted-runner limit.
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A newer push to the same PR makes the older run moot; cancel it. On main every
+# merge keeps its own run, so a red main can be traced to the merge that broke it.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-test:
@@ -124,7 +135,16 @@ jobs:
 
       # memu's test also runs its output through Yosys when there is one.
       - name: Install Yosys (optional)
-        run: pip install --user yowasp-yosys && echo "$HOME/.local/bin" >> "$GITHUB_PATH" || true
+        run: |
+          pip install --user yowasp-yosys && echo "$HOME/.local/bin" >> "$GITHUB_PATH" || true
+          pip install --user mtkahypar || true
+
+      # A one-node Slurm, so mregress -farm slurm runs on a real scheduler
+      # (test mregress_slurm). Without it that test skips.
+      - name: Start a one-node Slurm (mregress -farm test)
+        if: env.APT_OK == '1'
+        continue-on-error: true
+        run: sudo timeout 300 apt-get install -y slurm-wlm munge && sudo timeout 120 sh tests/regress/slurm_up.sh
 
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
       - name: Configure, build, and test with slang

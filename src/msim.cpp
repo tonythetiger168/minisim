@@ -29,9 +29,21 @@
 //                    pulse styles of every path output (30.7.4)
 //   -fst [<file>]    write an FST waveform (default dump.fst); -vcd x.fst too
 //   -vcd-arrays [N]  also write unpacked array elements (arrays of up to N, default 1024)
+//   -vcd-class [N]   also write class objects through handle variables (h.addr), N levels
 //   -saif [<file>]   write switching activity as SAIF (default dump.saif): the
 //                    time each bit spent at 0, 1 and x and its toggle count,
 //                    for power analysis with mpower (docs/POWER.md)
+//   -restore <file> [+args]  go back to a $save checkpoint and go on (docs/CHECKPOINT.md)
+//   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
+//   -xrun, -irun     take the rest of the command line as xrun / irun options
+//                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
+//   -profile [<file>] time every process and region and write a report
+//                    (default simprofile.txt): busiest processes, time per
+//                    instance, file and kind. Runs the interpreter on one thread.
+//   -saif_forward <file>  a forward SAIF file (IEEE 1801-2024 Annex J.4, J.5)
+//                    for -saif: a library one adds state- and path-dependent
+//                    activity of its cells, an RTL one keeps only its mapped
+//                    points (repeatable)
 //   -maxtime <n>     stop after simulation time n (default: run until no events or $finish)
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
@@ -111,7 +123,10 @@
 //
 // Exit status: 0 when the simulation ran, 1 on a compile or lowering error,
 // 2 on a bad command line.
+#include <array>
 #include <atomic>
+#include <functional>
+#include <sstream>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -140,8 +155,10 @@
 #include <unistd.h>
 
 #include "codegen.hpp"
+#include "cov_select.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
+#include "saif_fwd.hpp"
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
@@ -155,8 +172,13 @@
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
 #include "upf_rt.inc"
+#include "upf_design.hpp"
+#include "upf_hdl.hpp"
 #include "dpi.inc"
 #include "vpi.inc"
+#include "interactive.inc"
+#include "objview.inc"
+#include "xrun.inc"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -307,7 +329,7 @@ struct Plan {
 // run time; the drive of its ~1700 single-driver nets was another quarter.
 static void mergePartialDrivers(LowerResult& lowered) {
     if (!S.varPathDrv.empty() || !S.loadsOf.empty() || !lowered.netDelays.empty()) return;
-    for (auto& t : S.tranOf) if (!t.empty()) return;
+    if (!lowered.trans.empty()) return;   // switches resolve their nets from the drivers (S.tranOf is set later)
     for (uint8_t b : S.pathIn) if (b) return;
     size_t ns = S.sigs.size();
     std::vector<std::vector<Instr*>> by(ns);
@@ -317,6 +339,10 @@ static void mergePartialDrivers(LowerResult& lowered) {
     for (auto& lp : lowered.procs)
         for (auto& i : lp.prog.code)
             if (i.k == IK::Force) return;   // release goes back to the drivers (10.6.2)
+    for (auto& sp : lowered.subs)   // also a force in a task or function
+        if (sp)
+            for (auto& i : sp->code)
+                if (i.k == IK::Force) return;
     for (auto& lp : lowered.procs) {
         auto& code = lp.prog.code;
         // Only a continuous assign: Assign, wait, jump back.
@@ -348,6 +374,395 @@ static void mergePartialDrivers(LowerResult& lowered) {
     }
 }
 
+// A for loop with a constant trip count in a clocked process (the reset of
+// a register file: for (int i = 0; i < 16; i++) rf[i] <= 0) is unrolled:
+// each copy reads i as a constant, so an array write gets its fixed
+// element and the process needs neither the blocking writes of i nor a
+// jump back. It then runs in the cycle domain like any other register
+// process (bench/gen_soc.py: 512 such processes were coroutines). The loop
+// variable is automatic and local to the loop (12.7.1); it is kept out of
+// the waveform, which never shows automatic variables (21.7.1.2).
+static void unrollSeqLoops(LowerResult& lowered) {
+    std::set<int> lv(loopVarSigs().begin(), loopVarSigs().end());
+    if (lv.empty()) return;
+    const bool dbg = std::getenv("MSIM_WHYUNROLL") != nullptr;
+    auto plainW = [](const Instr& i) {
+        return i.sig >= 0 && i.hi < 0 && !i.arr && i.aidx.empty() && !i.bidx && i.drv < 0 && i.dyn < 0 && !i.de && !i.delay &&
+               i.dly.empty() && !i.tmp && i.gate < 0 && !i.udp;
+    };
+    // The value of e when signal `var` holds `v` and nothing else is read.
+    auto constEval = [](const E& e, int var, const Val* v, Val& out) {
+        bool other = false;
+        Reader rd = [&](int s) -> Val {
+            if (v && s == var) return *v;
+            other = true;
+            return S.sigs[(size_t)s].val;
+        };
+        try { out = eval(e, rd); } catch (...) { return false; }
+        return !other;
+    };
+    std::function<E(const E&, int, const Val&)> sub = [&](const E& e, int var, const Val& v) -> E {
+        if (!e) return e;
+        if (e->op == Op::Ref && e->sig == var && !e->at && !e->arr) { Val k = v; k.sgn = e->sgn; return konst(k); }
+        bool hit = false;
+        std::function<bool(const E&)> has = [&](const E& x) {
+            if (!x) return false;
+            if (x->op == Op::Ref && x->sig == var) return true;
+            if (has(x->at)) return true;
+            for (auto& k : x->kids) if (has(k)) return true;
+            return false;
+        };
+        hit = has(e);
+        if (!hit) return e;
+        auto c = std::make_shared<Expr>(*e);
+        c->at = sub(c->at, var, v);
+        for (auto& k : c->kids) k = sub(k, var, v);
+        return c;
+    };
+    std::set<int> used;
+    for (auto& lp : lowered.procs) {
+        if (lp.program >= 0 || lp.reactive) continue;
+        auto& code = lp.prog.code;
+        size_t n = code.size();
+        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[0].k != IK::WaitEdge || code[n - 1].k != IK::Jmp ||
+            code[n - 1].target != 0)
+            continue;
+        for (size_t pc = 1; pc + 3 < code.size(); pc++) {
+            // i = c; top: if (!(cond)) goto E; body; step: i = f(i); goto top; E:
+            const Instr& a = code[pc];
+            if (a.k != IK::Assign || !lv.count(a.sig) || !plainW(a)) continue;
+            int var = a.sig;
+            const Instr& t = code[pc + 1];
+            if (t.k != IK::JmpIfNot || t.xt != Instr::NOX || t.target < pc + 4 || t.target >= code.size()) continue;
+            size_t top = pc + 1, E = t.target, step = E - 2;
+            if (code[E - 1].k != IK::Jmp || code[E - 1].target != top) continue;
+            if (code[step].k != IK::Assign || code[step].sig != var || !plainW(code[step])) continue;
+            bool ok = true;
+            for (size_t b = top + 1; b < step && ok; b++) {
+                const Instr& x = code[b];
+                if (x.k == IK::Nba) ok = x.sig != var && x.drv < 0 && x.dyn < 0 && !x.nbaLater && !x.de && !x.delay;
+                else if (x.k == IK::Jmp || x.k == IK::JmpIfNot)
+                    ok = x.target > b && x.target <= E && x.xt == Instr::NOX;   // forward, inside or to the end
+                else ok = false;
+            }
+            // Nothing else jumps into the loop.
+            for (size_t b = 0; b < code.size() && ok; b++) {
+                if (b >= top && b < E) continue;
+                const Instr& x = code[b];
+                if ((x.k == IK::Jmp || x.k == IK::JmpIfNot) && ((x.target > pc && x.target < E) || (x.xt != Instr::NOX && x.xt > pc && x.xt < E)))
+                    ok = false;
+            }
+            Val v;
+            if (!ok || !constEval(a.e, var, nullptr, v)) continue;
+            int w = S.sigs[(size_t)var].w;
+            v = v_resize(v, w, v.sgn); v.sgn = false;
+            std::vector<Instr> out;
+            size_t bodyN = step - (top + 1);
+            std::vector<size_t> breaks;   // jumps to E, patched at the end
+            int iters = 0;
+            while (ok) {
+                Val c;
+                if (!constEval(t.e, var, &v, c) || c.x) { ok = false; break; }
+                if (truth(c) != 1) break;
+                if (++iters > 64 || out.size() + bodyN > 4096) { ok = false; break; }
+                size_t base = out.size();
+                for (size_t b = top + 1; b < step; b++) {
+                    Instr x = code[b];
+                    x.e = sub(x.e, var, v);
+                    for (auto& ai : x.aidx) ai = sub(ai, var, v);
+                    x.bidx = sub(x.bidx, var, v);   // v[i*8 +: 8] <= ...: the bit index too
+                    if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
+                        if (x.target == E) breaks.push_back(out.size());
+                        else x.target = base + (x.target - (top + 1));   // the step: the end of this copy
+                    }
+                    if (x.k == IK::Nba && x.arr && x.arr->base >= 0 && !x.arr->dynElem && !x.aidx.empty()) {   // a fixed element now?
+                        std::vector<int64_t> idx;
+                        bool fixed = true;
+                        for (auto& ai : x.aidx) {
+                            Val iv;
+                            if (!constEval(ai, -1, nullptr, iv) || iv.x) { fixed = false; break; }
+                            idx.push_back(v_to_i64(iv));
+                        }
+                        if (fixed) {
+                            int64_t off = x.arr->offset(idx);
+                            if (off < 0) { x = Instr{}; x.k = IK::Jmp; x.target = out.size() + 1; }   // an invalid index writes nothing (7.4.6)
+                            else { x.sig = x.arr->base + (int)off; x.arr = nullptr; x.aidx.clear(); }
+                        }
+                    }
+                    out.push_back(std::move(x));
+                }
+                Val nv;
+                if (!constEval(code[step].e, var, &v, nv)) { ok = false; break; }
+                v = v_resize(nv, w, nv.sgn); v.sgn = false;
+            }
+            if (!ok) continue;
+            // Splice: [pc, E) becomes `out`; later targets move by the difference.
+            size_t start = pc;
+            long delta = (long)out.size() - (long)(E - pc);
+            for (auto& x : out) if ((x.k == IK::Jmp || x.k == IK::JmpIfNot)) x.target += start;
+            for (size_t b : breaks) out[b].target = start + out.size();
+            for (size_t b = 0; b < code.size(); b++) {
+                if (b >= pc && b < E) continue;
+                Instr& x = code[b];
+                if ((x.k == IK::Jmp || x.k == IK::JmpIfNot) && x.target >= E) x.target += delta;
+                if (x.xt != Instr::NOX && x.xt >= E) x.xt += delta;
+            }
+            for (auto& x : out) x.line = x.line ? x.line : code[pc].line;
+            code.erase(code.begin() + (long)pc, code.begin() + (long)E);
+            code.insert(code.begin() + (long)pc, out.begin(), out.end());
+            used.insert(var);
+            if (dbg) std::cerr << "unrolled " << S.sigs[(size_t)var].name << ": " << iters << " times, " << out.size() << " instructions\n";
+            pc += out.size() ? out.size() - 1 : 0;
+        }
+        // What is left of an unrolled variable here: constant writes (its
+        // initial value at the block's entry) that nothing reads.
+        std::set<int> mine;
+        for (auto& x : code) if (x.k == IK::Assign && used.count(x.sig)) mine.insert(x.sig);
+        if (mine.empty()) continue;
+        std::function<void(const E&)> rd = [&](const E& e) {
+            if (!e) return;
+            if (e->op == Op::Ref) mine.erase(e->sig);
+            if (e->arr) mine.erase(e->arr->base);
+            rd(e->at);
+            for (auto& k : e->kids) rd(k);
+        };
+        for (auto& x : code) {
+            rd(x.e); rd(x.bidx); rd(x.de); rd(x.fd); rd(x.self);
+            for (auto& a : x.aidx) rd(a);
+            for (auto& a : x.args) rd(a);
+            if (x.k != IK::Assign && x.sig >= 0) mine.erase(x.sig);
+            for (auto& [sg, ed] : x.events) mine.erase(sg);
+        }
+        for (size_t b = 0; b < code.size(); b++) {
+            Instr& x = code[b];
+            Val k;
+            if (x.k == IK::Assign && mine.count(x.sig) && plainW(x) && constEval(x.e, -1, nullptr, k)) {
+                int ln = x.line;
+                x = Instr{}; x.k = IK::Jmp; x.target = b + 1; x.line = ln;
+            }
+        }
+    }
+    for (int x : used) S.sigs[(size_t)x].hide = true;
+}
+
+// A nonblocking write to an element of a small array chosen at run time
+// (rf[wa] <= y) becomes one fixed write per element, each behind its
+// compare: if (wa == 0) rf[0] <= y; else if (wa == 1) ... An index that
+// matches none (x, z or out of range) writes nothing, as before (7.4.6).
+// The clocked process then has only fixed targets and joins the cycle domain.
+static void fixArrayNbas(LowerResult& lowered) {
+    std::function<bool(const E&)> pure = [&](const E& e) {
+        if (!e) return true;
+        if (e->at) return false;
+        if (!(e->op <= Op::Mux || e->op == Op::WildEq || (e->op == Op::ArrRead && e->arr && !e->arr->dynElem))) return false;
+        for (auto& k : e->kids) if (!pure(k)) return false;
+        return true;
+    };
+    for (auto& lp : lowered.procs) {
+        if (lp.program >= 0 || lp.reactive) continue;
+        auto& code = lp.prog.code;
+        size_t n = code.size();
+        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[0].k != IK::WaitEdge || code[n - 1].k != IK::Jmp ||
+            code[n - 1].target != 0)
+            continue;
+        bool any = false;
+        for (auto& x : code) if (x.k == IK::Nba && x.arr) any = true;
+        if (!any) continue;
+        std::vector<Instr> out;
+        std::vector<char> made;          // a jump made here: its target is already a new pc
+        std::vector<size_t> at(n + 1);   // old pc -> new pc
+        for (size_t pc = 0; pc < n; pc++) {
+            at[pc] = out.size();
+            made.resize(out.size(), 0);
+            const Instr& x = code[pc];
+            const ArrShape* a = x.arr.get();
+            bool ok = x.k == IK::Nba && a && a->base >= 0 && !a->dynElem && x.aidx.size() == 1 && a->dims.size() == 1 && a->count >= 1 &&
+                      a->count <= 32 && x.drv < 0 && x.dyn < 0 && !x.nbaLater && !x.de && !x.delay && x.dly.empty() && !x.bidx &&
+                      std::min(a->dims[0].first, a->dims[0].second) >= 0 && pure(x.aidx[0]) && pure(x.e);
+            if (!ok) { out.push_back(x); made.push_back(0); continue; }
+            auto [l, r] = a->dims[0];
+            std::vector<size_t> ends;
+            for (int o = 0; o < a->count; o++) {
+                int64_t idx = l <= r ? l + o : l - o;
+                Instr j; j.k = IK::JmpIfNot; j.line = x.line;
+                j.e = node(Op::Eq, {x.aidx[0], konst(make((uint64_t)idx, 0, 64))});
+                size_t jp = out.size();
+                out.push_back(j);
+                Instr w = x;
+                w.sig = a->base + o; w.arr = nullptr; w.aidx.clear();
+                out.push_back(w);
+                Instr e; e.k = IK::Jmp; e.line = x.line;
+                ends.push_back(out.size());
+                out.push_back(e);
+                out[jp].target = out.size();   // relative to out, as new pcs
+            }
+            for (size_t k : ends) out[k].target = out.size();
+            made.resize(out.size(), 1);
+        }
+        at[n] = out.size();
+        for (size_t k = 0; k < out.size(); k++) {
+            Instr& x = out[k];
+            if ((x.k != IK::Jmp && x.k != IK::JmpIfNot) || made[k]) continue;
+            x.target = at[std::min<size_t>(x.target, n)];
+            if (x.xt != Instr::NOX) x.xt = at[std::min<size_t>(x.xt, n)];
+        }
+        code = std::move(out);
+    }
+}
+
+// `always @*` (9.4.2.2) lowers to WaitEdge(reads) ; body ; Jmp 0: it waits
+// first, so it is not a combinational shape (body ; WaitEdge ; Jmp 0) and
+// stays a coroutine. A body of plain assignments and forward jumps becomes
+//     JmpIfNot armed -> W ; body ; W: WaitEdge(reads, armed) ; Jmp 0
+// which the static schedule ranks like an always_comb (as Verilator treats
+// @*). Unlike always_comb, @* does not run at time 0: its outputs keep their
+// values until an input changes. `armed` (2-state, 0) is set by a one-shot
+// process that waits once on the same inputs, so the body runs from the
+// first change on, as the waiting process would. MSIM_NOATSTAR=1 keeps the
+// coroutines.
+static void rotateAtStar(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYATSTAR") != nullptr;
+    size_t done = 0, np = lowered.procs.size();
+    for (size_t pi = 0; pi < np; pi++) {
+        auto& pr = lowered.procs[pi];
+        Prog& q = pr.prog;
+        size_t n = q.code.size();
+        if (pr.kind != "Always" || !pr.loops || pr.program >= 0 || pr.reactive || n < 3) continue;
+        if (!q.roots.empty() || !q.spans.empty()) continue;
+        const Instr& w = q.code[0];
+        const Instr& j = q.code[n - 1];
+        if (w.k != IK::WaitEdge || w.dynWait || j.k != IK::Jmp || j.target != 0) continue;
+        std::vector<std::pair<int, Edge>> ev = w.events.empty() ? std::vector<std::pair<int, Edge>>{{w.sig, w.edge}} : w.events;
+        bool ok = true;
+        for (auto& [sg, ed] : ev) ok &= ed == ANY && sg >= 0;
+        for (size_t pc = 1; ok && pc + 1 < n; pc++) {
+            const Instr& x = q.code[pc];
+            if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
+                ok &= x.target > pc && x.target <= n - 1 && (x.xt == Instr::NOX || (x.xt > pc && x.xt <= n - 1));
+            } else if (x.k == IK::Assert) ok &= x.join == 1 || x.join == 2;
+            else ok &= x.k == IK::Assign && !x.de && !x.delay && x.dly.empty();
+        }
+        if (!ok) continue;
+        // The wait must cover everything the body reads (the sensitivity of
+        // @*, or a complete hand-written list).
+        auto rs = combReadSet(q);
+        std::set<int> have;
+        for (auto& e : ev) have.insert(e.first);
+        for (auto& e : rs) ok &= have.count(e.first) > 0;
+        if (!ok) { if (dbg) std::cerr << "@* kept: the wait misses a read, line " << q.code[1].line << "\n"; continue; }
+        int armed = S.sig("$atstar" + std::to_string(done), 1, false);
+        S.sigs[(size_t)armed].val = Val{0, 0, 1, 0, false};
+        S.sigs[(size_t)armed].hide = true;
+        Instr gate;
+        gate.k = IK::JmpIfNot;
+        gate.e = ref(armed);
+        gate.target = n - 1;
+        gate.line = q.code[1].line;
+        gate.file = q.code[1].file;
+        Instr wait = q.code[0];
+        ev.push_back({armed, ANY});
+        wait = waitInstr(ev);
+        wait.line = q.code[0].line;
+        wait.file = q.code[0].file;
+        q.code[0] = gate;
+        q.code.insert(q.code.end() - 1, wait);
+        // The one-shot process: wait for the first change, then arm.
+        LoweredProc arm;
+        arm.kind = "Always";
+        arm.loops = false;
+        arm.scope = pr.scope;
+        Instr w1 = waitInstr(std::vector<std::pair<int, Edge>>(ev.begin(), ev.end() - 1));
+        Instr set;
+        set.k = IK::Assign;
+        set.sig = armed;
+        set.e = konst(Val{1, 0, 1, 0, false});
+        arm.prog.code = {w1, set};
+        // The one-shot process takes the block's place in the start order,
+        // so it waits as early as the block would have (a change at time 0
+        // from a later process still wakes it); the block, now ranked, goes last.
+        LoweredProc blk = std::move(pr);
+        lowered.procs[pi] = std::move(arm);
+        lowered.procs.push_back(std::move(blk));
+        done++;
+    }
+    if (dbg) std::cerr << "@* rotated: " << done << "\n";
+}
+
+// A clocked block that keeps working values in module variables with
+// blocking assignments (PicoRV32's `set_mem_do_rinst = 0; ... if (...)
+// set_mem_do_rinst = 1;`) is not a seqShape: its Assigns wake readers, so
+// it stays a coroutine. When no other process, final block or wait touches
+// such a variable and nothing dumps waveforms, nobody can see the change
+// events: its Assigns become temporaries (Instr::tmp, a store without
+// notification; the value is still kept in the signal, so a read before the
+// first write of an activation sees the last one, as before), and the block
+// can join the static clocked schedule. MSIM_NOSEQTMP=1 keeps them.
+static void localizeSeqBlocking(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYSEQTMP") != nullptr;
+    size_t ns = S.sigs.size();
+    // Per signal: the process that touches it, -1 none, -2 more than one or something else.
+    std::vector<int> owner(ns, -1);
+    auto touch = [&](int s, int who) {
+        if (s < 0 || (size_t)s >= ns) return;
+        int& o = owner[s];
+        o = (o == -1 || o == who) ? who : -2;
+    };
+    auto scanProg = [&](const Prog& top, int who) -> bool {
+        std::vector<const Prog*> seen, todo{&top};
+        while (!todo.empty()) {
+            const Prog* p = todo.back(); todo.pop_back();
+            if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+            seen.push_back(p);
+            for (const Instr& i : p->code) {
+                if (i.k == IK::Dump) return false;
+                touch(i.sig, who);
+                for (auto& [sg, ed] : i.events) touch(sg, who);
+                if (i.arr) for (int k = 0; k < i.arr->count; k++) touch(i.arr->base + k, who);
+                if (i.k == IK::Call && i.callee) todo.push_back(i.callee);
+                for (const Prog* b : i.branches) todo.push_back(b);
+            }
+            std::vector<int> rd;
+            std::vector<const Prog*> seen2;
+            collectProgRefs(*p, rd, seen2);
+            for (int r : rd) touch(r, who);
+        }
+        return true;
+    };
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++)
+        if (!scanProg(lowered.procs[pi].prog, (int)pi)) return;
+    for (auto& f : lowered.finals) if (!scanProg(f.prog, -2)) return;
+    for (auto& sp : lowered.subs) if (sp) for (const Instr& i : sp->code) if (i.k == IK::Dump) return;
+    size_t done = 0, procsDone = 0;
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++) {
+        auto& pr = lowered.procs[pi];
+        Prog& q = pr.prog;
+        size_t n = q.code.size();
+        if (!pr.loops || pr.program >= 0 || pr.reactive || n < 3) continue;
+        if (!q.roots.empty() || !q.spans.empty()) continue;
+        if (q.code[0].k != IK::WaitEdge || q.code[n - 1].k != IK::Jmp || q.code[n - 1].target != 0) continue;
+        bool edge = !q.code[0].events.empty() || q.code[0].edge != ANY;
+        for (auto& [sg, ed] : q.code[0].events) edge &= ed != ANY;
+        if (!edge) continue;   // a clocked block only
+        std::vector<size_t> cand;
+        bool ok = true;
+        for (size_t pc = 1; ok && pc + 1 < n; pc++) {
+            const Instr& x = q.code[pc];
+            if (x.k != IK::Assign || x.tmp) continue;
+            ok = x.sig >= 0 && (size_t)x.sig < ns && owner[x.sig] == (int)pi && x.drv < 0 && !x.arr && x.aidx.empty() &&
+                 x.dyn < 0 && !x.de && !x.delay && x.dly.empty() && x.gate < 0 && !x.udp;
+            cand.push_back(pc);
+        }
+        if (!ok || cand.empty()) {
+            if (dbg && !cand.empty()) std::cerr << "seqtmp kept: line " << q.code[1].line << "\n";
+            continue;
+        }
+        for (size_t pc : cand) q.code[pc].tmp = true;
+        done += cand.size();
+        procsDone++;
+    }
+    if (dbg) std::cerr << "seqtmp: " << done << " assigns in " << procsDone << " clocked blocks\n";
+}
+
 // Subroutine calls in a combinational block (always_comb, or an assign whose
 // value calls a function) are expanded in place, so the block is straight
 // code that the static schedule can rank and split like any other. A static
@@ -366,7 +781,7 @@ static void inlineCombCalls(LowerResult& lowered) {
     };
     // A body that is only assignments, forward branches, deferred assertions and such calls.
     std::function<bool(const Prog&, int)> okBody = [&](const Prog& c, int depth) {
-        if (depth > 16 || !c.roots.empty()) return false;
+        if (depth > 16 || !c.roots.empty() || !c.spans.empty()) return false;   // spans: a disable finds it by its own code (9.6.2)
         for (size_t pc = 0; pc < c.code.size(); pc++) {
             const Instr& i = c.code[pc];
             if (i.k == IK::Jmp || i.k == IK::JmpIfNot) {
@@ -510,7 +925,7 @@ static void inlineCombCalls(LowerResult& lowered) {
         if (lp.program >= 0 || lp.reactive) continue;
         const Prog& p = lp.prog;
         size_t n = p.code.size();
-        if (n < 3 || !p.roots.empty() || p.code[n - 1].k != IK::Jmp || p.code[n - 1].target != 0 || p.code[n - 2].k != IK::WaitEdge) continue;
+        if (n < 3 || !p.roots.empty() || !p.spans.empty() || p.code[n - 1].k != IK::Jmp || p.code[n - 1].target != 0 || p.code[n - 2].k != IK::WaitEdge) continue;
         bool calls = false, ok = true;
         for (size_t pc = 0; pc + 2 < n && ok; pc++) {
             const Instr& i = p.code[pc];
@@ -892,6 +1307,7 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
                 const Instr& x = q.code[pc];
                 if (x.k == IK::WaitEdge) waits++;
                 else if (x.k == IK::Assign) { blk++; if (x.arr || !x.aidx.empty() || x.bidx) arr++;
+                    if (x.sig >= 0 && (size_t)x.sig < S.sigs.size()) w += " blk(" + S.sigs[(size_t)x.sig].name + ")";
                     if (x.arr) w += " arrW(" + S.sigs[x.arr->base].name + " n=" + std::to_string(x.arr->count) + ")";
                     else if (x.bidx) w += " bidx(" + S.sigs[x.sig].name + ")";
                     if (x.dyn >= 0) w += " dyn"; if (x.de || x.delay || !x.dly.empty()) w += " dly"; }
@@ -999,12 +1415,12 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
-                    : lowered.timescale() != "1ns" ? "a `timescale precision other than 1ns"
                     : std::any_of(asserts().begin(), asserts().end(), [](const AssertInfo& a) {
                           return a.hidden || (a.type & (AT_CONCURRENT | AT_FINAL | AT_EXPECT));
                       }) ? "a concurrent, final or expect assertion"
                     : !clockings().empty() ? "a clocking block"
                     : !cgDefs().empty() ? "a covergroup"
+                    : annexDUsed() ? "an Annex D system task"
                     : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
@@ -1014,7 +1430,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // With a VCD every signal must live in S.sigs, so no private signals.
         // A large design is built as several files at once, one per core (16 at most).
         src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
-                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()));
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale());
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -1180,7 +1596,297 @@ static void collectProgs(const Prog* p, std::vector<const Prog*>& all, std::unor
         for (auto* b : i.branches) collectProgs(b, all, seen);
     }
 }
+// Coverage access from SystemVerilog (20.13, 40.3.2): $coverage_control,
+// $coverage_get_max, $coverage_get, $coverage_save and $coverage_merge.
+// Statement, toggle and FSM state coverage exist only with msim -cov;
+// assertion coverage (an assertion or cover with at least one success)
+// always does. A hierarchy is a list of instance paths below the top.
+namespace covapi {
+enum { START = 0, STOP = 1, RESET = 2, CHECK = 3, MODULE = 10, HIER = 11,
+       ASSERTION = 20, FSM_STATE = 21, STATEMENT = 22, TOGGLE = 23,
+       OVERFLOW = -2, ERROR = -1, NOCOV = 0, OK = 1, PARTIAL = 2 };
+struct Stmt { std::string scope; uint32_t file, line; std::vector<uint64_t*> hits; };
+const LowerResult* lw = nullptr;
+std::vector<Stmt> stmts;
+bool built = false;
+// Stopped items keep the values they had at the stop; START puts them back
+// (what ran while stopped is not counted), queries read them meanwhile.
+std::map<uint64_t*, uint64_t> stopStmt;
+std::map<int, std::pair<std::vector<uint64_t>, std::vector<uint64_t>>> stopTog;
+std::map<int, std::array<uint64_t, 3>> stopAssert;
+std::map<size_t, std::map<uint64_t, uint64_t>> stopFsm;
+
+void build() {
+    if (built) return;
+    built = true;
+    std::map<std::tuple<std::string, uint32_t, uint32_t>, size_t> at;
+    std::function<void(const Prog*, const std::string&, std::unordered_set<const Prog*>&)> walk =
+        [&](const Prog* p, const std::string& sc, std::unordered_set<const Prog*>& seen) {
+            if (!p || !seen.insert(p).second) return;
+            for (auto& i : p->code) {
+                if (i.line) {
+                    auto key = std::make_tuple(sc, i.file, i.line);
+                    auto it = at.find(key);
+                    if (it == at.end()) { it = at.emplace(key, stmts.size()).first; stmts.push_back({sc, i.file, i.line, {}}); }
+                    stmts[it->second].hits.push_back(const_cast<uint64_t*>(&i.hits));
+                }
+                for (auto* b : i.branches) walk(b, sc, seen);
+            }
+        };
+    for (auto& p : lw->procs) { std::unordered_set<const Prog*> seen; walk(&p.prog, p.scope, seen); }
+    for (auto& p : lw->finals) { std::unordered_set<const Prog*> seen; walk(&p.prog, p.scope, seen); }
+}
+// "top.u1.x" -> "u1": the instance below the top of a signal or assertion.
+std::string instOfSig(const std::string& n) {
+    int br = 0;
+    size_t cut = std::string::npos;
+    for (size_t k = 0; k < n.size(); k++) {
+        if (n[k] == '[') br++;
+        else if (n[k] == ']') br--;
+        else if (n[k] == '.' && !br) cut = k;
+    }
+    return cut == std::string::npos ? std::string() : n.substr(0, cut);
+}
+std::string belowTop(const std::string& inst) {
+    size_t d = inst.find('.');
+    return d == std::string::npos ? std::string() : inst.substr(d + 1);
+}
+struct Sel {
+    std::vector<std::string> paths;
+    bool all = false, hier = false, bad = false;
+    bool has(const std::string& sc) const {
+        if (all) return hier || sc.empty();
+        for (const auto& p : paths) {
+            if (sc == p) return true;
+            if (hier && (p.empty() || (sc.size() > p.size() && sc.compare(0, p.size(), p) == 0 && sc[p.size()] == '.'))) return true;
+        }
+        return false;
+    }
+};
+Sel selOf(int64_t scopeDef, const std::string& t) {
+    Sel s;
+    if (scopeDef != MODULE && scopeDef != HIER) { s.bad = true; return s; }
+    s.hier = scopeDef == HIER;
+    if (t == "\x01") { s.bad = true; return s; }
+    if (t == "*") { s.all = true; return s; }
+    size_t b = 0;
+    for (;;) {
+        size_t e = t.find('|', b);
+        s.paths.push_back(t.substr(b, e == std::string::npos ? std::string::npos : e - b));
+        if (e == std::string::npos) break;
+        b = e + 1;
+    }
+    return s;
+}
+bool available(int64_t type) {
+    if (type == ASSERTION) return true;
+    if (type == STATEMENT || type == TOGGLE || type == FSM_STATE) return g_cov;
+    return false;
+}
+bool knownType(int64_t type) { return type >= ASSERTION && type <= TOGGLE; }
+// Every coverable item of the type in the selection: f(covered) per item.
+// op: 0 count, 1 stop, 2 start, 3 reset.
+int64_t visit(int64_t type, const Sel& sel, int op, int64_t* covered) {
+    int64_t n = 0;
+    if (covered) *covered = 0;
+    if (type == STATEMENT) {
+        build();
+        for (auto& st : stmts) {
+            if (!sel.has(st.scope)) continue;
+            n++;
+            uint64_t h = 0;
+            for (uint64_t* c : st.hits) {
+                auto sit = stopStmt.find(c);
+                uint64_t v = sit != stopStmt.end() ? sit->second : *c;
+                h = std::max(h, v);
+                if (op == 1 && sit == stopStmt.end()) stopStmt[c] = *c;
+                if (op == 2 && sit != stopStmt.end()) { *c = sit->second; stopStmt.erase(sit); }
+                if (op == 3) { *c = 0; if (sit != stopStmt.end()) sit->second = 0; }
+            }
+            if (covered && h) ++*covered;
+        }
+    } else if (type == TOGGLE) {
+        for (size_t s = 0; s < S.sigs.size(); s++) {
+            const auto& g = S.sigs[s];
+            if (g.hide || g.name.find('$') != std::string::npos || !sel.has(instOfSig(g.name))) continue;
+            n += g.w;
+            if (S.togRise.size() < S.sigs.size()) { S.togRise.resize(S.sigs.size()); S.togFall.resize(S.sigs.size()); }
+            auto& R = S.togRise[s];
+            auto& F = S.togFall[s];
+            auto st = stopTog.find((int)s);
+            if (op == 1 && st == stopTog.end()) st = stopTog.emplace((int)s, std::make_pair(R, F)).first;
+            else if (op == 2 && st != stopTog.end()) { R = st->second.first; F = st->second.second; stopTog.erase(st); st = stopTog.end(); }
+            else if (op == 3) {
+                std::fill(R.begin(), R.end(), 0); std::fill(F.begin(), F.end(), 0);
+                if (st != stopTog.end()) { st->second.first.assign(st->second.first.size(), 0); st->second.second.assign(st->second.second.size(), 0); }
+            }
+            if (covered) {
+                const auto& r = st != stopTog.end() ? st->second.first : R;
+                const auto& f = st != stopTog.end() ? st->second.second : F;
+                for (size_t k = 0; k < r.size() && k < f.size(); k++) *covered += __builtin_popcountll(r[k] & f[k]);
+            }
+        }
+    } else if (type == ASSERTION) {
+        for (size_t id = 0; id < asserts().size(); id++) {
+            AssertInfo& a = asserts()[id];
+            if (a.hidden || a.prot || !sel.has(belowTop(a.inst))) continue;
+            n++;
+            auto st = stopAssert.find((int)id);
+            if (op == 1 && st == stopAssert.end()) st = stopAssert.emplace((int)id, std::array<uint64_t, 3>{a.evals, a.passes, a.fails}).first;
+            else if (op == 2 && st != stopAssert.end()) { a.evals = st->second[0]; a.passes = st->second[1]; a.fails = st->second[2]; stopAssert.erase(st); st = stopAssert.end(); }
+            else if (op == 3) { a.evals = a.passes = a.fails = 0; if (st != stopAssert.end()) st->second = {0, 0, 0}; }
+            if (covered && (st != stopAssert.end() ? st->second[1] : a.passes)) ++*covered;
+        }
+    } else if (type == FSM_STATE) {
+        for (size_t k = 0; k < fsmDefs().size(); k++) {
+            const FsmDef& d = fsmDefs()[k];
+            if (!sel.has(belowTop(d.inst)) && !sel.has(d.inst)) continue;
+            n += (int64_t)d.states.size();
+            if (S.fsmSeen.size() <= k) continue;
+            auto& seen = S.fsmSeen[k];
+            auto st = stopFsm.find(k);
+            if (op == 1 && st == stopFsm.end()) st = stopFsm.emplace(k, seen).first;
+            else if (op == 2 && st != stopFsm.end()) { seen = st->second; stopFsm.erase(st); st = stopFsm.end(); }
+            else if (op == 3) { seen.clear(); if (st != stopFsm.end()) st->second.clear(); }
+            if (covered) {
+                const auto& m = st != stopFsm.end() ? st->second : seen;
+                for (auto& [v, nm] : d.states) if (m.count(v)) ++*covered;
+            }
+        }
+    }
+    return n;
+}
+// Put stopped items back as they were at the stop, before the database is written.
+void restoreStopped() {
+    for (auto& [c, v] : stopStmt) *c = v;
+    for (auto& [s, rf] : stopTog) if ((size_t)s < S.togRise.size()) { S.togRise[(size_t)s] = rf.first; S.togFall[(size_t)s] = rf.second; }
+    for (auto& [id, a] : stopAssert) { asserts()[(size_t)id].evals = a[0]; asserts()[(size_t)id].passes = a[1]; asserts()[(size_t)id].fails = a[2]; }
+    for (auto& [k, m] : stopFsm) if (k < S.fsmSeen.size()) S.fsmSeen[k] = m;
+}
+Val ret(int64_t v) {
+    if (v > INT32_MAX) v = OVERFLOW;
+    return make((uint64_t)v, 0, 32, 0, true);
+}
+std::string dbPath(const std::string& name) { return name + ".mcovsave"; }
+Val hook(int op, const std::vector<Val>& a) {
+    auto num = [&](size_t k) -> int64_t { return k < a.size() && !a[k].x ? v_to_i64(a[k]) : -1000; };
+    auto str = [&](size_t k) { if (k >= a.size()) return std::string(); Val v = a[k]; v.str = true; return v_str(v); };
+    if (op == 0) {   // $coverage_control
+        int64_t ctl = num(0), type = num(1);
+        Sel sel = selOf(num(2), str(3));
+        if (sel.bad || ctl < START || ctl > CHECK || !knownType(type)) return ret(ERROR);
+        if (!available(type)) return ret(ctl == STOP || ctl == RESET ? OK : NOCOV);
+        int64_t n = visit(type, sel, ctl == STOP ? 1 : ctl == START ? 2 : ctl == RESET ? 3 : 0, nullptr);
+        if ((ctl == CHECK || ctl == START) && n == 0) return ret(NOCOV);
+        return ret(OK);
+    }
+    if (op == 1 || op == 2) {   // $coverage_get_max / $coverage_get
+        int64_t type = num(0);
+        Sel sel = selOf(num(1), str(2));
+        if (sel.bad || !knownType(type)) return ret(ERROR);
+        if (!available(type)) return ret(NOCOV);
+        int64_t cov = 0;
+        int64_t n = visit(type, sel, 0, &cov);
+        return ret(op == 1 ? n : cov);
+    }
+    int64_t type = num(0);
+    std::string name = str(1);
+    if (!knownType(type) || name.empty()) return ret(ERROR);
+    Sel everything;
+    everything.all = everything.hier = true;
+    if (op == 3) {   // $coverage_save: the counts of every item of the type
+        if (!available(type)) return ret(NOCOV);
+        std::ofstream f(dbPath(name));
+        if (!f) return ret(ERROR);
+        f << "msim-covsave 1 " << type << "\n";
+        if (type == STATEMENT) {
+            build();
+            for (auto& st : stmts) {
+                uint64_t h = 0;
+                for (uint64_t* c : st.hits) { auto it = stopStmt.find(c); h = std::max(h, it != stopStmt.end() ? it->second : *c); }
+                f << "S " << (st.scope.empty() ? "." : st.scope) << " " << (st.file < g_covFiles.size() ? g_covFiles[st.file] : "?") << " " << st.line << " " << h << "\n";
+            }
+        } else if (type == TOGGLE) {
+            for (size_t s = 0; s < S.sigs.size() && s < S.togRise.size(); s++) {
+                auto st = stopTog.find((int)s);
+                const auto& r = st != stopTog.end() ? st->second.first : S.togRise[s];
+                const auto& fl = st != stopTog.end() ? st->second.second : S.togFall[s];
+                if (r.empty()) continue;
+                f << "T " << S.sigs[s].name;
+                for (size_t k = 0; k < r.size(); k++) f << " " << r[k] << " " << (k < fl.size() ? fl[k] : 0);
+                f << "\n";
+            }
+        } else if (type == ASSERTION) {
+            for (size_t id = 0; id < asserts().size(); id++) {
+                const AssertInfo& as = asserts()[id];
+                if (as.hidden || as.prot) continue;
+                auto st = stopAssert.find((int)id);
+                f << "A " << as.name << " " << (st != stopAssert.end() ? st->second[1] : as.passes) << "\n";
+            }
+        } else {
+            for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++)
+                for (auto& [v, c] : S.fsmSeen[k]) f << "F " << fsmDefs()[k].inst << "." << fsmDefs()[k].name << " " << v << " " << c << "\n";
+        }
+        return ret(f ? OK : ERROR);
+    }
+    // $coverage_merge: add the saved counts to this run's
+    std::ifstream f(dbPath(name));
+    std::string magic;
+    int ver = 0;
+    int64_t savedType = 0;
+    if (!f || !(f >> magic >> ver >> savedType) || magic != "msim-covsave") return ret(ERROR);
+    if (savedType != type) return ret(NOCOV);
+    if (!available(type)) return ret(NOCOV);
+    std::string kind, key;
+    if (type == STATEMENT) {
+        build();
+        std::string sc, file;
+        uint32_t line;
+        uint64_t h;
+        while (f >> kind >> sc >> file >> line >> h) {
+            if (sc == ".") sc.clear();
+            for (auto& st : stmts)
+                if (st.scope == sc && st.line == line && st.file < g_covFiles.size() && g_covFiles[st.file] == file && !st.hits.empty())
+                    *st.hits[0] += h;
+        }
+    } else if (type == TOGGLE) {
+        std::unordered_map<std::string, size_t> byName;
+        for (size_t s = 0; s < S.sigs.size(); s++) byName.emplace(S.sigs[s].name, s);
+        std::string line;
+        std::getline(f, line);
+        while (std::getline(f, line)) {
+            std::istringstream ls(line);
+            if (!(ls >> kind >> key)) continue;
+            auto it = byName.find(key);
+            if (it == byName.end()) continue;
+            size_t s = it->second;
+            if (S.togRise.size() < S.sigs.size()) { S.togRise.resize(S.sigs.size()); S.togFall.resize(S.sigs.size()); }
+            auto& R = S.togRise[s];
+            auto& F = S.togFall[s];
+            size_t words = (size_t)(S.sigs[s].w + 63) / 64;
+            if (R.size() < words) { R.resize(words, 0); F.resize(words, 0); }
+            uint64_t r, fl;
+            for (size_t k = 0; k < words && (ls >> r >> fl); k++) { R[k] |= r; F[k] |= fl; }
+        }
+    } else if (type == ASSERTION) {
+        uint64_t p;
+        while (f >> kind >> key >> p)
+            for (auto& as : asserts()) if (as.name == key) as.passes += p;
+    } else {
+        uint64_t v, c;
+        while (f >> kind >> key >> v >> c)
+            for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++)
+                if (fsmDefs()[k].inst + "." + fsmDefs()[k].name == key) S.fsmSeen[k][v] += c;
+    }
+    return ret(OK);
+}
+}  // namespace covapi
+
+// -cm / -cm_hier: the code coverage written (src/cov_select.hpp).
+static covsel::Selection g_covSel;
+
 static bool writeCoverage(const std::string& path, const LowerResult& lw, const std::string& top) {
+    covapi::restoreStopped();   // a coverage_control STOP still in force (40.3.2.1)
     std::vector<const Prog*> progs;
     std::unordered_set<const Prog*> seen;
     for (auto& p : lw.procs) collectProgs(&p.prog, progs, seen);
@@ -1188,15 +1894,54 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     for (auto& p : lw.subs) collectProgs(p.get(), progs, seen);
     std::map<std::pair<uint32_t, uint32_t>, uint64_t> lines;            // (file, line) -> hits
     std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint64_t, uint64_t>>> branches;
-    for (const Prog* p : progs)
+    // The same per module instance (Prog::covInst): its own line hits, and
+    // which of the decisions of a line are its own (n as in "branches").
+    struct InstCov {
+        std::map<std::pair<uint32_t, uint32_t>, uint64_t> lines;
+        std::vector<std::array<uint64_t, 5>> branches;       // file, line, n, true, false
+        std::map<size_t, std::vector<uint64_t>> conds;       // index in "conditions" -> hits
+    };
+    std::vector<InstCov> insts(g_covInsts.size());
+    // Selection (-cm, -cm_hier): the instance path and module of a coverage
+    // instance, and whether a metric of its code in a file is written.
+    auto instPath = [&](uint32_t k) {
+        if (!k || k >= g_covInsts.size()) return std::string();
+        return g_covInsts[k].path.empty() ? top : top + "." + g_covInsts[k].path;
+    };
+    const bool selAll = g_covSel.metrics == covsel::ALL && g_covSel.rules.empty();
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, bool> selCache;   // (instance, file, metric)
+    auto sel = [&](uint32_t m, uint32_t inst, uint32_t file) {
+        if (selAll) return true;
+        auto [it, fresh] = selCache.try_emplace({inst, file, m}, false);
+        if (fresh)
+            it->second = g_covSel.selected(m, instPath(inst), inst < g_covInsts.size() ? g_covInsts[inst].module : "",
+                                           file < g_covFiles.size() ? g_covFiles[file] : "");
+        return it->second;
+    };
+    for (const Prog* p : progs) {
+        InstCov* ic = p->covInst && p->covInst < insts.size() ? &insts[p->covInst] : nullptr;
         for (auto& i : p->code) {
             if (!i.line) continue;
             auto key = std::make_pair(i.file, i.line);
-            auto& h = lines[key];
-            h = std::max(h, i.hits);
+            if (sel(covsel::LINE, p->covInst, i.file)) {
+                auto& h = lines[key];
+                h = std::max(h, i.hits);
+                if (ic) {
+                    auto& ih = ic->lines[key];
+                    ih = std::max(ih, i.hits);
+                }
+            }
             // A JmpIfNot is a two-way decision: true = fell through, false = jumped.
-            if (i.k == IK::JmpIfNot) branches[key].push_back({i.hits - i.taken, i.taken});
+            // n counts every decision of the line, so that it is the same for any selection.
+            if (i.k == IK::JmpIfNot) {
+                auto& v = branches[key];
+                bool on = sel(covsel::BRANCH, p->covInst, i.file);
+                if (ic && on) ic->branches.push_back({i.file, i.line, v.size(), i.hits - i.taken, i.taken});
+                v.push_back({on ? i.hits - i.taken : UINT64_MAX, i.taken});
+            }
         }
+    }
+
     std::ofstream f(path);
     if (!f) return false;
     f << "{\n \"format\": \"msim-cov\", \"version\": 1, \"tool\": \"msim " MINISIM_VERSION "\", \"top\": " << jstr(top)
@@ -1212,6 +1957,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (auto& [k, v] : branches)
         for (size_t n = 0; n < v.size(); n++) {
+            if (v[n].first == UINT64_MAX) continue;   // not selected
             f << (first ? "\n  " : ",\n  ") << "[" << k.first << ", " << k.second << ", " << n << ", " << v[n].first << ", " << v[n].second << "]";
             first = false;
         }
@@ -1228,9 +1974,25 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         }
         return r;
     };
+    // A signal's instance: the longest prefix of its name that is one.
+    std::unordered_map<std::string, uint32_t> instByPath;
+    if (!selAll)
+        for (uint32_t k = 1; k < g_covInsts.size(); k++) instByPath.emplace(instPath(k), k);
+    auto sigSelected = [&](const std::string& full) {
+        if (selAll) return true;
+        std::string_view n = full;
+        while (true) {
+            size_t d = n.rfind('.');
+            if (d == std::string_view::npos) break;
+            n = n.substr(0, d);
+            if (auto it = instByPath.find(std::string(n)); it != instByPath.end()) return sel(covsel::TGL, it->second, 0);
+        }
+        return g_covSel.selected(covsel::TGL, n, "");
+    };
     for (size_t sidx = 0; sidx < S.sigs.size(); sidx++) {
         const auto& g = S.sigs[sidx];
         if (g.hide) continue;
+        if (!sigSelected(top + "." + g.name)) continue;
         static const std::vector<uint64_t> none;
         const auto& R = sidx < S.togRise.size() ? S.togRise[sidx] : none;
         const auto& F = sidx < S.togFall.size() ? S.togFall[sidx] : none;
@@ -1239,19 +2001,23 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     }
     // Conditions (a && b, a || b, the condition of ?:): per source position,
     // the hits of each vector, summed over the instances of the module.
-    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; };
+    struct CondSum { const CondDef* d; std::vector<uint64_t> hits; size_t index = 0; };
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, std::string>, CondSum> conds;
     for (auto& d : condDefs()) {
+        if (!sel(covsel::COND, d.inst, d.file)) continue;
         auto& c = conds[{d.file, d.line, d.col, d.text}];
-        if (!c.d) { c.d = &d; c.hits.assign(d.terms.size() + 1, 0); }
-        if (c.d->terms.size() != d.terms.size()) continue;
-        for (size_t k = 0; k <= d.terms.size(); k++) c.hits[k] += g_condHits[d.base + k];
+        if (!c.d) { c.d = &d; c.hits.assign(d.counters(), 0); }
+        if (c.d->counters() != d.counters()) continue;
+        for (size_t k = 0; k < d.counters(); k++) c.hits[k] += g_condHits[d.base + k];
     }
     f << "\n ],\n \"conditions\": [";
     first = true;
     for (auto& [key, c] : conds) {
         f << (first ? "\n  " : ",\n  ") << "[" << c.d->file << ", " << c.d->line << ", " << c.d->col << ", "
-          << (c.d->terms.size() == 1 ? "\"?:\"" : c.d->isOr ? (c.d->lazy ? "\"||s\"" : "\"||\"") : c.d->lazy ? "\"&&s\"" : "\"&&\"") << ", " << jstr(c.d->text) << ", [";
+          << (c.d->terms.size() == 1 ? std::string("\"?:\"")
+              : "\"" + std::string(c.d->bitwise ? (c.d->isOr ? "|" : "&") : (c.d->isOr ? "||" : "&&")) +
+                    (c.d->lazy ? "s" : c.d->full ? "f" : "") + "\"")
+          << ", " << jstr(c.d->text) << ", [";
         for (size_t k = 0; k < c.d->terms.size(); k++) f << (k ? ", " : "") << jstr(c.d->terms[k]);
         f << "], [";
         for (size_t k = 0; k < c.hits.size(); k++) f << (k ? ", " : "") << c.hits[k];
@@ -1265,6 +2031,8 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
     first = true;
     for (size_t k = 0; k < fsmDefs().size() && k < S.fsmSeen.size(); k++) {
         const FsmDef& d = fsmDefs()[k];
+        if (!selAll && !g_covSel.selected(covsel::FSM, d.inst, d.module, d.file < g_covFiles.size() ? g_covFiles[d.file] : ""))
+            continue;
         const auto& seen = S.fsmSeen[k];
         auto trans = S.fsmTrans[k];
         f << (first ? "\n  " : ",\n  ") << "{\"module\": " << jstr(d.module) << ", \"inst\": " << jstr(d.inst) << ", \"name\": "
@@ -1288,6 +2056,47 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
             f2 = false;
         }
         f << "]}";
+        first = false;
+    }
+    // Per instance: [path, module, lines [file, line, hits], branches [file,
+    // line, n, true, false], conditions [index in "conditions", hits]].
+    {
+        size_t ci = 0;
+        for (auto& [key, c] : conds) c.index = ci++;
+        for (auto& d : condDefs()) {
+            if (!d.inst || d.inst >= insts.size() || !sel(covsel::COND, d.inst, d.file)) continue;
+            const CondSum& c = conds[{d.file, d.line, d.col, d.text}];
+            if (d.counters() != c.d->counters()) continue;
+            auto& h = insts[d.inst].conds[c.index];
+            h.resize(d.counters(), 0);
+            for (size_t k = 0; k < d.counters(); k++) h[k] += g_condHits[d.base + k];
+        }
+    }
+    f << "\n ],\n \"instances\": [";
+    first = true;
+    for (size_t k = 1; k < insts.size(); k++) {
+        const InstCov& ic = insts[k];
+        f << (first ? "\n  " : ",\n  ") << "[" << jstr(g_covInsts[k].path.empty() ? top : top + "." + g_covInsts[k].path) << ", "
+          << jstr(g_covInsts[k].module) << ", [";
+        bool f2 = true;
+        for (auto& [key, h] : ic.lines) {
+            f << (f2 ? "" : ", ") << "[" << key.first << ", " << key.second << ", " << h << "]";
+            f2 = false;
+        }
+        f << "], [";
+        for (size_t j = 0; j < ic.branches.size(); j++) {
+            auto& b = ic.branches[j];
+            f << (j ? ", " : "") << "[" << b[0] << ", " << b[1] << ", " << b[2] << ", " << b[3] << ", " << b[4] << "]";
+        }
+        f << "], [";
+        f2 = true;
+        for (auto& [ci, h] : ic.conds) {
+            f << (f2 ? "" : ", ") << "[" << ci << ", [";
+            for (size_t j = 0; j < h.size(); j++) f << (j ? ", " : "") << h[j];
+            f << "]]";
+            f2 = false;
+        }
+        f << "]]";
         first = false;
     }
     f << "\n ],\n";
@@ -1368,11 +2177,87 @@ static std::vector<std::string> implicitTops(slang::driver::Driver& driver, slan
     return tops;
 }
 
+// -saif with -saif_forward (IEEE 1801-2024 Annex J): an RTL forward file
+// keeps only its mapped points (J.5); a library one adds the state- and
+// path-dependent activity of each instance of its cells (J.3.6 to J.3.10, J.4).
+static void writeForwardSaif(const saif::Db& db, const wave::Reader& wr, const std::vector<std::string>& files,
+                             std::ostream& f) {
+    saif::Forward lib, rtl;
+    lib.lib = true;
+    for (auto& p : files) {
+        saif::Forward fw = saif::readForward(p);
+        if (fw.lib) {
+            for (auto& [n, c] : fw.cells) lib.cells[n] = std::move(c);
+            lib.path = p;
+        } else {
+            if (rtl.path.empty()) rtl.path = p;
+            for (auto& in : fw.insts) rtl.insts.push_back(std::move(in));
+        }
+    }
+    if (!rtl.path.empty()) {
+        if (!lib.cells.empty())
+            std::cerr << "msim: -saif_forward: the RTL mapping of " << rtl.path
+                      << " is written; library cells are not mapped points, so " << lib.path << " is not used\n";
+        std::vector<std::string> warn;
+        saif::rtlBackward(db, rtl, f, S.vcdTop, "msim", MINISIM_VERSION, warn);
+        for (auto& w : warn) std::cerr << "msim: -saif_forward: " << w << "\n";
+        return;
+    }
+    std::vector<saif::CellInst> insts;
+    for (auto& [path, mod] : instCells()) {
+        auto it = lib.cells.find(mod);
+        if (it == lib.cells.end()) continue;
+        saif::CellInst ci;
+        ci.path = path;
+        ci.cell = &it->second;
+        std::string pre = path + ".";
+        for (auto pi = portRecs().lower_bound(pre); pi != portRecs().end() && pi->first.compare(0, pre.size(), pre) == 0; ++pi) {
+            std::string pin = pi->first.substr(pre.size());
+            if (pin.find('.') == std::string::npos) ci.output[pin] = pi->second.dir == 1;
+        }
+        insts.push_back(std::move(ci));
+    }
+    std::vector<saif::CellActivity> acts(insts.size());
+    uint64_t end = std::max<uint64_t>(wr.end, db.start);
+    par::parallelFor(insts.size(), par::defaultThreads(), [&](size_t i) {
+        acts[i] = saif::cellActivity(insts[i], wr, db.start, end);
+    });
+    std::map<std::string, size_t> at;
+    for (size_t i = 0; i < insts.size(); i++) at[insts[i].path] = i;
+    saif::WriteHooks h;
+    h.cell = [&](const std::string& p) {
+        auto it = at.find(p);
+        return it == at.end() ? std::string() : insts[it->second].cell->name;
+    };
+    h.isPort = [&](const std::string& p, const std::string& net) {
+        auto it = at.find(p);
+        if (it == at.end()) return false;
+        size_t br = net.find('[');
+        return insts[it->second].output.count(br == std::string::npos ? net : net.substr(0, br)) > 0;
+    };
+    h.pin = [&](const std::string& p, const std::string& pin, std::ostream& os, const std::string& ind) {
+        size_t i = at.at(p);
+        auto& ports = insts[i].cell->ports;
+        auto pd = std::find_if(ports.begin(), ports.end(), [&](auto& x) { return x.first == pin; });
+        if (pd != ports.end()) saif::writePortDirectives(os, pd->second, acts[i].ports.at(pin), ind);
+    };
+    h.extra = [&](const std::string& p, std::ostream& os, const std::string& ind) {
+        auto it = at.find(p);
+        if (it != at.end()) saif::writeLeakage(os, *insts[it->second].cell, acts[it->second], ind);
+    };
+    saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION, &h);
+}
+
 static void usage() {
     std::cerr << "usage: msim [options] <files...>\n"
                  "  -top <name>    top-level module (repeatable)\n"
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
+                 "  -restore <file> go back to a $save checkpoint (first option; also -r)\n"
+                 "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
+                 "  -elab          stop after elaboration, before the run\n"
+                 "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
+                 "  -saif_forward <file>  forward SAIF for -saif: library (SDPD) or RTL mapping\n"
                  "  +notimingcheck turn off timing checks ($setup, $hold, ...)\n"
                  "  -sdf [min|typ|max:]<inst>:<file>  annotate an SDF file before time 0\n"
                  "  +mindelays / +typdelays / +maxdelays  pick from min:typ:max delays\n"
@@ -1383,9 +2268,23 @@ static void usage() {
                  "  -fst [<file>]  write an FST waveform (default dump.fst)\n"
                  "  -vcd-arrays [N]  also write unpacked array elements (memories) of up to N\n"
                  "                 elements each (default 1024) to the VCD or FST, as mem[3]\n"
+                 "  -vcd-class [N]  also write the properties of the object each class handle\n"
+                 "                 variable points to, as h.addr (x while h is null); handle\n"
+                 "                 properties are followed N levels (default 1)\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
-                 "                 see mcov. -cm <metrics> (as VCS) does the same\n"
+                 "                 see mcov\n"
+                 "  -cm <metrics>  the same, with only these code coverage metrics: line+branch+cond+tgl+fsm\n"
+                 "                 (as VCS), b:e:t:f or all (as Xcelium -coverage), bcesftx (as Questa\n"
+                 "                 +cover); covergroups and assertions are always written\n"
+                 "  -cm_hier <f>   the part of the design whose code coverage is written: +tree/-tree\n"
+                 "                 <inst> [depth], +module/-module, +file/-file (as VCS -cm_hier), or\n"
+                 "                 select_coverage / deselect_coverage commands (as an Xcelium covfile)\n"
+                 "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
+                 "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n\n"
+                 "  -i             interactive: run, step, stop on a signal, print (signals and class objects),\n"
+                 "                 force, release, deposit; commands on the standard input (help lists them)\n"
+                 "  -do <file>     the same, with the commands from a file; then the run goes on to its end\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
                  "                 and reuses <dir>/simv while the design is unchanged\n"
                  "  -o <dir>       build directory for -compile (default msim.d)\n"
@@ -1397,6 +2296,8 @@ static void usage() {
               << protfront::Options::help() <<
                  "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
                  "                 merges the branches instead of picking one (docs/XPROP.md)\n"
+                 "  -xprop=<file>, -xprop-config <file>  X-propagation set per instance or module\n"
+                 "                 (tree / instance / module {names} {xpropOn|xpropOff}; merge = ...)\n"
                  "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
                  "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
@@ -1412,6 +2313,7 @@ static void usage() {
 }
 
 int main(int argc, char** argv) {
+    annexStartup(argc, argv);   // $reset / $restart run msim again (Annex D)
     std::atexit([] { g_framesDead = true; });   // before the kernel's waiting processes are destroyed
     for (int sg : {SIGSEGV, SIGABRT})
         std::signal(sg, [](int) {   // say where, then stop
@@ -1419,15 +2321,37 @@ int main(int argc, char** argv) {
             (void)!write(2, w.data(), w.size());
             _exit(139);
         });
+    // xrun / irun command line (xrun.inc): translated to msim's options.
+    xrun::Opts xo;
+    std::vector<char*> xargv;
+    if (xrun::wanted(argc, argv, xo)) {
+        for (auto& s : xo.out) xargv.push_back(s.data());
+        if (!xo.tclIn.empty()) {   // -input run.tcl: as an msim -do file
+            static std::string doFile = xo.tool + ".do";
+            if (!xrun::tclToDo(xo.tclIn, doFile, xo.tool)) { std::cerr << xo.tool << ": cannot read " << xo.tclIn << "\n"; return 2; }
+            static std::string doOpt = "-do";
+            xargv.push_back(doOpt.data());
+            xargv.push_back(doFile.data());
+        }
+        xargv.push_back(nullptr);
+        argc = (int)xargv.size() - 1;
+        argv = xargv.data();
+        xrun::teeLog(xo);
+    }
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;
     uint64_t seed = 0;
     std::optional<std::string> vcdPath;
+    int vcdClass = 0;   // -vcd-class [N]
     std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
     bool saifTmp = false;   // ...and the waveform was only written for that
+    std::vector<std::string> saifForward;   // -saif_forward (IEEE 1801-2024 Annex J)
     std::string covPath = "cov.json";
     uint64_t maxTime = ~0ULL;
+    bool interactiveMode = false;   // -i / -do FILE
+    std::string doPath;
+    bool elabOnly = false;   // -elab: stop after elaboration (xrun -elaborate)
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     int threads = defaultThreads();
     bool threadsGiven = false;
@@ -1455,6 +2379,9 @@ int main(int argc, char** argv) {
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
+        if (a == "-elab") { elabOnly = true; continue; }
+        if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
+        if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
         if (a == "-no-static-comb") { staticComb = false; continue; }
         if (a == "-no-static-seq") { staticSeq = false; continue; }
         if (a == "-no-partition") { staticPart = false; continue; }
@@ -1463,7 +2390,13 @@ int main(int argc, char** argv) {
         if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
         if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
         if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
-        if (a.rfind("-xprop=", 0) == 0) { std::cerr << "msim: bad " << a << " (tmerge, xmerge or off)\n"; return 2; }
+        if (a.rfind("-xprop=", 0) == 0 || a == "-xprop-config") {   // a configuration file (docs/XPROP.md)
+            std::string cfg = a == "-xprop-config" ? next("a file name") : a.substr(7);
+            if (a != "-xprop-config" && !std::ifstream(cfg)) { std::cerr << "msim: bad " << a << " (tmerge, xmerge, off or a configuration file)\n"; return 2; }
+            std::string err = Lowerer::xpReadConfig(cfg);
+            if (!err.empty()) { std::cerr << "msim: -xprop configuration " << cfg << ": " << err << "\n"; return 2; }
+            continue;
+        }
         if (a == "-xprop-report") { xpropReport = next("a file name"); continue; }
         if (a == "-no-pin") { g_pin = 0; continue; }
         if (a == "-pin") { g_pin = 1; continue; }
@@ -1547,14 +2480,66 @@ int main(int argc, char** argv) {
             saifPath = nx.ends_with(".saif") ? argv[++i] : "dump.saif";
             continue;
         }
+        if (a == "-saif_forward" && i + 1 < argc) {
+            saifForward.push_back(argv[++i]);
+            continue;
+        }
+        if (a == "-profile") {   // profile.hpp
+            prof::P().on = true;
+            if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".txt")) prof::P().path = argv[++i];
+            continue;
+        }
         if (a == "-cov") {
             g_cov = true;
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
             continue;
         }
-        if (a == "-cm" && i + 1 < argc) {   // VCS: -cm line+cond+fsm+tgl+branch. Every metric is recorded.
+        // -cm <metrics>: the code coverage metrics written; VCS line+cond+fsm+tgl+branch,
+        // Xcelium b:e:t:f:u:a or all, Questa bcesftx (src/cov_select.hpp). Covergroups
+        // and assertions are always written.
+        if ((a == "-cm" && i + 1 < argc) || a.starts_with("-cm=")) {
             g_cov = true;
-            ++i;
+            std::string err;
+            std::string_view v = a == "-cm" ? std::string_view(argv[++i]) : a.substr(4);
+            if (!covsel::parseMetrics(v, g_covSel.metrics, err)) {
+                std::cerr << "msim: -cm: " << err << "\n";
+                return 2;
+            }
+            continue;
+        }
+        // -cm_hier <file>: the part of the design whose code coverage is written: VCS
+        // +tree/-tree/+module/-module/+file/-file lines or Xcelium covfile commands.
+        if (a == "-cm_hier" && i + 1 < argc) {
+            std::string err;
+            if (!g_covSel.read(argv[++i], err)) {
+                std::cerr << "msim: -cm_hier: " << err << "\n";
+                return 2;
+            }
+            for (auto& n : g_covSel.notes) std::cerr << "msim: " << n << "\n";
+            g_covSel.notes.clear();
+            if (g_covSel.allops) g_condAllops = true;
+            continue;
+        }
+        if (a == "-cm_cond" && i + 1 < argc) {   // VCS: -cm_cond full+allops (std / basic: the default)
+            std::string_view v = argv[++i];
+            while (!v.empty()) {
+                size_t p = v.find('+');
+                std::string_view w = v.substr(0, p);
+                if (w == "full") g_condFull = true;
+                else if (w == "allops") g_condAllops = true;
+                else if (w != "std" && w != "basic") {
+                    std::cerr << "msim: -cm_cond: unknown mode '" << w << "' (full, allops, std)\n";
+                    return 2;
+                }
+                v = p == std::string_view::npos ? std::string_view() : v.substr(p + 1);
+            }
+            continue;
+        }
+        // -vcd-class [N]: class objects through handle variables, N levels deep (default 1).
+        if (a == "-vcd-class" || a == "-fst-class") {
+            vcdClass = 1;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                vcdClass = std::max(1, std::atoi(argv[++i]));
             continue;
         }
         // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
@@ -1672,6 +2657,7 @@ int main(int argc, char** argv) {
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
+    if (!saifForward.empty() && saifPath.empty()) saifPath = "dump.saif";   // -saif_forward implies -saif
     if (!saifPath.empty() && !vcdPath) {
 #ifdef MINISIM_FST
         vcdPath = saifPath + ".tmp.fst";
@@ -1686,10 +2672,15 @@ int main(int argc, char** argv) {
         S.closeWaves();
         try {
             saif::Db db;
-            saif::load(*vcdPath, db, par::defaultThreads());
+            wave::Reader wr;
+            saif::load(*vcdPath, db, par::defaultThreads(), saifForward.empty() ? nullptr : &wr);
             std::ofstream f(saifPath);
             if (!f) throw saif::Error("cannot write " + saifPath);
-            saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            if (saifForward.empty()) {
+                saif::write(db, f, S.vcdTop, "msim", MINISIM_VERSION);
+            } else {
+                writeForwardSaif(db, wr, saifForward, f);
+            }
         } catch (const std::exception& e) {
             std::cerr << "msim: -saif: " << e.what() << "\n";
             return false;
@@ -1800,6 +2791,46 @@ int main(int argc, char** argv) {
     // The VCD's root scope is the top module (several tops: "top").
     if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
 
+    // -upf: the power intent is read now; its bind_checker commands (IEEE
+    // 1801-2024 6.12) become bind directives, and the design is elaborated
+    // again with them.
+    if (!upfPath.empty()) {
+        auto& rt = upfrt::rt();
+        try {
+            upf::DesignView dv = upf::designView(*comp);
+            upf::loadWithDesign(rt.m, upfPath, *comp, dv, powerTop, powerTopSet);
+            rt.m.addHdlAttrs(upfHdlAttrs(*comp));   // (* UPF_... *) in the HDL (5.6)
+            // the simulation top: a checker module nothing instantiates yet is a top too
+            std::string simTop = S.vcdTop;
+            {
+                std::set<std::string> checkers;
+                for (auto& b : rt.m.bindCheckers) checkers.insert(b.module);
+                for (auto& [n, v] : rt.m.vcms)   // and so is a model VCM's module (6.30.9)
+                    if (v.kind == upf::Vcm::Model) checkers.insert(v.model.substr(v.model.rfind('.') == std::string::npos ? 0 : v.model.rfind('.') + 1));
+                std::vector<std::string> real;
+                for (auto* t : comp->getRoot().topInstances)
+                    if (!checkers.count(std::string(t->getDefinition().name))) real.push_back(std::string(t->name));
+                if (real.size() == 1) simTop = real[0];
+            }
+            // function and model VCMs (6.30.8, 6.30.9) are placed in the design too
+            std::string vcmText = rt.m.connectVcm.empty() ? std::string() : rt.vcmSource(*comp, simTop);
+            if (!rt.m.bindCheckers.empty() || !vcmText.empty()) {
+                static std::string bindText;
+                bindText = (rt.m.bindCheckers.empty() ? std::string() : rt.m.bindSource(simTop)) + vcmText;
+                if (upfVerbose) std::cout << "UPF: " << bindText;
+                driver.syntaxTrees.push_back(slang::syntax::SyntaxTree::fromText(bindText, driver.sourceManager, "upf_bind_checker.sv", "",
+                                                                                 driver.createOptionBag()));
+                comp = driver.createCompilation();
+                driver.reportCompilation(*comp, /*quiet*/ true);
+                if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
+                if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
+            }
+        } catch (const std::exception& ex) {
+            std::cerr << "msim: UPF: " << ex.what() << "\n";
+            return 1;
+        }
+    }
+
     // Pass 3: lower to the process IR and run on the kernel.
     LowerResult lowered;
     try {
@@ -1813,6 +2844,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     timeFmt().tickExp = timeFmt().units = lowered.precExp;   // %t defaults (20.4.3)
+    if (elabOnly) { std::cout << "msim: elaborated " << lowered.procs.size() << " processes; not run (-elab)\n"; return 0; }
     if (g_cov) {   // FSM coverage: the kernel records the state registers' values
         std::vector<int> watch;
         std::vector<char> hot;
@@ -1833,33 +2865,13 @@ int main(int argc, char** argv) {
         auto& rt = upfrt::rt();
         rt.verbose = upfVerbose;
         try {
-            rt.m.load(upfPath, "");
-            std::string top = powerTopSet ? powerTop : rt.m.designTop;
-            for (char& c : top) if (c == '/') c = '.';
-            while (!top.empty() && top[0] == '.') top.erase(0, 1);
-            // a path may start with the simulation top's own name (tb.u_dut)
-            if (!S.vcdTop.empty() && (top == S.vcdTop || top.starts_with(S.vcdTop + "."))) top = top.substr(std::min(top.size(), S.vcdTop.size() + 1));
-            // set_design_top may name the module the UPF was written for
-            if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
-                std::string found;
-                std::function<void(const slang::ast::InstanceSymbol&, const std::string&)> walk =
-                    [&](const slang::ast::InstanceSymbol& in, const std::string& path) {
-                        if (!found.empty()) return;
-                        if (in.getDefinition().name == top && !path.empty()) { found = path; return; }
-                        for (auto& m : in.body.members())
-                            if (m.kind == slang::ast::SymbolKind::Instance) {
-                                auto& ch = m.as<slang::ast::InstanceSymbol>();
-                                walk(ch, path.empty() ? std::string(ch.name) : path + "." + std::string(ch.name));
-                            }
-                    };
-                for (auto* t : comp->getRoot().topInstances) {
-                    if (t->getDefinition().name == top) { found = "."; break; }
-                    walk(*t, "");
-                }
-                if (found == ".") top.clear();
-                else if (!found.empty()) top = found;
-            }
-            rt.m.top = top;
+            rt.m.resolveApplies([](const std::string& mod) {   // apply_power_model without -elements (6.9)
+                std::vector<std::string> r;
+                std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
+                for (auto& [full, m] : instCells())
+                    if (m == mod && full.compare(0, pre.size(), pre) == 0) r.push_back(full.substr(pre.size()));
+                return r;
+            });
             rt.bind(lowered);
         } catch (const std::exception& ex) {
             std::cerr << "msim: UPF: " << ex.what() << "\n";
@@ -1878,6 +2890,14 @@ int main(int argc, char** argv) {
     }
 
     for (int id : hiddenSigs()) S.sigs[(size_t)id].hide = true;
+    // With protected IP in the design, the lowering's temporaries (_tf...)
+    // stay out of the waveform: one may hold a value computed inside the IP
+    // (an argument of the IP's own system task call).
+    if (hideSigIf())
+        for (auto& g : S.sigs) {
+            size_t dot = g.name.rfind('.');
+            if (g.name.compare(dot == std::string::npos ? 0 : dot + 1, 3, "_tf") == 0) g.hide = true;
+        }
 
     // DPI-C (35): write the header, build the C code and the export stubs,
     // load the libraries, and resolve the imports.
@@ -1927,6 +2947,10 @@ int main(int argc, char** argv) {
         if (!ok) { std::cerr << "msim: DPI: " << err << "\n"; return 1; }
         compiled = false;   // -compile does not run DPI calls yet
     }
+    if (compiled && interactiveMode) {
+        std::cerr << "msim: -compile: the interactive mode is not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
     if (compiled && (!pathRecs().empty() || !sdfRequests().empty() || sdfAtRunTime())) {
         std::cerr << "msim: -compile: specify path delays and SDF annotation are not compiled yet; using the interpreter\n";
         compiled = false;
@@ -1951,11 +2975,33 @@ int main(int argc, char** argv) {
     if ((!sdfRequests().empty() || sdfAtRunTime()) && !gateRecs().empty()) staticComb = staticSeq = false;
     // Paths, SDF and gate delays (30-32) act on drivers; tran and net kinds
     // resolve them: those designs keep every driver.
+    // $dumpports (21.7.4.3) tells which side of a port drives it: every
+    // continuous driver keeps its slot, and its instance is recorded.
+    bool dumpPorts = false;
+    {
+        auto scan = [&](const Prog& p) {
+            for (const Instr& i : p.code) if (i.k == IK::Dump && i.dcmd == DC_PORTS) dumpPorts = true;
+        };
+        for (auto& lp : lowered.procs) scan(lp.prog);
+        for (auto& sp : lowered.subs) if (sp) scan(*sp);
+        if (dumpPorts)
+            for (auto& lp : lowered.procs)
+                for (const Instr& i : lp.prog.code) {
+                    if (i.k != IK::Assign || i.drv < 0 || i.sig < 0 || (size_t)i.sig >= S.sigs.size()) continue;
+                    auto& v = S.drvScope[i.sig];
+                    if (v.size() <= (size_t)i.drv) v.resize((size_t)i.drv + 1);
+                    v[(size_t)i.drv] = lp.scope;
+                }
+    }
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
-        gateRecs().empty())
+        gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
-    if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);
+    if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOSEQTMP")) localizeSeqBlocking(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
@@ -1966,10 +3012,18 @@ int main(int argc, char** argv) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
         compiled = false;
     }
+    if (compiled && prof::P().on) {
+        std::cerr << "msim: -compile: -profile times the interpreter; using it\n";
+        compiled = false;
+    }
     bool anyReactive = false;
     for (auto& lp : lowered.procs) anyReactive |= lp.reactive;
     if (compiled && (lowered.programs || anyReactive)) {
         std::cerr << "msim: -compile: programs and checkers are not compiled yet; using the interpreter\n";
+        compiled = false;
+    }
+    if (compiled && vcdClass) {
+        std::cerr << "msim: -compile: -vcd-class needs the interpreter; using it\n";
         compiled = false;
     }
     if (compiled) {
@@ -1988,7 +3042,11 @@ int main(int argc, char** argv) {
     S.vcdPath = vcdPath.value_or("");
     S.timescale = lowered.timescale();
     for (auto& [s, d] : lowered.netDelays) S.netDelay[s] = d;
-    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist);
+    for (auto& t : lowered.trireg) {   // 28.16.2, Annex E
+        if (t.charge != STR_MEDIUM) S.charge[t.sig] = t.charge;
+        if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
+    }
+    for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist, t.aLo, t.bLo, t.w);
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
@@ -2016,6 +3074,29 @@ int main(int argc, char** argv) {
     // core, unless -threads was given.
     if (!threadsGiven && threads > 1 && vcdPath && vcdPath->ends_with(".fst")) threads--;
     S.threads = threads;
+    // msim -profile: one thread, so that the times add up, and one entry per process.
+    auto profEnt = [&](const LoweredProc& lp) {
+        std::string loc;
+        for (const Instr& in : lp.prog.code)
+            if (in.line) {
+                loc = (in.file < g_covFiles.size() ? g_covFiles[in.file] : std::string("?")) + ":" + std::to_string(in.line);
+                break;
+            }
+
+        // The kinds as they are written in the source.
+        static const std::map<std::string, std::string> kinds = {
+            {"Always", "always"}, {"AlwaysFF", "always_ff"}, {"AlwaysComb", "always_comb"},
+            {"AlwaysLatch", "always_latch"}, {"Initial", "initial"}, {"Final", "final"},
+            {"init", "initializers"}, {"assign", "assign"}};
+        auto k = kinds.find(lp.kind);
+        std::string top = S.vcdTop.empty() ? std::string("top") : S.vcdTop;
+        if (!lp.port.empty()) {   // a port connection: counted in the instance whose port it is
+            size_t dot = lp.port.rfind('.');
+            return prof::P().add("port " + lp.port.substr(dot + 1), top + "." + lp.port.substr(0, dot), "");
+        }
+        return prof::P().add(k == kinds.end() ? lp.kind : k->second, lp.scope.empty() ? top : top + "." + lp.scope, loc);
+    };
+    if (prof::P().on) { S.threads = 1; staticPart = false; prof::P().t0 = std::chrono::steady_clock::now(); }
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
         if (pl.rank[i] >= 0) byRank[pl.rank[i]] = (int)i;
@@ -2024,23 +3105,34 @@ int main(int argc, char** argv) {
         const Prog* pr = &lowered.procs[i].prog;
         for (auto& in : pr->code)
             if (in.k == IK::Assert && !pr->combCtl) pr->combCtl = std::make_shared<ProcCtl>();
+        if (prof::P().on) prof::P().combEnt.push_back(profEnt(lowered.procs[i]));
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
+    installCovergroupHooks();   // the init process below may run now, and may create covergroups
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] >= 0) continue;
-        if (vpi::st().active && lowered.procs[i].kind == "init") {
+        if (lowered.procs[i].kind == "init") {
             // Declaration initializers take effect before the simulation
-            // starts, so they are not value changes VPI callbacks see (6.8).
+            // starts (6.8): not value changes VPI callbacks see, and not
+            // edges a clocked process registered below could wake on
+            // (logic clk = 0 is no negedge).
             Task t = process(&lowered.procs[i].prog);
             S.all.push_back(t.h);
             t.h.resume();
             continue;
         }
-        if (pl.seq[i]) S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
-        else if (lowered.procs[i].program >= 0 || lowered.procs[i].reactive)
-            S.spawn(programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial"));
-        else S.spawn(process(&lowered.procs[i].prog));
+        int pe = prof::P().on ? profEnt(lowered.procs[i]) : -1;
+        if (pl.seq[i]) {
+            if (pe >= 0) prof::P().seqEnt.push_back(pe);
+            S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
+            continue;
+        }
+        Task t = lowered.procs[i].program >= 0 || lowered.procs[i].reactive
+                     ? programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial")
+                     : process(&lowered.procs[i].prog);
+        if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
+        S.spawn(t);
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
@@ -2057,6 +3149,10 @@ int main(int argc, char** argv) {
     startTimingChecks();
     if (!pathRecs().empty() || !S.icDelay.empty() || !S.shadowOf.empty() || sdfAtRunTime()) staticPart = false;   // path inputs' change times (30.5.3)
     if (!S.shadows.empty() || !asserts().empty() || !clockings().empty() || pl.cyclic) staticPart = false;
+    if (vpi::st().active && g_cov) {   // vpi_control(vpiCoverageSave, ...) writes the database now (40.5.1)
+        static const LowerResult* lw = &lowered;
+        covSaveHook() = [](const std::string& path) { return writeCoverage(path, *lw, S.vcdTop); };
+    }
     if (vpi::st().active) vpi::setup(*comp, lowered);   // compiletf, cbEndOfCompile, cbStartOfSimulation
     if (staticPart) {
         std::vector<std::vector<int>> po, pi;
@@ -2064,7 +3160,20 @@ int main(int argc, char** argv) {
         partitionInputs(lowered, pl, po, pi, pt);
         S.buildPartitions(po, pi, pt);
     }
-    S.run(maxTime);
+    covapi::lw = &lowered;
+    g_covApiHook = covapi::hook;   // 20.13
+    if (vcdClass && comp) objview::build(*comp, vcdClass);   // before the waveform header
+        if (interactiveMode) {   // msim -i: commands drive the run (interactive.inc)
+        interactive::Session ses;
+        ses.comp = comp.get();
+        ses.maxTime = maxTime;
+        if (doPath.empty()) { ses.prompt = isatty(0); ses.loop(std::cin); }
+        else {
+            std::ifstream df(doPath);
+            if (!df) { std::cerr << "msim: cannot read " << doPath << "\n"; return 2; }
+            ses.loop(df);
+        }
+    } else S.run(maxTime);
     std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
@@ -2075,5 +3184,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!writeSaif()) return 1;
+    if (prof::P().on && !prof::P().write(S.now, S.timescale)) {
+        std::cerr << "msim: cannot write " << prof::P().path << "\n";
+        return 1;
+    }
     return S.exitCode;
 }

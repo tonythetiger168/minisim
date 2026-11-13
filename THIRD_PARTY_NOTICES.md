@@ -1,8 +1,10 @@
 # Third-party notices
 
-Open-source code that is linked or compiled into the minisim tools. Each
+Open-source code that is linked or compiled into the minisim tools, and
+open-source data kept in the tree. Each
 entry names the project, where it is used, its license, and the license text.
-Programs that are only run as external tools are not listed here.
+Programs that are only run as external tools are not linked or compiled in;
+the ones CI builds from source are listed at the end.
 
 ## slang and slang-tidy
 
@@ -34,6 +36,22 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
+
+## SkyWater sky130 cell library (test data)
+
+- Project: the SkyWater Open Source PDK, library `sky130_fd_sc_hd`
+  (https://github.com/google/skywater-pdk). Liberty from
+  https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd at commit
+  `5a42fd01a0eeb2338340438443c7062e198d97a4`; LEF and technology LEF from
+  https://github.com/The-OpenROAD-Project/OpenROAD-flow-scripts at commit
+  `bfcc1895a7a1d9ff6e677066825812e549b72421`.
+- Used by: `lib/sky130` holds unmodified extracts (47 cells, 51 macros, the
+  technology LEF) as a second test library; the `sky130` test runs the
+  tools on them. Not compiled or linked into any tool. See
+  `lib/sky130/README.md`.
+- License: Apache-2.0, Copyright 2020 The SkyWater PDK Authors. The license
+  text is `lib/sky130/LICENSE`; the upstream repositories carry no NOTICE
+  file.
 
 ## Rule sets followed without their code
 

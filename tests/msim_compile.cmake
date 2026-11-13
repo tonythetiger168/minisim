@@ -19,6 +19,14 @@ set(CASES
   "-cfiles 3 examples/memories.sv"
   "-cfiles 3 examples/assertions.sv"
   "-cfiles 3 examples/islands.sv"
+  "-cfiles 3 examples/deadcopy.sv"
+  "-cfiles 3 examples/widesplit.sv"
+  "-cfiles 3 examples/timeps.sv"
+  "examples/loopreset.sv"
+  "-cfiles 3 examples/loopreset.sv"
+  "examples/seqtemp.sv"
+  "-cfiles 3 examples/seqtemp.sv"
+  "examples/shareinst.sv"
   "examples/islands.sv"
   "examples/combbranch.sv"
   "examples/combcycle.sv"
@@ -28,6 +36,8 @@ set(CASES
   "examples/combcall.sv"
   "examples/rstcopy.sv"
   "examples/deadcopy.sv"
+  "examples/widesplit.sv"
+  "examples/timeps.sv"
   "bench/chain.sv +define+END_TIME=2000"
   "examples/cli/init.sv"
   "examples/cli/adder.sv examples/cli/adder_tb.sv -top adder_tb +define+WIDTH=8"
@@ -70,10 +80,18 @@ foreach(c IN LISTS CASES)
   # and prints the same.
   if(c MATCHES "^bench/lanes")
     file(READ ${OUT}/c${n}/design.cpp gen)
-    string(REGEX MATCHALL "PSig P[0-9]+" hits "${gen}")
+    string(REGEX MATCHALL "PSig&? P[0-9]+" hits "${gen}")
     list(LENGTH hits nh)
     if(nh LESS 48)
       message(FATAL_ERROR "${c}: only ${nh} signals private to the cycle domain (expected 48)")
+    endif()
+  endif()
+  # Instances of one module share one copy of its code (codegen.hpp
+  # shareChunks, emitDomainFns).
+  if(c STREQUAL "examples/shareinst.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(NOT gen MATCHES "dsT[0-9]+\\(" OR NOT gen MATCHES "combPT[0-9]+_0\\(")
+      message(FATAL_ERROR "${c}: the instances do not share their code")
     endif()
   endif()
   math(EXPR n "${n} + 1")
