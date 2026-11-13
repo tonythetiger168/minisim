@@ -549,7 +549,11 @@ inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
     if (t.isVoid()) { w = 0; return DT_VOID; }
     if (t.isString()) { w = 64; return DT_STRING; }
     if (t.isCHandle()) { w = 64; return DT_CHANDLE; }
-    if (t.isFloating()) { w = (int)t.getBitWidth(); return w == 32 ? DT_SHORTREAL : DT_REAL; }
+    if (t.isFloating()) {   // a shortreal is held as a double, like a real (6.12)
+        bool sr = t.getBitWidth() == 32;
+        w = 64;
+        return sr ? DT_SHORTREAL : DT_REAL;
+    }
     if (!t.isIntegral()) throw std::runtime_error("lower: unsupported DPI argument type " + t0.toString());
     w = (int)t.getBitWidth();
     if (t.kind == SymbolKind::PredefinedIntegerType) {
@@ -970,6 +974,8 @@ struct Lowerer {
     int sigFind(const slang::ast::Symbol* sym) const {
         if (auto ov = symOverride.find(sym); ov != symOverride.end()) return ov->second;
         if (cgItemSig >= 0 && sym->kind == slang::ast::SymbolKind::Iterator && sym->name == "item") return cgItemSig;
+        if (!cgIterSigs.empty() && sym->kind == slang::ast::SymbolKind::Iterator)   // a cross with filter's coverpoint (19.6.1.2)
+            if (auto it = cgIterSigs.find(std::string(sym->name)); it != cgIterSigs.end()) return it->second;
         if (auto rf = refFormals().find(sym); rf != refFormals().end())
             return rf->second.kind == 0 ? indThrough(refSlot(sym)) : -1;
         if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
