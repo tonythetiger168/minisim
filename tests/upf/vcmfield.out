@@ -1,0 +1,4 @@
+1 start: VR=OFF 0 VS=OFF 0 | ri.v=0 ri.en=0
+2 on: VR=FULL_ON 1100000 VS=FULL_ON 1000000 | ri.v=1.1 ri.en=1
+3 partial: VR=PARTIAL_ON 800000 VS=PARTIAL_ON 600000 | ri.v=0.8 ri.en=1
+4 off: VR=OFF 800000 VS=OFF 600000 | ri.v=0 ri.en=0

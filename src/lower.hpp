@@ -549,7 +549,11 @@ inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
     if (t.isVoid()) { w = 0; return DT_VOID; }
     if (t.isString()) { w = 64; return DT_STRING; }
     if (t.isCHandle()) { w = 64; return DT_CHANDLE; }
-    if (t.isFloating()) { w = (int)t.getBitWidth(); return w == 32 ? DT_SHORTREAL : DT_REAL; }
+    if (t.isFloating()) {   // a shortreal is held as a double, like a real (6.12)
+        bool sr = t.getBitWidth() == 32;
+        w = 64;
+        return sr ? DT_SHORTREAL : DT_REAL;
+    }
     if (!t.isIntegral()) throw std::runtime_error("lower: unsupported DPI argument type " + t0.toString());
     w = (int)t.getBitWidth();
     if (t.kind == SymbolKind::PredefinedIntegerType) {
@@ -1017,6 +1021,8 @@ struct Lowerer {
     int sigFind(const slang::ast::Symbol* sym) const {
         if (auto ov = symOverride.find(sym); ov != symOverride.end()) return ov->second;
         if (cgItemSig >= 0 && sym->kind == slang::ast::SymbolKind::Iterator && sym->name == "item") return cgItemSig;
+        if (!cgIterSigs.empty() && sym->kind == slang::ast::SymbolKind::Iterator)   // a cross with filter's coverpoint (19.6.1.2)
+            if (auto it = cgIterSigs.find(std::string(sym->name)); it != cgIterSigs.end()) return it->second;
         if (auto rf = refFormals().find(sym); rf != refFormals().end())
             return rf->second.kind == 0 ? indThrough(refSlot(sym)) : -1;
         if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
@@ -2256,6 +2262,12 @@ struct Lowerer {
                     defaultSelf = saved;
                     continue;
                 }
+                // A string literal put into a typeless mailbox (15.4.9) goes
+                // in as a string, so a get into a string variable reads it.
+                if (fs && fs->getType().isUntypedType() && peel(a).kind == ExpressionKind::StringLiteral) {
+                    c.init.push_back({formal.sig, konst(mkstr(std::string(peel(a).as<StringLiteral>().getValue())))});
+                    continue;
+                }
                 c.init.push_back({formal.sig, expr(a)});
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
@@ -3114,6 +3126,10 @@ struct Lowerer {
                 auto n = c.getSubroutineName();
                 if (!c.isSystemCall() || n == "pop_front" || n == "pop_back") found = true;
                 else visitDefault(c);
+            }
+            void handle(const AssignmentExpression&) { found = true; }   // c ? i = 1 : 0
+            void handle(const UnaryExpression& u) {   // c ? i++ : i
+                if (OpInfo::isLValue(u.op)) found = true; else visitDefault(u);
             }
             void handle(const NewClassExpression&) { found = true; }
             void handle(const CopyClassExpression&) { found = true; }
@@ -4182,6 +4198,13 @@ struct Lowerer {
             for (int k = 0; k < a->count; k++) {
                 Instr i = dynCmd(t, D_PUSH_BACK); i.e = ref(a->base + k, a->sgn); prog.emit(i);
             }
+            return;
+        }
+        if (x.kind != ExpressionKind::NamedValue && isFixedArr(x) && x.type->getCanonicalType()
+                .as<FixedSizeUnpackedArrayType>().elementType.isIntegral()) {   // s.a, m[i]: its elements, left first
+            std::vector<E> vals;
+            arrayElems(*x.type, x, vals);
+            for (auto& v : vals) { Instr i = dynCmd(t, D_PUSH_BACK); i.e = v; prog.emit(i); }
             return;
         }
         if (x.kind == ExpressionKind::Concatenation && isDynType(*x.type)) {
@@ -7494,7 +7517,41 @@ struct Lowerer {
             const auto& x = peel(*call.arguments()[0]);
             auto a = x.kind == slang::ast::ExpressionKind::NamedValue
                          ? arrFind(&x.as<slang::ast::NamedValueExpression>().symbol) : nullptr;
-            if (!a || a->dims.size() != 1 || a->dynElem) unsupported("ordering method of this fixed-size array");
+            if (!a || a->dims.size() != 1 || a->dynElem) {
+                // A struct member, a row of a bigger array, ...: sort a copy,
+                // then write the whole array back in one go (7.12.2).
+                const Type& at = x.type->getCanonicalType();
+                const auto& ft = at.as<slang::ast::FixedSizeUnpackedArrayType>();
+                const Type& et = ft.elementType.getCanonicalType();
+                if (!et.isIntegral() || uWidth(at) <= 0) unsupported("ordering method of this fixed-size array");
+                dynMethod(call, false);
+                int q = lastFixedQueue, n = (int)ft.range.width(), ew = (int)et.getBitWidth();
+                std::vector<E> parts;
+                for (int k = 0; k < n; k++) {
+                    auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                    g->sig = q;
+                    parts.push_back(resize(std::move(g), ew, et.isSigned(), et.isSigned()));
+                }
+                // The values are read from the scratch queue, not from the
+                // array, so the writes can go one by one.
+                if (auto sa = subArraySel(x)) {   // m[i].sort(): the elements of the row
+                    auto idxs = subArrayIdx(*sa);
+                    if (idxs.size() != parts.size()) unsupported("ordering method of this fixed-size array");
+                    for (size_t k = 0; k < idxs.size(); k++) {
+                        Instr i; i.k = IK::Assign;
+                        i.sig = sa->a->base; i.arr = sa->a; i.e = parts[k];
+                        i.aidx = std::move(idxs[k]);
+                        prog.emit(i);
+                    }
+                    return;
+                }
+                if (classMember(x)) unsupported("ordering method of an array property");
+                Instr i; i.k = IK::Assign;   // held packed (a struct member): all its bits at once
+                i.e = parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+                lhs(x, i);
+                prog.emit(i);
+                return;
+            }
             dynMethod(call, false);   // on a scratch queue holding a copy; then the elements go back
             int q = lastFixedQueue;
             for (int k = 0; k < a->count; k++) {
@@ -8119,6 +8176,25 @@ struct Lowerer {
         }
         for (size_t k : toEnd) prog.code[k].target = prog.here();
     }
+    // An expression that reads signals and computes, with no side effect and
+    // nothing that depends on how often it runs: a case selector that may be
+    // evaluated once instead of once per label.
+    static bool pureSel(const E& e) {
+        if (!e) return true;
+        switch (e->op) {
+            case Op::Const: case Op::Ref: case Op::Not: case Op::And: case Op::Or: case Op::Xor:
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Eq: case Op::Ne: case Op::CaseEq:
+            case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Shl: case Op::Shr: case Op::Asr:
+            case Op::Resize: case Op::LogNot: case Op::LogAnd: case Op::LogOr: case Op::RedAnd: case Op::RedOr:
+            case Op::RedXor: case Op::Slice: case Op::Index: case Op::Concat: case Op::Mux: case Op::ArrRead:
+                break;
+            default: return false;
+        }
+        if (!pureSel(e->at)) return false;
+        for (const auto& k : e->kids) if (!pureSel(k)) return false;
+        return true;
+    }
+    inline static int caseIds = 0;   // the last Instr::caseId given out
     static int caseMayOverlap(const slang::ast::CaseStatement& c) {
         using namespace slang::ast;
         using slang::logic_t;
@@ -9447,11 +9523,16 @@ struct Lowerer {
                          : c.condition == CaseStatementCondition::WildcardJustZ ? Op::CaseZEq
                                                                                 : Op::CaseXEq;
                 std::vector<E> conds;
+                // A selector without side effects is lowered once and shared by
+                // every compare, so the interpreter can find the item through a
+                // table (Instr::caseId) instead of comparing label by label.
+                E sel1 = c.condition == CaseStatementCondition::Normal ? expr(c.expr) : nullptr;
+                if (sel1 && !pureSel(sel1)) sel1 = nullptr;
                 for (const auto& item : c.items) {
                     E cond;   // OR of (selector === item_expr) over this item's labels
                     for (const Expression* x : item.expressions) {
                         E m = c.condition == CaseStatementCondition::Inside ? insideItem(c.expr, *x)
-                                                                             : bin(cmp, expr(c.expr), expr(*x));
+                                                                             : bin(cmp, sel1 ? sel1 : expr(c.expr), expr(*x));
                         cond = cond ? bin(Op::LogOr, cond, m) : m;
                     }
                     conds.push_back(cond);
@@ -9462,6 +9543,14 @@ struct Lowerer {
                 bool uniq = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Unique0;
                 bool needAll = c.check == UniquePriorityCheck::Unique || c.check == UniquePriorityCheck::Priority;
                 int ov = uniq ? caseMayOverlap(c) : 0;
+                if (ov == 2 && sel1) {   // labels slang did not fold, such as enum names: compare the lowered constants
+                    E sel;
+                    std::vector<uint64_t> keys;
+                    bool known = true;
+                    for (const E& cd : conds) known = known && caseLabels(cd, sel, keys);
+                    std::sort(keys.begin(), keys.end());
+                    if (known && std::adjacent_find(keys.begin(), keys.end()) == keys.end()) ov = 0;
+                }
                 bool mayOverlap = ov > 0;
                 E selUnknown;   // casez / casex labels that never overlap can still
                                 // both match a selector with z (or x) bits
@@ -9472,8 +9561,11 @@ struct Lowerer {
                     uniqueCaseLinear(s, c, conds, selUnknown);
                     break;
                 }
+                bool table = sel1 && !mayOverlap && c.items.size() >= 4 && !g_cov;
+                if (table) caseIds++;
                 for (size_t k = 0; k < c.items.size(); k++) {
                     Instr j; j.k = IK::JmpIfNot; j.e = conds[k];
+                    if (table) { j.caseId = caseIds; j.caseItem = (int)k + 1; }
                     size_t jf = prog.emit(j);
                     if (mayOverlap && k + 1 < c.items.size()) {
                         E more;
@@ -11244,6 +11336,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (it == sigmap.end())
             throw std::runtime_error("lower: port '" + std::string(ps.name) + "' is not a signal");
         int w = (int)ps.getType().getBitWidth();
+        if (w <= 0 && (ps.getType().isUnpackedStruct() || ps.getType().isUnpackedUnion()))
+            w = storeW(ps.getType());   // an unpacked struct port: one vector, as for a variable (7.2)
         if (w <= 0) Lowerer::unsupported("port width");
         return Formal{it->second, w, ps.getType().isSigned()};
     }

@@ -20,6 +20,11 @@
 // cut at time stamps into one piece per thread, and no value is copied. The
 // result does not depend on the thread count. FST needs MINISIM_FST and
 // libfst (the `fst` CMake target).
+//
+// r.lazy = true before open() reads the header alone; a signal's changes are
+// read the first time find() returns it (or with r.fetch(names) for many in
+// one pass over the file). A waveform of a large design does not have to fit
+// in memory then: only the signals looked at do.
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -28,6 +33,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
@@ -103,6 +109,14 @@ struct Reader {
     size_t minPiece = 4u << 20;                  // a thread is not worth less of a VCD than this
 
     ~Reader() { if (data && size) munmap((void*)data, size); }
+
+    // On-demand loading (lazy): which waves hold their changes.
+    bool lazy = false;
+    std::vector<char> ready;
+    unsigned thr = 1;
+    std::string path;
+    bool isFst = false;
+    std::mutex mu;
 
     static bool space(char c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
 
@@ -243,8 +257,36 @@ struct Reader {
             }
         }
 
+        vids = std::move(ids);
+        vbody = p;
+        thr = threads;
+        ready.assign(waves.size(), 0);
+        if (lazy) {   // the end is the last time stamp
+            for (const char* q = e; q > vbody;) {
+                const char* h = (const char*)memrchr(vbody, '#', (size_t)(q - vbody));
+                if (!h) break;
+                if (h == vbody || space(h[-1])) {
+                    for (const char* d = h + 1; d < e && *d >= '0' && *d <= '9'; d++) end = end * 10 + (uint64_t)(*d - '0');
+                    break;
+                }
+                q = h;
+            }
+            return true;
+        }
+        std::vector<char> all(waves.size(), 1);
+        fetchVcd(all);
+        return true;
+    }
+    Ids vids;
+    const char* vbody = nullptr;
+
+    // Read the changes of the waves marked in `want` from the body.
+    void fetchVcd(const std::vector<char>& want) {
+        const unsigned threads = thr;
+        const Ids& ids = vids;
+        const char* e = data + size;
         // The body, cut at time stamps so every piece knows what time it is.
-        const char* body = p;
+        const char* body = vbody;
         size_t left = (size_t)(e - body);
         size_t pieces = std::max<size_t>(1, std::min<size_t>(threads, left / std::max<size_t>(minPiece, 16)));
         std::vector<const char*> cut{body};
@@ -261,11 +303,14 @@ struct Reader {
         std::vector<uint64_t> lastT(pieces, 0);
         par::parallelFor(pieces, threads, [&](size_t k) {
             auto& c = count[k];
-            lastT[k] = scan(data, cut[k], cut[k + 1], ids, [&](int w, uint64_t, uint64_t, uint64_t) { c[w]++; });
+            lastT[k] = scan(data, cut[k], cut[k + 1], ids, [&](int w, uint64_t, uint64_t, uint64_t) { if (want[w]) c[w]++; });
         });
         for (uint64_t t : lastT) end = std::max(end, t);
         // Where each piece writes each signal: the pieces before it, in order.
+        std::vector<int> got;
         for (size_t w = 0; w < nw; w++) {
+            if (!want[w]) continue;
+            got.push_back((int)w);
             uint64_t total = 0;
             for (size_t k = 0; k < pieces; k++) {
                 uint32_t n = count[k][w];
@@ -277,17 +322,18 @@ struct Reader {
         par::parallelFor(pieces, threads, [&](size_t k) {
             auto& c = count[k];
             scan(data, cut[k], cut[k + 1], ids, [&](int w, uint64_t t, uint64_t off, uint64_t len) {
-                waves[w].ch[c[w]++] = Change{t, off, len};
+                if (want[w]) waves[w].ch[c[w]++] = Change{t, off, len};
             });
         });
-        compact(threads);
-        return true;
+        compact(threads, got);
+        for (int w : got) ready[(size_t)w] = 1;
     }
 
     // One entry per change: the later of two at one time, and no entry
     // that repeats the value before it ($dumpvars, then the same at #0).
-    void compact(unsigned threads) {
-        par::parallelFor(waves.size(), threads, [&](size_t w) {
+    void compact(unsigned threads, const std::vector<int>& only) {
+        par::parallelFor(only.size(), threads, [&](size_t oi) {
+            const size_t w = (size_t)only[oi];
             auto& ch = waves[w].ch;
             const char* data = waves[w].base;
             size_t n = 0;
@@ -350,7 +396,35 @@ struct Reader {
         }
         pools.resize(waves.size());
         end = fstReaderGetEndTime(ctx);
-        uint64_t start = fstReaderGetStartTime(ctx);
+        fstStart = fstReaderGetStartTime(ctx);
+        fstHandles = std::move(byHandle);
+        int ts = fstReaderGetTimescale(ctx);
+        static const char* unit[] = {"s", "ms", "us", "ns", "ps", "fs"};
+        if (int k = -ts; k >= 0 && k <= 15) {   // 10^ts seconds
+            int idx = (k + 2) / 3, pw = 3 * idx - k;
+            timescale = std::string(pw == 0 ? "1" : pw == 1 ? "10" : "100") + unit[idx];
+            this->unit = seconds(timescale);
+        }
+        fstReaderClose(ctx);
+        path = file;
+        isFst = true;
+        thr = threads;
+        ready.assign(waves.size(), 0);
+        if (lazy) return true;
+        std::vector<char> all(waves.size(), 1);
+        if (!fetchFst(all)) { err = "cannot open " + file; return false; }
+        return true;
+    }
+    std::vector<int> fstHandles;   // FST handle -> wave
+    uint64_t fstStart = 0;
+
+    // Read the changes of the waves marked in `want`.
+    bool fetchFst(const std::vector<char>& want) {
+        const std::string& file = path;
+        const unsigned threads = thr;
+        const std::vector<int>& byHandle = fstHandles;
+        const uint64_t start = fstStart;
+        bool every = std::all_of(want.begin(), want.end(), [](char c) { return c != 0; });
         // Decode in time slices, one libfst reader each: a reader with a time
         // limit gives every signal's value at the start of its slice, then
         // the changes inside it. A value equal to the one before it is not
@@ -365,6 +439,7 @@ struct Reader {
             uint64_t lo, hi;
             std::vector<std::vector<Change>> ch;
             std::vector<std::string> pool;
+            const std::vector<char>* want;
         };
         std::vector<Slice> sl(slices);
         std::atomic<bool> failed{false};
@@ -372,20 +447,26 @@ struct Reader {
             Slice& S = sl[k];
             S.v = this;
             S.byHandle = &byHandle;
+            S.want = &want;
             uint64_t span = end - start + 1;
             S.lo = start + span / slices * k;
             S.hi = k + 1 == slices ? end : start + span / slices * (k + 1) - 1;
             S.ch.resize(waves.size());
             S.pool.resize(waves.size());
-            fstReaderContext* c = k == 0 ? ctx : fstReaderOpen(file.c_str());
+            fstReaderContext* c = fstReaderOpen(file.c_str());
             if (!c) { failed = true; return; }
             if (slices > 1) fstReaderSetLimitTimeRange(c, S.lo, S.hi);
-            fstReaderSetFacProcessMaskAll(c);
+            if (every) fstReaderSetFacProcessMaskAll(c);
+            else {
+                fstReaderClrFacProcessMaskAll(c);
+                for (size_t hd = 0; hd < byHandle.size(); hd++)
+                    if (byHandle[hd] >= 0 && want[(size_t)byHandle[hd]]) fstReaderSetFacProcessMask(c, (fstHandle)hd);
+            }
             fstReaderIterBlocks(c, [](void* u, uint64_t t, fstHandle hd, const unsigned char* val) {
                 Slice& S = *(Slice*)u;
                 if (hd >= S.byHandle->size()) return;
                 int w = (*S.byHandle)[hd];
-                if (w < 0 || t > S.hi) return;
+                if (w < 0 || t > S.hi || !(*S.want)[(size_t)w]) return;
                 if (t < S.lo) t = S.lo;
                 std::string& pool = S.pool[w];
                 auto& ch = S.ch[w];
@@ -402,11 +483,15 @@ struct Reader {
                 ch.push_back(Change{t, pool.size(), len});
                 pool.append((const char*)val, len);
             }, &S, nullptr);
-            if (k != 0) fstReaderClose(c);
+            fstReaderClose(c);
         });
-        if (failed) { fstReaderClose(ctx); err = "cannot open " + file; return false; }
+        if (failed) return false;
+        std::vector<int> got;
+        for (size_t w = 0; w < waves.size(); w++)
+            if (want[w]) got.push_back((int)w);
         // Each signal's slices, in time order, into one buffer.
-        par::parallelFor(waves.size(), threads, [&](size_t w) {
+        par::parallelFor(got.size(), threads, [&](size_t gi) {
+            const size_t w = (size_t)got[gi];
             if (sl.size() == 1) {
                 waves[w].ch = std::move(sl[0].ch[w]);
                 pools[w] = std::move(sl[0].pool[w]);
@@ -426,16 +511,9 @@ struct Reader {
                 std::string().swap(S.pool[w]);
             }
         });
-        int ts = fstReaderGetTimescale(ctx);
-        static const char* unit[] = {"s", "ms", "us", "ns", "ps", "fs"};
-        if (int k = -ts; k >= 0 && k <= 15) {   // 10^ts seconds
-            int idx = (k + 2) / 3, pw = 3 * idx - k;
-            timescale = std::string(pw == 0 ? "1" : pw == 1 ? "10" : "100") + unit[idx];
-            this->unit = seconds(timescale);
-        }
-        fstReaderClose(ctx);
-        for (size_t w = 0; w < waves.size(); w++) waves[w].base = pools[w].data();
-        compact(threads);
+        for (int w : got) waves[(size_t)w].base = pools[(size_t)w].data();
+        compact(threads, got);
+        for (int w : got) ready[(size_t)w] = 1;
         return true;
     }
 #endif
@@ -455,9 +533,50 @@ struct Reader {
 #endif
     }
 
+    // Read the changes of these waves now (lazy), in one pass over the file.
+    void fetch(const std::vector<int>& ws) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<char> want(waves.size(), 0);
+        bool any = false;
+        for (int w : ws)
+            if (w >= 0 && (size_t)w < waves.size() && !ready[(size_t)w]) want[(size_t)w] = 1, any = true;
+        if (!any) return;
+#ifdef MINISIM_FST
+        if (isFst) { fetchFst(want); return; }
+#endif
+        fetchVcd(want);
+    }
+    void fetch(const std::vector<std::string>& names) {
+        std::vector<int> ws;
+        for (auto& n : names)
+            if (auto it = byName.find(n); it != byName.end()) ws.push_back(it->second);
+        fetch(ws);
+    }
+    // Drop the changes of these waves again (lazy only): find() reads them anew.
+    void release(const std::vector<std::string>& names) {
+        if (!lazy) return;
+        std::lock_guard<std::mutex> lk(mu);
+        for (auto& n : names) {
+            auto it = byName.find(n);
+            if (it == byName.end()) continue;
+            size_t w = (size_t)it->second;
+            std::vector<Change>().swap(waves[w].ch);
+#ifdef MINISIM_FST
+            if (w < pools.size()) std::string().swap(pools[w]);
+#endif
+            ready[w] = 0;
+        }
+    }
+    // The width of a signal, without reading its changes (0: not in the file).
+    int widthOf(const std::string& name) const {
+        auto it = byName.find(name);
+        return it == byName.end() ? 0 : waves[(size_t)it->second].width;
+    }
     const Wave* find(const std::string& name) const {
         auto it = byName.find(name);
-        return it == byName.end() ? nullptr : &waves[it->second];
+        if (it == byName.end()) return nullptr;
+        if (lazy && !ready[(size_t)it->second]) const_cast<Reader*>(this)->fetch(std::vector<int>{it->second});
+        return &waves[it->second];
     }
 };
 
