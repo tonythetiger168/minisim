@@ -139,6 +139,19 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
   expect "Linux boots to /init on 2 harts and powers off" 0 linux.out "mvplat-init: powering off"
   grep -q "^Linux version" linux.out && grep -q "smp: Brought up 1 node, 2 CPUs" linux.out &&
     ok "Linux brought up both harts and printed /proc/version" || bad "Linux SMP bring-up"
+  # An rv64gc user space (floating point included): BusyBox's shell runs
+  # what is typed on the console once the kernel's driver is up.
+  if [ -n "${MVPLAT_BUSYBOX:-}" ] && command -v python3 > /dev/null 2>&1; then
+    python3 "$T/mkcpio.py" bb.cpio d:dev c:dev/console:5:1 d:bin "f:bin/busybox:$MVPLAT_BUSYBOX" "f:init:$T/busybox_init.sh"
+    "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio \
+      -append "console=ttyS0 rdinit=/init quiet" -harts 2 -q \
+      -input "echo typed \$((6*7)); busybox printf '%.3f\n' 3.14159; poweroff -f
+" > bb.out 2>&1; rc=$?
+    expect "BusyBox shell on Linux: rv64gc user space and console input" 0 bb.out "^typed 42"
+    grep -q "^3.142" bb.out && ok "floating point in user space (printf %.3f)" || bad "user-space floating point"
+  else
+    echo "skip  BusyBox: set MVPLAT_BUSYBOX (tests/vplat/get-linux.sh fetches it)"
+  fi
 else
   echo "skip  Linux boot: set MVPLAT_LINUX_KERNEL (tests/vplat/get-linux.sh fetches a kernel)"
 fi

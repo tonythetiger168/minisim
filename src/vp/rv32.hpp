@@ -113,8 +113,9 @@ enum : uint32_t {
     MSTATUS_MXR = 1u << 19,
     MSTATUS_TVM = 1u << 20,
     MSTATUS_TSR = 1u << 22,
+    MSTATUS_FS = 3u << 13,
     // The view of mstatus that sstatus is.
-    SSTATUS_MASK = (1u << 1) | (1u << 5) | (1u << 8) | (1u << 18) | (1u << 19),
+    SSTATUS_MASK = (1u << 1) | (1u << 5) | (1u << 8) | (1u << 13) | (1u << 14) | (1u << 18) | (1u << 19),
 };
 enum : uint32_t { MIP_MSIP = 1u << 3, MIP_MTIP = 1u << 7, MIP_MEIP = 1u << 11,
                   MIP_SSIP = 1u << 1, MIP_STIP = 1u << 5, MIP_SEIP = 1u << 9 };
@@ -123,6 +124,10 @@ struct Hart {
     unsigned id = 0;
     bool rv64 = false;
     uint64_t x[32] = {};
+    // F and D: the floating-point registers (a single is NaN-boxed: the
+    // upper 32 bits all ones) and fcsr (frm << 5 | fflags).
+    uint64_t f[32] = {};
+    uint32_t fcsr = 0;
     uint64_t pc = 0;
     uint64_t cycle = 0, instret = 0;
     int64_t cycleAdj = 0, instretAdj = 0;  // what software wrote to mcycle / minstret
@@ -256,12 +261,21 @@ inline uint32_t expand(uint32_t c, bool rv64) {
                 return S(0x23, 2, rs1p, rdp, (int32_t)imm);
             }
             case 3:
-            case 7: {  // C.LD, C.SD (RV64); C.FLW, C.FSW (RV32) need F
-                if (!rv64) return 0;
+            case 7: {
+                if (!rv64) {  // C.FLW, C.FSW (RV32)
+                    uint32_t imm = bits(c, 12, 10) << 3 | bits(c, 6, 6) << 2 | bits(c, 5, 5) << 6;
+                    return f3 == 3 ? I(0x07, rdp, 2, rs1p, (int32_t)imm) : S(0x27, 2, rs1p, rdp, (int32_t)imm);
+                }
+                // C.LD, C.SD (RV64)
                 uint32_t imm = bits(c, 12, 10) << 3 | bits(c, 6, 5) << 6;
                 return f3 == 3 ? I(0x03, rdp, 3, rs1p, (int32_t)imm) : S(0x23, 3, rs1p, rdp, (int32_t)imm);
             }
-            default: return 0;  // C.FLD, C.FSD: no D
+            case 1:
+            case 5: {  // C.FLD, C.FSD
+                uint32_t imm = bits(c, 12, 10) << 3 | bits(c, 6, 5) << 6;
+                return f3 == 1 ? I(0x07, rdp, 3, rs1p, (int32_t)imm) : S(0x27, 3, rs1p, rdp, (int32_t)imm);
+            }
+            default: return 0;
         }
     }
     if (op == 1) {
@@ -345,13 +359,28 @@ inline uint32_t expand(uint32_t c, bool rv64) {
                 uint32_t u = bits(c, 12, 9) << 2 | bits(c, 8, 7) << 6;
                 return S(0x23, 2, 2, rs2, (int32_t)u);
             }
-            case 3: {  // C.LDSP (RV64)
-                if (!rv64 || !rd) return 0;
+            case 1: {  // C.FLDSP
+                uint32_t u = bits(c, 12, 12) << 5 | bits(c, 6, 5) << 3 | bits(c, 4, 2) << 6;
+                return I(0x07, rd, 3, 2, (int32_t)u);
+            }
+            case 5: {  // C.FSDSP
+                uint32_t u = bits(c, 12, 10) << 3 | bits(c, 9, 7) << 6;
+                return S(0x27, 3, 2, rs2, (int32_t)u);
+            }
+            case 3: {  // C.LDSP (RV64), C.FLWSP (RV32)
+                if (!rv64) {
+                    uint32_t u = bits(c, 12, 12) << 5 | bits(c, 6, 4) << 2 | bits(c, 3, 2) << 6;
+                    return I(0x07, rd, 2, 2, (int32_t)u);
+                }
+                if (!rd) return 0;
                 uint32_t u = bits(c, 12, 12) << 5 | bits(c, 6, 5) << 3 | bits(c, 4, 2) << 6;
                 return I(0x03, rd, 3, 2, (int32_t)u);
             }
-            case 7: {  // C.SDSP (RV64)
-                if (!rv64) return 0;
+            case 7: {  // C.SDSP (RV64), C.FSWSP (RV32)
+                if (!rv64) {
+                    uint32_t u = bits(c, 12, 9) << 2 | bits(c, 8, 7) << 6;
+                    return S(0x27, 2, 2, rs2, (int32_t)u);
+                }
                 uint32_t u = bits(c, 12, 10) << 3 | bits(c, 9, 7) << 6;
                 return S(0x23, 3, 2, rs2, (int32_t)u);
             }
