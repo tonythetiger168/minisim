@@ -1765,6 +1765,37 @@ struct Lowerer {
         return wantValue ? ref(res, sym.getReturnType().isSigned()) : nullptr;
     }
     const slang::ast::SubroutineSymbol* vifTarget = nullptr;
+    const slang::ast::SubroutineSymbol* externImpl = nullptr;   // the exporter one fork branch calls
+    // extern forkjoin task exported by several modules (25.7.4): the call
+    // runs every exporter's task at once, as fork ... join, and returns when
+    // all of them have.
+    E forkJoinCall(const slang::ast::CallExpression& call, const slang::ast::MethodPrototypeSymbol& pr, bool wantValue) {
+        if (wantValue || pr.subroutineKind != slang::ast::SubroutineKind::Task) unsupported("extern function with more than one export");
+        if (!store) unsupported("extern forkjoin task call here");
+        Instr f; f.k = IK::Fork; f.join = 0;
+        for (auto* im = pr.getFirstExternImpl(); im; im = im->getNextImpl()) {
+            Lowerer lw(sigmap);
+            lw.bind(subs, mkSig, tempSeq, store);
+            lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+            lw.current = current;
+            lw.scope = scope;
+            lw.sampleEv = sampleEv;
+            lw.curClass = curClass;
+            FrameLayout* bl = newLayout("forkjoin branch");
+            lw.frames = frames;
+            lw.frames.push_back(bl);
+            if (frames.empty()) lw.frames.clear();
+            f.blays.push_back(frames.empty() ? nullptr : bl);
+            lw.stmtDepth = stmtDepth;
+            lw.externImpl = im->impl;
+            lw.emitUserCall(call, false);
+            lw.finishImplicit();
+            store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+            f.branches.push_back(store->back().get());
+        }
+        prog.emit(f);
+        return nullptr;
+    }
     E emitUserCall(const slang::ast::CallExpression& call, bool wantValue) {
         using namespace slang::ast;
         if (call.isSystemCall()) unsupported("system call");
@@ -1797,9 +1828,10 @@ struct Lowerer {
                 return nullptr;
             }
         }
-        if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
+        if (externImpl) { sym = externImpl; externImpl = nullptr; }
+        else if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
             if (const auto* pr = sym->getPrototype(); pr && pr->getFirstExternImpl()) {
-                if (pr->getFirstExternImpl()->getNextImpl()) unsupported("extern forkjoin task with more than one export");
+                if (pr->getFirstExternImpl()->getNextImpl()) return forkJoinCall(call, *pr, wantValue);
                 sym = pr->getFirstExternImpl()->impl;
             }
         auto it = subs->find(sym);
