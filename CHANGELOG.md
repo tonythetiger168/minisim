@@ -36,6 +36,8 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
   object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
   `vpiRefObj` has `vpiName` and `vpiFullName`.
+- VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
+  immediate assertion, or the boolean of a single-expression property.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction

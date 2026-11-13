@@ -144,8 +144,12 @@ concurrent assertion makes every clock step of each of its attempts call
 attempt, numbered per assertion in the order they are first seen (two
 attempts in the same state have the same number). `vpiAssertionDisableStep`
 turns it off. Not supported: `vpiAssertionClockSteps`, the matched
-expressions of a step (`matched_expression_count` is 0), and `failExpr` of
-a failure is NULL.
+expressions of a step (`matched_expression_count` is 0). On
+`cbAssertionFailure`, `info->detail.failExpr` is the failing expression: an
+immediate assertion's condition, or the boolean of a concurrent property
+that is a single expression (under its clock and `disable iff`); it is NULL
+for a property with sequence or property operators, because msim's engine
+does not keep which part of such a property failed.
 
 **Coverage (clause 40).** With `msim -cov`, `vpi_get(<coverage type>,
 instance)` gives the covered items of that instance: `vpiStatementCoverage`
@@ -388,7 +392,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `39.4-vpi-fail-expr.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
