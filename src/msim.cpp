@@ -182,6 +182,7 @@
 #include "interactive.inc"
 #include "vendor_tasks.hpp"
 #include "objview.inc"
+#include "statview.inc"
 #include "xrun.inc"
 #include "vhdl/front.hpp"
 
@@ -2445,6 +2446,10 @@ static void usage() {
                  "  -vcd-class [N]  also write the properties of the object each class handle\n"
                  "                 variable points to, as h.addr (x while h is null); handle\n"
                  "                 properties are followed N levels (default 1)\n"
+                 "  -vcd-sva       also write how many times each assertion and cover has\n"
+                 "                 passed and failed, as a.passes and a.fails\n"
+                 "  -vcd-power     with -upf: also write each power domain's simstate and each\n"
+                 "                 supply net's state and voltage, as upf.PD.simstate, upf.VDD.mV\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov\n"
                  "  -cm <metrics>  the same, with only these code coverage metrics: line+branch+cond+tgl+fsm\n"
@@ -2518,6 +2523,7 @@ int main(int argc, char** argv) {
     uint64_t seed = 0;
     std::optional<std::string> vcdPath;
     int vcdClass = 0;   // -vcd-class [N]
+    bool vcdSva = false, vcdPower = false;   // -vcd-sva, -vcd-power
     std::string saifPath;   // -saif: the waveform is summed into a SAIF file after the run
     bool saifTmp = false;   // ...and the waveform was only written for that
     std::vector<std::string> saifForward;   // -saif_forward (IEEE 1801-2024 Annex J)
@@ -2720,6 +2726,9 @@ int main(int argc, char** argv) {
                 vcdClass = std::max(1, std::atoi(argv[++i]));
             continue;
         }
+        // -vcd-sva / -vcd-power: assertion counts, power states and supplies as signals (statview.inc).
+        if (a == "-vcd-sva" || a == "-fst-sva") { vcdSva = true; continue; }
+        if (a == "-vcd-power" || a == "-fst-power") { vcdPower = true; continue; }
         // -vcd-arrays [N]: memories of up to N elements (default 1024) in the waveform.
         if (a == "-vcd-arrays" || a == "-fst-arrays") {
             S.dumpArrays = 1024;
@@ -3248,6 +3257,12 @@ int main(int argc, char** argv) {
         std::cerr << "msim: -compile: -vcd-class needs the interpreter; using it\n";
         compiled = false;
     }
+    if (g_vendorWave() & 1) vcdSva = true;   // $fsdbDumpSVA, "+sva"
+    if (g_vendorWave() & 2) vcdPower = true;   // $fsdbDumpvars(..., "+power")
+    if (compiled && (vcdSva || vcdPower)) {
+        std::cerr << "msim: -compile: " << (vcdSva ? "assertions" : "power states") << " in the waveform need the interpreter; using it\n";
+        compiled = false;
+    }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle,
                              seed, covPath);
@@ -3392,6 +3407,8 @@ int main(int argc, char** argv) {
     covapi::lw = &lowered;
     g_covApiHook = covapi::hook;   // 20.13
     if (vcdClass && comp) objview::build(*comp, vcdClass);   // before the waveform header
+    if (vcdSva) statview::sva();
+    if (vcdPower) statview::power();
         if (interactiveMode) {   // msim -i: commands drive the run (interactive.inc)
         interactive::Session ses;
         ses.comp = comp.get();

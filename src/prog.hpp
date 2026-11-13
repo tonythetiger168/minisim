@@ -92,6 +92,10 @@ enum DumpCmd { DC_FILE, DC_VARS, DC_OFF, DC_ON, DC_ALL, DC_FLUSH, DC_LIMIT,
                DC_VFILE, DC_ARRAYS, DC_VVARS,
                // Extended VCD (21.7.3): args hold [size,] file name; dsel the ports of $dumpports.
                DC_PORTS, DC_POFF, DC_PON, DC_PALL, DC_PFLUSH, DC_PLIMIT };
+// What the design's vendor tasks ask to have in the waveform beyond signals,
+// set while lowering: 1 assertions ($fsdbDumpSVA, "+sva"), 2 power ("+power").
+// msim then adds them as -vcd-sva / -vcd-power do (statview.inc).
+inline unsigned& g_vendorWave() { static unsigned w = 0; return w; }
 
 // Code coverage (msim -cov). The lowerer sets g_emitLoc to the statement it
 // is lowering; Prog::emit stamps it on each instruction. When g_cov is on,
