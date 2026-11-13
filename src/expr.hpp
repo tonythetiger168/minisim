@@ -1398,6 +1398,12 @@ enum class Op {
     DynBits, StreamPack,
     DynHas,    // kids[0] inside container sig (11.4.13): 1 if an element matches with ==?, x if none does but one may
     DynElemRef,   // element kids[0] of container sig, itself a container (7.5, 7.10): its id + 1, made if missing
+    // Containers inside an unpacked struct (7.2): the struct holds each one's
+    // id (0: none yet), at the bit offsets in conts. StructClone: kids[0]
+    // with every container copied (a struct is a value). DynAlloc: the id of
+    // a new empty container shaped like conts[0].
+    StructClone, DynAlloc,
+    DynById,   // %p only: the container whose id kids[0] is (0 or X: an empty one)
     ArrAddr,   // the signal id + 1 of element kids of array arr (0 when an index is outside it)
     // Classes (8). A handle is the first signal id of its object (0: null).
     This,      // the running method's `this`
@@ -1490,7 +1496,7 @@ enum UpfOp : int { UPF_SUPPLY_ON, UPF_SUPPLY_OFF, UPF_SUPPLY_PARTIAL_ON, UPF_SET
                    UPF_GET_SUPPLY_VALUE, UPF_ISO, UPF_LS };
 inline Val (*g_upfHook)(int op, const std::vector<Val>& a) = nullptr;
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
-enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
+enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT, CG_BLOCK };
 inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
 // 40.3.2: lo 0 control, 1 get_max, 2 get, 3 save, 4 merge. With no hook
 // (no design data) every call answers SV_COV_NOCOV (0).
@@ -1547,6 +1553,7 @@ struct Expr {
     // value, and sig is the property's slot in it. Read only when evaluated,
     // so `h != null && h.x` never touches a null h.
     std::shared_ptr<Expr> at;
+    std::shared_ptr<const std::vector<std::pair<int, DynObj>>> conts;   // StructClone, DynAlloc
 };
 
 inline E node(Op op, std::vector<E> kids = {}) {
@@ -2745,6 +2752,23 @@ inline Val eval(const E& e, const Reader& rd) {
             Val& el = d.vec[(size_t)i];
             if (el.x || !el.v) el = dynNewElem(d);
             return make(el.v + 1, 0, 64);
+        }
+        case Op::DynById: return k(0);
+        case Op::StructClone: {
+            Val v = k(0);
+            for (const auto& [off, shape] : *e->conts) {
+                Val id = v_slice(v, off + 63, off);
+                if (id.x || !id.v) continue;
+                DynObj parent;
+                parent.elem = std::make_shared<DynObj>(shape);
+                v = v_insert(v, dynCopyElem(parent, make(id.v, 0, 64)), off + 63, off);
+            }
+            return v;
+        }
+        case Op::DynAlloc: {
+            DynObj parent;
+            parent.elem = std::make_shared<DynObj>((*e->conts)[0].second);
+            return dynNewElem(parent);
         }
         case Op::DynSize: { Val r = make(dynStore()[R(e->sig)].size(), 0, 32); r.sgn = true; return r; }
         case Op::DynExists: {

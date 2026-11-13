@@ -64,6 +64,7 @@ struct Finding {
     std::string file;
     size_t line = 0, col = 0;
     std::string rule, text;
+    std::string signal;  // hierarchical path of the signal the finding is about, when known (mdebug -lint)
     bool operator<(const Finding& o) const {
         return std::tie(file, line, col, rule) < std::tie(o.file, o.line, o.col, o.rule);
     }
@@ -104,7 +105,7 @@ struct Report {
         os << (first ? "" : ")") << "\n";
     }
 
-    void add(std::string_view rule, SourceLocation loc, std::string text) {
+    void add(std::string_view rule, SourceLocation loc, std::string text, std::string signal = {}) {
         if (!rules.enabled(rule)) return;
         if (pc && pc->hidden(loc)) {
             if (hiddenSeen.insert({std::string(rule), loc}).second) hiddenCount++;
@@ -113,6 +114,7 @@ struct Report {
         Finding f;
         f.rule = std::string(rule);
         f.text = std::move(text);
+        f.signal = std::move(signal);
         if (sm && loc) {
             auto full = sm->getFullyOriginalLoc(loc);
             f.file = std::string(sm->getFileName(full));

@@ -20,7 +20,7 @@
 
 namespace vp {
 
-enum class Acc : uint8_t { Ok, Fault, Pending };
+enum class Acc : uint8_t { Ok, Fault, Pending, PageFault };
 
 // Who is asking: the hart and its own cycle count, so a device that reports
 // time (the CLINT's mtime) answers the asking hart's time, not a global one.

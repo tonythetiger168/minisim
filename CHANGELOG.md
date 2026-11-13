@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
+  the power intent, then writes a snapshot that `simv` reads with the UPF
+  file; processes of a power domain sleep while it is off and corrupt their
+  writes in the generated code. Without `-upf` the generated C++ is
+  unchanged. `tests/msim_compile.cmake` runs four UPF designs and the
+  low-power coverage report both ways.
 - `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
@@ -41,6 +47,11 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
+  `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
+  TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
+  context per hart. The riscv-tests run grows to 144 programs (rv32si, and
+  the `v` environment with paging on), all passing.
 - The `minisimCore` package installs `compat.hpp`, so a tool built against the
   installed kernel can register its vendor command-line rules too.
 - UPF `use_interface_cell -force_function` (IEEE 1801-2024 6.62) is
@@ -72,6 +83,33 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI drivers and loads as 37.16 and 37.46 read: of a bit or part select
+  (only what touches those bits), primitive terminals, and the ports of
+  the net's own module as local drivers (inputs) and loads (outputs).
+- VPI: `force` and procedural `assign` statements in effect are drivers
+  (a net: forces only) and loads of what they read (37.16, 37.21).
+- VPI `cbEndOfObject` (38.36.1) on a thread or frame runs when it ends;
+  `cbReclaimObj` and `cbEndOfObject` on class objects register (msim never
+  reclaims class objects).
+- VPI assertion control as 39.5 reads: `vpiAssertionEnableStep` /
+  `DisableStep` and `vpiAssertionKill` act on one attempt, named by its
+  start time (`vpiAssertionClockSteps` accepted); kill no longer disables
+  the assertion. System control takes a scope handle (NULL: all);
+  `vpiAssertionSysReset` removes the step callbacks, `vpiAssertionSysEnd`
+  every assertion callback.
+- VPI save, restart and reset (38.6, 38.36.3): `vpi_control(vpiReset)`;
+  `cbStartOfSave` / `cbEndOfSave`, `cbStartOfRestart` / `cbEndOfRestart`
+  and `cbStartOfReset` / `cbEndOfReset` now run around `$save`,
+  `$restart` and `$reset`; `cbSignal` runs at the next time slot after the
+  signal. `cbUnresolvedSystf` now also passes the name in `user_data`.
+- VPI coverage stop and start on one instance below the top (40.5.1):
+  its statement, toggle or FSM counts freeze until `vpiCoverageStart`.
+- VPI coverage control as 40.5 reads: `vpi_control` returns the
+  `SV_COV_*` codes of the system functions (`vpiCoverageCheck` is 1 when
+  coverage is available, not when all is covered; errors are -1), and
+  `vpiCovered` of an assertion needs an attempt, a success and no failure.
+- VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
+  immediate assertion, or the boolean of a single-expression property.
 - UPF information model and Tcl queries (IEEE 1801-2024 clause 10, 11.1):
   `upf_query_object_properties`, `upf_query_object_type`,
   `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
@@ -318,6 +356,9 @@ Spec references are IEEE 1800-2023 clauses.
   (next/previous time the selected signal takes it), Del to remove a row,
   Ctrl+arrows to step changes; the view lives in the page address, so a
   reload or a copied link opens on it.
+- `mdebug -lint FILE`: mlint's findings (`mlint -json`) in the page: a list
+  with a severity filter, marks on the source lines, and a click that opens
+  the line and selects the signal the finding names; script command `lint`.
 - `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
   signal's waves are sent when the page first shows it, so large waveforms
   are not cut to the one-file page's budget.
@@ -706,6 +747,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a write to an element of a multidimensional array whose indexes
+  have unknown bits (`m[r][c] <= d`) merges into every element the indexes
+  may name. Before, only one-dimensional arrays did, and the write was
+  skipped.
 - `-xprop`: a branch that calls a task or function with a nonblocking
   assignment is merged. The task's `<=` target becomes `x` when the branch
   only might be taken (each process calls its own copy of the task that
@@ -1236,6 +1281,23 @@ Spec references are IEEE 1800-2023 clauses.
   comments, package file names, explicit lifetimes and parameter types,
   range direction, macro names, short binary literals. Off by default; one
   task per file, same output at any `-threads`.
+- `mlint`: eight more rules after Verible's: `NAME015`..`NAME017` (interface
+  and constraint names, parameters named for what they disable), `SUS002`
+  (`void'(x.randomize())`), `SUS003` (`$psprintf`, `$random`, `$dist_*`),
+  `STY010`..`STY012` (string line continuations, a semicolon after a UVM
+  macro, `disable` of something other than an enclosing block).
+- `mlint` formal-assisted checks (`FML001`..`FML003`, `src/lintformal.hpp`):
+  dead `if`/`case` branches, indexes and part selects that can fall out of
+  range, and registers that never leave their reset value, each proved by
+  enumerating the values of the signals involved through single-driver nets
+  and the reachable values of small registers. Multithreaded; settings
+  `formal.max_bits` and `formal.reg_bits`.
+- `mlint` SoC flow (`src/lintsoc.hpp`): `-abstract-out` writes a block
+  abstract (ports and what the block does with them, parameters, open
+  findings); `-abstract` checks the top against it without the block's RTL
+  (rules `ABS001`..`ABS004`); `-bbox` makes modules black boxes.
+- `mlint -html FILE`: a self-contained report page with counts by severity
+  and rule, the source around each finding, and filters.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
