@@ -1,0 +1,19 @@
+UPF low-power coverage: 12 of 14 bins (85.7%)
+power states
+  supply set SS_AON ON                                          1
+  supply set SS_AON OFF                                         1
+  power domain PD_A RUN                                         3
+  power domain PD_A OFF                                         3
+  power domain PD_A SCAN                                        0  <- not hit
+state transitions
+  PD_A wake                                                     3
+  PD_A sleep                                                    2
+  PD_A scan                                                     0  <- not hit
+  SS_AON up                                                     1
+isolation enables
+  ISO_F u_a.f                                                   1
+retention
+  RET_F save                                                    1
+  RET_F restore                                                 1
+  RET_L save                                                    1
+  RET_L restore                                                 1
