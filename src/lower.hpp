@@ -9279,7 +9279,7 @@ struct Lowerer {
         switch (s.kind) {
             case StatementKind::Empty: break;
             case StatementKind::List:
-                if (!loops.empty() && loops.back().xpBrk >= 0) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
+                if ((!loops.empty() && loops.back().xpBrk >= 0) || (!xp.dis.empty() && !xp.clean)) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
                 for (auto* st : s.as<StatementList>().list) stmt(*st);
                 break;
             case StatementKind::Block: {
@@ -9293,7 +9293,9 @@ struct Lowerer {
                     labelOf = &b.body;
                     size_t s0 = prog.here();
                     blockEventSample(b.blockSymbol, true);   // @@(begin blk) (19.3)
+                    bool xpd = !current && !forkyBlocks.count(b.blockSymbol) && xpBlockStart(b.blockSymbol, b.body);   // -xprop
                     stmt(b.body);
+                    if (xpd) xpBlockEnd();
                     blockEventSample(b.blockSymbol, false);
                     if (blockIds().targets.count(b.blockSymbol))   // another process may disable it (9.6.2)
                     { prog.spans.push_back({blockIds().of(b.blockSymbol), s0, prog.here()}); anySpans() = true; }
@@ -10043,7 +10045,11 @@ struct Lowerer {
                 // forked in it: no other process can be inside it, so a jump
                 // past it is the whole disable.
                 for (size_t k = named.size(); k-- > 0;)
-                    if (named[k].first == sym && !current && !forkyBlocks.count(sym)) { named[k].second.push_back(emitJmp()); return; }
+                    if (named[k].first == sym && !current && !forkyBlocks.count(sym)) {
+                        if (xpDisable(sym)) return;   // -xprop: flags (xpBlockStart)
+                        named[k].second.push_back(emitJmp());
+                        return;
+                    }
                 // A block or task some process is running: a process it is
                 // the whole of ends; any other process inside it resumes
                 // after it, this one included (a task disabling itself).
