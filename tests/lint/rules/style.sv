@@ -8,8 +8,8 @@ module style(input logic clk, a, b, output logic y, z);
   function automatic logic f2(input logic x, input logic w);
     return x & w;
   endfunction
-  always @(posedge clk) y <= f1(b);       //~ STY003
-  always @* z = f2(a, b);                 //~ STY003
+  always @(posedge clk) y <= f1(b);       //~ STY003 STY013
+  always @* z = f2(a, b);                 //~ STY003 STY013
 endmodule
 
 module style2(input logic a, output logic y);    //~ STY001 STY002
