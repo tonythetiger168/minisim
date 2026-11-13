@@ -482,14 +482,16 @@ void xpEmit(Instr i, const slang::ast::Expression& target) {
     // An index with an unknown bit (7.4.6 skips the write). tmerge reads
     // mem[a] = d as a case on a: every element the index may name takes
     // the merge of its present value and d (xmerge: x).
-    E idxX;
-    if (arrOk && i.arr->dims.size() == 1 && !i.aidx.empty())
-        idxX = xpIsX(un(Op::RedXor, i.aidx[0]));
+    E idxX, idxP;   // idxP: x or z in some index bit (as a 1-bit value)
+    if (arrOk && !i.aidx.empty() && i.aidx.size() == i.arr->dims.size()) {
+        for (const E& ix : i.aidx) idxP = idxP ? bin(Op::Xor, idxP, un(Op::RedXor, ix)) : un(Op::RedXor, ix);
+        idxX = xpIsX(idxP);
+    }
     if (xp.clean) {   // the clean copy: an unknown index goes to the merging copy
         if (idxX) {
             std::vector<size_t> to = xp.cleanSite(&target);
             if (!to.empty()) {
-                size_t jx = emitJmpIfNot(un(Op::RedXor, i.aidx[0]));   // 0 or 1: go on
+                size_t jx = emitJmpIfNot(idxP);   // 0 or 1: go on
                 prog.code[jx].target = prog.here();
                 prog.code[jx].xt = to[0];
             }
@@ -518,17 +520,32 @@ void xpEmit(Instr i, const slang::ast::Expression& target) {
         xp.sites[&target].push_back({chk});
         jidx = emitJmpIfNot(idxX);
         const ArrShape& a = *i.arr;
-        auto [l, r] = a.dims[0];
+        int64_t total = 1;
+        for (size_t d = 0; d < a.dims.size(); d++) total *= a.size(d);
         int k = xpTemp(32);
         auto s32 = [](int64_t v) { return konst(make((uint64_t)v, 0, 32, 0, true)); };
         xpSet(k, s32(0));
         size_t top = prog.here();
-        size_t jend = emitJmpIfNot(bin(Op::Lt, ref(k, true), s32(a.size(0))));
-        E kidx = l <= r ? bin(Op::Add, s32(l), ref(k, true)) : bin(Op::Sub, s32(l), ref(k, true));
-        // May the index name element k? Not when a bit known in both differs.
-        E same = un(Op::RedAnd, un(Op::Not, bin(Op::Xor, resize(i.aidx[0], 64, false, false), resize(kidx, 64, true, false))));
+        size_t jend = emitJmpIfNot(bin(Op::Lt, ref(k, true), s32(total)));
+        // Element k (row-major, the last dimension fastest): its index in
+        // each dimension. May the index name it? Not when, in some
+        // dimension, a bit known in both differs.
+        std::vector<E> kidx;
+        E same;
+        int64_t stride = total;
+        for (size_t d = 0; d < a.dims.size(); d++) {
+            auto [l, r] = a.dims[d];
+            stride /= a.size(d);
+            E o = ref(k, true);
+            if (stride > 1) o = bin(Op::Div, o, s32(stride));
+            if (d > 0) o = bin(Op::Mod, o, s32(a.size(d)));
+            E kd = l <= r ? bin(Op::Add, s32(l), o) : bin(Op::Sub, s32(l), o);
+            E sd = un(Op::RedAnd, un(Op::Not, bin(Op::Xor, resize(i.aidx[d], 64, false, false), resize(kd, 64, true, false))));
+            same = same ? bin(Op::And, same, sd) : sd;
+            kidx.push_back(kd);
+        }
         size_t jn = emitJmpIfNot(xpNot(xpIs(same, 0)));
-        xp.okArr.insert(prog.emit(merged({kidx})));
+        xp.okArr.insert(prog.emit(merged(kidx)));
         prog.code[jn].target = prog.here();
         xpSet(k, bin(Op::Add, ref(k, true), s32(1)));
         xpJmp(top);
@@ -1128,17 +1145,25 @@ bool xpIf(const slang::ast::ConditionalStatement& top) {
     return true;
 }
 
-// case / casez / casex (12.5). A selector with no x or z bit is matched
-// as always. Otherwise an item may match unless a bit known in both
-// differs, and every item that may match before the first that does runs.
+// case / casez / casex / case inside (12.5). A selector with no x or z bit
+// is matched as always. Otherwise an item may match unless a bit known in
+// both differs (case inside: unless ==? or the range compare is 0), and
+// every item that may match before the first that does runs.
 bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) {
     using namespace slang::ast;
-    if (!xp.on || c.condition == CaseStatementCondition::Inside) return false;
+    if (!xp.on) return false;
     if (!c.expr.type->isIntegral()) return false;
     bool wz = c.condition == CaseStatementCondition::WildcardJustZ;
     bool wx = c.condition == CaseStatementCondition::WildcardXOrZ;
+    bool in = c.condition == CaseStatementCondition::Inside;
     for (const auto& item : c.items)
         for (const Expression* x : item.expressions) {
+            if (in && x->kind == ExpressionKind::ValueRange) {   // [lo:hi]
+                const auto& vr = x->as<ValueRangeExpression>();
+                if (vr.rangeKind != ValueRangeKind::Simple || !vr.left().type->isIntegral() || !vr.right().type->isIntegral())
+                    return false;
+                continue;
+            }
             if (!x->type->isIntegral()) return false;
             if ((wz || wx) && !xpConstInt(*x)) return false;
         }
@@ -1158,7 +1183,7 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
     for (const auto& item : c.items) {
         E cond;
         for (const Expression* x : item.expressions) {
-            E m = bin(cmp, expr(c.expr), expr(*x));
+            E m = in ? insideItem(c.expr, *x) : bin(cmp, expr(c.expr), expr(*x));
             cond = cond ? bin(Op::LogOr, cond, m) : m;
         }
         conds.push_back(cond);
@@ -1198,7 +1223,7 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
     // A plain case whose labels are distinct known constants: an unknown
     // selector with k unknown bits stands for 2^k values and each label
     // that may match is one of them.
-    bool countable = !wz && !wx;
+    bool countable = !wz && !wx && !in;
     {
         std::vector<slang::SVInt> seen;
         for (const auto& item : c.items)
@@ -1217,6 +1242,9 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
     xp.key = &c;
     bool ok = xpChain(n,
         [&](size_t k) {
+            // case inside (12.5.4): ==? and the range compares are x when
+            // the item may match, and 0 when a known bit rules it out.
+            if (in) return std::pair<E, E>{xpIsX(conds[k]), conds[k]};
             E g;
             for (const Expression* x : c.items[k].expressions) {
                 E m = un(Op::Not, bin(Op::Xor, expr(c.expr), expr(*x)));
@@ -1246,14 +1274,14 @@ bool xpCase(const slang::ast::Statement& s, const slang::ast::CaseStatement& c) 
             else if (needAll)
                 xpGuard([&] { violation(s, checkName(c.check) + " case: no case item matches", c.check); });
         }, "case", T.get(),
-        [&](size_t k) {
+        in ? std::function<E(size_t)>() : [&](size_t k) {
             E sum;
             for (const Expression* x : c.items[k].expressions) {
                 E one = resize(xpIsX(label(x)), 32, false, false);
                 sum = sum ? bin(Op::Add, sum, one) : one;
             }
             return sum;
-        }, total);
+        }, in ? nullptr : total);
     if (ok) *xp.lastSite = {entry};
     xp.ool.push_back([=, this] {
         if (!ok) { Instr j; j.k = IK::Jmp; j.line = prog.code[jfast].line; j.file = prog.code[jfast].file; prog.code[jfast] = j; }
@@ -1280,6 +1308,56 @@ E xpAmbiguousEdge(const std::vector<std::pair<int, Edge>>& ev, const std::unorde
     for (auto& [sig, edge] : ev)
         kids.push_back(konst(mk(((uint64_t)sig << 2) | (edge == NEG ? 2 : 0) | (level.count(sig) ? 1 : 0), 64)));
     return sysFnNode(SF_XPROP_EDGE, std::move(kids));
+}
+// A combinational block: the merging copy [m0, mEnd) (entered from the
+// clean copy [c0, c1) by its unknown-condition jumps, left by the jump at
+// mEnd) writes the block's variables many times while it tries branches
+// and puts values back. Each change would wake the readers, and two blocks
+// that read each other would wake each other forever. So those writes are
+// quiet (Instr::xq), each entry saves the variables, and the exit puts
+// the saved values back and writes the final ones: one change event per
+// variable that ends with a new value.
+void xpQuiet(size_t m0, size_t mEnd, size_t c0, size_t c1) {
+    std::vector<int> W;
+    std::unordered_set<int> seen;
+    for (size_t pc = m0; pc < mEnd; pc++) {
+        const Instr& i = prog.code[pc];
+        if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && (i.target < m0 || i.target > mEnd || (i.xt != Instr::NOX && (i.xt < m0 || i.xt > mEnd))))
+            return;   // another way out
+        if (i.k != IK::Assign || i.tmp || i.sig < 0 || isRel(i.sig) || xp.temps.count(i.sig) || i.arr || i.dyn >= 0 ||
+            i.drv >= 0 || i.bidx || i.pw > 0 || !xpSigW(i.sig) || xp.bad.count(i.sig) || i.de || i.delay || !i.dly.empty())
+            continue;
+        if (seen.insert(i.sig).second) W.push_back(i.sig);
+    }
+    if (W.empty()) return;
+    for (size_t pc = m0; pc < mEnd; pc++) {
+        Instr& i = prog.code[pc];
+        if (i.k == IK::Assign && !i.tmp && i.sig >= 0 && seen.count(i.sig) && !i.arr && i.dyn < 0 && i.drv < 0 && !i.bidx &&
+            i.pw <= 0 && !i.de && !i.delay && i.dly.empty())
+            i.xq = true;
+    }
+    std::vector<int> snap, fin;
+    for (int s : W) { snap.push_back(xpTemp(xpSigW(s))); fin.push_back(xpTemp(xpSigW(s))); }
+    size_t skip = xpJmp();   // the clean copy's end goes past what follows
+    std::map<size_t, size_t> tramp;   // entry -> its saves
+    for (size_t pc = c0; pc < c1; pc++) {
+        size_t to = prog.code[pc].xt;
+        if (to == Instr::NOX) continue;
+        auto [it, isNew] = tramp.try_emplace(to, 0);
+        if (isNew) {
+            it->second = prog.here();
+            for (size_t k = 0; k < W.size(); k++) { Instr a; a.k = IK::Assign; a.sig = snap[k]; a.e = ref(W[k]); a.tmp = true; prog.emit(a); }
+            xpJmp(to);
+        }
+        prog.code[pc].xt = it->second;
+    }
+    prog.code[mEnd].target = prog.here();
+    for (size_t k = 0; k < W.size(); k++) {
+        Instr f; f.k = IK::Assign; f.sig = fin[k]; f.e = ref(W[k]); f.tmp = true; prog.emit(f);
+        Instr r; r.k = IK::Assign; r.sig = W[k]; r.e = ref(snap[k]); r.xq = true; prog.emit(r);
+        Instr w; w.k = IK::Assign; w.sig = W[k]; w.e = ref(fin[k]); prog.emit(w);
+    }
+    prog.code[skip].target = prog.here();
 }
 // The body of an always, always_comb, always_ff or always_latch.
 void xpProc(const slang::ast::Statement& body) {
@@ -1397,9 +1475,11 @@ void xpProc(const slang::ast::Statement& body) {
             prog.code[lead].target = prog.here();
             if (ambLead && lead == 1) prog.xpFast = prog.here();
             xp.clean = true;
+            size_t cs = prog.here();
             stmt(*b);
             xp.clean = false;
             prog.code[jend].target = prog.here();
+            if (ev.empty() && lead == start) xpQuiet(start + 1, jend, cs, prog.here());
         }
     }
     // Only this process uses its temporaries: their writes need no kernel.

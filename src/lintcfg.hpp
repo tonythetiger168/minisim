@@ -216,6 +216,9 @@ inline const std::vector<RuleInfo>& table() {
         {"NAME014", "naming", Sev::Warning, false, "a macro name does not match name.macro", "Verible rule macro-name-style."},
 
         // ------------------------------------------------------------------- style
+        {"NAME015", "naming", Sev::Warning, false, "an interface name does not match name.interface", "Verible rule interface-name-style."},
+        {"NAME016", "naming", Sev::Warning, false, "a constraint name does not match name.constraint", "Verible rule constraint-name-style."},
+        {"NAME017", "naming", Sev::Info, false, "a parameter named for what it disables", "Verible rule positive-meaning-parameter-name."},
         {"STY001", "style", Sev::Info, true, "more than one module in a file", ""},
         {"STY002", "style", Sev::Info, false, "a file's name is not its module's name", ""},
         {"STY003", "style", Sev::Info, false, "a plain always where always_ff / always_comb / always_latch says more", ""},
@@ -225,6 +228,9 @@ inline const std::vector<RuleInfo>& table() {
         {"STY007", "style", Sev::Info, false, "a parameter with no type", "Verible rule explicit-parameter-storage-type."},
         {"STY008", "style", Sev::Info, false, "a packed dimension that counts up", "Verible rule packed-dimensions-range-ordering."},
         {"STY009", "style", Sev::Info, false, "an unpacked dimension that counts down", "Verible rule unpacked-dimensions-range-ordering."},
+        {"STY010", "style", Sev::Info, false, "a string literal carried over the line with a backslash", "Verible rule forbid-line-continuations."},
+        {"STY011", "style", Sev::Info, false, "a semicolon after a UVM macro", "Verible rule uvm-macro-semicolon."},
+        {"STY012", "style", Sev::Info, false, "disable of a name that is not an enclosing begin block", "Verible rule disable-statement."},
         {"FUNC001", "style", Sev::Info, true, "a function reads or writes a signal that is not one of its arguments",
          "always @* does not see signals read inside a function, and the function cannot be reused."},
 
@@ -260,7 +266,42 @@ inline const std::vector<RuleInfo>& table() {
         {"FMT003", "format", Sev::Info, false, "trailing whitespace", "Verible rule no-trailing-spaces."},
         {"FMT004", "format", Sev::Info, false, "the file does not end with a newline", "Verible rule posix-eof."},
         {"SUS001", "suspicious", Sev::Info, false, "a stray semicolon (x = 1;; or endfunction;)", "Verible rule forbid-consecutive-null-statements."},
+        {"SUS002", "suspicious", Sev::Warning, false, "void'() around randomize() or uvm_hdl_read()", "Verible rule void-cast."},
+        {"SUS003", "suspicious", Sev::Info, false, "$psprintf, $random, $srandom or a $dist_ function",
+         "Verible rule invalid-system-task-function."},
         {"W009", "width", Sev::Info, false, "a sized binary literal with fewer digits than its width (8'b101)", "Verible rule undersized-binary-literal."},
+        // ------------------------------------------------------------------ formal
+        // lintformal.hpp: answered by enumerating the values the logic can take.
+        {"FML001", "formal", Sev::Warning, true, "an if condition or case item that can never be true where it stands",
+         "Dead code: the enclosing conditions or the earlier branches rule the branch out, for every value of the "
+         "signals involved. Proved by enumeration up to formal.max_bits free bits; else and default branches are "
+         "not reported (defensive code)."},
+        {"FML002", "formal", Sev::Warning, true, "an index or part select that can fall outside its array or vector",
+         "Some value the index can take on a path that reaches the select is outside the declared range: the read "
+         "gives X (or the default) and the write is lost. The message gives one such value."},
+        {"FML003", "formal", Sev::Warning, true, "a register that never leaves its reset value",
+         "Every assignment after reset gives it the value it already has: a constant, so the logic it feeds is "
+         "fixed too."},
+        // ---------------------------------------------------------------- soc flow
+        // lintsoc.hpp: the top checked against block abstracts (-abstract).
+        {"ABS001", "soc", Sev::Warning, true, "a block output the block never drives is connected at the top",
+         "The block's abstract says nothing inside drives the output, so whatever reads it at the top floats."},
+        {"ABS002", "soc", Sev::Info, true, "the top drives a block input the block never reads",
+         "Logic at the top feeds an input the block ignores. Tie it off, or check the block uses it."},
+        {"ABS003", "soc", Sev::Warning, true, "a block clock input is left open or tied to a constant",
+         "The block clocks registers on this input."},
+        {"ABS004", "soc", Sev::Warning, true, "a block was signed off with errors or warnings not waived",
+         "From the counts in its abstract (-abstract-out at block level)."},
+        // ---------------------------------------------------------------- soc flow
+        // lintsoc.hpp: the top checked against block abstracts (-abstract).
+        {"ABS001", "soc", Sev::Warning, true, "a block output the block never drives is connected at the top",
+         "The block's abstract says nothing inside drives the output, so whatever reads it at the top floats."},
+        {"ABS002", "soc", Sev::Info, true, "the top drives a block input the block never reads",
+         "Logic at the top feeds an input the block ignores. Tie it off, or check the block uses it."},
+        {"ABS003", "soc", Sev::Warning, true, "a block clock input is left open or tied to a constant",
+         "The block clocks registers on this input."},
+        {"ABS004", "soc", Sev::Warning, true, "a block was signed off with errors or warnings not waived",
+         "From the counts in its abstract (-abstract-out at block level)."},
         // --------------------------------------------------------------------- fsm
         {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
          "The state is named or tested, but the machine can never be in it: dead logic, or a transition that was forgotten."},

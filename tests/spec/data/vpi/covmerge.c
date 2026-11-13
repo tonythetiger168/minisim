@@ -32,7 +32,7 @@ static PLI_INT32 run(PLI_BYTE8* u) {
     vpi_control(vpiCoverageMerge, vpiAssertCoverage, path);
     report("merged twice (fsm, assertions)");
     remove(path);
-    if (!vpi_control(vpiCoverageMerge, vpiStatementCoverage, path)) {
+    if (vpi_control(vpiCoverageMerge, vpiStatementCoverage, path) == -1) {   /* SV_COV_ERROR */
         vpi_chk_error(&e);
         vpi_printf("missing database: %s\n", e.message);
     }

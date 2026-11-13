@@ -385,7 +385,13 @@ static void mergePartialDrivers(LowerResult& lowered) {
 // process (bench/gen_soc.py: 512 such processes were coroutines). The loop
 // variable is automatic and local to the loop (12.7.1); it is kept out of
 // the waveform, which never shows automatic variables (21.7.1.2).
-static void unrollSeqLoops(LowerResult& lowered) {
+//
+// With comb set, the same is done in combinational processes (always_comb,
+// always @*: body; wait; goto 0), before splitCombBlocks: a loop that sets
+// one bit per pass (for (int i = 0; i < 32; i++) r[i] = a[31 - i]) becomes
+// straight code, which runs without the compare and step of each pass and
+// can be split like any other block.
+static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
     std::set<int> lv(loopVarSigs().begin(), loopVarSigs().end());
     if (lv.empty()) return;
     const bool dbg = std::getenv("MSIM_WHYUNROLL") != nullptr;
@@ -427,10 +433,10 @@ static void unrollSeqLoops(LowerResult& lowered) {
         if (lp.program >= 0 || lp.reactive) continue;
         auto& code = lp.prog.code;
         size_t n = code.size();
-        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[0].k != IK::WaitEdge || code[n - 1].k != IK::Jmp ||
-            code[n - 1].target != 0)
+        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[n - 1].k != IK::Jmp || code[n - 1].target != 0)
             continue;
-        for (size_t pc = 1; pc + 3 < code.size(); pc++) {
+        if (comb ? code[n - 2].k != IK::WaitEdge || code[0].k == IK::WaitEdge : code[0].k != IK::WaitEdge) continue;
+        for (size_t pc = comb ? 0 : 1; pc + 3 < code.size(); pc++) {
             // i = c; top: if (!(cond)) goto E; body; step: i = f(i); goto top; E:
             const Instr& a = code[pc];
             if (a.k != IK::Assign || !lv.count(a.sig) || !plainW(a)) continue;
@@ -444,6 +450,8 @@ static void unrollSeqLoops(LowerResult& lowered) {
             for (size_t b = top + 1; b < step && ok; b++) {
                 const Instr& x = code[b];
                 if (x.k == IK::Nba) ok = x.sig != var && x.drv < 0 && x.dyn < 0 && !x.nbaLater && !x.de && !x.delay;
+                else if (x.k == IK::Assign && comb)   // a blocking write of the block's own (not a driver, not of i)
+                    ok = x.sig != var && x.drv < 0 && x.dyn < 0 && x.dsrc < 0 && !x.de && !x.delay && x.dly.empty() && x.gate < 0 && !x.udp;
                 else if (x.k == IK::Jmp || x.k == IK::JmpIfNot)
                     ok = x.target > b && x.target <= E && x.xt == Instr::NOX;   // forward, inside or to the end
                 else ok = false;
@@ -1427,6 +1435,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
                        uint64_t seed, const std::string& covPath) {
+    // -upf: the power-aware runtime runs in simv too (codegen.hpp Codegen::upf);
+    // the runtime sees every signal, so no private ones.
+    const bool upf = upfrt::rt().on;
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
     std::vector<CodegenProc> procs;
@@ -1443,7 +1454,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         if (pl.rank[i] >= 0)
             for (auto& in : lowered.procs[i].prog.code) combAssert |= in.k == IK::Assert;
     parts.on = staticPart && !combAssert && !pl.cyclic;
-    cycle = cycle && !pl.cyclic;   // the domain evaluates every comb statement once, in rank order
+    // The domain evaluates every comb statement once, in rank order. Not with
+    // -upf: every write goes through Sim::set, which keeps the UPF holds.
+    cycle = cycle && !pl.cyclic && !upf;
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     std::vector<std::pair<const Prog*, size_t>> covSlots;
@@ -1465,8 +1478,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     try {
         // With a VCD every signal must live in S.sigs, so no private signals.
         // A large design is built as several files at once, one per core (16 at most).
-        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
-                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale());
+        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath && !upf, g_cov ? &covSlots : nullptr,
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale(), upf);
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -1513,7 +1526,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     };
     std::string stamp = build + "\n";
-    for (const char* k : {"minisim.cpp", "exec.inc", "expr.hpp", "prog.hpp", "cpu.hpp"}) {
+    std::vector<const char*> kfiles = {"minisim.cpp", "exec.inc", "expr.hpp", "prog.hpp", "cpu.hpp"};
+    if (upf) kfiles.insert(kfiles.end(), {"upf_rt.inc", "upf.hpp", "upf_impl.inc", "upf_vct.hpp", "tcl.hpp"});
+    for (const char* k : kfiles) {
         std::error_code ec;
         auto p = std::filesystem::path(inc) / k;
         auto t = std::filesystem::last_write_time(p, ec);
@@ -1633,6 +1648,16 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // Run-time inputs go to simv, so one build serves every seed and plusarg.
     if (seed) run += " -seed " + std::to_string(seed);
     for (auto& a : plusArgs()) run += " " + shq("+" + a);
+    // -upf: the bound power intent, per run (parallel runs share the build);
+    // MSIM_KEEP_SNAP keeps it, to run simv by hand.
+    std::string snap = dir + "/upf.snap." + std::to_string(::getpid());
+    struct RmSnap { std::string p; ~RmSnap() { if (!p.empty() && !std::getenv("MSIM_KEEP_SNAP")) std::filesystem::remove(p); } } rmSnap{upf ? snap : ""};
+    if (upf) {
+        std::vector<const Prog*> progs;
+        for (auto& lp : lowered.procs) progs.push_back(&lp.prog);
+        if (!upfrt::rt().writeSnapshot(snap, progs)) { std::cerr << "msim: cannot write " << snap << "\n"; return 1; }
+        run += " -upf_snap " + shq(snap);
+    }
     std::string covBin = covPath + ".bin";   // per run: parallel runs share the build directory
     if (g_cov) { std::filesystem::remove(covBin); std::filesystem::remove(covBin + ".fcov"); run += " -cov " + shq(covBin); }
     std::cout.flush();
@@ -2870,7 +2895,11 @@ int main(int argc, char** argv) {
         try {
             upf::DesignView dv = upf::designView(*comp);
             upf::loadWithDesign(rt.m, upfPath, *comp, dv, powerTop, powerTopSet);
-            rt.m.addHdlAttrs(upfHdlAttrs(*comp));   // (* UPF_... *) in the HDL (5.6)
+            rt.lrec.attrs = upfHdlAttrs(*comp);
+            rt.m.addHdlAttrs(rt.lrec.attrs);   // (* UPF_... *) in the HDL (5.6)
+            rt.lrec.path = upfPath;   // msim -compile: simv reads the file again (Rt::readSnapshot)
+            rt.lrec.topFixed = powerTopSet;
+            rt.lrec.dv = dv;
             // the simulation top: a checker module nothing instantiates yet is a top too
             std::string simTop = S.vcdTop;
             {
@@ -2948,6 +2977,7 @@ int main(int argc, char** argv) {
                 std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
                 for (auto& [full, m] : instCells())
                     if (m == mod && full.compare(0, pre.size(), pre) == 0) r.push_back(full.substr(pre.size()));
+                upfrt::rt().lrec.applies[mod] = r;
                 return r;
             });
             rt.bind(lowered);
@@ -2962,7 +2992,11 @@ int main(int argc, char** argv) {
             staticComb = staticSeq = staticPart = false;
             threads = 1;
         }
-        if (compiled) { std::cerr << "msim: -compile: power-aware simulation is not compiled yet; using the interpreter\n"; compiled = false; }
+        // -compile: simv runs the same runtime from a snapshot of it (upf_rt.inc).
+        if (std::string gap = rt.simvGap(); compiled && !gap.empty()) {
+            std::cerr << "msim: -compile: " << gap << " in the power intent is not compiled yet; using the interpreter\n";
+            compiled = false;
+        }
     }
     if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
@@ -3080,6 +3114,8 @@ int main(int argc, char** argv) {
         mergePartialDrivers(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
+    if (staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL"))
+        unrollSeqLoops(lowered, true);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);

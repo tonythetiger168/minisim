@@ -184,7 +184,16 @@ enum DpiType : uint8_t {
     DT_BIT,      // svBit
     DT_LOGIC,    // svLogic
     DT_BITVEC,   // svBitVecVal[], 32 bits a word
-    DT_LOGICVEC  // svLogicVecVal[], aval/bval pairs
+    DT_LOGICVEC, // svLogicVecVal[], aval/bval pairs
+    DT_STRUCT    // an unpacked struct (35.5.6): a C struct, always by pointer
+};
+// One scalar of an unpacked struct argument: where it sits in the C struct
+// and in the SV value (the struct held packed, see uWidth).
+struct DpiField {
+    DpiType t = DT_INT;
+    int w = 32, lo = 0;   // bits, and the lowest bit in the SV value
+    bool sgn = false;
+    size_t off = 0;       // byte offset in the C struct
 };
 struct DpiArg {
     DpiType t = DT_INT;
@@ -197,6 +206,10 @@ struct DpiArg {
     bool uarr = false, open = false;
     std::vector<std::pair<int64_t, int64_t>> udims;
     std::vector<bool> uopen;   // per dimension: open
+    // DT_STRUCT: its scalars, the C struct's size, and its type name
+    std::vector<DpiField> fields;
+    size_t cSize = 0;
+    std::string cName;
 
     std::string name;
 };
@@ -303,6 +316,10 @@ struct Instr {
     // Assign to a temporary only this process uses (msim -xprop): nothing
     // watches it, so the value is stored at once (Sim::poke).
     bool tmp = false;
+    // Assign inside the merging copy of a combinational block (msim -xprop):
+    // stored at once with no change event; the block's end publishes the
+    // final value of each such variable once (xpQuiet).
+    bool xq = false;
     const UdpTable* udp = nullptr;   // Udp
     // Dump with DC_VARS: the scopes and variables named by $dumpvars, as
     // signal-name prefixes relative to the top ("" is the top, "u1." an

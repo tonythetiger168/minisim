@@ -3,6 +3,9 @@
 // cbEndOfThread, cbEnterThread, cbStartOfFrame and cbEndOfFrame.
 // #included in vpi.inc, inside namespace vpi.
 //
+// cbEndOfObject on a thread or frame handle runs as cbEndOfThread /
+// cbEndOfFrame on it.
+//
 // A thread is one msim process (ProcCtl): an initial, always or final
 // procedure, a fork branch, an assertion action. A frame is one running call
 // of a task or function in a thread; depth counts the calls below it. A
@@ -107,6 +110,7 @@ inline void onThread(int what, ProcCtl& t) {
     std::vector<Cb*> due;
     for (Cb* c : s.thrCbs)
         if (c->live && c->d.reason == reason && thrCbOn(c, t, what == 0)) due.push_back(c);
+        else if (c->live && what == 1 && c->d.reason == cbEndOfObject && !c->obj->gone && c->obj->thr == &t) due.push_back(c);
     if (!due.empty()) {
         Obj* h = thrObj(t);
         for (Cb* c : due) fireObjCb(c, h);
@@ -130,6 +134,10 @@ inline void onFrame(int what, ProcCtl& t, size_t depth, const Prog* callee) {
         fit = s.frameObjs.end();
     }
     for (Cb* c : s.frameCbs) {
+        if (c->live && what == 1 && c->d.reason == cbEndOfObject) {   // that frame ends (38.36.1)
+            if (fit != s.frameObjs.end() && fit->second == c->obj) due.push_back(c);
+            continue;
+        }
         if (!c->live || c->d.reason != reason) continue;
         if (c->obj && c->obj->kind == Obj::Frame) {
             if (fit == s.frameObjs.end() || fit->second != c->obj) continue;

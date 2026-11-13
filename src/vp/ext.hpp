@@ -22,7 +22,7 @@ namespace vp {
 
 // Changes whenever Ext, Machine, Hart or Device change shape, so a library
 // built against other headers is refused rather than misread.
-constexpr int EXT_ABI = 1;
+constexpr int EXT_ABI = 2;
 
 struct Ext {
     virtual ~Ext() = default;

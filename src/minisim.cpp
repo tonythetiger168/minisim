@@ -1922,6 +1922,12 @@ struct Sim {
                     }
                     cout << '}';
                 };
+                if (h->op == Op::DynById) {   // a container member of a struct (7.2), by its id
+                    Val id = eval(h->kids[0], rd);
+                    if (id.x || !id.v) cout << "'{}";
+                    else show(dynStore()[(int)id.v]);
+                    continue;
+                }
                 show(dynStore()[R(h->sig)]);   // R: a property through a handle, or an automatic container
                 continue;
             }
@@ -2687,6 +2693,7 @@ struct Sim {
     void (*vpiChange)(int) = nullptr;
     bool (*vpiRegion)(int) = nullptr;
     void (*vpiHoldCb)(int s, bool force, bool on, int hi, int lo) = nullptr;
+    SrcLoc holdSrc;   // the force / assign statement running holdOn (VPI drivers and loads, 37.16)
     bool vpiNbaPend = false;
     std::map<uint64_t, int> vpiAt;
     void set(int s, Val nv) {

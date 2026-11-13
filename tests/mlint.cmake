@@ -344,3 +344,27 @@ if(NOT out MATCHES "0 findings")
   message(FATAL_ERROR "cdc_pulse.sv without -sdc:\n${out}")
 endif()
 message(STATUS "mlint: ok")
+
+# SoC flow: a block signed off on its own writes the abstract the top-level
+# rule test (rules/soc.sv) reads; the checked-in copy must match.
+set(abs ${CMAKE_CURRENT_BINARY_DIR}/mlint_blk.abs.json)
+run(soc/blk.sv "-top;blk;-q;-abstract-out;${abs}")
+file(READ ${abs} got)
+file(READ ${SRC}/tests/lint/soc/blk.abs.json want)
+if(NOT got STREQUAL want)
+  message(FATAL_ERROR "the block abstract changed; regenerate tests/lint/soc/blk.abs.json:\n${got}")
+endif()
+# -bbox: nothing inside the black box is reported.
+execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/rules/soc.sv ${SRC}/tests/lint/soc/blk.sv -top soc -bbox "bl?"
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(out MATCHES "blk.sv")
+  message(FATAL_ERROR "-bbox: findings inside the black box:\n${out}")
+endif()
+
+# -html: one page with the findings and their source.
+set(page ${CMAKE_CURRENT_BINARY_DIR}/mlint_report.html)
+run(rules/formal.sv "-top;fml;-only;formal;-q;-html;${page}")
+file(READ ${page} html)
+if(NOT html MATCHES "mlint report" OR NOT html MATCHES "FML002" OR NOT html MATCHES "mem\\[wild\\] <= d")
+  message(FATAL_ERROR "-html: the page lacks the findings or their source")
+endif()

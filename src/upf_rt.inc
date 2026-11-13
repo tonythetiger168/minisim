@@ -19,10 +19,96 @@
 //   * domain power states, -illegal states, and legacy PSTs, reported as
 //     errors when the simulation reaches a state that is not legal.
 #include <iomanip>
+#include <type_traits>
 #include "upf.hpp"
+
+#ifdef UPF_RT_NO_DESIGN
+namespace slang::ast { class Type; class Symbol; }
+#endif
 
 namespace upfrt {
 using namespace upf;
+
+// A binary archive of plain data for the msim -compile snapshot (Rt::snapshot):
+// a(x, y, ...) writes or reads each argument; seq(v, f) a vector of structs.
+namespace snap {
+template <class D> struct Ar {
+    template <class... T> void operator()(T&... x) { (io(x), ...); }
+    template <class T, class F> void seq(std::vector<T>& v, F f) {
+        size_t n = v.size();
+        io(n);
+        if (!D::out) v.assign(n, T{});
+        for (auto& e : v) f(e);
+    }
+    D& d() { return static_cast<D&>(*this); }
+    template <class T> requires std::is_arithmetic_v<T> || std::is_enum_v<T> void io(T& x) { d().raw(&x, sizeof x); }
+    void io(std::string& s) {
+        size_t n = s.size();
+        io(n);
+        if (!D::out) s.resize(n);
+        d().raw(s.data(), n);
+    }
+    void io(Val& v) {
+        io(v.v); io(v.x); io(v.w); io(v.z); io(v.sgn); io(v.real); io(v.str);
+        size_t n = v.hi.size();
+        io(n);
+        if (!D::out) v.hi.resize(n);
+        for (size_t k = 0; k < n; k++) { io(v.hi[k].v); io(v.hi[k].x); io(v.hi[k].z); }
+    }
+    void io(SupplyVal& v) { io(v.st); io(v.v); io(v.hasV); }
+    template <class A, class B> void io(std::pair<A, B>& p) { io(p.first); io(p.second); }
+    template <class T> void io(std::vector<T>& v) {
+        size_t n = v.size();
+        io(n);
+        if (!D::out) v.assign(n, T{});
+        for (auto& e : v) io(e);
+    }
+    template <class C> void assoc(C& c) {   // map, set, unordered_map
+        constexpr bool kv = requires { typename C::mapped_type; };
+        size_t n = c.size();
+        io(n);
+        if (D::out) {
+            for (auto& e : c) {
+                if constexpr (kv) {
+                    std::pair<typename C::key_type, typename C::mapped_type> x(e.first, e.second);
+                    io(x);
+                } else {
+                    typename C::key_type x = e;
+                    io(x);
+                }
+            }
+            return;
+        }
+        c.clear();
+        for (size_t k = 0; k < n; k++) {
+            if constexpr (kv) {
+                std::pair<typename C::key_type, typename C::mapped_type> x;
+                io(x);
+                c.emplace(std::move(x.first), std::move(x.second));
+            } else {
+                typename C::key_type x;
+                io(x);
+                c.insert(std::move(x));
+            }
+        }
+    }
+    template <class K, class V, class Cm> void io(std::map<K, V, Cm>& c) { assoc(c); }
+    template <class K, class V, class H> void io(std::unordered_map<K, V, H>& c) { assoc(c); }
+    template <class K, class Cm> void io(std::set<K, Cm>& c) { assoc(c); }
+};
+struct Out : Ar<Out> {
+    static constexpr bool out = true;
+    std::ostream& o;
+    explicit Out(std::ostream& s) : o(s) {}
+    void raw(const void* p, size_t n) { o.write((const char*)p, (std::streamsize)n); }
+};
+struct In : Ar<In> {
+    static constexpr bool out = false;
+    std::istream& i;
+    explicit In(std::istream& s) : i(s) {}
+    void raw(void* p, size_t n) { i.read((char*)p, (std::streamsize)n); }
+};
+}   // namespace snap
 
 struct SetRt {
     std::string state = "OFF";
@@ -300,6 +386,7 @@ struct Rt {
     }
 
     // ----------------------------------------------------------- bind
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     void bind(LowerResult& lw) {
         on = true;
         g_upf = true;
@@ -553,6 +640,7 @@ struct Rt {
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
     }
+#endif
     // Low-power coverage (msim -upf_cov): power states and named transitions
     // reached, isolation cells enabled, retention saves and restores.
     std::string covPath;
@@ -656,6 +744,7 @@ struct Rt {
     // ------------------------------------- simulation controls (6.58, 6.59)
     std::set<int> noCorr;   // signals sim_corruption_control keeps from corruption
     std::set<int> realSigs, intSigs;   // variables of type real / shortreal, and of a predefined integer type
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     void bindTypes(LowerResult& lw) {
         if (m.corrCtls.empty()) return;
         for (auto& [sym, sid] : lw.sigOf) {
@@ -665,6 +754,7 @@ struct Rt {
             else if (t.kind == slang::ast::SymbolKind::PredefinedIntegerType) intSigs.insert(sid);
         }
     }
+#endif
     // Instances of a model (5.8), as design paths.
     std::vector<std::string> instancesOf(const std::string& model) const {
         std::vector<std::string> r;
@@ -764,6 +854,11 @@ struct Rt {
     // sim_replay_control (6.60): the initial blocks to run again, by the
     // domain whose power-up replays them.
     std::vector<std::pair<const Prog*, int>> replays;
+    // msim -compile: the replayed processes by number (Rt::snapshot), and
+    // simv's compiled processes, proc<n> (codegen.hpp).
+    std::vector<int> replayProc;
+    Task (*const* procFns)() = nullptr;
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     void bindReplays(LowerResult& lw) {
         std::map<std::string, const ReplayCtl*> byModel;   // instances a -model command covers
         for (auto& rc : m.replayCtls)
@@ -792,6 +887,7 @@ struct Rt {
             }
         }
     }
+#endif
     void applyAsserts() {
         for (auto& x : asrtCtls) {
             if (x.dead) continue;
@@ -816,6 +912,7 @@ struct Rt {
     // source side to the sink side. A connection to a port of a descendant
     // instance is a port connection like those of the HDL, so the interface
     // cell strategies see it (4.5.5).
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     void bindLogic(LowerResult& lw) {
         auto make1 = [&](const std::string& upfName) {
             std::string dn = m.design(upfName);
@@ -894,6 +991,7 @@ struct Rt {
             note("logic net " + m.design(lc.net) + (portDrives ? " <- " : " -> ") + dn);
         }
     }
+#endif
 
     // ------------------------------------------- HDL ports on supply nets
     // connect_supply_net to a port of the design that is not a UPF supply
@@ -1056,6 +1154,7 @@ struct Rt {
     static std::string stateName(int st) {
         return st == S_OFF ? "OFF" : st == S_FULL_ON ? "FULL_ON" : st == S_PARTIAL_ON ? "PARTIAL_ON" : "UNDETERMINED";
     }
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     static PortType portTypeOf(const slang::ast::Symbol* sym) {
         using namespace slang::ast;
         if (!sym || !ValueSymbol::isKind(sym->kind)) return {};
@@ -1095,10 +1194,12 @@ struct Rt {
         }
         return pt;
     }
+#endif
     // A field of a struct port (-field of a table VCM, 6.30): its bits in the
     // port's value, counted from bit 0, and its type. "a.b" names a field of
     // a nested struct.
     struct FieldLoc { bool ok = false; int off = 0, w = 0; PortType pt; std::string why; };
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     static FieldLoc fieldOf(const slang::ast::Type& t0, const std::string& path) {
         using namespace slang::ast;
         FieldLoc r;
@@ -1136,8 +1237,10 @@ struct Rt {
         r.ok = true;
         return r;
     }
+#endif
     // Whether a table VCM converts this port: its type, or with -field the
     // named field of a struct of the VCM's -hdl_type.
+#ifndef UPF_RT_NO_DESIGN
     static bool tableFits(const Vcm& v, const PortType& pt) {
         if (v.field.empty()) return v.cat == 'b' ? pt.cat == 'b' && (v.lang == "sv" || v.bits.lang == "sv") : vcmFits(v, pt);
         if (pt.cat != 'u' || !pt.type || v.lang != "sv") return false;
@@ -1147,6 +1250,7 @@ struct Rt {
         if (!fl.ok) return false;
         return fl.pt.cat == v.cat;   // the table's values say which kind of field it converts
     }
+#endif
     // Whether a table VCM converts this port's type (6.14).
     static bool vcmFits(const Vcm& v, const PortType& pt) {
         if (v.lang != "sv") return false;
@@ -1163,6 +1267,7 @@ struct Rt {
         if (pt.cat == 'i') return ty == "integer" || ty == "int" || ty == "longint";   // a vector
         return true;
     }
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     void bindHdlPorts(LowerResult& lw) {
         std::map<std::string, int> dirOf;   // instance port (simulator name) -> 0 input, 1 output, 2 inout
         for (auto& lp : lw.procs)
@@ -1323,6 +1428,7 @@ struct Rt {
                 throw Error("supply net " + h.net + " is driven by two HDL ports (" + m.design(drivers[r]) + ", " + m.design(h.port) + ")");
         }
     }
+#endif
     // A function or model VCM's result, held on its port (upf2hdl).
     void copyVcmResults() {
         for (auto& h : hdlPorts) {
@@ -1334,6 +1440,7 @@ struct Rt {
             S.holdOn(h.target, konst(v), true);
         }
     }
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     static bool supplyType(const slang::ast::Type& t) {
         using namespace slang::ast;
         const Type& ct = t.getCanonicalType();
@@ -1342,12 +1449,14 @@ struct Rt {
         for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>()) f.insert(std::string(fs.name));
         return f == std::set<std::string>{"state", "voltage"};
     }
+#endif
     // SystemVerilog for the function and model VCMs of connect_supply_net
     // -vcm (6.30.8, 6.30.9): one module per connection, bound into the
     // simulation top, that calls the function or instantiates the model on
     // the port (a hierarchical reference) and a upfSupplyTypeT variable the
     // runtime reads or writes. Table VCMs need none. simTop is the
     // simulation's top instance; comp is the design elaborated without them.
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     std::string vcmSource(slang::ast::Compilation& comp, const std::string& simTop) {
         using namespace slang::ast;
         std::string out;
@@ -1477,6 +1586,7 @@ struct Rt {
         }
         return out;
     }
+#endif
     // map_retention_cell -lib_model_name (6.39): each mapped register is
     // simulated by the model. A wrapper module bound into the register's
     // instance takes the register's canonical interface, inferred from the
@@ -1492,6 +1602,7 @@ struct Rt {
         for (auto& i : retModelInsts) if (DomainMap::within(scope, i)) return true;
         return false;
     }
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     std::string retModelSource(slang::ast::Compilation& comp, const std::string& simTop) {
         using namespace slang::ast;
         std::string out;
@@ -1778,6 +1889,7 @@ struct Rt {
         }
         return out;
     }
+#endif
     void copyRetModels() {
         for (auto& e : retModelEls) {
             if (e.qSig < 0) continue;
@@ -1800,6 +1912,7 @@ struct Rt {
     struct IfcEl { std::string port, d, y; int dSig = -1, ySig = -1; bool held = false; Val last; };
     std::vector<IfcEl> ifcEls;
     std::map<std::string, int> ifcElOf;   // "inst.port" -> ifcEls index
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     std::string ifcModelSource(slang::ast::Compilation& comp, const std::string& simTop) {
         using namespace slang::ast;
         std::string out;
@@ -1977,6 +2090,7 @@ struct Rt {
         }
         return out;
     }
+#endif
     // The HDL ports that drive supply nets: their value is the root supply.
     void readHdlPorts() {
         for (auto& h : hdlPorts) {
@@ -2093,6 +2207,7 @@ struct Rt {
 
     // Isolation and level-shifter cells on the port connections that cross
     // a domain boundary.
+#ifndef UPF_RT_NO_DESIGN   // simv (msim -compile) has no slang design
     void bindCells(LowerResult& lw) {
         std::vector<PortSite> sites;
         std::vector<size_t> procOf;
@@ -2241,6 +2356,7 @@ struct Rt {
             }
         }
     }
+#endif
 
     void bindRetention() {
         for (auto& r : m.rets) {
@@ -2587,10 +2703,11 @@ struct Rt {
             d.applied = true;
             if (old != -1 || nm != SS_NORMAL) note((d.region ? "elements on " : "power domain ") + d.name + " simstate " + simstateName(nm));
             if (nm == SS_NORMAL && old != -1 && old != SS_NORMAL && S.now > 0)
-                for (auto& [prog, rd] : replays)
-                    if (rd == (int)i) {
+                for (size_t k = 0; k < replays.size(); k++)
+                    if (replays[k].second == (int)i) {
                         note("sim_replay_control: replaying an initial block on the power-up of " + d.name);
-                        S.spawn(process(prog));
+                        if (procFns) S.spawn(procFns[(size_t)replayProc[k]]());   // simv: the compiled process
+                        else S.spawn(process(replays[k].first));
                     }
             if (nm == SS_CORRUPT && old != SS_CORRUPT) {
                 // Retention: the retained value is kept by the retention
@@ -2965,6 +3082,173 @@ struct Rt {
         if (cv == "1") return d.w <= 64 ? make(d.w >= 64 ? ~0ull : ((1ull << d.w) - 1), 0, d.w, 0) : v_not(make(0, 0, d.w, 0));
         if (cv == "Z" || cv == "z") return allz(d.w);
         return c.latched ? c.latch : allx(d.w);
+    }
+
+    // ------------------------------------------- msim -compile (simv)
+    // simv has no slang design: msim binds the power intent to the design,
+    // then writes what simv needs to run it into a snapshot. simv reads
+    // the UPF file again with the design's answers that msim recorded (the
+    // DesignView for find_objects, set_design_top, apply_power_model,
+    // the HDL attributes), then takes the bound state from the snapshot.
+    struct LoadRec {
+        std::string path;
+        bool topFixed = false;
+        std::vector<HdlAttr> attrs;
+        std::map<std::string, std::vector<std::string>> applies;   // apply_power_model: module -> instances
+        DesignView dv;
+    } lrec;
+    // Why the bound state cannot run in simv yet, or "".
+    std::string simvGap() const {
+        if (!override.empty() || !pendingChecks.empty()) return "a power state held at bind time";
+        return "";
+    }
+    // VCMs and VCTs by name: the model simv reads holds its own.
+    std::string vcmName(const Vcm* v) const {
+        if (!v) return "";
+        for (auto& [n, vv] : m.vcms) if (&vv == v) return n;
+        throw Error("msim -compile: a VCM outside the power intent");
+    }
+    const Vcm* vcmNamed(const std::string& n) const { return n.empty() ? nullptr : &m.vcms.at(n); }
+    std::string vctName(const Vct* v) const {
+        if (!v) return "";
+        for (auto& [n, vv] : m.vcms) if (&vv.bits == v) return "#" + n;   // a bit VCM's table
+        if (m.vct(v->name) != v) throw Error("msim -compile: VCT " + v->name + " is not found by its name");
+        return v->name;
+    }
+    const Vct* vctNamed(const std::string& n) const {
+        if (n.empty()) return nullptr;
+        if (n[0] == '#') return &m.vcms.at(n.substr(1)).bits;
+        return m.vct(n);
+    }
+    template <class A> void snapshot(A& a) {
+        auto& M = m;
+        a(M.top, M.connects, M.connectWhere, dm.el, dm.excl, g.up);
+        {   // connect_supply_net -vcm: by name
+            std::map<std::pair<std::string, std::string>, std::string> cv;
+            if (a.out)
+                for (auto& [k, v] : M.connectVcm)
+                    for (auto& [n, vv] : M.vcms) if (&vv == v) cv[k] = n;
+            a(cv);
+            if (!a.out) {
+                M.connectVcm.clear();
+                for (auto& [k, n] : cv) M.connectVcm[k] = &M.vcms.at(n);
+            }
+        }
+        a(on, verbose, sigByName, drv, val, swOf, swState, domIdx, groupIdx, lastState, watch, reported, chkSig, errors);
+        size_t n = sets.size();
+        a(n);
+        if (!a.out) sets.clear();
+        auto si = sets.begin();
+        for (size_t k = 0; k < n; k++) {
+            std::string key = a.out ? si->first : std::string();
+            a(key);
+            SetRt& r = a.out ? (si++)->second : sets[key];
+            a(r.state, r.sim, r.sig, r.known, r.forced);
+        }
+        a.seq(doms, [&](DomRt& d) { a(d.name, d.set, d.mode, d.applied, d.alwaysOn, d.region, d.owned, d.state, d.forced); });
+        a.seq(cells, [&](Cell& c) {
+            int iso = c.iso ? (int)(c.iso - M.isos.data()) : -1;
+            a(c.kind, c.clamp, iso, c.supplies, c.senseLow, c.latch, c.latched, c.port, c.model, c.enables, c.isolating);
+            c.iso = iso >= 0 ? &M.isos[(size_t)iso] : nullptr;
+        });
+        a.seq(groups, [&](GroupRt& gr) { a(gr.name, gr.state, gr.forced); });
+        a.seq(rets, [&](RetRt& r) {
+            int ri = r.r ? (int)(r.r - M.rets.data()) : -1;
+            a(ri, r.dom, r.saveSig, r.restoreSig, r.lastSave, r.lastRestore, r.single, r.inRet, r.restoring);
+            r.r = ri >= 0 ? &M.rets[(size_t)ri] : nullptr;
+            a.seq(r.els, [&](RetEl& e) { a(e.sig, e.saved, e.have); });
+        });
+        a(regionIdx, covPath, stateHits, transHits, retHits, stateSigs, latchSigs, noCorr, realSigs, intSigs);
+        a.seq(retModelEls, [&](RetModelEl& e) { a(e.el, e.q, e.inst, e.strategy, e.elSig, e.qSig, e.copied, e.last); });
+        a(retModelInsts, ifcElOf);
+        a.seq(ifcEls, [&](IfcEl& e) { a(e.port, e.d, e.y, e.dSig, e.ySig, e.held, e.last); });
+        a.seq(hdlPorts, [&](HdlPort& h) {
+            std::string vct = a.out ? vctName(h.vct) : "", vcm = a.out ? vcmName(h.vcm) : "";
+            a(vct, vcm, h.sig, h.net, h.port, h.supply, h.hdl2upf, h.cat, h.sgn, h.w, h.labelOf, h.valueOf, h.last, h.lastVal, h.held,
+              h.lastV, h.hasV, h.warned, h.fOff, h.copyFrom, h.target, h.lastCopy, h.copied);
+            if (!a.out) { h.vct = vctNamed(vct); h.vcm = vcmNamed(vcm); }
+        });
+        {
+            size_t nb = vcmBinds.size();
+            a(nb);
+            if (!a.out) vcmBinds.clear();
+            auto it = vcmBinds.begin();
+            for (size_t k = 0; k < nb; k++) {
+                std::pair<std::string, std::string> key;
+                VcmBind b;
+                std::string vn;
+                if (a.out) { key = it->first; b = it->second; vn = vcmName(b.vcm); ++it; }
+                a(key, vn, b.hdl2upf, b.inst);
+                if (!a.out) { b.vcm = vcmNamed(vn); vcmBinds[key] = b; }
+            }
+        }
+        a(fieldHeld, swCat, swPrevCat, ackVal, ackGen, pstLast, checkArmed, g_pdMode, g_pdSig, S.vcdTop, instCells());
+        // sim_replay_control: by process number; simv runs its compiled process
+        if (a.out) {
+            replayProc.clear();
+            for (auto& [p, d] : replays) {
+                auto it = std::find(progs.begin(), progs.end(), p);
+                if (it == progs.end()) throw Error("msim -compile: a replayed initial block is not a process of the design");
+                replayProc.push_back((int)(it - progs.begin()));
+            }
+        }
+        std::vector<int> rd;
+        for (auto& r : replays) rd.push_back(r.second);
+        a(replayProc, rd);
+        if (!a.out) {
+            replays.clear();
+            for (int d : rd) replays.push_back({nullptr, d});
+        }
+        a.seq(asrtCtls, [&](AsrtCtlRt& x) {   // sim_assertion_control
+            int ri = x.r ? (int)(x.r - M.assertCtls.data()) : -1;
+            a(ri, x.id, x.dom, x.active, x.dead);
+            x.r = ri >= 0 ? &M.assertCtls[(size_t)ri] : nullptr;
+        });
+    }
+    std::vector<const Prog*> progs;   // msim: the design's processes in simv's order (proc<n>)
+    // msim: the load record and the bound state.
+    bool writeSnapshot(const std::string& path, std::vector<const Prog*> procs) {
+        progs = std::move(procs);
+        std::ofstream f(path, std::ios::binary);
+        snap::Out a{f};
+        a(lrec.path, lrec.topFixed, m.loadStart, m.topSeen, lrec.applies);
+        a.seq(lrec.attrs, [&](HdlAttr& h) { a(h.model, h.port, h.name, h.value, h.where); });
+        a(lrec.dv.models, lrec.dv.instances, lrec.dv.signals, lrec.dv.model, lrec.dv.portsOf);
+        a.seq(lrec.dv.ports, [&](PortSite& p) { a(p.inst, p.port, p.dir, p.width, p.where); });
+        snapshot(a);
+        return (bool)f;
+    }
+    // simv: the same model, then the bound state.
+    bool readSnapshot(const std::string& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        snap::In a{f};
+        std::string start;
+        std::map<std::string, std::string> seen;
+        a(lrec.path, lrec.topFixed, start, seen, lrec.applies);
+        a.seq(lrec.attrs, [&](HdlAttr& h) { a(h.model, h.port, h.name, h.value, h.where); });
+        a(lrec.dv.models, lrec.dv.instances, lrec.dv.signals, lrec.dv.model, lrec.dv.portsOf);
+        a.seq(lrec.dv.ports, [&](PortSite& p) { a(p.inst, p.port, p.dir, p.width, p.where); });
+        if (!f) return false;
+        std::ostringstream quiet;   // Tcl puts printed once already, by msim
+        m.out = &quiet;
+        m.dv = &lrec.dv;
+        m.topFixed = lrec.topFixed;
+        m.resolveTop = [seen](const std::string& t) {
+            auto it = seen.find(t);
+            return it == seen.end() ? t : it->second;
+        };
+        m.load(lrec.path, start);
+        m.dv = nullptr;
+        m.resolveTop = nullptr;
+        m.out = &std::cout;
+        m.addHdlAttrs(lrec.attrs);
+        m.resolveApplies([this](const std::string& mod) { return lrec.applies[mod]; });
+        snapshot(a);
+        if (!f) return false;
+        g_upf = on;
+        g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
+        return true;
     }
 };
 
