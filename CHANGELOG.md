@@ -61,6 +61,14 @@ Spec references are IEEE 1800-2023 clauses.
   toggles, FSMs, assertions and covergroups. It also reads what other tools
   write, such as blocks, case statements with more than two arms and
   SystemVerilog literal state values.
+- `mcov` takes other vendors' coverage command lines:
+  - URG options with `--compat=synopsys`
+  - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
+  - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
+  - the same through a symlink named `urg`, `imc` or `vcover`
+
+  The engine is mcov's own, and it reads mcov's own databases.
+  A database that does not exist is now a one-line error instead of a traceback.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -82,6 +90,11 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- The interpreter finds the matching item of a case statement with constant
+  labels through a table instead of comparing label by label, and a `unique
+  case` whose labels are enum names is no longer treated as possibly
+  overlapping. OpenTitan Ibex runs in 15.7 s instead of 20.8 s on one thread
+  (`tests/spec/12.5-case-many-items.sv`).
 - VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
   `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
   one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and
