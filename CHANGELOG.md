@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-sva`: handshake checks are now an alternation check that
+  holds on both sides (the side that starts a transfer and the side that
+  answers), and an acknowledge read back through logic (an FSM) counts.
+  Checked by simulation on pulp common_cells `cdc_2phase`, `cdc_4phase`,
+  `cdc_fifo_2phase` and `cdc_fifo_gray`: no assertion fails.
+
+### Fixed
+- `mlint -cdc-sva`: no held check on a FIFO memory (storage wider than what
+  the reader takes), which failed on correct FIFOs such as common_cells
+  `cdc_fifo_gray`.
 - `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
