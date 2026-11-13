@@ -370,7 +370,9 @@ size); a write to an existing element does not.
 so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
 `cbStartOfReset` and `cbEndOfReset` register (with a handle) and never run.
 
-**Data read API (41).** Annex M declares no data read routines or
+**Data read API (41).** The clause is deprecated: 1800-2023 says only
+"This clause has been deprecated. See IEEE Std 1800-2005 for the contents of
+this clause." Annex M declares no data read routines or
 constants, so there is nothing to implement; recorded data is read with the
 waveform tools (`mwave`, the FST and VCD readers).
 
