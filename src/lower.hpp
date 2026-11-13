@@ -11614,6 +11614,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     bool inoutTran(const slang::ast::PortSymbol& ps, const slang::ast::Expression& act0, const Formal& f) {
         using namespace slang::ast;
         const Expression& act = Lowerer::peel(act0);
+        if (act.kind == ExpressionKind::Concatenation) return inoutTranConcat(ps, act.as<ConcatenationExpression>(), f);
         if (act.kind != ExpressionKind::ElementSelect && act.kind != ExpressionKind::RangeSelect &&
             act.kind != ExpressionKind::NamedValue && act.kind != ExpressionKind::HierarchicalValue)
             return false;
@@ -11643,6 +11644,63 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         t.k = IK::Tran;
         t.sig = id;
         lw.prog.emit(t);
+        out.procs.push_back({std::move(lw.prog), false, "tran"});
+        return true;
+    }
+    // An inout port on a concatenation of net bits (`.pad({p[1], p[0]})`, as
+    // gate netlists write it): one switch per run of operands that are
+    // neighbouring bits of the same net, formal bits to those bits. A net
+    // bit used twice, or a non-constant select, is left to the plain
+    // continuous assignments.
+    bool inoutTranConcat(const slang::ast::PortSymbol& ps, const slang::ast::ConcatenationExpression& cat, const Formal& f) {
+        using namespace slang::ast;
+        auto simple = [](const Symbol& s) {
+            if (s.kind != SymbolKind::Net) return false;
+            const auto& n = s.as<NetSymbol>();
+            auto k = n.netType.netKind;
+            return n.getType().isIntegral() && !n.getDelay() && k != NetType::UserDefined && k != NetType::Interconnect &&
+                   k != NetType::TriReg && k != NetType::Unknown;
+        };
+        if (!ps.internalSymbol || !simple(*ps.internalSymbol)) return false;
+        struct Run { int sig, fLo, aLo, w; };
+        std::vector<Run> runs;
+        int off = f.w;
+        for (const Expression* op0 : cat.operands()) {
+            const Expression& op = Lowerer::peel(*op0);
+            int w = (int)op.type->getBitWidth();
+            if (w <= 0) continue;   // a replication of zero
+            const Expression* root = &op;
+            while (root->kind == ExpressionKind::ElementSelect || root->kind == ExpressionKind::RangeSelect)
+                root = root->kind == ExpressionKind::ElementSelect ? &root->as<ElementSelectExpression>().value()
+                                                                   : &root->as<RangeSelectExpression>().value();
+            if (root->kind != ExpressionKind::NamedValue && root->kind != ExpressionKind::HierarchicalValue) return false;
+            if (!simple(root->as<ValueExpressionBase>().symbol)) return false;
+            Lowerer lw(sigmap);
+            prep(lw);
+            Instr i;
+            lw.lhs(op, i);
+            if (i.arr || i.bidx || i.dyn >= 0 || !lw.prog.code.empty()) return false;
+            off -= w;
+            int lo = i.hi >= 0 ? i.lo : 0;
+            if (!runs.empty() && runs.back().sig == i.sig && runs.back().fLo == off + w && runs.back().aLo == lo + w) {
+                runs.back().fLo = off; runs.back().aLo = lo; runs.back().w += w;   // the next lower bits of the same net
+            } else runs.push_back({i.sig, off, lo, w});
+        }
+        if (off != 0 || runs.empty()) return false;
+        for (size_t a = 0; a < runs.size(); a++)   // the same net bit twice ({p[0], p[0]}) would short two port bits
+            for (size_t b = a + 1; b < runs.size(); b++)
+                if (runs[a].sig == runs[b].sig && runs[a].aLo < runs[b].aLo + runs[b].w && runs[b].aLo < runs[a].aLo + runs[a].w)
+                    return false;
+        Lowerer lw(sigmap);
+        prep(lw);
+        for (const Run& r : runs) {
+            int id = (int)out.trans.size();
+            out.trans.push_back({f.sig, r.sig, false, r.fLo, r.aLo, r.w});
+            Instr t;
+            t.k = IK::Tran;
+            t.sig = id;
+            lw.prog.emit(t);
+        }
         out.procs.push_back({std::move(lw.prog), false, "tran"});
         return true;
     }
