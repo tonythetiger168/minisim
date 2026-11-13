@@ -5,6 +5,7 @@
 // #delay inside the callee suspends the process and keeps the address.
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -337,7 +338,74 @@ struct Instr {
     bool noSelf = false;
     int vslot = -1;
     std::shared_ptr<const struct RandCall> rc;   // Randomize
+    // JmpIfNot of one item of a case statement whose labels are constants
+    // (12.5): every item of that statement carries the same caseId (> 0).
+    // Each item's condition compares the one selector expression with its
+    // labels, and its target is the next item; after the last item comes
+    // the default. A pass may drop items that do not matter to it, as long
+    // as each kept item still jumps to the next kept one. The interpreter
+    // goes straight to the matching item through a table built on first use
+    // (caseJump); a copy of the instruction starts with no table, so passes
+    // that move code need not know about it. caseItem numbers the items
+    // from 1, so a walk along the chain stops at a copy of the same
+    // statement that follows it (an unrolled loop).
+    int caseId = 0, caseItem = 0;
+    struct CaseCache {
+        mutable std::atomic<const struct CaseTable*> t{nullptr};
+        CaseCache() = default;
+        CaseCache(const CaseCache&) {}
+        CaseCache& operator=(const CaseCache&) { t.store(nullptr, std::memory_order_relaxed); return *this; }
+    } caseTab;
 };
+
+// The jump table of a case statement (Instr::caseId): label value -> the pc
+// of its item's body, sorted by value; `dflt` when no label matches.
+struct CaseTable {
+    E sel;
+    std::vector<std::pair<uint64_t, size_t>> to;
+    size_t dflt = 0;
+    bool ok = false;   // false: the code is not in the expected shape; run the compares
+};
+// A case item's labels: the condition is (sel === K) or an || of them, with
+// the same `sel` node in every compare.
+inline bool caseLabels(const E& e, E& sel, std::vector<uint64_t>& keys) {
+    if (!e) return false;
+    if (e->op == Op::LogOr && e->kids.size() == 2) return caseLabels(e->kids[0], sel, keys) && caseLabels(e->kids[1], sel, keys);
+    if (e->op != Op::CaseEq || e->kids.size() != 2) return false;
+    const E& a = e->kids[0];
+    const E& b = e->kids[1];
+    if (!b || b->op != Op::Const || b->k.x || b->k.z || !b->k.hi.empty() || b->k.real || b->k.str) return false;
+    if (!sel) sel = a;
+    else if (sel != a) return false;
+    keys.push_back(b->k.v);
+    return true;
+}
+inline const CaseTable* caseTable(const std::vector<Instr>& code, size_t pc) {
+    const Instr& h = code[pc];
+    if (const CaseTable* t = h.caseTab.t.load(std::memory_order_acquire)) return t;
+    auto* t = new CaseTable;
+    size_t q = pc;
+    bool ok = true;
+    int last = 0;
+    while (q < code.size() && code[q].k == IK::JmpIfNot && code[q].caseId == h.caseId && code[q].caseItem > last) {
+        last = code[q].caseItem;
+        if (code[q].xt != Instr::NOX || code[q].target <= q) { ok = false; break; }
+        std::vector<uint64_t> keys;
+        if (!caseLabels(code[q].e, t->sel, keys)) { ok = false; break; }
+        for (uint64_t key : keys) t->to.push_back({key, q + 1});
+        q = code[q].target;
+    }
+    if (ok) {
+        t->dflt = q;
+        // The first item with a label wins, as in the chain of compares.
+        std::stable_sort(t->to.begin(), t->to.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        t->to.erase(std::unique(t->to.begin(), t->to.end(), [](const auto& a, const auto& b) { return a.first == b.first; }), t->to.end());
+    }
+    t->ok = ok;
+    const CaseTable* none = nullptr;
+    if (!h.caseTab.t.compare_exchange_strong(none, t, std::memory_order_acq_rel)) { delete t; return none; }
+    return t;
+}
 
 // ---------- constrained randomization (18) ----------
 // One range of a dist (18.5.3): [lo, hi] (hi null: the single value lo),

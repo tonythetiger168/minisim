@@ -61,6 +61,14 @@ Spec references are IEEE 1800-2023 clauses.
   toggles, FSMs, assertions and covergroups. It also reads what other tools
   write, such as blocks, case statements with more than two arms and
   SystemVerilog literal state values.
+- `mcov` takes other vendors' coverage command lines:
+  - URG options with `--compat=synopsys`
+  - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
+  - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
+  - the same through a symlink named `urg`, `imc` or `vcover`
+
+  The engine is mcov's own, and it reads mcov's own databases.
+  A database that does not exist is now a one-line error instead of a traceback.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -82,6 +90,11 @@ Spec references are IEEE 1800-2023 clauses.
     which writes them, has gone.
 
 ### Changed
+- The interpreter finds the matching item of a case statement with constant
+  labels through a table instead of comparing label by label, and a `unique
+  case` whose labels are enum names is no longer treated as possibly
+  overlapping. OpenTitan Ibex runs in 15.7 s instead of 20.8 s on one thread
+  (`tests/spec/12.5-case-many-items.sv`).
 - VPI: a variable of a SystemVerilog type no longer reports `vpiReg` (an
   `int` is a `vpiIntVar`, a `bit` vector a `vpiBitVar`), a
   one-dimensional array reports `vpiRegArray` (`vpiIsMemory` is 1 and
@@ -263,6 +276,11 @@ Spec references are IEEE 1800-2023 clauses.
   `run [T]`, `step`, stops on a signal change, edge or value, `print` of
   signals and class objects (properties, inherited ones, paths through
   handles), `force`, `release`, `deposit` and `signals`.
+- `mdebug` waves: a marker with the time to the cursor (shift+click or `m`),
+  a radix per row (`r`: hex, decimal, signed, binary), find value
+  (next/previous time the selected signal takes it), Del to remove a row,
+  Ctrl+arrows to step changes; the view lives in the page address, so a
+  reload or a copied link opens on it.
 - `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
   signal's waves are sent when the page first shows it, so large waveforms
   are not cut to the one-file page's budget.
@@ -902,6 +920,17 @@ Spec references are IEEE 1800-2023 clauses.
   by default (`-threads N`) with the same report for every thread count. A
   35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
   is the shared GDSII reader and writer. See `docs/MPV.md`.
+- UVM (IEEE 1800.2-2020): three tests cover the classes that compiled but
+  had no check of their own: `tests/uvm/base_extras.sv` (`uvm_time`,
+  `uvm_heartbeat`, `uvm_sequence_library`, report macros,
+  `uvm_callback_iter`, `uvm_run_test_callback`, `uvm_root`),
+  `reg_extras.sv` (`uvm_reg_file`, `uvm_reg_indirect_data`, `uvm_reg_fifo`,
+  `uvm_vreg`, `uvm_vreg_field`, `uvm_mem_mam`, block lookups) and
+  `reg_sequences.sv` (the built-in register and memory test sequences of
+  Annex E, each also run against a faulty DUT). Two faults they found are
+  fixed: `c ? i++ : i` and `c ? (x = 1) : 0` ran the assignment in the arm
+  not picked (11.4.11), and a `randc` property named in `randomize(v)` lost
+  its cycle (18.11).
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
