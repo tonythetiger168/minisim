@@ -92,8 +92,16 @@ turned on.
 keeps running in a powered-off domain (9.2.1). Errors print as
 `UPF error: <time>: <text>` and the simulation goes on.
 
-Power-aware runs use the interpreter on one thread: `-compile`, the static
-schedules and `-threads` are turned off with `-upf`.
+Power-aware runs turn the static schedules and `-threads` off. `-compile`
+works with `-upf`: msim binds the power intent to the design, writes what it
+bound to a snapshot next to `simv`, and `simv` reads the UPF file again with
+the design's answers and runs the same power-aware runtime. A process of a
+power domain sleeps while the domain is off and corrupts its writes as its
+simstate says, as in the interpreter; replayed initial blocks
+(`sim_replay_control`), HDL ports on supply nets, VCMs, retention and
+isolation models, and `-upf_cov` all run in `simv`. A design `-compile`
+cannot build for another reason (a concurrent assertion, say) still runs on
+the interpreter.
 
 ### Forward SAIF (Annex J)
 
