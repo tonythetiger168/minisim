@@ -148,6 +148,9 @@ struct Xp {
     // Called subroutines with nonblocking assignments, and their copies for
     // this process (see xpVariant).
     std::unordered_map<const Prog*, const Prog*> variants;
+    // Named blocks a disable may leave (xpBlockStart), innermost last.
+    struct Dis { const void* sym; int flag; size_t loops; };
+    std::vector<Dis> dis;
     // The clean copy (see xpProc): `sites` holds, per region in the order
     // the regions are lowered, where the merging copy takes over when
     // condition k is unknown (empty: the region is not merged).
@@ -621,6 +624,16 @@ void xpEmit(Instr i, const slang::ast::Expression& target) {
 // under if (!brk), and the loop ends once brk is 1. An unknown condition
 // around a break then makes brk x, and the rest of the loop merges with
 // not running, as tmerge asks. Both flags are 0 outside the loop.
+// Whether st holds a disable statement, at any depth (see xpDisable).
+static bool xpHasDisable(const slang::ast::Statement& st) {
+    using namespace slang::ast;
+    struct V : ASTVisitor<V, VisitFlags::Statements> {
+        bool any = false;
+        void handle(const DisableStatement&) { any = true; }
+    } v;
+    st.visit(v);
+    return v.any;
+}
 static bool xpEscapes(const slang::ast::Statement& st) {
     using namespace slang::ast;
     struct V : ASTVisitor<V, VisitFlags::Statements> {
@@ -635,7 +648,7 @@ static bool xpEscapes(const slang::ast::Statement& st) {
         void handle(const RepeatLoopStatement&) {}
     } v;
     st.visit(v);
-    return v.any;
+    return v.any || xpHasDisable(st);
 }
 bool xpLoopOk(const slang::ast::Statement& body) { return xp.on && !xp.clean && xpEscapes(body); }
 // Whether a loop body has a nonblocking assignment or writes an array
@@ -731,17 +744,56 @@ void xpLoopEnd() {
     xpSet(loops.back().xpBrk, konst(mk(0, 1)));
     xpSet(loops.back().xpCnt, konst(mk(0, 1)));
 }
+// 1 once a break, continue or disable has run (or may have): the flags of
+// the innermost loop and of every block a disable may leave.
+E xpEscaped() {
+    E e;
+    auto add = [&](int f) { e = e ? bin(Op::Or, e, ref(f)) : ref(f); };
+    if (!loops.empty() && loops.back().xpBrk >= 0) { add(loops.back().xpBrk); add(loops.back().xpCnt); }
+    for (const auto& d : xp.dis) add(d.flag);
+    return e;
+}
 void xpList(std::span<const slang::ast::Statement* const> list, size_t k0) {
     for (size_t k = k0; k < list.size(); k++) {
         stmt(*list[k]);
         if (k + 1 < list.size() && xpEscapes(*list[k])) {
-            int brk = loops.back().xpBrk, cnt = loops.back().xpCnt;
+            E esc = xpEscaped();
+            if (!esc) continue;
             xp.key = list[k];
-            xpChain(1, [&](size_t) { return std::pair<E, E>{nullptr, xpNot(bin(Op::Or, ref(brk), ref(cnt)))}; },
-                    [&](size_t j) { if (j == 0) xpList(list, k + 1); }, "rest after break / continue");
+            xpChain(1, [&](size_t) { return std::pair<E, E>{nullptr, xpNot(esc)}; },
+                    [&](size_t j) { if (j == 0) xpList(list, k + 1); }, "rest after break / continue / disable");
             return;
         }
     }
+}
+// In the merging copy, a named block that a disable inside it may leave
+// (9.6.2) gets a flag: the disable sets it, and the break flag of every loop
+// between, instead of jumping; the rest of each statement list runs under
+// !flag (xpList), so an unknown condition around the disable merges the
+// rest of the block with not running it.
+bool xpBlockStart(const slang::ast::Symbol* sym, const slang::ast::Statement& body) {
+    if (!xp.on || xp.clean || !xpHasDisable(body)) return false;
+    int f = xpTemp(1);
+    xpSet(f, konst(mk(0, 1)));
+    xp.dis.push_back({sym, f, loops.size()});
+    return true;
+}
+void xpBlockEnd() {
+    xpSet(xp.dis.back().flag, konst(mk(0, 1)));
+    xp.dis.pop_back();
+}
+// disable sym: true when it was lowered as flags.
+bool xpDisable(const slang::ast::Symbol* sym) {
+    if (!xp.on || xp.clean) return false;
+    for (size_t k = xp.dis.size(); k-- > 0;) {
+        if (xp.dis[k].sym != sym) continue;
+        for (size_t l = xp.dis[k].loops; l < loops.size(); l++)
+            if (loops[l].xpBrk < 0) return false;
+        for (size_t l = xp.dis[k].loops; l < loops.size(); l++) xpSet(loops[l].xpBrk, konst(mk(1, 1)));
+        xpSet(xp.dis[k].flag, konst(mk(1, 1)));
+        return true;
+    }
+    return false;
 }
 
 // ---- a region ----

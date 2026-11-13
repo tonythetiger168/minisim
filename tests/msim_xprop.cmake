@@ -45,8 +45,8 @@ endforeach()
 execute_process(COMMAND ${MSIM} checks-fallback.sv -xprop -xprop-report ${OUT}/report.txt
                 OUTPUT_QUIET RESULT_VARIABLE rc WORKING_DIRECTORY ${SRC}/tests/xprop)
 file(READ ${OUT}/report.txt rep)
-if(NOT rc EQUAL 0 OR NOT rep MATCHES "xprop tmerge: 16 of 19" OR NOT rep MATCHES "case: merged"
-   OR NOT rep MATCHES "if: not merged, it holds a jump out of the branch"
+if(NOT rc EQUAL 0 OR NOT rep MATCHES "xprop tmerge: 19 of 21" OR NOT rep MATCHES "case: merged"
+   OR NOT rep MATCHES "rest after break / continue / disable: merged"
    OR NOT rep MATCHES "loop body: merged"
    OR NOT rep MATCHES "if: not merged, it holds a task or function call statement"
    OR NOT rep MATCHES "edge: merged")
