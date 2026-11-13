@@ -3,7 +3,10 @@
 // states, assertions); vpiCovered / vpiCoveredCount / vpiCoveredMax read
 // one assertion, FSM, FSM state, net or bit; vpi_iterate(vpiFsm) and
 // vpiFsmStates walk the FSMs; vpi_control starts, stops, resets, checks
-// and saves coverage.
+// and saves coverage. vpiCovered of an assertion: attempted, succeeded at
+// least once, never failed. vpiCoverageCheck answers as $coverage_control
+// (40.3.2.1): SV_COV_OK (1) when there is coverage of that type in the
+// instance, whether or not all of it is covered.
 //! icarus-skip: Icarus 13 has no coverage API
 //! args: -cov /tmp/msim-spec-40-vpi-coverage.json data/vpi/coverage.c
 module fsm_m(input logic clk, input logic rst, input logic go);
@@ -63,7 +66,7 @@ endmodule
 //>   cnt: 1 of 4 bits toggled, cnt[0]: 1
 //>   a_go: covered 1, attempts 7 success 2 failure 0 vacuous 4 disabled 1 killed 0
 //>   c_done: covered 1, attempts 7 success 1 failure 6 vacuous 0 disabled 0 killed 0
-//>   check: statements 0 fsm 0
+//>   check: statements 1 fsm 1
 //> control 751 763: 1
 //> control 751 760: 1
 //> top.u: statements 9 toggles 5 fsm 3 asserts 2
@@ -75,7 +78,7 @@ endmodule
 //>   cnt: 1 of 4 bits toggled, cnt[0]: 1
 //>   a_go: covered 1, attempts 7 success 2 failure 0 vacuous 4 disabled 1 killed 0
 //>   c_done: covered 1, attempts 7 success 1 failure 6 vacuous 0 disabled 0 killed 0
-//>   check: statements 0 fsm 0
+//>   check: statements 1 fsm 1
 //> control 750 763: 1
 //> control 752 762: 1
 //> control 752 760: 1
@@ -88,8 +91,8 @@ endmodule
 //>   cnt: 1 of 4 bits toggled, cnt[0]: 1
 //>   a_go: covered 0, attempts 0 success 0 failure 0 vacuous 0 disabled 0 killed 0
 //>   c_done: covered 0, attempts 0 success 0 failure 0 vacuous 0 disabled 0 killed 0
-//>   check: statements 0 fsm 0
+//>   check: statements 1 fsm 1
 //> save: 1
 //> saved database: msim-cov
-//> merge: 0
-//> stop under a sub-instance: 0
+//> merge: -1
+//> stop under a sub-instance: 1

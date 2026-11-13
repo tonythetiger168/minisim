@@ -25,6 +25,8 @@ h3{margin:0;padding:5px 10px;font-size:11px;letter-spacing:.06em;text-transform:
 .row.on{background:var(--sel)}.row i{color:var(--dim);font-style:normal;margin-left:auto;font-family:ui-monospace,monospace;font-size:11px}
 .row small{color:var(--dim)}
 .ln{display:flex;white-space:pre}.ln>u{flex:0 0 52px;text-align:right;padding-right:10px;color:var(--dim);text-decoration:none;user-select:none}
+.ln.lw>u{background:#fde2b0;color:#7a4b00}.ln.le>u{background:#f6c6c0;color:#8a1d12}.ln.li>u{background:var(--sel)}
+#lintp .d small b{font-weight:600}#lintp .d.wv{opacity:.55}#lintp select{font:inherit;margin-left:6px}
 .ln.hit>u{border-right:3px solid #3a9a5c}.ln.miss>u{border-right:3px solid #d0453a;color:#d0453a}.ln.drv{background:var(--hi)}.ln.load{background:var(--sel)}.ln.cur{outline:1px solid var(--acc)}
 .id{cursor:pointer;border-bottom:1px dotted var(--dim)}.id:hover,.id.on{background:var(--sel);color:var(--acc)}
 .id em{font-style:normal;color:var(--w1);font-size:10px;margin-left:2px}
@@ -52,7 +54,7 @@ svg path.c{stroke-dasharray:3 3}svg .tri{fill:none;stroke:var(--fg)}
 <span id="stat"></span><span style="margin-left:auto" id="tcur"></span></header>
 <div id="left"><h3>Hierarchy</h3><div id="tree"></div><h3>Signals</h3><div id="sigs"></div></div>
 <div id="src"></div>
-<div id="right"><h3>Signal</h3><div id="name" class="none">Click a signal in the source or the list.</div><div id="meta"></div>
+<div id="right"><div id="lintp" style="display:none"><h3>Lint <span id="lintn"></span><select id="lintf"><option value="">all</option><option>error</option><option>warning</option><option>info</option><option value="w">waived</option></select></h3><div id="lintl"></div></div><h3>Signal</h3><div id="name" class="none">Click a signal in the source or the list.</div><div id="meta"></div>
 <h3>Active driver at the cursor</h3><div id="act"><div class="none">With a waveform: the assignment that gave the signal its value, and what caused it.</div></div>
 <div id="trxp" style="display:none"><h3>Transaction</h3><div id="trx"></div></div>
 <h3>Drivers</h3><div id="drv"></div><h3>Loads</h3><div id="lod"></div></div>
@@ -74,6 +76,8 @@ const TL=TR?TR.streams.map(s=>{const ends=[],lane=new Map;s.tx.forEach(i=>{const
   let k=ends.findIndex(v=>v<=b);if(k<0){k=ends.length;ends.push(0)}ends[k]=Math.max(e,b+1);lane.set(i,k)});return {n:Math.max(ends.length,1),lane}}):[];
 const byPath=new Map(S.map((s,i)=>[s.path,i])),drvOf=S.map(()=>[]),loadOf=S.map(()=>[]);
 D.forEach((d,i)=>{drvOf[d.sig].push(i);new Set([...d.reads,...d.ctl]).forEach(s=>loadOf[s].push(i))});
+// mlint findings (-lint): [file, line, col, rule, severity, text, waived, signal, group]; by "file:line" for the source marks.
+const LI=DB.lint||[],LF=new Map();LI.forEach(x=>{if(x[0]<0||x[6])return;const k=x[0]+':'+x[1];(LF.get(k)||LF.set(k,[]).get(k)).push(x)});
 const scopeOf=p=>p.slice(0,p.lastIndexOf('.')),leaf=p=>p.slice(p.lastIndexOf('.')+1);
 const sigsIn=new Map();S.forEach((s,i)=>{const k=scopeOf(s.path);(sigsIn.get(k)||sigsIn.set(k,[]).get(k)).push(i)});
 const st={scope:DB.scopes.length?DB.scopes[0].path:'',sig:-1,file:-1,t:END,rows:[],tx:-1,t0:0,t1:Math.max(END,1),rad:{},mark:-1};
@@ -164,7 +168,9 @@ function source(scroll){const sc=DB.scopes.find(s=>s.path==st.scope);const f=st.
       else if(s!==undefined){const v=W?val(s,st.t):null;o+=`<span class="id${s==st.sig?' on':''}" data-s="${s}">${m}${v===null?'':`<em>${v}</em>`}</span>`}
       else o+=esc(m);return m});
     o+=esc(code.slice(p))+(cm?`<span class="cm">${esc(cm)}</span>`:'');
-    const cv=CL&&CL[n+1];h+=`<div class="ln${drv.has(n+1)?' drv':lod.has(n+1)?' load':''}${n+1==scroll?' cur':''}${cv===undefined?'':cv?' hit':' miss'}" id="L${n+1}"${cv===undefined?'':` title="${cv?'line ran '+cv+(cv==1?' time':' times'):'line never ran'}"`}><u>${n+1}</u><span>${o}</span></div>`});
+    const cv=CL&&CL[n+1],lf=LF.get(f+':'+(n+1));
+    const tip=(cv===undefined?'':cv?'line ran '+cv+(cv==1?' time':' times'):'line never ran')+(lf?(cv===undefined?'':'\n')+lf.map(x=>x[3]+' '+x[4]+': '+x[5]).join('\n'):'');
+    h+=`<div class="ln${drv.has(n+1)?' drv':lod.has(n+1)?' load':''}${n+1==scroll?' cur':''}${cv===undefined?'':cv?' hit':' miss'}${lf?lf.some(x=>x[4]=='error')?' le':lf.some(x=>x[4]=='warning')?' lw':' li':''}" id="L${n+1}"${tip?` title="${esc(tip)}"`:''}><u>${n+1}</u><span>${o}</span></div>`});
   $('src').innerHTML=h;if(scroll){const e=$('L'+scroll);e&&e.scrollIntoView({block:'center'})}}
 function card(i,showT){const d=D[i],f=DB.files[d.file];return `<div class="d" data-d="${i}"><code>${esc(d.text)}</code><small>${esc(f?f.name:'?')}:${d.line} &middot; ${esc(d.kind)}${showT?' &rarr; '+esc(S[d.sig].path):''}</small>${d.when?`<small><br>when <span class="w">${esc(d.when)}</span></small>`:''}</div>`}
 function panel(){if(st.sig<0)return;const s=S[st.sig],v=W?val(st.sig,st.t):null;$('name').className='';$('name').textContent=s.path;
@@ -292,6 +298,13 @@ function step(dir){if(!W||st.sig<0||!W[st.sig])return;const c=W[st.sig],k=chAt(s
 $('prev').onclick=()=>step(-1);$('next').onclick=()=>step(1);$('clr').onclick=()=>{st.rows=[];waves()};$('fit').onclick=()=>{st.t0=0;st.t1=Math.max(END,1);waves()};
 $('cone').onclick=()=>{if(st.sig<0)return;drvOf[st.sig].forEach(i=>[...D[i].reads,...D[i].ctl].forEach(s=>W&&W[s]&&!st.rows.includes(s)&&st.rows.push(s)));waves()};
 window.addEventListener('resize',waves);
+function lintList(){if(!LI.length)return;$('lintp').style.display='';const f=$('lintf').value;
+  const sel=LI.map((x,i)=>i).filter(i=>{const x=LI[i];return f=='w'?x[6]:!x[6]&&(!f||x[4]==f)});
+  $('lintn').textContent='('+LI.filter(x=>!x[6]).length+(LI.some(x=>x[6])?', '+LI.filter(x=>x[6]).length+' waived':'')+')';
+  $('lintl').innerHTML=sel.slice(0,2000).map(i=>{const x=LI[i],fl=DB.files[x[0]];return `<div class="d${x[6]?' wv':''}" data-li="${i}"><code>${esc(x[5])}</code><small><b>${esc(x[3])}</b> ${esc(x[4])} &middot; ${esc(fl?fl.name.replace(/.*\//,''):'?')}:${x[1]}${x[7]>=0?' &middot; '+esc(S[x[7]].path):''}</small></div>`}).join('')+(sel.length>2000?'<div class="none">first 2000 shown</div>':'')||'<div class="none">none</div>'}
+$('lintf').addEventListener('change',lintList);
+$('lintl').addEventListener('click',e=>{const t=e.target.closest('[data-li]');if(!t)return;e.stopPropagation();const x=LI[+t.dataset.li];
+  if(x[7]>=0){pick(x[7],x[1]);if(x[0]>=0&&st.file!=x[0]){st.file=x[0];source(x[1])}}else if(x[0]>=0){st.file=x[0];source(x[1])}});
 document.addEventListener('keydown',e=>{if(/INPUT|TEXTAREA/.test(document.activeElement.tagName)||st.sig<0)return;
   if(e.key=='r'){const o=['hex','dec','sdec','bin'],c=o.indexOf(st.rad[st.sig]||'hex');const n=o[(c+1)%o.length];if(n=='hex')delete st.rad[st.sig];else st.rad[st.sig]=n;waves()}
   else if(e.key=='Delete'||e.key=='Backspace'){const k=st.rows.indexOf(st.sig);if(k>=0){st.rows.splice(k,1);waves()}}
@@ -306,6 +319,6 @@ $('fv').addEventListener('keydown',e=>{if(e.key!='Enter'||!W||st.sig<0||!W[st.si
   if(e.shiftKey){for(let j=k-1;j>=0;j--)if(c[j][1]==want){setT(c[j][0]);return}}else for(let j=k+1;j<c.length;j++)if(c[j][1]==want){setT(c[j][0]);return}
   e.target.style.borderColor='var(--wz)'});
 $('stat').textContent=DB.scopes.length+' instances · '+S.length+' signals · '+D.length+' drivers'+(TR?' · '+TR.tx.length+' transactions':'');
-tree();sigList();source();if(!loadView())setT(DB.at===undefined?END:DB.at);blocks();
+lintList();tree();sigList();source();if(!loadView())setT(DB.at===undefined?END:DB.at);blocks();
 </script></body></html>
 )MDV";

@@ -6,7 +6,7 @@
 //   mvplat prog.elf -harts 4                four harts, on every core
 //   mvplat prog.elf -trace commits.log      a commit log, in spike's format
 //
-// The platform is RV32IMAC harts (machine and user mode, PMP) on a bus of
+// The platform is RV32IMAC harts (machine, supervisor and user mode, PMP, Sv32) on a bus of
 // RAM, ROM, a 16550 UART, a CLINT, a PLIC and a test finisher. Several harts
 // run on several threads with the same result as on one (vp/machine.hpp says
 // how). Options and device types this file does not know go to an extension
