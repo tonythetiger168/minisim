@@ -549,7 +549,11 @@ inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
     if (t.isVoid()) { w = 0; return DT_VOID; }
     if (t.isString()) { w = 64; return DT_STRING; }
     if (t.isCHandle()) { w = 64; return DT_CHANDLE; }
-    if (t.isFloating()) { w = (int)t.getBitWidth(); return w == 32 ? DT_SHORTREAL : DT_REAL; }
+    if (t.isFloating()) {   // a shortreal is held as a double, like a real (6.12)
+        bool sr = t.getBitWidth() == 32;
+        w = 64;
+        return sr ? DT_SHORTREAL : DT_REAL;
+    }
     if (!t.isIntegral()) throw std::runtime_error("lower: unsupported DPI argument type " + t0.toString());
     w = (int)t.getBitWidth();
     if (t.kind == SymbolKind::PredefinedIntegerType) {
