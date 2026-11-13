@@ -128,6 +128,8 @@ public:
         if (!dom.empty() && privates && !std::getenv("MSIM_NOWIDE")) wideProcs = splitWide(procs, dom);
         for (size_t i = 0; i < procs.size(); i++) {
             bool inDom = std::find(dom.begin(), dom.end(), (int)i) != dom.end();
+            if (upf && procs[i].prog->pd >= 0 && (procs[i].combRank >= 0 || procs[i].seq || inDom))
+                throw CodegenUnsupported("a statically scheduled process of a power domain");
             if (procs[i].combRank >= 0) {
                 if (dom.empty()) chunk([&](std::ostream& c) { emitComb(c, (int)i, *procs[i].prog, procs[i].kind); });   // else: inlined in combAll
                 if ((size_t)procs[i].combRank >= byRank.size()) byRank.resize(procs[i].combRank + 1, -1);
@@ -266,6 +268,10 @@ public:
              "    if (cl > ch) return false;\n"
              "    val = v_slice(val, (int)(ch - l), (int)(cl - l)); hi = (int)ch; lo = (int)cl; return true;\n"
              "}\n\n";
+        if (upf)   // msim -upf: a write by a process of a power domain (exec.inc upfWrite)
+            o << "static inline Val UPFW(int pd, bool ps, int s, int hi, int lo, Val v) {\n"
+                 "    return __builtin_expect(g_pdMode[(size_t)pd] > 0, 0) ? upfWriteM(pd, ps, s, hi, lo, v) : v;\n"
+                 "}\n\n";
         // Trees rebuilt at startup, made now: they may name arrays (AS<k>).
         std::vector<std::string> sysTrees;
         for (auto& args : sysArgs_) {
@@ -482,9 +488,11 @@ public:
                  "    { std::ofstream fc(std::string(path) + \".fcov\"); writeFuncCov(fc); }   // covergroups, assertions\n"
                  "    return std::fclose(f) == 0;\n"
                  "}\n\n";
+        if (upf) o << "#define UPF_RT_NO_DESIGN\n#include \"upf_rt.inc\"\n\n";   // msim -upf: the power-aware runtime
         o << "int main(int argc, char** argv) {\n"
              "    uint64_t maxTime = ~0ULL;\n"
              "    const char* covOut = nullptr;\n"
+          << (upf ? "    const char* upfSnap = \"upf.snap\";\n" : "") <<
              "    S.vcdPath = \"\";\n"
              "    timeFmt().tickExp = timeFmt().units = " << precExp << ";\n"
              "    S.timescale = " << quote(timescale) << ";\n"
@@ -506,6 +514,7 @@ public:
              "            urandomState() = st ? st : 1;\n"
              "        }\n"
              "        else if (argv[i][0] == '+') plusArgs().push_back(argv[i] + 1);\n"
+          << (upf ? "        else if (!std::strcmp(argv[i], \"-upf_snap\") && i + 1 < argc) upfSnap = argv[++i];\n" : "") <<
              "    }\n"
              "    S.threads = std::min(S.threads, maxThreads());\n";
         // Startup is data plus loops, not one statement per item: a main() of
@@ -523,6 +532,16 @@ public:
                  "        for (int d = 0; d < SIGS[s].drv; d++) S.newDriver(s);\n"
                  "    }\n";
         }
+        if (upf) {   // the power intent msim bound to the design (upf_rt.inc Rt::writeSnapshot)
+            o << "    static Task (*const UPFPROC[])() = {";   // sim_replay_control runs these again
+            for (size_t i = 0; i < procs.size(); i++)
+                o << (i ? ", " : "") << (procs[i].combRank < 0 && !procs[i].seq && std::find(dom.begin(), dom.end(), (int)i) == dom.end() ? "proc" + std::to_string(i) : std::string("nullptr"));
+            o << "};\n    upfrt::rt().procFns = UPFPROC;\n";
+        }
+        if (upf)
+            o << "    try {\n"
+                 "        if (!upfrt::rt().readSnapshot(upfSnap)) { std::cerr << \"simv: cannot read \" << upfSnap << \"\\n\"; return 1; }\n"
+                 "    } catch (const std::exception& ex) { std::cerr << \"simv: UPF: \" << ex.what() << \"\\n\"; return 1; }\n";
         o << initText << initCalls;
         for (size_t i = 0; i < events_.size(); i++) {
             o << "    EV" << i << " = {";
@@ -629,8 +648,14 @@ public:
             for (size_t k = 0; k < fsmDefs().size(); k++) o << (k ? ", " : "") << (fsmDefs()[k].onehot ? 1 : 0);
             o << "});\n";
         }
+        if (upf) o << "    upfrt::rt().start();\n";
         o << "    S.run(maxTime);\n"
              "    std::cout.flush();\n";
+        if (upf)
+            o << "    if (!upfrt::rt().covPath.empty() && !upfrt::rt().writeCoverage()) {\n"
+                 "        std::cerr << \"simv: cannot write \" << upfrt::rt().covPath << \"\\n\";\n"
+                 "        return 1;\n"
+                 "    }\n";
         if (cov) o << "    if (covOut && !writeCov(covOut)) { std::cerr << \"simv: cannot write \" << covOut << \"\\n\"; return 1; }\n";
         o << "    return 0;\n"
              "}\n";
@@ -651,6 +676,11 @@ public:
     // writes the counters and toggle masks to its -cov file and msim turns
     // them into the coverage database. The cycle domain is off with it.
     bool cov = false;
+    // msim -upf: simv runs the power-aware runtime (upf_rt.inc) from msim's
+    // snapshot; a process of a power domain (Prog::pd >= 0) sleeps while the
+    // domain is off and corrupts its writes as its simstate says. Off, the
+    // generated code is the same as without this option.
+    bool upf = false;
     // Build in up to this many C++ files (in parallel): a large design as one
     // file took minutes. Small designs stay one file. Negative: -files files
     // whatever the size (msim -cfiles).
@@ -3324,6 +3354,22 @@ private:
         o << "// process " << n << " (" << kind << ")\n";
         o << "static Task proc" << n << "() {\n";
         if (calls) o << "    std::vector<int> rs;\n";
+        // msim -upf: a process of a domain that is off sleeps until it powers
+        // up, then starts over from its top (exec.inc, 1801 9.5.3).
+        const int pd = upf ? entry.pd : -1;
+        std::string gate;
+        if (pd >= 0) {
+            std::string m = "g_pdMode[" + std::to_string(pd) + "] == 5";
+            gate = " if (__builtin_expect(" + m + ", 0)) { while (" + m + ") co_await Wait{g_pdSig[" + std::to_string(pd) + "], ANY};" +
+                   (calls ? " rs.clear();" : "") + " goto " + L(0, 0) + "; }\n";
+            o << gate;
+        }
+        // ...and stores corrupt values while its simstate says so (upfWrite).
+        auto W = [&](const Instr& i, const std::string& v) {
+            if (pd < 0 || i.tmp || i.sig < 0 || isRel(i.sig) || i.arr) return v;
+            return "UPFW(" + std::to_string(pd) + ", " + (entry.pstate ? "true" : "false") + ", " + std::to_string(i.sig) + ", " +
+                   std::to_string(i.hi) + ", " + std::to_string(i.lo) + ", " + v + ")";
+        };
         bool asserting = false;
         for (const Prog* q : progs)
             for (auto& i : q->code) asserting |= i.k == IK::Assert;
@@ -3361,14 +3407,14 @@ private:
                     continue;
                 }
                 if (dynW) {
-                    o << dynTarget(i, fast(i.e), i.k == IK::Nba ? " S.nba(s, v, hi, lo);"
-                                                                : " S.set(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+                    o << dynTarget(i, W(i, fast(i.e)), i.k == IK::Nba ? " S.nba(s, v, hi, lo);"
+                                                                      : " S.set(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
                     continue;
                 }
                 switch (i.k) {
-                    case IK::Assign: o << assign(i); break;
+                    case IK::Assign: o << (pd >= 0 ? assign(i, W(i, fast(i.e))) : assign(i)); break;
                     case IK::Nba:
-                        o << " S.nba(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
+                        o << " S.nba(" << i.sig << ", " << W(i, fast(i.e)) << ", " << i.hi << ", " << i.lo << ");\n";
                         break;
                     case IK::JmpIfNot:
                         o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, tgt(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, tgt(i.xt)));
@@ -3381,8 +3427,9 @@ private:
                         } else
                             o << " co_await Wait{" << i.sig << ", " << edge(i.edge) << "};";
                         o << (asserting ? " ctl->epoch++;\n" : "\n");   // a deferred assertion flush point (16.4.2)
+                        o << gate;
                         break;
-                    case IK::WaitDelay: o << " co_await Delay{" << i.delay << "ULL};\n"; break;
+                    case IK::WaitDelay: o << " co_await Delay{" << i.delay << "ULL};\n" << gate; break;
                     case IK::Display:
                     case IK::Strobe:
                     case IK::Monitor: {
@@ -3455,7 +3502,7 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
                            const CodegenParts& parts = {}, bool twoState = true, bool cycle = true,
                            bool privates = true,
                            std::vector<std::pair<const Prog*, size_t>>* covSlots = nullptr, int split = 1,
-                           int precExp = -9, const std::string& timescale = "1ns") {
+                           int precExp = -9, const std::string& timescale = "1ns", bool upf = false) {
     std::set<int> noPriv;
     for (int pass = 0;; pass++) {
         Codegen g;
@@ -3467,6 +3514,7 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
         g.privates = privates && pass < 8;   // each pass keeps the signals the last one tripped on in S.sigs
         g.noPriv = noPriv;
         g.cov = covSlots != nullptr;
+        g.upf = upf;
         std::string src = g.run(sigs, procs, parts);
         if (!g.privHits_.empty()) {
             if (!g.privates) throw CodegenUnsupported("a private signal");

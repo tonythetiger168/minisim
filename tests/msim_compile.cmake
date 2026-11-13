@@ -98,4 +98,33 @@ foreach(c IN LISTS CASES)
   endif()
   math(EXPR n "${n} + 1")
 endforeach()
+# Power-aware simulation (msim -upf, IEEE 1801-2024): simv runs the same
+# power intent from msim's snapshot (upf_rt.inc). Domains switched off and
+# on, isolation, corruption, retention of flops and latches, isolation cells
+# by their functional model (HDL ports on supply nets), replayed initial
+# blocks, and the low-power coverage report.
+foreach(t gating retlatch isomodel replay)
+  set(files ${SRC}/tests/upf/${t}.sv -upf ${SRC}/tests/upf/${t}.upf)
+  execute_process(COMMAND ${MSIM} ${files} OUTPUT_VARIABLE want RESULT_VARIABLE r1)
+  execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/upf_${t} ${files}
+                  OUTPUT_VARIABLE got RESULT_VARIABLE r2 ERROR_VARIABLE err)
+  if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0)
+    message(FATAL_ERROR "upf ${t}: exit ${r1} (interpreter) / ${r2} (-compile)\n${err}")
+  endif()
+  if(err MATCHES "using the interpreter")
+    message(FATAL_ERROR "upf ${t}: -compile fell back to the interpreter\n${err}")
+  endif()
+  if(NOT want STREQUAL got)
+    message(FATAL_ERROR "upf ${t}: -compile output differs\n--- interpreter\n${want}--- compiled\n${got}")
+  endif()
+  math(EXPR n "${n} + 1")
+endforeach()
+execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/upf_lpcov ${SRC}/tests/upf/retlatch.sv -upf ${SRC}/tests/upf/lpcov.upf
+                        -upf_cov ${OUT}/lpcov.cov
+                RESULT_VARIABLE rc ERROR_VARIABLE err)
+file(READ ${SRC}/tests/upf/lpcov.cov want)
+file(READ ${OUT}/lpcov.cov got)
+if(NOT rc EQUAL 0 OR NOT want STREQUAL got)
+  message(FATAL_ERROR "upf lpcov: -compile coverage differs: ${rc}\n${err}--- got\n${got}--- want\n${want}")
+endif()
 message(STATUS "${n} designs match")

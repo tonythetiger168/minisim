@@ -313,6 +313,17 @@ inline void invoke(const Instr& ins) {
             continue;
         }
         Val v = S.get(a.sig);
+        if (a.t == DT_STRUCT) {   // a C struct, passed by pointer whatever the direction
+            s.vec.assign(std::max<size_t>(a.cSize, 1), 0);
+            for (const DpiField& fl : a.fields) {
+                Val fv = v_slice(v, fl.lo + fl.w - 1, fl.lo);
+                if (fl.t == DT_REAL || fl.t == DT_SHORTREAL) fv.real = true;
+                toC(s.vec.data() + fl.off, fl.t, fl.w, fv, strs);
+            }
+            s.ptr = s.vec.data();
+            argv[k] = &s.ptr;
+            continue;
+        }
         if (a.t == DT_REAL || a.t == DT_SHORTREAL) { v.real = true; }
         bool vec = a.t == DT_BITVEC || a.t == DT_LOGICVEC;
         if (vec) {
@@ -339,6 +350,16 @@ inline void invoke(const Instr& ins) {
         const DpiArg& a = f.args[k];
         if (a.dir == 0) continue;
         if (a.uarr) { arrOut(arrs[k], a, ins.dact[k], maps[k]); continue; }
+        if (a.t == DT_STRUCT) {
+            Val v = S.get(a.sig);
+            for (const DpiField& fl : a.fields) {
+                Val fv = fromC(slots[k].vec.data() + fl.off, fl.t, fl.w, fl.sgn);
+                fv.real = false;
+                v = v_insert(v, v_resize(fv, fl.w, false), fl.lo + fl.w - 1, fl.lo);
+            }
+            S.set(a.sig, v);
+            continue;
+        }
         const void* p = (a.t == DT_BITVEC || a.t == DT_LOGICVEC) ? (const void*)slots[k].vec.data() : (const void*)slots[k].val;
         S.set(a.sig, fromC(p, a.t, a.w, a.sgn));
     }
@@ -710,6 +731,7 @@ inline std::string cType(DpiType t, bool ptr, bool isConst, bool sgn = true) {
         case DT_LOGIC: b = "svLogic"; break;
         case DT_BITVEC: return std::string(isConst ? "const " : "") + "svBitVecVal*";
         case DT_LOGICVEC: return std::string(isConst ? "const " : "") + "svLogicVecVal*";
+        case DT_STRUCT: b = "void"; break;
     }
     if (!ptr) return b;
     return std::string(isConst ? "const " : "") + b + "*";
@@ -717,6 +739,7 @@ inline std::string cType(DpiType t, bool ptr, bool isConst, bool sgn = true) {
 // The C prototype of an import or export (35.5.6): what -dpiheader writes
 // and what an export stub defines.
 inline std::string cArgType(const DpiArg& a) {
+    if (a.t == DT_STRUCT) return std::string(a.dir == 0 ? "const " : "") + a.cName + "*";
     if (a.uarr && a.open) return a.dir == 0 ? "const svOpenArrayHandle" : "svOpenArrayHandle";
     if (a.uarr) return a.t == DT_STRING ? "const char**" : cType(a.t, true, a.dir == 0, a.sgn);
     if (a.dir == 0) return cType(a.t, false, true, a.sgn);

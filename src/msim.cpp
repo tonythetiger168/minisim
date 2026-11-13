@@ -1430,6 +1430,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
                        uint64_t seed, const std::string& covPath) {
+    // -upf: the power-aware runtime runs in simv too (codegen.hpp Codegen::upf);
+    // the runtime sees every signal, so no private ones.
+    const bool upf = upfrt::rt().on;
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
     std::vector<CodegenProc> procs;
@@ -1446,7 +1449,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         if (pl.rank[i] >= 0)
             for (auto& in : lowered.procs[i].prog.code) combAssert |= in.k == IK::Assert;
     parts.on = staticPart && !combAssert && !pl.cyclic;
-    cycle = cycle && !pl.cyclic;   // the domain evaluates every comb statement once, in rank order
+    // The domain evaluates every comb statement once, in rank order. Not with
+    // -upf: every write goes through Sim::set, which keeps the UPF holds.
+    cycle = cycle && !pl.cyclic && !upf;
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     std::vector<std::pair<const Prog*, size_t>> covSlots;
@@ -1468,8 +1473,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     try {
         // With a VCD every signal must live in S.sigs, so no private signals.
         // A large design is built as several files at once, one per core (16 at most).
-        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath, g_cov ? &covSlots : nullptr,
-                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale());
+        src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath && !upf, g_cov ? &covSlots : nullptr,
+                      g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale(), upf);
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -1516,7 +1521,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     };
     std::string stamp = build + "\n";
-    for (const char* k : {"minisim.cpp", "exec.inc", "expr.hpp", "prog.hpp", "cpu.hpp"}) {
+    std::vector<const char*> kfiles = {"minisim.cpp", "exec.inc", "expr.hpp", "prog.hpp", "cpu.hpp"};
+    if (upf) kfiles.insert(kfiles.end(), {"upf_rt.inc", "upf.hpp", "upf_impl.inc", "upf_vct.hpp", "tcl.hpp"});
+    for (const char* k : kfiles) {
         std::error_code ec;
         auto p = std::filesystem::path(inc) / k;
         auto t = std::filesystem::last_write_time(p, ec);
@@ -1636,6 +1643,16 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // Run-time inputs go to simv, so one build serves every seed and plusarg.
     if (seed) run += " -seed " + std::to_string(seed);
     for (auto& a : plusArgs()) run += " " + shq("+" + a);
+    // -upf: the bound power intent, per run (parallel runs share the build);
+    // MSIM_KEEP_SNAP keeps it, to run simv by hand.
+    std::string snap = dir + "/upf.snap." + std::to_string(::getpid());
+    struct RmSnap { std::string p; ~RmSnap() { if (!p.empty() && !std::getenv("MSIM_KEEP_SNAP")) std::filesystem::remove(p); } } rmSnap{upf ? snap : ""};
+    if (upf) {
+        std::vector<const Prog*> progs;
+        for (auto& lp : lowered.procs) progs.push_back(&lp.prog);
+        if (!upfrt::rt().writeSnapshot(snap, progs)) { std::cerr << "msim: cannot write " << snap << "\n"; return 1; }
+        run += " -upf_snap " + shq(snap);
+    }
     std::string covBin = covPath + ".bin";   // per run: parallel runs share the build directory
     if (g_cov) { std::filesystem::remove(covBin); std::filesystem::remove(covBin + ".fcov"); run += " -cov " + shq(covBin); }
     std::cout.flush();
@@ -2873,7 +2890,11 @@ int main(int argc, char** argv) {
         try {
             upf::DesignView dv = upf::designView(*comp);
             upf::loadWithDesign(rt.m, upfPath, *comp, dv, powerTop, powerTopSet);
-            rt.m.addHdlAttrs(upfHdlAttrs(*comp));   // (* UPF_... *) in the HDL (5.6)
+            rt.lrec.attrs = upfHdlAttrs(*comp);
+            rt.m.addHdlAttrs(rt.lrec.attrs);   // (* UPF_... *) in the HDL (5.6)
+            rt.lrec.path = upfPath;   // msim -compile: simv reads the file again (Rt::readSnapshot)
+            rt.lrec.topFixed = powerTopSet;
+            rt.lrec.dv = dv;
             // the simulation top: a checker module nothing instantiates yet is a top too
             std::string simTop = S.vcdTop;
             {
@@ -2951,6 +2972,7 @@ int main(int argc, char** argv) {
                 std::string pre = S.vcdTop.empty() ? "" : S.vcdTop + ".";
                 for (auto& [full, m] : instCells())
                     if (m == mod && full.compare(0, pre.size(), pre) == 0) r.push_back(full.substr(pre.size()));
+                upfrt::rt().lrec.applies[mod] = r;
                 return r;
             });
             rt.bind(lowered);
@@ -2965,7 +2987,11 @@ int main(int argc, char** argv) {
             staticComb = staticSeq = staticPart = false;
             threads = 1;
         }
-        if (compiled) { std::cerr << "msim: -compile: power-aware simulation is not compiled yet; using the interpreter\n"; compiled = false; }
+        // -compile: simv runs the same runtime from a snapshot of it (upf_rt.inc).
+        if (std::string gap = rt.simvGap(); compiled && !gap.empty()) {
+            std::cerr << "msim: -compile: " << gap << " in the power intent is not compiled yet; using the interpreter\n";
+            compiled = false;
+        }
     }
     if (usesForce()) staticPart = false;   // a forced signal must see every write (10.6)
     if (lowered.procs.empty()) {
