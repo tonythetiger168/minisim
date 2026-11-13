@@ -434,7 +434,28 @@ inline void realBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci, double 
 inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double realInterval = 1.0) {
     std::vector<KR> excl;   // ignored and illegal values
     bool explicitBins = false;
+    std::vector<std::pair<Val, Val>> wideAuto;   // a wide coverpoint's automatic bins, [lo, hi]
     if (c.wide) {   // the bounds of every value bin, in order (keyOf)
+        if (std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0 || b.dflt; })) {
+            // Automatic bins (19.5.3): the 2^w values in autoBinMax equal parts,
+            // the last taking the rest, counted from the lowest value.
+            int W = c.w + 2;
+            int64_t n = std::max<int64_t>(autoBinMax, 1);
+            Val space = v_shl(mk(1, W), mk((uint64_t)c.w, 32));
+            Val per = v_div(space, mk((uint64_t)n, W));
+            auto asVal = [&](const Val& off) {   // an offset from the lowest value, as a value
+                Val v = v_resize(off, c.w, false);
+                if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+                return v;
+            };
+            for (int64_t k = 0; k < n; k++) {
+                Val a = v_mul(per, mk((uint64_t)k, W));
+                Val b = k == n - 1 ? v_sub(space, mk(1, W)) : v_sub(v_mul(per, mk((uint64_t)k + 1, W)), mk(1, W));
+                wideAuto.push_back({asVal(a), asVal(b)});
+                ci.wb.push_back(wideAuto.back().first);
+                ci.wb.push_back(wideAuto.back().second);
+            }
+        }
         for (const auto& bd : c.bins)
             for (const auto& it : bd.items)
                 for (const E& e : {it.range && it.loMin ? E() : it.lo, it.range && !it.hiMax ? it.hi : E()})
@@ -551,7 +572,12 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
             bin.ranges.push_back({a, b});
             ci.bins.push_back(std::move(bin));
         };
-        if (c.isEnum)
+        if (c.wide)
+            for (auto& [a, b] : wideAuto) {
+                uint64_t ka = keyOf(c, a), kb = keyOf(c, b);
+                add(ka == kb ? "auto[" + wideDec(c, a) + "]" : "auto[" + wideDec(c, a) + ":" + wideDec(c, b) + "]", ka, kb);
+            }
+        else if (c.isEnum)
             for (auto& [name, v] : c.enumVals) {
                 uint64_t k = keyOf(c, make(v, 0, c.w, 0));
                 add("auto[" + name + "]", k, k);

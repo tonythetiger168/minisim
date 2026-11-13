@@ -1,6 +1,7 @@
 // IEEE 1800-2023 19.5: a coverpoint may be wider than 64 bits. Explicit
 // value bins with single values and ranges (also open with $), ignore_bins,
-// illegal_bins and default work on the full width, signed or not.
+// illegal_bins and default work on the full width, signed or not, and so
+// do automatic bins (19.5.3): 2^w values in auto_bin_max equal parts.
 //! icarus-skip: Icarus has no covergroups
 module t;
   bit [127:0] addr;
@@ -19,6 +20,8 @@ module t;
       bins big = {[80'sh1_0000_0000_0000_0000 : $]};
       illegal_bins bad = {80'sh10, -80'sd7};
     }
+    a4: coverpoint t.addr { option.auto_bin_max = 4; }
+    s3: coverpoint t.off { option.auto_bin_max = 3; }
   endgroup
   cg c = new;
   initial begin
@@ -30,10 +33,12 @@ module t;
     $display("%.2f %.2f", c.addr.get_coverage(), c.off.get_coverage());
     addr = '1; off = -80'sd7; c.sample();
     $display("%.2f %.2f", c.addr.get_coverage(), c.off.get_coverage());
+    $display("%.2f %.2f", c.a4.get_coverage(), c.s3.get_coverage());
   end
 endmodule
-//> 33.33 33.33 33.33
+//> 33.33 33.33 31.25
 //> 33.33 66.67
 //> 66.67 100.00
 //> Error: covergroup t.cg: illegal bin off.bad hit (value -7) at time 0
 //> 100.00 100.00
+//> 50.00 33.33

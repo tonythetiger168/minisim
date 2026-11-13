@@ -332,8 +332,6 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             unsupported("a real coverpoint without bins: there are no automatic bins for reals (19.5.3)");
         cgWideW = 0;
         if (c.wide) {   // wider than 64 bits: explicit value bins only
-            if (std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0 || b.dflt; }))
-                unsupported("automatic bins of a coverpoint wider than 64 bits (19.5.3)");
             for (const auto& b : c.bins)
                 if (b.array || b.wildcard || !b.trans.empty() || b.with || b.setIdx >= 0 || b.dfltSeq)
                     unsupported("array, wildcard, transition, with or set bins of a coverpoint wider than 64 bits");
