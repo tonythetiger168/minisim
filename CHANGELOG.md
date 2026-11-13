@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- msim VHDL: unconstrained array ports (6.5.6.3). Each port's index range
+  comes from the actual, ascending or descending, also through another
+  unconstrained port; a SystemVerilog parent sets `<port>__L`/`<port>__R`.
 - mvplat: Zbkb, Zbkx, Zabha, Zacas, Zfh (half precision), the CBO.*
   instructions (Zicboz in the device tree) and Svnapot. riscv-tests: 837
   programs (uzbkb, uzbkx, uzabha, uzacas, uzabha_zacas, uzfh, mzicbo and
@@ -180,6 +183,8 @@ Spec references are IEEE 1800-2023 clauses.
   off.
 
 ### Fixed
+- msim VHDL: a process's first run sees its input ports' initial values,
+  not `Z` (14.7.5.2).
 - A continuous assignment to part of a variable (a bit, a slice, a member of
   a packed struct, also through an output port) no longer makes the rest of
   the variable z: procedures keep writing the other bits (6.5).

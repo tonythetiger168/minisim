@@ -30,7 +30,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 |---|---|
 | entity + architecture (the last analyzed one) | a module with the entity's name; generics are parameters |
 | package + package body | a package; deferred constants get the body's value |
-| process | `always` that runs the body once at time 0, then waits on the sensitivity list (VHDL's equivalent `wait on` at the end) |
+| process | `always` that runs the body once at time 0, then waits on the sensitivity list (VHDL's equivalent `wait on` at the end). The first run waits one `#0`, so port connections already hold their initial values (14.7.5.2) |
 | `process (clk)` + `if rising_edge(clk)`, and the async-reset form | `always @(posedge clk ...)` |
 | signal assignment | nonblocking assignment (the next delta); `after` gives the delay |
 | `wait for T` | `#T`, then the process resumes on an event triggered in the NBA region (`->>`), so it sees the signal updates due at T as VHDL's simulation cycle does (14.7.5) |
@@ -44,6 +44,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | protected type (5.6) | a class; `shared variable` and protected variables hold an object made at elaboration; methods are class methods (a method that needs a per-call specialization is a function taking the object) |
 | access type (5.4) | a class handle: `new`, `null`, `.all`, implicit dereference, `deallocate`. A designated record's elements are the class's own members (so a list node may hold the access type); an array is a dynamic array with its left bound and direction |
 | incomplete type | a forward `typedef class`, completed by the full declaration |
+| unconstrained array port (6.5.6.3) | the parameters `<port>__L` and `<port>__R` hold the index range the actual gives it; an instance whose actual is ascending uses a copy of the module named `<entity>__to_<ports>`. A SystemVerilog parent sets the two parameters (`par #(.d__L(7), .d__R(0)) u (.d(v), ...)`); from SystemVerilog the range is descending |
 | generic package, package instantiation (4.7, 4.9) | one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals |
 | `report`, `assert` | a message in GHDL's format (`file:line:col:@time:(report note): text`); severity failure stops the run with a non-zero exit |
 | `std.env.stop` / `finish` | `$stop` / `$finish` |
@@ -100,7 +101,6 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   space, where VHDL has NUL (SystemVerilog strings hold no NUL).
 - Configurations (choosing an architecture other than the last analyzed),
   configuration instances, and conversion functions in port maps.
-- Unconstrained ports (an entity port without a range).
 - Guarded signals and blocks with ports; package generics (a generic
   package passed to another); generic types and subprograms on entities and
   subprograms (generic packages have them); package instantiation inside a

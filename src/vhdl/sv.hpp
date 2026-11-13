@@ -155,6 +155,8 @@ public:
             if (u->k == Unit::Package || u->k == Unit::PackageInst) emitPkg(u);
         for (auto& u : order)
             if (u->k == Unit::Entity) o << emitEntity(u);
+        emitVariants();
+        o << lateModules.str();
         return o.str();
     }
 
@@ -4595,6 +4597,35 @@ endpackage
         return r;
     }
 
+    // Unconstrained ports: the module is emitted with every such port descending;
+    // an instance whose actual is ascending uses a copy of the module, emitted
+    // once per set of ascending ports, where those ports are ascending.
+    const std::set<std::string>* ascPorts = nullptr;
+    std::string modSuffix;
+    std::set<std::string> variantsDone;
+    std::ostringstream lateModules;
+    std::string unconVariant(const UP& ent, const std::set<std::string>& asc) {
+        std::string suf = "__to";
+        for (auto& n : asc) suf += "_" + n;
+        if (variantsDone.insert(ent->name + suf).second) variantsTodo.push_back({ent, asc});
+        return suf;
+    }
+    std::deque<std::pair<UP, std::set<std::string>>> variantsTodo;
+    // after the other modules (emitting one is not reentrant)
+    void emitVariants() {
+        while (!variantsTodo.empty()) {
+            auto [ent, asc] = variantsTodo.front();
+            variantsTodo.pop_front();
+            std::string suf = "__to";
+            for (auto& n : asc) suf += "_" + n;
+            ascPorts = &asc;
+            modSuffix = suf;
+            try { lateModules << emitEntity(ent); } catch (...) { ascPorts = nullptr; modSuffix.clear(); throw; }
+            ascPorts = nullptr;
+            modSuffix.clear();
+        }
+    }
+
     std::string emitEntity(const UP& ent) {
         UP arch = archOf(ent->name);
         Ctx c;
@@ -4647,10 +4678,34 @@ endpackage
             std::vector<std::string> portList;
             std::vector<int> portLines;   // each port's VHDL line, for diagnostics about it
             std::vector<std::pair<std::string, TP>> portSigs;
+            std::map<std::string, TP> unconPort;   // lower-case port -> its type with parameter bounds
             for (auto& p : ent->ports) {
                 TP t = subtype(p->type);
-                if (isUnconstrained(t)) fail(p->line, "unconstrained port '" + p->texts[0] + "' is not supported yet; give it a range");
+                if (isUnconstrained(t)) {
+                    // an unconstrained array port (6.5.6.3): the actual gives its range, through
+                    // two parameters per port; the direction is the module's (see unconVariant)
+                    if (t->k != Type::Array || t->dims.size() != 1 || !t->dims[0].box || (t->elem && isUnconstrained(t->elem)))
+                        fail(p->line, "unconstrained port '" + p->texts[0] + "': only a one-dimensional array with a constrained element is supported");
+                    for (size_t k = 0; k < p->names.size(); ++k) {
+                        std::string sv = svId(p->texts[k]);
+                        TP n = std::make_shared<Type>(*t);
+                        n->base = baseOf(t);
+                        n->name = n->text = "";
+                        Rng g = t->dims[0];
+                        g.box = false;
+                        g.l = sv + "__L";
+                        g.r = sv + "__R";
+                        g.lv.reset();
+                        g.rv.reset();
+                        g.downto = !(ascPorts && ascPorts->count(p->names[k]));
+                        n->dims[0] = g;
+                        unconPort[p->names[k]] = n;
+                        plist.push_back("parameter int " + sv + "__L");
+                        plist.push_back("parameter int " + sv + "__R");
+                    }
+                }
                 for (size_t k = 0; k < p->names.size(); ++k) {
+                    if (unconPort.count(p->names[k])) t = unconPort[p->names[k]];
                     Sym y;
                     y.k = Sym::Obj;
                     y.cls = "signal";
@@ -4667,6 +4722,7 @@ endpackage
             for (auto& p : ent->ports) {
                 TP t = subtype(p->type);
                 for (size_t k = 0; k < p->names.size(); ++k) {
+                    if (unconPort.count(p->names[k])) t = unconPort[p->names[k]];
                     std::string sv = svId(p->texts[k]);
                     std::string dir = p->mode == "in" ? "input" : p->mode == "inout" ? "inout" : "output";
                     std::string decl;
@@ -4683,7 +4739,7 @@ endpackage
             std::string imports = "import vhdl_rt::*;";
             for (auto& pk : c.usePkgs) imports += " import " + svId(pk) + "::*;";
             for (auto& [n, pi] : c.useItems) imports += " import " + svId(pi.first) + "::" + svIdOfPkgItem(pi.first, pi.second) + ";";
-            o << lineDir(ent->line) << "module " << svId(ent->text) << " " << imports;
+            o << lineDir(ent->line) << "module " << svId(ent->text) << modSuffix << " " << imports;
             if (!plist.empty()) {
                 o << " #(";
                 for (size_t i = 0; i < plist.size(); ++i) o << (i ? ", " : "") << plist[i];
@@ -4846,6 +4902,12 @@ endpackage
         return l;
     }
 
+    // VHDL runs every process for the first time after all signals, ports
+    // included, hold their initial values (14.7.5.2). Port connections are
+    // continuous assignments, so the first run waits one #0: the connections
+    // settle in the active region first.
+    std::string firstRun() const { return synth ? "" : "    static bit vhdl_go; if (!vhdl_go) begin vhdl_go = 1; #0; end\n"; }
+
     std::string procName(const std::string& label) { return label.empty() ? "" : " : " + svId(label); }
 
     // an equivalent process: body once at time 0, then wait on the signals read
@@ -4860,7 +4922,7 @@ endpackage
         replaceAll(bodyText, "@@PREV@@", prevUpd);
         if (synth && prevDecl.empty() && !sigs.empty() && bodyText.find("@(") == std::string::npos && bodyText.find("wait") == std::string::npos)
             return "  always @* begin" + procName(label) + "\n" + bodyText + "  end\n";
-        std::string r = "  always begin" + procName(label) + "\n" + prevDecl + bodyText;
+        std::string r = "  always begin" + procName(label) + "\n" + prevDecl + firstRun() + bodyText;
         if (sigs.empty()) r += "    " + prevUpd + "wait (0);\n";
         else r += "    " + prevUpd + "@(" + eventList(sigs) + ");\n";
         if (postponed) {}
@@ -5065,7 +5127,7 @@ endpackage
                 if (synth && s.hasSens && !sens.empty() && prevDecl.empty()) {
                     out = "  always @* begin" + procName(s.label) + "\n" + decls.str() + body + "  end\n";
                 } else {
-                    out = "  always begin" + procName(s.label) + "\n" + decls.str() + prevDecl + body;
+                    out = "  always begin" + procName(s.label) + "\n" + decls.str() + prevDecl + firstRun() + body;
                     if (s.hasSens) {
                         if (sens.empty()) out += "    " + prevUpd + "wait (0);\n";
                         else out += "    " + prevUpd + "@(" + eventList(sens) + ");\n";
@@ -5237,6 +5299,8 @@ endpackage
                 for (auto& g : comp->decl->generics) for (auto& t : g->texts) { formalGenerics.push_back(svId(t)); lowerGenerics.push_back(lowerStr(t)); genTypes.push_back(nullptr); }
             }
         }
+        std::vector<std::string> unconGens;
+        std::set<std::string> unconAsc;
         auto mapList = [&](const std::vector<Assoc>& m, const std::vector<std::string>& order, const std::vector<std::string>& lowerNames,
                            const std::vector<TP>& types, const std::vector<std::string>& compOrder, const std::vector<TP>& compTypes, bool isPort) {
             std::vector<std::string> items;
@@ -5271,7 +5335,19 @@ endpackage
                 if (formalSv.empty()) formalSv = svId(fl);
                 std::string act;
                 if (a.actual->k == EK::Open) act = "";
-                else act = ex(a.actual, ft).s;
+                else {
+                    Val x = ex(a.actual, ft);
+                    act = x.s;
+                    if (isPort && ft && isUnconstrained(ft) && ft->k == Type::Array && ft->dims.size() == 1 && ent) {
+                        // an unconstrained port takes the actual's range (6.5.6.3)
+                        if (!x.t || x.t->dims.empty() || x.t->dims[0].box || x.t->dims[0].l.empty())
+                            fail(s.line, "the actual of unconstrained port '" + fl + "' needs a known range");
+                        const Rng& g = x.t->dims[0];
+                        unconGens.push_back("." + formalSv + "__L(" + g.l + ")");
+                        unconGens.push_back("." + formalSv + "__R(" + g.r + ")");
+                        if (!g.downto) unconAsc.insert(fl);
+                    }
+                }
                 items.push_back("." + formalSv + "(" + act + ")");
             }
             for (auto& [fl, parts] : partial) {
@@ -5315,6 +5391,8 @@ endpackage
         };
         std::vector<std::string> gens = mapList(s.genericMap, formalGenerics, lowerGenerics, genTypes, compGenerics, compGenTypes, false);
         std::vector<std::string> ports = mapList(s.portMap, formalPorts, lowerPorts, portTypes, compPorts, compPortTypes, true);
+        gens.insert(gens.end(), unconGens.begin(), unconGens.end());
+        if (!unconAsc.empty() && ent) modName += unconVariant(ent, unconAsc);
         // component generics with defaults that the instance does not map: pass the component's default
         if (comp && comp->decl) {
             for (auto& g : comp->decl->generics)
