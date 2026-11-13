@@ -2178,6 +2178,12 @@ struct Lowerer {
                     defaultSelf = saved;
                     continue;
                 }
+                // A string literal put into a typeless mailbox (15.4.9) goes
+                // in as a string, so a get into a string variable reads it.
+                if (fs && fs->getType().isUntypedType() && peel(a).kind == ExpressionKind::StringLiteral) {
+                    c.init.push_back({formal.sig, konst(mkstr(std::string(peel(a).as<StringLiteral>().getValue())))});
+                    continue;
+                }
                 c.init.push_back({formal.sig, expr(a)});
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
