@@ -43,7 +43,8 @@ inline const std::vector<const char*>& syntaxRules() {
     static const std::vector<const char*> r = {"SUS001", "STY005", "STY006", "STY007",
                                                "STY008", "STY009", "W009", "NAME015", "NAME016", "NAME017",
                                                "SUS002", "SUS003", "STY010", "STY012",
-                                               "STY013", "STY014", "STY015", "SUS004"};
+                                               "STY013", "STY014", "STY015", "SUS004",
+                                               "NAME018", "NAME019"};
     return r;
 }
 inline bool any(const Rules& rules, const std::vector<const char*>& ids) {
@@ -130,6 +131,16 @@ struct Walk : SyntaxVisitor<Walk> {
     std::vector<std::string_view> blocks;   // names of the begin blocks we are inside
     int inClass = 0;       // methods of a class are automatic already
     int autoScope = 0;     // module automatic ...: its functions are too
+    // NAME019: the names declared in each scope we are inside, outermost first.
+    std::vector<std::vector<std::pair<std::string_view, SourceLocation>>> scopes{1};
+    // NAME018: inside always_ff; the flops already reported in this module.
+    int inFF = 0;
+    std::vector<std::string_view> ffSeen;
+    struct Scoped {
+        Walk& w;
+        explicit Scoped(Walk& w) : w(w) { w.scopes.emplace_back(); }
+        ~Scoped() { w.scopes.pop_back(); }
+    };
     Walk(const Rules& r, const SourceManager& s, const lintrules::Params& p, std::vector<Found>& o)
         : rules(r), sm(s), P(p), out(o) {}
 
@@ -149,6 +160,7 @@ struct Walk : SyntaxVisitor<Walk> {
             else if (s.label) name = s.label->name.valueText();
         }
         if (!name.empty()) blocks.push_back(name);
+        Scoped sc(*this);
         visitDefault(s);
         if (!name.empty()) blocks.pop_back();
     }
@@ -248,6 +260,7 @@ struct Walk : SyntaxVisitor<Walk> {
     }
 
     void handle(const ClassDeclarationSyntax& s) {
+        Scoped sc(*this);
         inClass++;
         visitDefault(s);
         inClass--;
@@ -276,6 +289,8 @@ struct Walk : SyntaxVisitor<Walk> {
                 add("STY005", name.location(), "package '" + pkg + "' is in a file named '" + stem + "'");
         }
         autoScope += isAuto;
+        Scoped sc(*this);
+        ffSeen.clear();
         visitDefault(s);
         autoScope -= isAuto;
     }
@@ -286,6 +301,73 @@ struct Walk : SyntaxVisitor<Walk> {
                 std::string(task ? "task" : "function") +
                     " with no lifetime: it is static, so its variables are shared by every call; say automatic (or static)");
         }
+        Scoped sc(*this);
+        visitDefault(s);
+    }
+    // extern and pure virtual methods, DPI imports: their arguments live in their own scope.
+    void handle(const FunctionPrototypeSyntax& s) {
+        if (s.parent && s.parent->kind != SyntaxKind::FunctionDeclaration && s.parent->kind != SyntaxKind::TaskDeclaration) {
+            Scoped sc(*this);
+            visitDefault(s);
+        } else {
+            visitDefault(s);
+        }
+    }
+    void handle(const GenerateBlockSyntax& s) {
+        Scoped sc(*this);
+        visitDefault(s);
+    }
+    // A name declared again in an inner scope hides the outer one there.
+    void handle(const DeclaratorSyntax& s) {
+        std::string_view n = s.name.valueText();
+        bool skip = n.empty() || !s.parent || s.parent->kind == SyntaxKind::StructUnionMember ||
+                    s.parent->kind == SyntaxKind::EnumType;
+        if (!skip && rules.enabled("NAME019")) {
+            for (size_t i = 0; i + 1 < scopes.size(); i++)
+                for (auto& [m, loc] : scopes[i])
+                    if (m == n) {
+                        add("NAME019", s.name.location(),
+                            "'" + std::string(n) + "' hides the '" + std::string(n) + "' declared on line " +
+                                std::to_string(sm.getLineNumber(loc)) + "; rename one");
+                        goto done;
+                    }
+        done:
+            scopes.back().emplace_back(n, s.name.location());
+        }
+        visitDefault(s);
+    }
+    // In always_ff, every register written should say it is one: data_q, data_ff, data_reg.
+    void flop(const ExpressionSyntax& e) {
+        switch (e.kind) {
+            case SyntaxKind::IdentifierName: {
+                Token t = e.as<IdentifierNameSyntax>().identifier;
+                std::string_view n = t.valueText();
+                if (n.empty() || P.dff.ok(n)) return;
+                for (auto m : ffSeen)
+                    if (m == n) return;
+                ffSeen.push_back(n);
+                add("NAME018", t.location(),
+                    "register '" + std::string(n) + "' written in always_ff does not match " + P.dff.src);
+                return;
+            }
+            case SyntaxKind::ElementSelectExpression:
+                return flop(*e.as<ElementSelectExpressionSyntax>().left);
+            case SyntaxKind::MemberAccessExpression:
+                return flop(*e.as<MemberAccessExpressionSyntax>().left);
+            case SyntaxKind::ScopedName:
+                if (e.as<ScopedNameSyntax>().separator.kind == TokenKind::Dot) flop(*e.as<ScopedNameSyntax>().left);
+                return;
+            case SyntaxKind::ParenthesizedExpression:
+                return flop(*e.as<ParenthesizedExpressionSyntax>().expression);
+            case SyntaxKind::ConcatenationExpression:
+                for (auto* x : e.as<ConcatenationExpressionSyntax>().expressions) flop(*x);
+                return;
+            default:
+                return;
+        }
+    }
+    void handle(const BinaryExpressionSyntax& s) {
+        if (inFF && s.kind == SyntaxKind::NonblockingAssignmentExpression && rules.enabled("NAME018")) flop(*s.left);
         visitDefault(s);
     }
     // parameter in a module body, package or class body: overridable only by defparam (or not at all).
@@ -312,12 +394,22 @@ struct Walk : SyntaxVisitor<Walk> {
             body(*s.elseClause->clause, s.elseClause->elseKeyword);
         visitDefault(s);
     }
-    void handle(const ForLoopStatementSyntax& s) { body(*s.statement, s.forKeyword); visitDefault(s); }
+    void handle(const ForLoopStatementSyntax& s) {
+        body(*s.statement, s.forKeyword);
+        Scoped sc(*this);
+        visitDefault(s);
+    }
     void handle(const ForeachLoopStatementSyntax& s) { body(*s.statement, s.keyword); visitDefault(s); }
     void handle(const LoopStatementSyntax& s) { body(*s.statement, s.repeatOrWhile); visitDefault(s); }
     void handle(const ForeverStatementSyntax& s) { body(*s.statement, s.foreverKeyword); visitDefault(s); }
     void handle(const DoWhileStatementSyntax& s) { body(*s.statement, s.doKeyword); visitDefault(s); }
-    void handle(const ProceduralBlockSyntax& s) { body(*s.statement, s.keyword); visitDefault(s); }
+    void handle(const ProceduralBlockSyntax& s) {
+        body(*s.statement, s.keyword);
+        bool ff = s.kind == SyntaxKind::AlwaysFFBlock;
+        inFF += ff;
+        visitDefault(s);
+        inFF -= ff;
+    }
 
     void handle(const ParameterDeclarationSyntax& s) {
         // parameter DisableFoo = 0: "not disabled" is a double negative at every use.

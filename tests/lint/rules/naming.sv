@@ -1,4 +1,4 @@
-//! args: -only naming -top BadName -set name.max_length=20 -severity NAME001=error
+//! args: -only naming -disable NAME018 -top BadName -set name.max_length=20 -severity NAME001=error
 module BadName #(parameter width = 4,    //~ NAME001 NAME003
                  parameter Depth = 2)
                (input logic ck, input logic resetb, input logic start, output logic done_o,   //~ NAME008 NAME008 NAME008 NAME006
