@@ -2266,9 +2266,9 @@ struct Rt {
                     note("port " + cell.port + " is corrupted with supply set " + portSupply);
                 }
             }
-            for (auto& is : m.isos) {
-                if (!cross || !isoApplies(m, is, c)) continue;
-                if (is.noIso) break;
+            const Isolation* isP = cross ? pickStrategy(m, m.isos, c, isoApplies, +[](const Isolation& x) { return x.noIso; }, "isolation") : nullptr;
+            if (isP && !isP->noIso) {
+                const Isolation& is = *isP;
                 Cell cell;
                 cell.kind = 0;
                 cell.iso = &is;
@@ -2283,10 +2283,10 @@ struct Rt {
                 made.push_back((int)cells.size());
                 cells.push_back(cell);
                 note("isolation " + is.name + " on " + cell.port);
-                break;   // one strategy per port (5.7 precedence: the first that applies)
             }
-            for (auto& l : m.lss) {
-                if (!cross || !lsApplies(m, l, c) || l.noShift) continue;
+            const LevelShifter* lsP = cross ? pickStrategy(m, m.lss, c, lsApplies, +[](const LevelShifter& x) { return x.noShift; }, "level shifter") : nullptr;
+            if (lsP && !lsP->noShift) {
+                const LevelShifter& l = *lsP;
                 Cell cell;
                 cell.kind = 1;
                 cell.port = p.inst + "." + p.port;
@@ -2296,10 +2296,10 @@ struct Rt {
                 if (!out.empty()) cell.supplies.push_back(out);
                 made.push_back((int)cells.size());
                 cells.push_back(cell);
-                break;
             }
-            for (auto& rp : m.reps) {   // 9.10: the repeater's output follows its supply's simstate
-                if (!cross || !repApplies(m, rp, c)) continue;
+            // 9.10: the repeater's output follows its supply's simstate
+            if (const Repeater* rpP = cross ? pickStrategy(m, m.reps, c, repApplies, +[](const Repeater&) { return false; }, "repeater") : nullptr) {
+                const Repeater& rp = *rpP;
                 Cell cell;
                 cell.kind = 2;
                 cell.port = p.inst + "." + p.port;
@@ -2309,7 +2309,6 @@ struct Rt {
                 made.push_back((int)cells.size());
                 cells.push_back(cell);
                 note("repeater " + rp.name + " on " + cell.port);
-                break;
             }
             if (made.empty()) continue;
             // Wrap the connection's value in the cells (isolation first, at
@@ -2359,6 +2358,36 @@ struct Rt {
     }
 #endif
 
+    // Which retention strategy, if any, retains state element s (5.7.3):
+    // the most specific element wins (the signal, its instance, the lowest
+    // ancestor, the whole domain), then -no_retention.
+    const Retention* retentionOf(int s, int dom) {
+        const std::string& n = S.sigs[(size_t)s].name;
+        const Retention* best = nullptr;
+        const Retention* tie = nullptr;
+        long br = -1;
+        for (auto& r : m.rets) {
+            if (domIdx.at(r.domain) != dom) continue;
+            long g = r.elements.empty() ? 0 : -1;
+            for (auto& e : r.elements) {
+                std::string d = m.design(e);
+                if (!DomainMap::within(n, d)) continue;
+                long ge = d == n ? 4000 : d == parentOf(n) ? 3000 : 1000 + (long)std::count(d.begin(), d.end(), '.');
+                g = std::max(g, ge);
+            }
+            for (auto& e : r.exclude) if (DomainMap::within(n, m.design(e))) g = -1;
+            if (r.appliesTo == "flop" && latchSigs.count(s)) g = -1;   // -applies_to (6.54)
+            if (r.appliesTo == "latch" && !latchSigs.count(s)) g = -1;
+            if (g < 0) continue;
+            long rank = g * 2 + (r.noRet ? 1 : 0);
+            if (rank > br) { best = &r; br = rank; tie = nullptr; }
+            else if (rank == br) tie = &r;
+        }
+        if (tie && !best->noRet)
+            throw Error(tie->where + ": retention strategies " + best->name + " and " + tie->name + " both apply to " + n +
+                        " with the same precedence (5.7.3, 5.7.10)");
+        return best;
+    }
     void bindRetention() {
         for (auto& r : m.rets) {
             if (r.noRet) continue;
@@ -2370,15 +2399,8 @@ struct Rt {
             if (rr.saveSig < 0) throw Error(r.where + ": retention " + r.name + ": no signal '" + m.design(r.save.net) + "' in the design");
             if (rr.restoreSig < 0) throw Error(r.where + ": retention " + r.name + ": no signal '" + m.design(r.restore.net) + "' in the design");
             rr.single = r.save.net == r.restore.net && r.save.sense < 2 && r.restore.sense < 2 && r.save.sense != r.restore.sense;
-            for (int s : stateSigs[(size_t)rr.dom]) {
-                const std::string& n = S.sigs[(size_t)s].name;
-                bool in = r.elements.empty();
-                for (auto& e : r.elements) in |= DomainMap::within(n, m.design(e));
-                for (auto& e : r.exclude) if (DomainMap::within(n, m.design(e))) in = false;
-                if (r.appliesTo == "flop" && latchSigs.count(s)) in = false;   // -applies_to (6.54)
-                if (r.appliesTo == "latch" && !latchSigs.count(s)) in = false;
-                if (in) rr.els.push_back({s, allx(S.sigs[(size_t)s].w), false});
-            }
+            for (int s : stateSigs[(size_t)rr.dom])
+                if (retentionOf(s, rr.dom) == &r) rr.els.push_back({s, allx(S.sigs[(size_t)s].w), false});
             bool modelled = std::any_of(retModelEls.begin(), retModelEls.end(), [&](const RetModelEl& e) { return e.strategy == r.name; });
             if (rr.els.empty() && !modelled)
                 std::cerr << "msim: UPF: " << r.where << ": retention " << r.name << " applies to no state element\n";

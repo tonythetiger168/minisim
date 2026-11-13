@@ -86,6 +86,50 @@ upf_error(e_upd2 "set_isolation ISO -domain PD_CORE -elements {u_core/r}" "isola
 upf_error(e_upd3 "set_isolation ISO -domain PD_CORE -update -clamp_value 0" "changes -clamp_value of ISO from 1 to 0 (5.10)")
 upf_error(e_upd4 "set_level_shifter LS -domain PD_CORE -applies_to outputs\nset_level_shifter LS -domain PD_CORE -rule low_to_high" "level shifter strategy LS is already defined")
 upf_error(e_upd5 "set_retention RET -domain PD_CORE -update -elements {u_core}" "-update of unknown retention strategy RET")
+# 5.7.4: which strategy isolates a port. A strategy that names the port
+# beats one that names its instance, which beats one for the whole domain;
+# among equals -no_isolation wins, then -source with -sink, then one of them.
+# Two strategies of the same precedence on one port are an error (5.7.10).
+function(upf_pick t name text)
+  file(READ ${D}/${t}.upf base)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/${name}.upf "${base}${text}\n")
+  execute_process(COMMAND ${MSIM} ${D}/${t}.sv -upf ${CMAKE_CURRENT_BINARY_DIR}/${name}.upf -upf_verbose
+                  RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL 0)
+    message(FATAL_ERROR "${name}: ${rc}\n${out}${err}")
+  endif()
+  foreach(want ${ARGN})
+    if(want MATCHES "^!(.*)")
+      string(FIND "${out}" "${CMAKE_MATCH_1}" pos)
+      if(NOT pos EQUAL -1)
+        message(FATAL_ERROR "${name}: did not expect '${CMAKE_MATCH_1}'\n${out}")
+      endif()
+    else()
+      string(FIND "${out}" "${want}" pos)
+      if(pos EQUAL -1)
+        message(FATAL_ERROR "${name}: expected '${want}'\n${out}")
+      endif()
+    endif()
+  endforeach()
+endfunction()
+set(iso_opts "-isolation_supply SS_AON -isolation_signal iso_en -isolation_sense high")
+upf_pick(gating p_gran "set_isolation ISO_D -domain PD_CORE -applies_to outputs ${iso_opts}\nset_isolation ISO_I -domain PD_CORE -applies_to outputs -elements {u_core} ${iso_opts}"
+         "isolation ISO_0 on u_dut.u_core.cnt" "isolation ISO_1 on u_dut.u_core.hi" "!isolation ISO_D" "!isolation ISO_I")
+upf_pick(gating p_noiso "set_isolation ISO_N -domain PD_CORE -elements {u_core/q} -no_isolation"
+         "isolation ISO_0 on u_dut.u_core.cnt" "!on u_dut.u_core.q\n")
+upf_pick(gating p_sink "set_isolation ISO_S -domain PD_CORE -applies_to outputs -elements {u_core/hi} -sink SS_AON -clamp_value 0 ${iso_opts}"
+         "isolation ISO_S on u_dut.u_core.hi" "!isolation ISO_1")
+upf_error_in(gating p_tie "set_isolation ISO_T -domain PD_CORE -applies_to outputs -elements {u_core/hi} ${iso_opts}"
+             "isolation strategies ISO_1 and ISO_T both apply to port u_dut.u_core.hi with the same precedence (5.7.4, 5.7.10)")
+# 5.7.3: which retention strategy keeps a state element. The signal named
+# beats its instance, which beats the domain; among equals -no_retention wins.
+set(ret_opts "-save_signal {ret high} -restore_signal {ret low}")
+upf_pick(retention r_inst "set_retention RET_W -domain PD_A -elements {u_a} ${ret_opts}"
+         "retention RET_A: 1 state elements" "retention RET_W: 1 state elements")
+upf_pick(retention r_noret "set_retention RET_N -domain PD_A -elements {u_a/keep} -no_retention"
+         "retention RET_A: 0 state elements")
+upf_error_in(retention r_tie "set_retention RET_T -domain PD_A -elements {u_a/keep} ${ret_opts}"
+             "retention strategies RET_A and RET_T both apply to u_a.keep with the same precedence (5.7.3, 5.7.10)")
 # 5.7.7: one attribute of one port, two values.
 upf_error(e_attr "set_port_attributes -ports {u_core/q} -clamp_value 0\nset_port_attributes -ports {u_core/q} -clamp_value 1" "an earlier command gave it 0 (5.7.7)")
 # 8.3: -instance names an instance of the design; a supply port does not take

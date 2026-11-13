@@ -14,7 +14,9 @@ Spec references are IEEE 1800-2023 clauses.
   conflicting port attributes, `{.}` with `-models`, `-instance` cells that
   are not in the design, and supply ports named like HDL logic ports are
   errors. Expressions gain `<`, `<=`, `>`, `>=`, `.voltage` and `.state`;
-  Tcl `catch` sets `errorInfo` and `errorCode`.
+  Tcl `catch` sets `errorInfo` and `errorCode`. Strategies are chosen by the
+  precedence of 5.7.3 and 5.7.4 (port, instance, domain; then options),
+  not by the order they were written; a tie is an error.
 - `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
   the power intent, then writes a snapshot that `simv` reads with the UPF
   file; processes of a power domain sleep while it is off and corrupt their

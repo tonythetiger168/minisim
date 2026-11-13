@@ -3457,6 +3457,39 @@ inline bool lsApplies(const Model& m, const LevelShifter& l, const Crossing& c) 
 inline bool repApplies(const Model& m, const Repeater& r, const Crossing& c) {
     return strategyApplies(m, r.domain, r.appliesTo, r.boundary, r.elements, r.exclude, r.source, r.sink, c);
 }
+// Precedence of a strategy that applies to a port (5.7.4): granularity first
+// (the port named, then its instance, then the whole domain), then options
+// (-no_isolation / -no_shift, then -source with -sink, then one of them).
+// Higher wins.
+inline int strategyRank(const Model& m, const std::vector<std::string>& elements, bool src, bool sink, bool no,
+                        const PortSite& p) {
+    int g = 1;
+    for (auto& e : elements) {
+        std::string d = m.design(e);
+        if (d == p.inst + "." + p.port) g = std::max(g, 3);
+        else if (DomainMap::within(p.inst, d)) g = std::max(g, 2);
+    }
+    return g * 4 + (no ? 3 : src && sink ? 2 : src || sink ? 1 : 0);
+}
+// The strategy of v that applies to crossing c with the highest precedence,
+// or null; two of the same highest precedence are an error (5.7.10).
+template <class S, class A>
+inline const S* pickStrategy(const Model& m, const std::vector<S>& v, const Crossing& c, A applies, bool (*no)(const S&),
+                             const char* what) {
+    const S* best = nullptr;
+    const S* tie = nullptr;
+    int br = -1;
+    for (auto& s : v) {
+        if (!applies(m, s, c)) continue;
+        int r = strategyRank(m, s.elements, !s.source.empty(), !s.sink.empty(), no(s), *c.p);
+        if (r > br) { best = &s; br = r; tie = nullptr; }
+        else if (r == br) tie = &s;
+    }
+    if (tie)
+        throw Error(tie->where + ": " + what + " strategies " + best->name + " and " + tie->name + " both apply to port " + c.p->inst + "." +
+                    c.p->port + " with the same precedence (5.7.4, 5.7.10)");
+    return best;
+}
 
 // ------------------------------------------------------------ static checks
 // Checks for mlint (and msim at load): the model is complete, its names
