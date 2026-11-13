@@ -611,6 +611,11 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: a branch that calls a task or function with a nonblocking
+  assignment is merged. The task's `<=` target becomes `x` when the branch
+  only might be taken (each process calls its own copy of the task that
+  tests its unknown flag); before, the whole block kept the standard
+  behavior.
 - `-xprop`: `break` and `continue` in `while`, `do ... while`, `repeat` and
   `forever` loops are merged; once a break or the condition of an unbounded
   loop is unknown, what the loop assigns becomes x. Fixed: a `foreach` or
