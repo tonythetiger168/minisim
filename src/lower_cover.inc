@@ -8,6 +8,8 @@ static std::unordered_map<const slang::ast::CovergroupType*, int>& cgIdxMap() {
     return m;
 }
 int cgItemSig = -1;   // the `item` of a bin's with clause (19.5.1.1)
+int cgWithSeq = 0;    // numbers the value signals of cross with filters
+std::unordered_map<std::string, int> cgIterSigs;   // a cross with filter's coverpoints, by name
 
 // A bins value or range bound, as written: conversions to the coverpoint
 // type are peeled so that the bound keeps its own value (19.5.7), and it is
@@ -132,6 +134,31 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             s->kids.push_back(cgSel(bb.right, x));
             return s;
         }
+        case BinsSelectExprKind::CrossId:   // the cross itself: every tuple (19.6.1.2)
+            s->kind = 4;
+            return s;
+        case BinsSelectExprKind::WithFilter: {   // sel with (expr) [matches n] (19.6.1.2)
+            const auto& w = b.as<BinSelectWithFilterExpr>();
+            s->kind = 5;
+            s->kids.push_back(cgSel(w.expr, x));
+            for (size_t k = 0; k < x.targets.size(); k++) {
+                const Type& t = x.targets[k]->getType();
+                if (t.isFloating() || !t.isIntegral()) unsupported("a cross with filter over a real coverpoint (19.6.1.2)");
+                int sg = mkSig(x.getHierarchicalPath() + "$with" + std::to_string(cgWithSeq++) + "." + std::string(x.targets[k]->name),
+                               (int)t.getBitWidth(), false);
+                s->valSigs.push_back(sg);
+                cgIterSigs[std::string(x.targets[k]->name)] = sg;
+            }
+            s->with = expr(w.filter);
+            cgIterSigs.clear();
+            if (const Expression* m = w.matchesExpr) {
+                const Expression* p = m;
+                while (p->kind == ExpressionKind::Conversion) p = &p->as<ConversionExpression>().operand();
+                if (p->kind == ExpressionKind::UnboundedLiteral) s->all = true;
+                else s->matches = resize(expr(*m), 64, false, false);
+            }
+            return s;
+        }
         default: unsupported("this cross bin select expression (19.6.1)");
     }
 }
@@ -253,7 +280,32 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             bd.dflt = b->isDefault;
             bd.dfltSeq = b->isDefaultSequence;
             if (const Expression* iff = b->getIffExpr()) bd.iff = expr(*iff);
-            if (b->getSetCoverageExpr()) unsupported("a bin set expression (19.5.1.2)");
+            if (const Expression* se = b->getSetCoverageExpr()) {   // bins b = arr; (19.5.1.2)
+                if (c.isReal) unsupported("a bin set expression of a real coverpoint (19.5.1.2)");
+                const Expression& x = peel(*se);
+                const Type& st = x.type->getCanonicalType();
+                const Type* et = st.getArrayElementType();
+                if (!et || !et->isIntegral() || et->getBitWidth() > 64)
+                    unsupported("a bin set expression that is not an array of integral values (19.5.1.2)");
+                bool sg = et->isSigned();
+                if (int ds = dynSig(x); ds >= 0) {
+                    bd.setIdx = mkSig(d.name + "." + c.name + "$setidx", 32, false);
+                    auto sz = node(Op::DynSize); sz->sig = ds;
+                    bd.setSize = resize(sz, 64, false, false);
+                    auto g = node(Op::DynGet, {ref(bd.setIdx)}); g->sig = ds;
+                    bd.setItem.lo = resize(resize(g, (int)et->getBitWidth(), sg, sg), 64, sg, sg);
+                    bd.setItem.loSgn = sg;
+                } else if (ValueExpressionBase::isKind(x.kind) && arrFind(&x.as<ValueExpressionBase>().symbol)) {
+                    auto a = arrFind(&x.as<ValueExpressionBase>().symbol);
+                    if (a->dynElem || isInd(a->base)) unsupported("a bin set expression of this array (19.5.1.2)");
+                    for (int k = 0; k < a->count; k++) {
+                        CgItem it;
+                        it.lo = resize(ref(a->base + k, a->sgn), 64, sg, sg);
+                        it.loSgn = sg;
+                        bd.items.push_back(std::move(it));
+                    }
+                } else unsupported("a bin set expression of this kind (19.5.1.2)");
+            }
             for (const Expression* v : b->getValues()) bd.items.push_back(c.isReal ? cgItemReal(*v) : cgItem(*v));
             if (c.isReal) {   // only value bins (19.5)
                 if (!b->getTransList().empty()) unsupported("a transition bin of a real coverpoint (19.5)");

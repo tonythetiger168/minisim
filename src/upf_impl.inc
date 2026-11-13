@@ -185,6 +185,29 @@ inline bool Model::implCommand(const Cmd& c, const std::string& scope) {
                 if (!within(full, r->elements))
                     fail("element " + e + " is not in the elements of retention strategy " + r->name);
         }
+        if (o.has("-lib_model_name")) {
+            RetModel rm;
+            rm.strategies = names;
+            rm.domain = dn;
+            rm.scope = scope;
+            rm.where = c.where();
+            rm.model = o.get("-lib_model_name");
+            for (auto& e : o.list("-elements")) rm.elements.push_back(join(scope, e));
+            std::set<std::string> seen;
+            for (auto& g : groups("-port_map", 2, 2)) {
+                if (!seen.insert(g[0]).second) fail("-port_map maps model port " + g[0] + " twice");
+                rm.portMap.push_back({g[0], g[1]});
+            }
+            for (auto* r : rs)
+                for (auto& [port, ref] : rm.portMap) {
+                    std::string x = ref[0] == '~' ? ref.substr(1) : ref;
+                    if (x == "save_signal" && r->save.net.empty()) fail("strategy " + r->name + " has no save signal for " + port);
+                    if (x == "restore_signal" && r->restore.net.empty()) fail("strategy " + r->name + " has no restore signal for " + port);
+                    if (x.rfind("retention_supply.", 0) == 0 && r->supply.empty())
+                        fail("strategy " + r->name + " has no -retention_supply for " + port);
+                }
+            retModels.push_back(rm);
+        }
     } else if (n == "map_retention_clamp_cell") {
         auto names = splitList(o.pos[0]);
         if (names.empty()) fail("the retention strategy list is empty");
@@ -289,6 +312,66 @@ inline bool Model::implCommand(const Cmd& c, const std::string& scope) {
         }
         if (o.has("-applies_to_clamp") && o.get("-applies_to_clamp").empty()) fail("-applies_to_clamp needs a value");
         for (auto& x : o.list("-inverter_supply_set")) setRef(join(scope, x), c.where());
+        std::set<std::string> seen;
+        for (auto& g : groups("-port_map", 2, 2))
+            if (!seen.insert(g[0]).second) fail("-port_map maps model port " + g[0] + " twice");
+        if (o.has("-force_function")) {
+            const Isolation* is = nullptr;
+            const LevelShifter* ls = nullptr;
+            for (auto& nm : st) {
+                for (auto& x : isos) if (x.name == nm && x.domain == dn) is = &x;
+                for (auto& x : lss) if (x.name == nm && x.domain == dn) ls = &x;
+            }
+            if (!is) fail("-force_function needs an isolation strategy in -strategy");
+            IfcModel im;
+            im.strategy = is->name;
+            if (ls) im.ls = ls->name;
+            im.domain = dn;
+            im.scope = scope;
+            im.where = c.where();
+            im.model = splitList(o.get("-lib_cells"))[0];
+            im.clamp = o.get("-applies_to_clamp");
+            // the model clamps to the strategy's value (define_isolation_cell -clamp_cell)
+            for (auto& ic : implCmds) {
+                if (ic.cmd != "define_isolation_cell") continue;
+                auto cells = ic.opts.find("-cells"), cl = ic.opts.find("-clamp_cell");
+                if (cells == ic.opts.end() || cl == ic.opts.end() || (cl->second != "high" && cl->second != "low")) continue;
+                auto names = splitList(cells->second);
+                if (std::find(names.begin(), names.end(), im.model) == names.end()) continue;
+                std::string mc = cl->second == "high" ? "1" : "0";
+                if (is->clampSet && (is->clamp == "0" || is->clamp == "1") && is->clamp != mc)
+                    fail("the functional model " + im.model + " clamps to " + mc + " (" + ic.where + "); strategy " + is->name +
+                         " clamps to " + is->clamp);
+            }
+            for (auto& e : o.list("-elements")) im.elements.push_back(join(scope, e));
+            for (auto& e : o.list("-exclude_elements")) im.exclude.push_back(join(scope, e));
+            // the symbolic references (6.62 a-c)
+            static const std::regex fnRef(R"((isolation_supply|input_supply|output_supply|internal_supply)(\[([0-9]+)\])?\.(\w+))");
+            static const std::regex sigRef(R"(isolation_signal(\[([0-9]+)\])?)");
+            for (auto& g : groups("-port_map", 2, 2)) {
+                std::string x = g[1][0] == '~' ? g[1].substr(1) : g[1];
+                std::smatch mm;
+                if (std::regex_match(x, mm, sigRef)) {
+                    size_t i = mm[2].matched ? std::stoul(mm[2].str()) : 0;
+                    if (!mm[2].matched && is->signals.size() > 1)
+                        fail("strategy " + is->name + " has " + std::to_string(is->signals.size()) + " isolation signals; give isolation_signal[index]");
+                    if (i >= is->signals.size()) fail("strategy " + is->name + " has no " + x);
+                } else if (g[1][0] == '~') {
+                    fail("~ is only for isolation_signal, not " + x);
+                } else if (std::regex_match(x, mm, fnRef)) {
+                    std::string k = mm[1].str();
+                    if (k == "isolation_supply") {
+                        if (is->supply.empty()) fail("strategy " + is->name + " has no isolation supply for " + g[0]);
+                        if (mm[3].matched && mm[3].str() != "0") fail("strategy " + is->name + " has one isolation supply, not " + x);
+                    } else if (!ls) fail(x + " needs a level-shifter strategy in -strategy");
+                    else if (k == "input_supply" && ls->inSupply.empty()) fail("strategy " + ls->name + " has no -input_supply for " + g[0]);
+                    else if (k == "output_supply" && ls->outSupply.empty()) fail("strategy " + ls->name + " has no -output_supply for " + g[0]);
+                    else if (k == "internal_supply") fail("internal_supply is not simulated; map " + g[0] + " to a supply net");
+                }
+                im.portMap.push_back({g[0], g[1]});
+            }
+            ifcModels.push_back(im);
+        }
     } else if (n == "define_always_on_cell") {
         req("-cells");
         nonEmpty("-cells");

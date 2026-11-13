@@ -32,6 +32,12 @@ struct ClockingRT {
         uint64_t skew = 0;
         std::vector<int> refs;                           // kind 2: the signals src reads
         std::deque<std::pair<uint64_t, Val>> hist;       // kind 2: (time, value), oldest first
+        // kind 3: an edge skew (input negedge): the value at the last such
+        // edge of the clock signal edgeSig before the clocking event (14.3).
+        int edgeSig = -1;
+        int edge = 0;
+        uint64_t lastAt = ~0ull;
+        Val last;
     };
     std::vector<In> ins;
     // An output or inout (14.16): its clockvar's bits go to pieces of signals,
@@ -39,7 +45,9 @@ struct ClockingRT {
     // A net target is driven through a hidden variable `sig` (starting at
     // Z) and a driver on `net`, bits [netLo + w - 1 : netLo] (14.16).
     struct Piece { int sig; int lo; int w; int net = -1; int netLo = 0; };
-    struct Out { int cv; int w; std::vector<Piece> pieces; uint64_t skew = 0; };
+    // An output with an edge skew (output negedge #1) is driven at the next
+    // such edge of the clock signal edgeSig, then skew ticks later (14.3).
+    struct Out { int cv; int w; std::vector<Piece> pieces; uint64_t skew = 0; int edgeSig = -1; int edge = 0; };
     std::vector<Out> outs;
     // Drives waiting for a later clocking event: at tick `tick`, bits
     // [hi:lo] of output `out` (hi < 0: all of it) take `v`.
