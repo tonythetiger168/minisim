@@ -165,6 +165,12 @@ Spec references are IEEE 1800-2023 clauses.
   `CLK004` (divided/ripple clocks), and `L005` (a VHDL std_logic driven by
   several processes that do not all release it with 'Z'). docs/LINT.md maps
   the STARC guide's topics to rules. `-list` no longer shows `ABS001`..`ABS004` twice.
+- `mlint -html`: a schematic for each finding about a signal: its drivers
+  (flops with their clock, logic, assigns, and what they read), the signal,
+  and its readers (and what they drive); names link to their own schematic.
+  More findings now carry their signal (`UNU001`..`UNU005`, `L004`, `L005`,
+  `LAT001`, `SEQ001`, `EXP001`, `CLK001`, `CLK004`), which `-json` and
+  `mdebug -lint` use too.
 
 ### Changed
 - `msim -compile` builds the kernel once into a cached object
