@@ -44,7 +44,7 @@ svg .b rect{fill:var(--panel);stroke:var(--fg)}svg .b text.bn{fill:var(--fg);fon
 svg path{fill:none;stroke:var(--dim)}svg .st circle{fill:var(--bg);stroke:var(--fg)}svg .st.me circle{stroke:var(--acc);stroke-width:2.5}svg .st.rs circle{stroke-dasharray:4 2}svg .st text{text-anchor:middle}
 svg path.tr{cursor:pointer;stroke:var(--fg);stroke-width:1.6}svg path.tr.off{stroke:var(--dim);opacity:.45}svg path.tr.on{stroke:var(--acc)}svg marker path{fill:var(--dim);stroke:none}
 svg path.c{stroke-dasharray:3 3}svg .tri{fill:none;stroke:var(--fg)}
-#wbar{display:flex;gap:8px;align-items:center;padding:3px 10px;border-bottom:1px solid var(--line);color:var(--dim)}
+#wbar{display:flex;gap:8px;align-items:center;white-space:nowrap;overflow:hidden;padding:3px 10px;border-bottom:1px solid var(--line);color:var(--dim)}
 #wc{flex:1;min-height:0;position:relative;overflow-y:auto}canvas{display:block;width:100%}
 .none{color:var(--dim);padding:4px 0}
 </style></head><body>
@@ -59,7 +59,9 @@ svg path.c{stroke-dasharray:3 3}svg .tri{fill:none;stroke:var(--fg)}
 <div id="schp"><h3>Schematic</h3><div id="sch"><div class="none">Select a signal to draw its drivers and loads.</div></div></div>
 <div id="wave"><div id="wbar"><span>Waves</span><button id="prev" title="previous change of the selected signal">&#9664; change</button>
 <button id="next" title="next change of the selected signal">change &#9654;</button><button id="cone" title="add the inputs of the selected signal">+ inputs</button>
-<button id="clr">clear</button><button id="fit">fit</button><span id="winfo"></span></div><div id="wc"><canvas id="cv"></canvas></div></div>
+<button id="clr">clear</button><button id="fit">fit</button>
+<input id="fv" size="10" placeholder="find value" title="next time the selected signal has this value (hex, or 'b..., 'd...; shift+Enter: previous)" style="font:inherit;padding:1px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg)">
+<span id="mk"></span><span id="winfo"></span></div><div id="wc"><canvas id="cv"></canvas></div></div>
 <script>
 const DB=/*MDEBUG_DATA*/null;
 const $=id=>document.getElementById(id),esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -74,7 +76,7 @@ const byPath=new Map(S.map((s,i)=>[s.path,i])),drvOf=S.map(()=>[]),loadOf=S.map(
 D.forEach((d,i)=>{drvOf[d.sig].push(i);new Set([...d.reads,...d.ctl]).forEach(s=>loadOf[s].push(i))});
 const scopeOf=p=>p.slice(0,p.lastIndexOf('.')),leaf=p=>p.slice(p.lastIndexOf('.')+1);
 const sigsIn=new Map();S.forEach((s,i)=>{const k=scopeOf(s.path);(sigsIn.get(k)||sigsIn.set(k,[]).get(k)).push(i)});
-const st={scope:DB.scopes.length?DB.scopes[0].path:'',sig:-1,file:-1,t:END,rows:[],tx:-1,t0:0,t1:Math.max(END,1)};
+const st={scope:DB.scopes.length?DB.scopes[0].path:'',sig:-1,file:-1,t:END,rows:[],tx:-1,t0:0,t1:Math.max(END,1),rad:{},mark:-1};
 const KW=new Set('module endmodule input output inout logic wire reg assign always always_ff always_comb always_latch initial begin end if else case casez casex endcase default for while posedge negedge or parameter localparam generate endgenerate genvar function endfunction task endtask int bit integer typedef enum struct packed signed unsigned interface endinterface package endpackage import return'.split(' '));
 function hex(b){if(b.length==1)return b;if(/[xz]/.test(b))return /^x+$/.test(b)?'x':/^z+$/.test(b)?'z':b.length+"'b"+b;
   let h='';for(let i=b.length;i>0;i-=4)h=parseInt(b.slice(Math.max(0,i-4),i),2).toString(16)+h;return h}
@@ -226,11 +228,11 @@ function waves(){const cv=$('cv'),RH=22,NW=200,dpr=window.devicePixelRatio||1,w=
   const X=t=>NW+(t-st.t0)/(st.t1-st.t0)*(w-NW-6);
   if(!W&&!TR){g.fillStyle=css('--dim');g.fillText('No waveform: run mdebug with -vcd <file> to link waves to the source.',10,18);return}
   if(W)st.rows.forEach((i,r)=>{const y=r*RH+2,c=W[i]||[];g.fillStyle=i==st.sig?css('--acc'):css('--fg');
-    const nm=S[i].path;g.fillText(nm.length>30?'…'+nm.slice(-29):nm,6,y+RH/2);
+    const nm=S[i].path+(st.rad[i]?' ('+st.rad[i]+')':'');g.fillText(nm.length>30?'…'+nm.slice(-29):nm,6,y+RH/2);
     for(let k=Math.max(0,chAt(i,st.t0));k<c.length&&c[k][0]<=st.t1;k++){const a=Math.max(X(c[k][0]),NW),b=Math.min(k+1<c.length?X(c[k+1][0]):X(st.t1),w-6),v=c[k][1];
       if(b<=a)continue;g.strokeStyle=/x/.test(v)?css('--wx'):/z/.test(v)?css('--wz'):css('--w1');g.beginPath();
       if(v.length==1){const yy=v=='1'?y+4:v=='0'?y+RH-4:y+RH/2;g.moveTo(a,yy);g.lineTo(b,yy);if(k+1<c.length&&b<w-6){const n=c[k+1][1];g.lineTo(b,n=='1'?y+4:n=='0'?y+RH-4:y+RH/2)}}
-      else{g.rect(a,y+4,b-a,RH-8);if(b-a>14){g.fillStyle=css('--fg');const t=hex(v);g.fillText(t.length*6.6>b-a-6?'…':t,a+3,y+RH/2)}}
+      else{g.rect(a,y+4,b-a,RH-8);if(b-a>14){g.fillStyle=css('--fg');const t=inRad(v,st.rad[i]);g.fillText(t.length*6.6>b-a-6?'…':t,a+3,y+RH/2)}}
       g.stroke()}});
   let r0=W?st.rows.length:0;if(TR)TR.streams.forEach((s,si)=>{const y0=r0*RH+2,L=TL[si];g.fillStyle=css('--dim');
     const nm=(s.scope?s.scope+'.':'')+s.name;g.fillText(nm.length>30?'…'+nm.slice(-29):nm,6,y0+RH/2);
@@ -239,8 +241,21 @@ function waves(){const cv=$('cv'),RH=22,NW=200,dpr=window.devicePixelRatio||1,w=
       if(b-a>14){g.fillStyle=css('--fg');const t=x[3]+(x[5].length?' '+x[5].map(f=>f[0]+'='+f[1]).join(' '):'');g.fillText(t.length*6.6>b-a-6?t.slice(0,Math.max(0,Math.floor((b-a-6)/6.6)-1))+'…':t,a+3,y+RH/2)}});
     r0+=L.n});
   const cx=X(st.t);if(cx>=NW){g.strokeStyle=css('--acc');g.beginPath();g.moveTo(cx,0);g.lineTo(cx,h);g.stroke()}
+  if(st.mark>=0){const mx=X(st.mark);if(mx>=NW&&mx<=w-6){g.strokeStyle=css('--num');g.setLineDash([4,3]);g.beginPath();g.moveTo(mx,0);g.lineTo(mx,h);g.stroke();g.setLineDash([])}}
+  $('mk').textContent=st.mark>=0?'marker '+st.mark+'  Δ '+(st.t-st.mark)+' '+(DB.timescale||''):'';saveView();
   g.fillStyle=css('--dim');g.fillText(st.t0+'',NW,h-8);const e=st.t1+' '+(DB.timescale||'');g.fillText(e,w-8-g.measureText(e).width,h-8);
-  $('winfo').textContent=st.rows.length?'click to move the cursor, wheel to zoom':'select a signal to add it'}
+  $('winfo').textContent=st.rows.length?'shift+click or m: marker · r: radix · Del: remove':'select a signal to add it'}
+// Radix of a row (r cycles it): hex (default), unsigned and signed decimal, binary.
+function inRad(v,r){if(!r||/[xz]/.test(v))return hex(v);if(r=='bin')return v;const u=BigInt('0b'+v);
+  if(r=='dec')return u.toString();return (v[0]=='1'?u-(1n<<BigInt(v.length)):u).toString()}
+// The view (rows, radixes, window, cursor, marker) lives in the address: a reload or a copied link shows the same.
+let restoring=false;
+function saveView(){if(restoring||!W)return;const r=st.rows.map(i=>S[i].path+(st.rad[i]?'~'+st.rad[i]:'')).join(',');
+  const h='t='+st.t+'&w='+st.t0+'-'+st.t1+(st.mark>=0?'&m='+st.mark:'')+(r?'&r='+encodeURIComponent(r):'');if(location.hash.slice(1)!=h)history.replaceState(null,'','#'+h)}
+function loadView(){const q=new URLSearchParams(location.hash.slice(1));if(!q.has('t'))return false;restoring=true;
+  (q.get('r')||'').split(',').filter(x=>x).forEach(x=>{const [p,rd]=x.split('~'),i=byPath.get(p);if(i===undefined)return;if(!st.rows.includes(i))st.rows.push(i);if(rd)st.rad[i]=rd});
+  const ww=(q.get('w')||'').split('-').map(Number);if(ww.length==2&&ww[1]>ww[0]){st.t0=Math.max(0,ww[0]);st.t1=Math.min(Math.max(END,1),ww[1])}
+  if(q.has('m'))st.mark=+q.get('m');if(st.rows.length)st.sig=st.rows[st.rows.length-1];restoring=false;setT(+q.get('t'));return true}
 function setT(t){st.t=Math.max(0,Math.min(END,Math.round(t)));$('tcur').textContent=W||TR?'t = '+st.t+' '+(DB.timescale||''):'';sigList();source();panel();waves()}
 // Object views (msim -vcd-class): picking a class handle adds the properties of the object it points to.
 const objKids=new Map();S.forEach((s,i)=>{if(s.of!==undefined)(objKids.get(s.of)||objKids.set(s.of,[]).get(s.of)).push(i)});
@@ -263,6 +278,7 @@ $('cv').addEventListener('click',e=>{const r=$('cv').getBoundingClientRect(),x=e
   // A click on a transaction shows it; elsewhere it moves the cursor.
   let row=Math.floor((e.clientY-r.top-2)/22)-(W?st.rows.length:0);if(TR&&row>=0)for(let si=0;si<TL.length;si++){if(row<TL[si].n){
     const i=TR.streams[si].tx.find(i=>TL[si].lane.get(i)==row&&TR.tx[i][1]<=t&&t<=(TR.tx[i][2]<0?END:TR.tx[i][2]));if(i!==undefined){showTx(i);return}break}row-=TL[si].n}
+  if(e.shiftKey){st.mark=Math.max(0,Math.min(END,Math.round(t)));waves();return}
   setT(t)});
 function showTx(i){const x=TR.tx[i],s=TR.streams[x[0]],p=x[4]>=0?TR.tx[x[4]]:null;st.tx=i;$('trxp').style.display='';
   $('trx').innerHTML=`<div class="d"><code>${esc(x[3])}</code><small> on ${esc((s.scope?s.scope+'.':'')+s.name)} &middot; ${x[1]} to ${x[2]<0?'(open)':x[2]}</small>`+
@@ -276,7 +292,20 @@ function step(dir){if(!W||st.sig<0||!W[st.sig])return;const c=W[st.sig],k=chAt(s
 $('prev').onclick=()=>step(-1);$('next').onclick=()=>step(1);$('clr').onclick=()=>{st.rows=[];waves()};$('fit').onclick=()=>{st.t0=0;st.t1=Math.max(END,1);waves()};
 $('cone').onclick=()=>{if(st.sig<0)return;drvOf[st.sig].forEach(i=>[...D[i].reads,...D[i].ctl].forEach(s=>W&&W[s]&&!st.rows.includes(s)&&st.rows.push(s)));waves()};
 window.addEventListener('resize',waves);
+document.addEventListener('keydown',e=>{if(/INPUT|TEXTAREA/.test(document.activeElement.tagName)||st.sig<0)return;
+  if(e.key=='r'){const o=['hex','dec','sdec','bin'],c=o.indexOf(st.rad[st.sig]||'hex');const n=o[(c+1)%o.length];if(n=='hex')delete st.rad[st.sig];else st.rad[st.sig]=n;waves()}
+  else if(e.key=='Delete'||e.key=='Backspace'){const k=st.rows.indexOf(st.sig);if(k>=0){st.rows.splice(k,1);waves()}}
+  else if(e.key=='m'){st.mark=st.t;waves()}else if(e.key=='ArrowRight'&&e.ctrlKey)step(1);else if(e.key=='ArrowLeft'&&e.ctrlKey)step(-1)});
+// Find value: the next (shift+Enter: previous) change of the selected signal to this value.
+function wantBits(txt,wd){txt=txt.trim().toLowerCase().replace(/_/g,'');let b;
+  if(/^'?b[01xz]+$/.test(txt))b=txt.replace(/^'?b/,'');else if(/^'?d-?\d+$/.test(txt)){let n=BigInt(txt.replace(/^'?d/,''));if(n<0n)n+=1n<<BigInt(wd);b=n.toString(2)}
+  else if(/^(0x|'?h)?[0-9a-f]+$/.test(txt))b=BigInt('0x'+txt.replace(/^(0x|'?h)/,'')).toString(2);else return null;
+  return b.length>=wd?b.slice(b.length-wd):b.padStart(wd,/^[xz]/.test(b)?b[0]:'0')}
+$('fv').addEventListener('keydown',e=>{if(e.key!='Enter'||!W||st.sig<0||!W[st.sig])return;const c=W[st.sig],want=wantBits(e.target.value,c.length?c[0][1].length:1);
+  if(want===null){e.target.style.borderColor='var(--wx)';return}e.target.style.borderColor='';const k=chAt(st.sig,st.t);
+  if(e.shiftKey){for(let j=k-1;j>=0;j--)if(c[j][1]==want){setT(c[j][0]);return}}else for(let j=k+1;j<c.length;j++)if(c[j][1]==want){setT(c[j][0]);return}
+  e.target.style.borderColor='var(--wz)'});
 $('stat').textContent=DB.scopes.length+' instances · '+S.length+' signals · '+D.length+' drivers'+(TR?' · '+TR.tx.length+' transactions':'');
-tree();sigList();source();setT(DB.at===undefined?END:DB.at);blocks();
+tree();sigList();source();if(!loadView())setT(DB.at===undefined?END:DB.at);blocks();
 </script></body></html>
 )MDV";

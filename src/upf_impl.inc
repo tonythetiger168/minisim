@@ -185,6 +185,29 @@ inline bool Model::implCommand(const Cmd& c, const std::string& scope) {
                 if (!within(full, r->elements))
                     fail("element " + e + " is not in the elements of retention strategy " + r->name);
         }
+        if (o.has("-lib_model_name")) {
+            RetModel rm;
+            rm.strategies = names;
+            rm.domain = dn;
+            rm.scope = scope;
+            rm.where = c.where();
+            rm.model = o.get("-lib_model_name");
+            for (auto& e : o.list("-elements")) rm.elements.push_back(join(scope, e));
+            std::set<std::string> seen;
+            for (auto& g : groups("-port_map", 2, 2)) {
+                if (!seen.insert(g[0]).second) fail("-port_map maps model port " + g[0] + " twice");
+                rm.portMap.push_back({g[0], g[1]});
+            }
+            for (auto* r : rs)
+                for (auto& [port, ref] : rm.portMap) {
+                    std::string x = ref[0] == '~' ? ref.substr(1) : ref;
+                    if (x == "save_signal" && r->save.net.empty()) fail("strategy " + r->name + " has no save signal for " + port);
+                    if (x == "restore_signal" && r->restore.net.empty()) fail("strategy " + r->name + " has no restore signal for " + port);
+                    if (x.rfind("retention_supply.", 0) == 0 && r->supply.empty())
+                        fail("strategy " + r->name + " has no -retention_supply for " + port);
+                }
+            retModels.push_back(rm);
+        }
     } else if (n == "map_retention_clamp_cell") {
         auto names = splitList(o.pos[0]);
         if (names.empty()) fail("the retention strategy list is empty");

@@ -304,6 +304,13 @@ struct Rt {
         g.build(m);
         for (size_t i = 0; i < S.sigs.size(); i++) sigByName.emplace(S.sigs[i].name, (int)i);
         for (auto& w : m.warnings) std::cerr << "msim: UPF: " << w << "\n";
+        for (auto& e : retModelEls) {   // map_retention_cell -lib_model_name (6.39)
+            auto a = sigByName.find(e.el), b = sigByName.find(e.q);
+            if (a == sigByName.end() || b == sigByName.end())
+                throw Error("map_retention_cell: no signal " + (a == sigByName.end() ? e.el : e.q) + " for the retention model");
+            e.elSig = a->second;
+            e.qSig = b->second;
+        }
         // supply subnets: every supply port, net and switch port; switches
         // driving a subnet
         std::set<std::string> all(m.ports.begin(), m.ports.end());
@@ -388,6 +395,7 @@ struct Rt {
             // slang names procedure kinds "Initial", "AlwaysFF", ...; lowering adds "assign", "init", "sampled"
             const std::string& k = lp.kind;
             if (k == "Initial" || k == "Final" || k == "init" || k == "sampled") continue;
+            if (inRetModel(lp.scope)) continue;   // a -lib_model_name model is not corrupted (6.39)
             std::string dn = dm.of(lp.scope);
             // set_simstate_behavior (6.56): DISABLE and PORT_CORR_ONLY leave the logic alone
             auto [beh, behAt] = behaviorOf(lp.scope);
@@ -443,6 +451,10 @@ struct Rt {
                     for (int s : w) stateSigs[(size_t)domIdx.at(dn)].insert(s);
             }
         }
+        for (auto& e : retModelEls)
+            for (auto& o : owned) o.erase(e.elSig);
+        for (auto& st2 : stateSigs)
+            for (auto& e : retModelEls) st2.erase(e.elSig);
         for (size_t d = 0; d < doms.size(); d++) {
             for (int s : owned[d])
                 if (S.sigs[(size_t)s].name.find('$') == std::string::npos && !noCorr.count(s)) doms[d].owned.push_back(s);
@@ -498,6 +510,7 @@ struct Rt {
             if (h.hdl2upf) w.insert(h.sig);
             if (h.copyFrom >= 0) w.insert(h.copyFrom);
         }
+        for (auto& e : retModelEls) w.insert(e.qSig);
         for (int s : w) watch.push_back({s, ANY});
         chkSig = S.sig("$upf.check", 1);
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
@@ -776,6 +789,7 @@ struct Rt {
         double lastV = 0;            // hdl2upf: the voltage last driven (rows without a voltage keep it)
         bool hasV = false;
         bool warned = false;
+        int fOff = -1;               // -field: the field's lowest bit in the port (its width is w)
         int copyFrom = -1, target = -1;   // a function or model VCM (upf2hdl): its result, held on the port
         Val lastCopy;
         bool copied = false;
@@ -901,21 +915,28 @@ struct Rt {
         std::string name, keyword;   // the type's own name (an alias or enum), the predefined keyword
         bool sgn = false;
         std::map<int64_t, std::string> labels;
+        const slang::ast::Type* type = nullptr;   // the port's declared type
     };
     static std::string stateName(int st) {
         return st == S_OFF ? "OFF" : st == S_FULL_ON ? "FULL_ON" : st == S_PARTIAL_ON ? "PARTIAL_ON" : "UNDETERMINED";
     }
     static PortType portTypeOf(const slang::ast::Symbol* sym) {
         using namespace slang::ast;
+        if (!sym || !ValueSymbol::isKind(sym->kind)) return {};
+        return typeInfo(sym->as<ValueSymbol>().getType());
+    }
+    static PortType typeInfo(const slang::ast::Type& t) {
+        using namespace slang::ast;
         PortType pt;
-        if (!sym || !ValueSymbol::isKind(sym->kind)) return pt;
-        const Type& t = sym->as<ValueSymbol>().getType();
+        pt.type = &t;
         const Type& ct = t.getCanonicalType();
         if (t.isAlias()) pt.name = std::string(t.name);
-        if (ct.kind == SymbolKind::PackedStructType) {
+        if (ct.kind == SymbolKind::PackedStructType || ct.kind == SymbolKind::UnpackedStructType) {
             std::set<std::string> f;
             for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>()) f.insert(std::string(fs.name));
-            if (f == std::set<std::string>{"state", "voltage"}) pt.cat = 's';
+            if (ct.kind == SymbolKind::PackedStructType && f == std::set<std::string>{"state", "voltage"}) pt.cat = 's';
+            else pt.cat = 'u';   // a struct: a VCM converts one of its fields (-field)
+            if (pt.name.empty()) pt.name = std::string(ct.name);
             return pt;
         }
         if (ct.isFloating()) { pt.cat = 'r'; pt.keyword = ct.toString(); return pt; }
@@ -937,6 +958,58 @@ struct Rt {
             else pt.cat = ct.getBitWidth() == 1 ? 'b' : 'i';
         }
         return pt;
+    }
+    // A field of a struct port (-field of a table VCM, 6.30): its bits in the
+    // port's value, counted from bit 0, and its type. "a.b" names a field of
+    // a nested struct.
+    struct FieldLoc { bool ok = false; int off = 0, w = 0; PortType pt; std::string why; };
+    static FieldLoc fieldOf(const slang::ast::Type& t0, const std::string& path) {
+        using namespace slang::ast;
+        FieldLoc r;
+        const Type* cur = &t0;
+        size_t b = 0;
+        while (true) {
+            size_t e = path.find('.', b);
+            std::string nm = path.substr(b, e == std::string::npos ? std::string::npos : e - b);
+            const Type& ct = cur->getCanonicalType();
+            if (ct.kind != SymbolKind::PackedStructType && ct.kind != SymbolKind::UnpackedStructType) {
+                r.why = "it is not a struct where " + nm + " is looked up";
+                return r;
+            }
+            const FieldSymbol* f = nullptr;
+            for (auto& fs : ct.as<Scope>().membersOfType<FieldSymbol>())
+                if (fs.name == nm) f = &fs;
+            if (!f) {
+                r.why = "it has no field " + nm;
+                return r;
+            }
+            if (ct.kind == SymbolKind::PackedStructType) r.off += (int)f->bitOffset;
+            else r.off += uField(ct, *f).first;
+            cur = &f->getType();
+            if (e == std::string::npos) break;
+            b = e + 1;
+        }
+        const Type& ft = cur->getCanonicalType();
+        r.w = ft.isFloating() ? 64 : ft.isIntegral() ? (int)ft.getBitWidth() : uWidth(ft);
+        r.pt = typeInfo(*cur);
+        if (r.pt.cat == 'b') r.pt.cat = 'i';   // a one-bit field: an integer table (0 and 1)
+        if (r.pt.cat == 'x' || r.pt.cat == 'u' || r.pt.cat == 's') {
+            r.why = "field " + path + " is not of a type a table converts (4.10.1)";
+            return r;
+        }
+        r.ok = true;
+        return r;
+    }
+    // Whether a table VCM converts this port: its type, or with -field the
+    // named field of a struct of the VCM's -hdl_type.
+    static bool tableFits(const Vcm& v, const PortType& pt) {
+        if (v.field.empty()) return v.cat == 'b' ? pt.cat == 'b' && (v.lang == "sv" || v.bits.lang == "sv") : vcmFits(v, pt);
+        if (pt.cat != 'u' || !pt.type || v.lang != "sv") return false;
+        std::string last = v.hdlType.substr(v.hdlType.rfind(':') == std::string::npos ? 0 : v.hdlType.rfind(':') + 1);
+        if (last != pt.name) return false;
+        FieldLoc fl = fieldOf(*pt.type, v.field);
+        if (!fl.ok) return false;
+        return fl.pt.cat == v.cat;   // the table's values say which kind of field it converts
     }
     // Whether a table VCM converts this port's type (6.14).
     static bool vcmFits(const Vcm& v, const PortType& pt) {
@@ -1023,34 +1096,62 @@ struct Rt {
                         if (v->kind == Vcm::Function || v->kind == Vcm::Model) continue;   // none fit this port (vcmSource)
                         bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
                         if (!dirOk) continue;
-                        bool typeOk = v->cat == 'b' ? (pt.cat == 'b' && (v->lang == "sv" || v->bits.lang == "sv")) : vcmFits(*v, pt);
-                        if (typeOk) fit.push_back(v);
+                        if (tableFits(*v, pt)) fit.push_back(v);
                     }
                     std::string tn = pt.cat == 'b' ? "a one-bit port" : pt.cat == 'r' ? "a real port" : pt.cat == 'e' ? "an enum port (" + pt.name + ")"
-                                   : pt.cat == 'i' ? "an integer port" : "a port of a type no VCM converts";
+                                   : pt.cat == 'i' ? "an integer port" : pt.cat == 'u' ? "a struct port (" + pt.name + ")"
+                                   : "a port of a type no VCM converts";
                     std::string dn = dir == 0 ? "input" : dir == 1 ? "output" : "inout";
+                    if (fit.empty() && pt.cat == 'u')   // say why no field fits (6.30)
+                        for (auto* v : all) {
+                            if (v->kind != Vcm::Table) continue;
+                            std::string last = v->hdlType.substr(v->hdlType.rfind(':') == std::string::npos ? 0 : v->hdlType.rfind(':') + 1);
+                            if (last != pt.name) continue;
+                            if (v->field.empty())
+                                fail(" is " + tn + ", and VCM " + v->name + " converts the whole struct " + v->hdlType +
+                                     "; a struct with several fields needs -field (6.30)");
+                            FieldLoc fl = fieldOf(*pt.type, v->field);
+                            if (!fl.ok) fail(": VCM " + v->name + " -field " + v->field + ": " + fl.why + " (6.30)");
+                        }
                     if (fit.empty())
                         fail(" is " + tn + " (" + dn + "), and VCM " + nvcm->second->name + " has no " +
                              (dir == 0 ? "upf2hdl " : dir == 1 ? "hdl2upf " : "") + "conversion for it (6.14, 4.10.2)");
-                    if (fit.size() > 1)
-                        fail(" is " + tn + " (" + dn + "), and VCMs " + fit[0]->name + " and " + fit[1]->name + " both fit it" +
-                             (dir == 2 ? "; a list for an inout port holds one direction per type (4.10.2)" : " (6.14)"));
-                    const Vcm* v = fit[0];
-                    if (!v->field.empty()) fail(": VCM " + v->name + " converts field " + v->field + " of a struct; msim does not convert struct fields yet");
-                    h.hdl2upf = v->hdl2upf;
-                    if (v->cat == 'b') h.vct = &v->bits;
-                    else {
-                        h.vcm = v;
-                        h.cat = pt.cat;
-                        h.sgn = pt.sgn;
-                        for (auto& [val, nm] : pt.labels) { h.labelOf[val] = nm; h.valueOf[nm] = val; }
-                        if (pt.cat == 'e')
-                            for (auto& r : v->rows)
-                                if (r.h == Vcm::Row::Label && !h.valueOf.count(r.label))
-                                    fail(": VCM " + v->name + " names " + r.label + ", which is not a value of " + pt.name + " (6.30.6)");
+                    // Fields of a struct input: one upf2hdl VCM for each field (6.30).
+                    bool perField = fit.size() > 1 && pt.cat == 'u';
+                    std::set<std::string> fieldsSeen;
+                    for (auto* v : fit) {
+                        if (!perField) break;
+                        if (v->hdl2upf || !fieldsSeen.insert(v->field).second) perField = false;
                     }
-                    note(std::string("supply net ") + net + (h.hdl2upf ? " is driven by " : " drives ") + m.design(p) + " through " + v->name);
-                    hdlPorts.push_back(h);
+                    if (fit.size() > 1 && !perField)
+                        fail(" is " + tn + " (" + dn + "), and VCMs " + fit[0]->name + " and " + fit[1]->name + " both fit it" +
+                             (dir == 2 ? "; a list for an inout port holds one direction per type (4.10.2)"
+                              : pt.cat == 'u' ? "; only a struct input takes one upf2hdl VCM for each of its fields (6.30)" : " (6.14)"));
+                    for (const Vcm* v : fit) {
+                        HdlPort hf = h;
+                        PortType ft = pt;
+                        if (!v->field.empty()) {
+                            FieldLoc fl = fieldOf(*pt.type, v->field);
+                            hf.fOff = fl.off;
+                            hf.w = fl.w;
+                            ft = fl.pt;
+                        }
+                        hf.hdl2upf = v->hdl2upf;
+                        if (v->cat == 'b') hf.vct = &v->bits;
+                        else {
+                            hf.vcm = v;
+                            hf.cat = ft.cat;
+                            hf.sgn = ft.sgn;
+                            for (auto& [val, nm] : ft.labels) { hf.labelOf[val] = nm; hf.valueOf[nm] = val; }
+                            if (ft.cat == 'e')
+                                for (auto& r : v->rows)
+                                    if (r.h == Vcm::Row::Label && !hf.valueOf.count(r.label))
+                                        fail(": VCM " + v->name + " names " + r.label + ", which is not a value of " + ft.name + " (6.30.6)");
+                        }
+                        note(std::string("supply net ") + net + (hf.hdl2upf ? " is driven by " : " drives ") + m.design(p) +
+                             (v->field.empty() ? "" : "." + v->field) + " through " + v->name);
+                        hdlPorts.push_back(hf);
+                    }
                     continue;
                 }
                 if (named != m.connectVct.end()) {
@@ -1159,8 +1260,7 @@ struct Rt {
                 std::string inP, outP;
                 if (v->kind == Vcm::Table) {
                     bool dirOk = dir == 2 || (dir == 0 && !v->hdl2upf) || (dir == 1 && v->hdl2upf);
-                    bool typeOk = v->cat == 'b' ? ptc.cat == 'b' : vcmFits(*v, ptc);
-                    if (dirOk && typeOk) fits.push_back({v, v->hdl2upf, "", ""});
+                    if (dirOk && tableFits(*v, ptc)) fits.push_back({v, v->hdl2upf, "", ""});
                     continue;
                 }
                 if (v->kind == Vcm::Function) {   // 6.30.8
@@ -1241,11 +1341,323 @@ struct Rt {
         }
         return out;
     }
+    // map_retention_cell -lib_model_name (6.39): each mapped register is
+    // simulated by the model. A wrapper module bound into the register's
+    // instance takes the register's canonical interface, inferred from the
+    // always block that assigns it (UPF_GENERIC_CLOCK, _DATA,
+    // _ASYNC_SET_RESET / _ASYNC_LOAD, _OUTPUT), and instantiates the model
+    // with -port_map; supply ports of the model are connected like
+    // connect_supply_net. The register then follows the model's output, and
+    // neither corruption nor the strategy's retention applies to it.
+    struct RetModelEl { std::string el, q, inst, strategy; int elSig = -1, qSig = -1; bool copied = false; Val last; };
+    std::vector<RetModelEl> retModelEls;
+    std::vector<std::string> retModelInsts;   // design paths of the wrapper instances
+    bool inRetModel(const std::string& scope) const {
+        for (auto& i : retModelInsts) if (DomainMap::within(scope, i)) return true;
+        return false;
+    }
+    std::string retModelSource(slang::ast::Compilation& comp, const std::string& simTop) {
+        using namespace slang::ast;
+        std::string out;
+        int k = 0;
+        auto trim = [](std::string t) {
+            size_t a = t.find_first_not_of(" \t\r\n"), b = t.find_last_not_of(" \t\r\n");
+            return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+        };
+        auto text = [&](const Expression& e) { return e.syntax ? trim(e.syntax->toString()) : std::string(); };
+        auto instAt = [&](const std::string& full) -> const InstanceSymbol* {
+            const Symbol* cur = nullptr;
+            size_t a = 0;
+            while (true) {
+                size_t b = full.find('.', a);
+                std::string part = full.substr(a, b == std::string::npos ? std::string::npos : b - a);
+                if (!cur) {
+                    for (auto* t : comp.getRoot().topInstances) if (t->name == part) cur = t;
+                } else {
+                    const Symbol* c2 = cur->as<InstanceSymbol>().body.find(part);
+                    cur = c2 && c2->kind == SymbolKind::Instance ? c2 : nullptr;
+                }
+                if (!cur) return nullptr;
+                if (b == std::string::npos) return &cur->as<InstanceSymbol>();
+                a = b + 1;
+            }
+        };
+        for (auto& rm : m.retModels) {
+            auto fail = [&](const std::string& msg) -> void { throw Error(rm.where + ": map_retention_cell -lib_model_name " + rm.model + ": " + msg + " (6.39)"); };
+            std::string mod = rm.model.substr(rm.model.rfind('.') == std::string::npos ? 0 : rm.model.rfind('.') + 1);
+            auto def = comp.tryGetDefinition(mod, comp.getRoot());
+            if (!def.definition || def.definition->kind != SymbolKind::Definition) fail("no module " + rm.model);
+            auto& minst = InstanceSymbol::createDefault(comp, def.definition->as<DefinitionSymbol>());
+            struct MP { std::string name; int dir; bool supply; int w; };
+            std::vector<MP> mports;
+            for (const Symbol* q : minst.body.getPortList()) {
+                if (q->kind != SymbolKind::Port) fail(rm.model + " has a port that is not a plain port");
+                auto& qp = q->as<PortSymbol>();
+                int dir = qp.direction == ArgumentDirection::In ? 0 : qp.direction == ArgumentDirection::Out ? 1 : 2;
+                if (dir == 2) fail(rm.model + " has an inout port " + std::string(qp.name));
+                mports.push_back({std::string(qp.name), dir, supplyType(qp.getType()), (int)qp.getType().getBitWidth()});
+            }
+            for (auto& [port, ref] : rm.portMap)
+                if (std::none_of(mports.begin(), mports.end(), [&](const MP& x) { return x.name == port; }))
+                    fail(rm.model + " has no port " + port);
+            // the registers: -elements, or each strategy's elements
+            std::vector<std::pair<const Retention*, std::string>> regs;   // strategy, rooted element
+            for (auto& sn : rm.strategies)
+                for (auto& r : m.rets)
+                    if (r.name == sn && r.domain == rm.domain) {
+                        const auto& els = rm.elements.empty() ? r.elements : rm.elements;
+                        if (els.empty()) fail("strategy " + sn + " names no elements; give -elements");
+                        for (auto& e : els) regs.push_back({&r, e});
+                    }
+            for (auto& [r, e] : regs) {
+                std::string d = m.design(e);
+                std::string full = simTop.empty() ? d : simTop + "." + d;
+                // an instance: every register its clocked blocks assign; else one variable
+                std::vector<std::pair<const InstanceSymbol*, const Symbol*>> vars;
+                if (const InstanceSymbol* is = instAt(full)) {
+                    std::function<void(const InstanceSymbol&)> walk = [&](const InstanceSymbol& in) {
+                        for (auto& pb : in.body.membersOfType<ProceduralBlockSymbol>()) {
+                            if (pb.procedureKind != ProceduralBlockKind::AlwaysFF && pb.procedureKind != ProceduralBlockKind::Always) continue;
+                            std::function<void(const Statement&)> sv = [&](const Statement& st) {
+                                if (st.kind == StatementKind::Timed) sv(st.as<TimedStatement>().stmt);
+                                else if (st.kind == StatementKind::Block) sv(st.as<BlockStatement>().body);
+                                else if (st.kind == StatementKind::List) for (auto* x : st.as<StatementList>().list) sv(*x);
+                                else if (st.kind == StatementKind::Conditional) {
+                                    auto& c = st.as<ConditionalStatement>();
+                                    sv(c.ifTrue);
+                                    if (c.ifFalse) sv(*c.ifFalse);
+                                } else if (st.kind == StatementKind::ExpressionStatement) {
+                                    auto& x = st.as<ExpressionStatement>().expr;
+                                    if (x.kind == ExpressionKind::Assignment) {
+                                        auto& l = x.as<AssignmentExpression>().left();
+                                        if (l.kind == ExpressionKind::NamedValue) {
+                                            const Symbol* v = &l.as<NamedValueExpression>().symbol;
+                                            if (std::none_of(vars.begin(), vars.end(), [&](auto& pv) { return pv.second == v; })) vars.push_back({&in, v});
+                                        }
+                                    }
+                                }
+                            };
+                            if (pb.getBody().kind == StatementKind::Timed) sv(pb.getBody());
+                        }
+                        for (auto& ch : in.body.membersOfType<InstanceSymbol>()) walk(ch);
+                    };
+                    walk(*is);
+                    if (vars.empty()) fail("instance " + e + " has no register");
+                } else {
+                    size_t dot = full.rfind('.');
+                    const InstanceSymbol* is2 = dot == std::string::npos ? nullptr : instAt(full.substr(0, dot));
+                    const Symbol* v = is2 ? is2->body.find(full.substr(dot + 1)) : nullptr;
+                    if (!v || !ValueSymbol::isKind(v->kind)) fail("no register " + e + " in the design");
+                    vars.push_back({is2, v});
+                }
+                for (auto& [is, var] : vars) {
+                    // the always block that assigns it
+                    const ProceduralBlockSymbol* blk = nullptr;
+                    std::function<bool(const Statement&)> assigns = [&](const Statement& st) -> bool {
+                        switch (st.kind) {
+                            case StatementKind::Timed: return assigns(st.as<TimedStatement>().stmt);
+                            case StatementKind::Block: return assigns(st.as<BlockStatement>().body);
+                            case StatementKind::List:
+                                for (auto* x : st.as<StatementList>().list) if (assigns(*x)) return true;
+                                return false;
+                            case StatementKind::Conditional: {
+                                auto& c = st.as<ConditionalStatement>();
+                                return assigns(c.ifTrue) || (c.ifFalse && assigns(*c.ifFalse));
+                            }
+                            case StatementKind::ExpressionStatement: {
+                                auto& x = st.as<ExpressionStatement>().expr;
+                                if (x.kind != ExpressionKind::Assignment) return false;
+                                auto& l = x.as<AssignmentExpression>().left();
+                                return l.kind == ExpressionKind::NamedValue && &l.as<NamedValueExpression>().symbol == var;
+                            }
+                            default: return false;
+                        }
+                    };
+                    for (auto& pb : is->body.membersOfType<ProceduralBlockSymbol>())
+                        if (pb.getBody().kind == StatementKind::Timed && assigns(pb.getBody())) blk = &pb;
+                    std::string vname(var->name);
+                    if (!blk) fail("no clocked always block assigns " + vname);
+                    auto& ts = blk->getBody().as<TimedStatement>();
+                    struct Ev { std::string sig; int edge; };   // 1 posedge, 2 negedge
+                    std::vector<Ev> evs;
+                    auto addEv = [&](const TimingControl& t) {
+                        if (t.kind != TimingControlKind::SignalEvent) fail("the block that assigns " + vname + " is not edge triggered");
+                        auto& se = t.as<SignalEventControl>();
+                        if (se.edge != EdgeKind::PosEdge && se.edge != EdgeKind::NegEdge) fail("the block that assigns " + vname + " is not edge triggered");
+                        evs.push_back({text(se.expr), se.edge == EdgeKind::PosEdge ? 1 : 2});
+                    };
+                    if (ts.timing.kind == TimingControlKind::EventList)
+                        for (auto* t : ts.timing.as<EventListControl>().events) addEv(*t);
+                    else addEv(ts.timing);
+                    // the next state of the clocked branch, and the async events tested by the if chain
+                    const Statement* body = &ts.stmt;
+                    while (body->kind == StatementKind::Block) body = &body->as<BlockStatement>().body;
+                    auto mentions = [](const std::string& t, const std::string& id) {
+                        std::regex re("(^|[^A-Za-z0-9_$.])" + std::regex_replace(id, std::regex(R"([.^$|()\[\]{}*+?\\])"), R"(\$&)") + "($|[^A-Za-z0-9_$])");
+                        return std::regex_search(t, re);
+                    };
+                    std::vector<bool> isAsync(evs.size(), false);
+                    if (evs.size() > 1) {
+                        const Statement* b = body;
+                        while (b->kind == StatementKind::Conditional) {
+                            auto& c = b->as<ConditionalStatement>();
+                            std::string ct = text(*c.conditions[0].expr);
+                            bool any = false;
+                            for (size_t i = 0; i < evs.size(); i++)
+                                if (mentions(ct, evs[i].sig)) { isAsync[i] = true; any = true; }
+                            if (!any || !c.ifFalse) break;
+                            b = c.ifFalse;
+                            while (b->kind == StatementKind::Block) b = &b->as<BlockStatement>().body;
+                        }
+                        body = b;
+                    }
+                    int clk = -1;
+                    for (size_t i = 0; i < evs.size(); i++)
+                        if (!isAsync[i]) {
+                            if (clk >= 0) fail("the block that assigns " + vname + " has two clocks");
+                            clk = (int)i;
+                        }
+                    if (clk < 0) fail("the block that assigns " + vname + " has no clock");
+                    std::function<std::string(const Statement&, const std::string&)> next = [&](const Statement& st, const std::string& cur) -> std::string {
+                        switch (st.kind) {
+                            case StatementKind::Block: return next(st.as<BlockStatement>().body, cur);
+                            case StatementKind::List: {
+                                std::string c2 = cur;
+                                for (auto* x : st.as<StatementList>().list) c2 = next(*x, c2);
+                                return c2;
+                            }
+                            case StatementKind::Conditional: {
+                                auto& c = st.as<ConditionalStatement>();
+                                std::string t = next(c.ifTrue, cur), f = c.ifFalse ? next(*c.ifFalse, cur) : cur;
+                                if (t == f) return t;
+                                return "((" + text(*c.conditions[0].expr) + ") ? " + t + " : " + f + ")";
+                            }
+                            case StatementKind::ExpressionStatement: {
+                                auto& x = st.as<ExpressionStatement>().expr;
+                                if (x.kind != ExpressionKind::Assignment) return cur;
+                                auto& a = x.as<AssignmentExpression>();
+                                if (a.left().kind == ExpressionKind::NamedValue && &a.left().as<NamedValueExpression>().symbol == var)
+                                    return "(" + text(a.right()) + ")";
+                                return cur;
+                            }
+                            case StatementKind::Empty: return cur;
+                            default: fail("the block that assigns " + vname + " has a statement the canonical interface is not inferred from");
+                        }
+                        return cur;
+                    };
+                    std::string data = next(*body, vname);
+                    std::string clkT = (evs[(size_t)clk].edge == 1 ? "" : "!") + std::string("(") + evs[(size_t)clk].sig + ")";
+                    std::string async;
+                    for (size_t i = 0; i < evs.size(); i++)
+                        if (isAsync[i]) async += std::string(async.empty() ? "" : " || ") + (evs[i].edge == 1 ? "(" : "!(") + evs[i].sig + ")";
+                    if (async.empty()) async = "1'b0";
+                    const Type& vt = var->as<ValueSymbol>().getType();
+                    int w = (int)vt.getBitWidth();
+                    if (w <= 0) fail(vname + " is not a vector of bits");
+                    std::string instPath = std::string(is->getHierarchicalPath());   // slang's dotted path from the root
+                    std::string relInst = instPath.substr(simTop.size() + (instPath.size() > simTop.size() ? 1 : 0));
+                    std::string id = std::to_string(k++);
+                    std::string modName = "upf_retm_mod_" + id, inst = "upf_retm_" + id;
+                    std::string root = simTop.empty() ? "" : simTop + ".";
+                    auto hier = [&](const std::string& upfName) { return root + m.design(upfName); };
+                    // the model's ports
+                    std::string ports = "input logic upf_clk, input logic [" + std::to_string(w - 1) + ":0] upf_data, input logic upf_async, "
+                                        "input logic upf_save, input logic upf_restore";
+                    std::string conns;
+                    std::string relInstUpf = relInst;
+                    {
+                        std::string topPre = m.top.empty() ? "" : m.top + ".";
+                        if (!topPre.empty() && relInstUpf.compare(0, topPre.size(), topPre) == 0) relInstUpf = relInstUpf.substr(topPre.size());
+                        else if (relInstUpf == m.top) relInstUpf.clear();
+                        for (char& ch : relInstUpf) if (ch == '.') ch = '/';
+                    }
+                    bool outMapped = false;
+                    int nsup = 0;
+                    std::string supConns;   // tied off in the bind: the runtime drives them from the supply nets
+                    for (auto& mp : mports) {
+                        std::string ref;
+                        for (auto& [port, r2] : rm.portMap) if (port == mp.name) ref = r2;
+                        bool inv = !ref.empty() && ref[0] == '~';
+                        std::string x = inv ? ref.substr(1) : ref;
+                        std::string neg = inv ? "~" : "";
+                        std::string e2;
+                        if (ref.empty()) {
+                            if (mp.dir == 1 && std::count_if(mports.begin(), mports.end(), [](const MP& y) { return y.dir == 1; }) == 1 &&
+                                std::none_of(rm.portMap.begin(), rm.portMap.end(), [](auto& pm) { return pm.second == "UPF_GENERIC_OUTPUT"; })) {
+                                e2 = "upf_q";
+                                outMapped = true;
+                            } else if (mp.dir == 0) fail("input port " + mp.name + " of " + rm.model + " is not connected by -port_map");
+                            else continue;
+                        } else if (x == "UPF_GENERIC_CLOCK") e2 = neg + "upf_clk";
+                        else if (x == "UPF_GENERIC_DATA") e2 = neg + "upf_data";
+                        else if (x == "UPF_GENERIC_ASYNC_SET_RESET" || x == "UPF_GENERIC_ASYNC_LOAD") e2 = neg + "upf_async";
+                        else if (x == "UPF_GENERIC_OUTPUT") {
+                            if (mp.dir != 1) fail("UPF_GENERIC_OUTPUT goes to an output port, not " + mp.name);
+                            e2 = "upf_q";
+                            outMapped = true;
+                        } else if (x == "save_signal") e2 = neg + "upf_save";
+                        else if (x == "restore_signal") e2 = neg + "upf_restore";
+                        else {
+                            // a supply: a supply net or port, retention_supply.f, primary_supply.f
+                            std::string net;
+                            std::string j = Model::join(rm.scope, x);
+                            if (x.rfind("retention_supply.", 0) == 0) net = m.fnNet(r->supply + x.substr(16));
+                            else if (x.rfind("primary_supply.", 0) == 0) net = m.fnNet(m.primaryOf(rm.domain) + x.substr(14));
+                            else if (m.nets.count(j) || m.ports.count(j)) net = j;
+                            else if (!m.fnNet(j).empty()) net = m.fnNet(j);
+                            if (!net.empty()) {
+                                if (mp.dir != 0) fail("supply " + x + " goes to an input port, not " + mp.name);
+                                std::string sp = "upf_sup_" + std::to_string(nsup++);
+                                ports += std::string(", input ") + (mp.supply ? "UPF::upfSupplyTypeT " : "logic ") + sp;
+                                e2 = sp;
+                                supConns += ", ." + sp + "('0)";
+                                std::string upfPort = (relInstUpf.empty() ? "" : relInstUpf + "/") + inst + "/" + sp;
+                                m.connects[net].push_back(upfPort);
+                                m.connectWhere[{net, upfPort}] = rm.where;
+                            } else {
+                                // a logic net
+                                if (inv) fail("~ is only for the symbolic references, not " + x);
+                                e2 = hier(j);
+                            }
+                        }
+                        conns += std::string(conns.empty() ? "" : ", ") + "." + mp.name + "(" + e2 + ")";
+                    }
+                    if (!outMapped) fail("no output port of " + rm.model + " drives " + vname + "; map one to UPF_GENERIC_OUTPUT");
+                    std::string sv = r->save.net.empty() ? "1'b0" : hier(r->save.net), rs = r->restore.net.empty() ? "1'b0" : hier(r->restore.net);
+                    out += "// map_retention_cell " + rm.strategies[0] + " -lib_model_name " + rm.model + ": " + relInst + "." + vname +
+                           " (IEEE 1801-2024 6.39)\nmodule " + modName + "(" + ports + ");\n  logic [" + std::to_string(w - 1) +
+                           ":0] upf_q;\n  " + mod + " u_model(" + conns + ");\nendmodule\nbind " + instPath + " " + modName + " " + inst +
+                           "(.upf_clk(" + clkT + "), .upf_data(" + data + "), .upf_async(" + async + "), .upf_save(" + sv +
+                           "), .upf_restore(" + rs + ")" + supConns + ");\n";
+                    RetModelEl el;
+                    el.el = relInst + "." + vname;
+                    el.inst = relInst + "." + inst;
+                    el.q = el.inst + ".upf_q";
+                    el.strategy = r->name;
+                    retModelEls.push_back(el);
+                    retModelInsts.push_back(el.inst);
+                    note("map_retention_cell: " + el.el + " is simulated by " + rm.model + " (" + el.inst + ")");
+                }
+            }
+        }
+        return out;
+    }
+    void copyRetModels() {
+        for (auto& e : retModelEls) {
+            if (e.qSig < 0) continue;
+            Val v = S.get(e.qSig);
+            if (e.copied && v == e.last) continue;
+            e.copied = true;
+            e.last = v;
+            S.holdOn(e.elSig, konst(v), true);
+        }
+    }
     // The HDL ports that drive supply nets: their value is the root supply.
     void readHdlPorts() {
         for (auto& h : hdlPorts) {
             if (!h.hdl2upf) continue;
             Val v = S.get(h.sig);
+            if (h.fOff >= 0) v = v_slice(v, h.fOff + h.w - 1, h.fOff);   // -field
             SupplyVal sv;
             if (h.supply) {   // {state, voltage in microvolts}, state in the upper word
                 if (v.x) sv.st = S_UNDETERMINED;
@@ -1320,18 +1732,38 @@ struct Rt {
                             out = h.cat == 'r' ? mkreal(r->num) : make((uint64_t)(int64_t)r->num & mask, 0, h.w, 0);
                     }
                 }
-                if (h.held && out == h.lastVal) continue;
-                h.held = true;
-                h.lastVal = out;
-                S.holdOn(h.sig, konst(out), true);
+                hold(h, out);
                 continue;
             }
             char c = h.vct->toHdl(sv.st);
-            if (c == h.last) continue;
+            if (h.fOff < 0 && c == h.last) continue;
             h.last = c;
             bool one = c == '1' || c == 'H', zero = c == '0' || c == 'L', z = c == 'Z';
-            S.holdOn(h.sig, konst(make(one ? 1 : 0, one || zero || z ? 0 : 1, 1, z ? 1 : 0)), true);
+            hold(h, make(one ? 1 : 0, one || zero || z ? 0 : 1, 1, z ? 1 : 0));
         }
+    }
+    // Holds an HDL port at a converted value. With -field the value goes into
+    // the field's bits; the other fields keep what the other VCMs of the
+    // port put there (x until then).
+    std::map<int, Val> fieldHeld;
+    void hold(HdlPort& h, Val out) {
+        if (h.fOff >= 0) {
+            int W = S.sigs[(size_t)h.sig].w;
+            auto it = fieldHeld.find(h.sig);
+            if (it == fieldHeld.end()) it = fieldHeld.emplace(h.sig, allx(W)).first;
+            Val f = make(out.v, out.x, h.w, out.z);
+            f.hi = out.hi;
+            std::vector<Val> parts;
+            if (h.fOff + h.w < W) parts.push_back(v_slice(it->second, W - 1, h.fOff + h.w));
+            parts.push_back(f);
+            if (h.fOff > 0) parts.push_back(v_slice(it->second, h.fOff - 1, 0));
+            it->second = v_concat(parts);
+            out = it->second;
+        }
+        if (h.held && out == h.lastVal) return;
+        h.held = true;
+        h.lastVal = out;
+        S.holdOn(h.sig, konst(out), true);
     }
 
     // Isolation and level-shifter cells on the port connections that cross
@@ -1502,7 +1934,8 @@ struct Rt {
                 // -applies_to flop / latch is not told apart: both are state elements
                 if (in) rr.els.push_back({s, allx(S.sigs[(size_t)s].w), false});
             }
-            if (rr.els.empty())
+            bool modelled = std::any_of(retModelEls.begin(), retModelEls.end(), [&](const RetModelEl& e) { return e.strategy == r.name; });
+            if (rr.els.empty() && !modelled)
                 std::cerr << "msim: UPF: " << r.where << ": retention " << r.name << " applies to no state element\n";
             note("retention " + r.name + ": " + std::to_string(rr.els.size()) + " state elements");
             rets.push_back(std::move(rr));
@@ -1996,6 +2429,7 @@ struct Rt {
     bool checkArmed = false;
     void evaluate() {
         copyVcmResults();
+        copyRetModels();
         readHdlPorts();
         evalSupplies();
         driveHdlPorts();
