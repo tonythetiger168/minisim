@@ -9049,6 +9049,7 @@ struct Lowerer {
                         ? packedValue(*r.expr->type, *r.expr) : expr(*r.expr);
                     prog.emit(i);
                 }
+                if (current && current->sym) blockEventSample(current->sym, false);   // @@(end f) (19.3)
                 Instr ret;
                 ret.k = IK::Ret;
                 prog.emit(ret);
@@ -11976,6 +11977,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     clockings().clear();
     Lowerer::clockingIdxMap().clear();
     cgDefs().clear();
+    cgBlockDefs().clear();
+    Lowerer::blockEventIds().clear();
     cgInsts().clear();
     Lowerer::cgIdxMap().clear();
     Lowerer::seqTrackers().clear();
@@ -12372,6 +12375,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         g_nullSig = mkSig("$null", 64, false);
     }
 
+    Lowerer::scanBlockEvents(comp.getRoot());
     int tempSeq = 0;
     for (Subr* sub : order) {
         if (sub->sym && sub->sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
@@ -12402,7 +12406,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (isClassMethod(*sub->sym)) lw.curClass = classInfo(sub->sym->getParentScope()->asSymbol().as<slang::ast::ClassType>());
         lw.current = sub;
         if (lw.curClass && lw.curClass->builtin) lw.builtinMethod(*lw.curClass, *sub);
-        else lw.stmt(sub->sym->getBody());
+        else {
+            lw.blockEventSample(sub->sym, true);   // @@(begin f) / @@(end f) (19.3)
+            lw.stmt(sub->sym->getBody());
+            lw.blockEventSample(sub->sym, false);
+        }
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);

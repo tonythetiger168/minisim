@@ -1490,7 +1490,7 @@ enum UpfOp : int { UPF_SUPPLY_ON, UPF_SUPPLY_OFF, UPF_SUPPLY_PARTIAL_ON, UPF_SET
                    UPF_GET_SUPPLY_VALUE, UPF_ISO, UPF_LS };
 inline Val (*g_upfHook)(int op, const std::vector<Val>& a) = nullptr;
 // Covergroup operations (19.3, 19.8, 19.9), run by the kernel (cover_rt.inc).
-enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT };
+enum CgOp : int { CG_NEW, CG_SAMPLE, CG_GETCOV, CG_INSTCOV, CG_START, CG_STOP, CG_SETNAME, CG_ITEMCOV, CG_ITEMINST, CG_GLOBAL, CG_COUNT, CG_BLOCK };
 inline Val (*g_cgHook)(int op, const std::vector<Val>& a) = nullptr;
 // 40.3.2: lo 0 control, 1 get_max, 2 get, 3 save, 4 merge. With no hook
 // (no design data) every call answers SV_COV_NOCOV (0).

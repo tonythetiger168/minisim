@@ -848,6 +848,17 @@ inline Val hook(int op, const std::vector<Val>& a) {
             sampleInst(in);
             return make(0, 0, 64, 0);
         }
+        case CG_BLOCK: {   // a block event: every instance of each covergroup on it samples now
+            size_t id = (size_t)a[0].v;
+            if (id < cgBlockDefs().size())
+                for (int d : cgBlockDefs()[id])
+                    for (int i : cgDefs()[(size_t)d].insts) {
+                        CgInst& in = cgInsts()[(size_t)i];
+                        SelfScope ss(in);
+                        sampleInst(in);
+                    }
+            return make(0, 0, 64, 0);
+        }
         case CG_START: instOf(a[0]).on = true; return make(0, 0, 64, 0);
         case CG_STOP: instOf(a[0]).on = false; return make(0, 0, 64, 0);
         case CG_SETNAME: return make(0, 0, 64, 0);

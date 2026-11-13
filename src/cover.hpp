@@ -108,6 +108,9 @@ struct CgDef {
     bool inClass = false;           // embedded in a class (19.4): new() passes `this` last
 };
 inline std::vector<CgDef>& cgDefs() { static std::vector<CgDef> v; return v; }
+// Block events (19.3, @@(begin f) / @@(end f)): for each begin or end point,
+// the covergroups that sample there.
+inline std::vector<std::vector<int>>& cgBlockDefs() { static std::vector<std::vector<int>> v; return v; }
 
 // ---- instances (built by the kernel) ----
 // Coverpoint values are compared as keys: the value's w bits, with the sign
