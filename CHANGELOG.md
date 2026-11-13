@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI class definitions (37.31): `vpiVariables` of a class defn gives its
+  automatic properties too (before only static ones), as declarations
+  with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);
+  `vpiNamedEvent`, `vpiParameter` (with `vpiLocalParam`), `vpiTypedef` and
+  `vpiInternalScope` iterate its events, parameters, typedefs and methods.
+  `tests/spec/37.31-vpi-class-defn.sv`.
 - `mlint` CDC on generated register blocks: a register struct written field
   by field through ports on fields or on concatenations of fields, copied
   whole (`assign hw2reg_regtop = hw2reg`) and passed whole down a port, is
