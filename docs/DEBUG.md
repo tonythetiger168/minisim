@@ -92,6 +92,22 @@ end of the waveform is used.
   and the value of every signal at the cursor written next to its name in the
   source.
 
+In the waves, as in a waveform viewer:
+
+| | |
+|---|---|
+| click | move the cursor |
+| shift+click, or `m` | put the marker there; the bar shows the marker and the time from it to the cursor |
+| wheel | zoom around the pointer; `fit` shows the whole run |
+| `r` | radix of the selected row: hex, unsigned decimal, signed decimal, binary |
+| Del | take the selected row out of the waves |
+| Ctrl+← / Ctrl+→ | previous / next change of the selected signal |
+| find value | the next time the selected signal takes a value (`fe`, `'hfe`, `'d-2`, `'b1x`); shift+Enter for the previous |
+
+The view (rows, their radix, the zoom window, cursor and marker) is kept in
+the page address, so a reload shows it again and a copied link (with
+`-serve`, or the same `.html` file) opens on the same view.
+
 `-json file` writes the database the page reads (instances, signals, drivers
 with their conditions, sources, waves).
 
