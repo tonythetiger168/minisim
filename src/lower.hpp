@@ -8803,7 +8803,9 @@ struct Lowerer {
                     labelSym = b.blockSymbol;   // label: assert ... names the assertion
                     labelOf = &b.body;
                     size_t s0 = prog.here();
+                    blockEventSample(b.blockSymbol, true);   // @@(begin blk) (19.3)
                     stmt(b.body);
+                    blockEventSample(b.blockSymbol, false);
                     if (blockIds().targets.count(b.blockSymbol))   // another process may disable it (9.6.2)
                     { prog.spans.push_back({blockIds().of(b.blockSymbol), s0, prog.here()}); anySpans() = true; }
                     patch(named[k].second, prog.here());   // disable blk: jump past it

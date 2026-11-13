@@ -136,20 +136,20 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
     }
 }
 // The definition of a covergroup type, built on first use.
-// Block events (19.3): the task or function a block event names, null for
-// a named block; and the number of its begin or end point.
-static const slang::ast::SubroutineSymbol* blockEventSub(const slang::ast::Expression& e) {
+// Block events (19.3): the task, function or named block a block event
+// names (null: something else); and the number of its begin or end point.
+static const slang::ast::Symbol* blockEventSub(const slang::ast::Expression& e) {
     using namespace slang::ast;
     const Symbol* s = nullptr;
     if (e.kind == ExpressionKind::ArbitrarySymbol) s = e.as<ArbitrarySymbolExpression>().symbol;
     else if (ValueExpressionBase::isKind(e.kind)) s = &e.as<ValueExpressionBase>().symbol;
-    return s && s->kind == SymbolKind::Subroutine ? &s->as<SubroutineSymbol>() : nullptr;
+    return s && (s->kind == SymbolKind::Subroutine || s->kind == SymbolKind::StatementBlock) ? s : nullptr;
 }
-static std::map<std::pair<const slang::ast::SubroutineSymbol*, bool>, size_t>& blockEventIds() {
-    static std::map<std::pair<const slang::ast::SubroutineSymbol*, bool>, size_t> m;
+static std::map<std::pair<const slang::ast::Symbol*, bool>, size_t>& blockEventIds() {
+    static std::map<std::pair<const slang::ast::Symbol*, bool>, size_t> m;
     return m;
 }
-static size_t blockEventId(const slang::ast::SubroutineSymbol* sub, bool begin) {
+static size_t blockEventId(const slang::ast::Symbol* sub, bool begin) {
     auto [it, fresh] = blockEventIds().try_emplace({sub, begin}, cgBlockDefs().size());
     if (fresh) cgBlockDefs().emplace_back();
     return it->second;
@@ -169,7 +169,7 @@ static void scanBlockEvents(const slang::ast::Symbol& root) {
     root.visit(v);
 }
 // The sampling call at a block event's point, or nothing.
-void blockEventSample(const slang::ast::SubroutineSymbol* sub, bool begin) {
+void blockEventSample(const slang::ast::Symbol* sub, bool begin) {
     auto it = blockEventIds().find({sub, begin});
     if (it == blockEventIds().end()) return;
     Instr i; i.k = IK::Assign; i.sig = fresh(64);
@@ -224,8 +224,8 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
     if (const TimingControl* ev = argT->getCoverageEvent()) {
         if (ev->kind == TimingControlKind::BlockEventList) {   // @@(begin f or end g) (19.3)
             for (const auto& be : ev->as<BlockEventListControl>().events) {
-                const SubroutineSymbol* sub = blockEventSub(*be.target);
-                if (!sub) unsupported("a block event on a named block (19.3)");
+                const Symbol* sub = blockEventSub(*be.target);
+                if (!sub) unsupported("a block event on something other than a task, function or named block (19.3)");
                 blockAt.push_back(blockEventId(sub, be.isBegin));
             }
         } else if (ev->kind != TimingControlKind::SignalEvent && ev->kind != TimingControlKind::EventList)
