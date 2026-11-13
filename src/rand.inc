@@ -845,6 +845,75 @@ inline bool solveOnce(const std::vector<int>& order) {
     return true;
 }
 
+// Exact uniformity (18.5.9): every legal combination equally likely. After
+// bounds propagation every solution lies inside the box of the variables'
+// ranges, so a point drawn uniformly from the box and kept only when every
+// constraint holds is a uniform draw over the solutions. This is tried
+// first when nothing asks for another distribution (no dist, randc,
+// solve-before or function calls); when the solutions are too thin in the
+// box to be hit within the tries, the variable-by-variable search below
+// is used instead.
+inline bool sampleExact(int tries) {
+    for (auto& v : g_ctx->vars) { v.set = false; v.lo = rMin(v.w, v.sgn); v.hi = rMax(v.w, v.sgn); }
+    if (!propagate()) return false;
+    std::vector<std::pair<i128, i128>> box;
+    for (auto& v : g_ctx->vars) box.push_back({v.lo, v.hi});
+    auto allOk = [&]() {
+        for (auto& it : g_ctx->items)
+            if (it.on && !itemOk(it)) return false;
+        return true;
+    };
+    auto setAll = [&](const std::vector<i128>& x) {
+        for (size_t k = 0; k < x.size(); k++) {
+            auto& v = g_ctx->vars[k];
+            v.val = v.lo = v.hi = x[k];
+            v.set = true;
+        }
+    };
+    // A small box: walk all of it and take one of its solutions.
+    i128 points = 1;
+    for (auto& [lo, hi] : box) { points *= hi - lo + 1; if (points > 4096) break; }
+    if (points <= 4096) {
+        std::vector<std::vector<i128>> sols;
+        std::vector<i128> x;
+        for (auto& b : box) x.push_back(b.first);
+        for (;;) {
+            setAll(x);
+            if (allOk()) sols.push_back(x);
+            size_t k = 0;
+            for (; k < x.size(); k++) {
+                if (x[k] < box[k].second) { x[k]++; break; }
+                x[k] = box[k].first;
+            }
+            if (k == x.size()) break;
+        }
+        if (!sols.empty()) { setAll(sols[(size_t)below((i128)sols.size())]); return true; }
+        tries = 0;   // no solution at all
+    }
+    for (int t = 0; t < tries; t++) {
+        for (size_t k = 0; k < g_ctx->vars.size(); k++) {
+            auto& v = g_ctx->vars[k];
+            v.val = box[k].first + below(box[k].second - box[k].first + 1);
+            v.lo = v.hi = v.val;
+            v.set = true;
+        }
+        if (allOk()) return true;
+    }
+    for (size_t k = 0; k < g_ctx->vars.size(); k++) {
+        auto& v = g_ctx->vars[k];
+        v.set = false; v.lo = box[k].first; v.hi = box[k].second;
+    }
+    return false;
+}
+inline bool exactEligible(const std::vector<int>& rank) {
+    for (auto& v : g_ctx->vars)
+        if (v.randc || v.ordered || v.dist) return false;
+    for (int r : rank) if (r < 0) return false;
+    for (auto& it : g_ctx->items)
+        if (it.on && (it.it->isDist || !it.it->fns.empty() || !it.fnVars.empty())) return false;
+    return !g_ctx->vars.empty();
+}
+
 }   // namespace rnd
 
 // pre_randomize / post_randomize (18.6.2): run a method to its end now.
@@ -1420,6 +1489,8 @@ static int doRandomize(int obj, const RandCall* rc) {
             if (ctx.items[k].it->soft && ctx.items[k].on) softs.push_back((int)k);
         std::sort(softs.begin(), softs.end(), [&](int a, int b) { return ctx.items[(size_t)a].prio < ctx.items[(size_t)b].prio; });
         auto attempt = [&]() {
+            ctx.budget = 20000 + 2000 * (long)ctx.vars.size();
+            if (exactEligible(rank) && sampleExact(512)) return true;
             for (int a = 0; a < 16; a++) {
                 ctx.budget = 20000 + 2000 * (long)ctx.vars.size();
                 auto saveRandc = randcLeft();
