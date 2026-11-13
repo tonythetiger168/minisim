@@ -139,7 +139,6 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
 int cgDefOf(const slang::ast::CovergroupType& t) {
     using namespace slang::ast;
     if (auto it = cgIdxMap().find(&t); it != cgIdxMap().end()) return it->second;
-    if (t.getBaseGroup()) unsupported("a covergroup that extends another (19.4.1)");
     auto savedScope = scope;
     auto savedUnit = tsUnit, savedPrec = tsPrec;
     setScope(t.getParentScope());
@@ -163,22 +162,34 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         sigmap[&s] = id;
         return id;
     };
-    for (const FormalArgumentSymbol* a : t.getArguments()) {
+    // covergroup extends base (19.4.1): the base's members, then this one's;
+    // a member with a base member's name replaces it.
+    std::vector<const CovergroupType*> chain;
+    for (const CovergroupType* g = &t; g;) {
+        chain.insert(chain.begin(), g);
+        const Type* bt = g->getBaseGroup();
+        g = bt && bt->getCanonicalType().kind == SymbolKind::CovergroupType ? &bt->getCanonicalType().as<CovergroupType>() : nullptr;
+    }
+    const CovergroupType* argT = chain.front();   // arguments and the sampling event: the base's, unless given again
+    for (const CovergroupType* g : chain)
+        if (!g->getArguments().empty() || g->getCoverageEvent()) argT = g;
+    for (const FormalArgumentSymbol* a : argT->getArguments()) {
         d.argSigs.push_back(hidden(*a, a->getType()));
         d.argRef.push_back(a->direction == ArgumentDirection::Ref);
     }
-    for (const auto& m : t.members())
+    for (const auto& m : argT->members())
         if (const auto* a = m.as_if<FormalArgumentSymbol>(); a && (a->flags & VariableFlags::CoverageSampleFormal))
             d.sampleSigs.push_back(hidden(*a, a->getType()));
-    if (const TimingControl* ev = t.getCoverageEvent()) {
+    if (const TimingControl* ev = argT->getCoverageEvent()) {
         if (ev->kind != TimingControlKind::SignalEvent && ev->kind != TimingControlKind::EventList)
             unsupported("this covergroup sampling event (block events, 19.3)");
         clockOf(*ev, d.ev, d.evIff);
     }
-    const auto& body = t.getBody();
-    cgOpts(body.options, d.opts, &d.realInterval);
+    for (const CovergroupType* g : chain) cgOpts(g->getBody().options, d.opts, &d.realInterval);
     std::unordered_map<const CoverpointSymbol*, int> cpIdx;
-    for (const auto& m : body.members()) {
+    std::unordered_map<std::string, int> cpByName, xByName;
+    for (const CovergroupType* g : chain)
+    for (const auto& m : g->getBody().members()) {
         const auto* cp = m.as_if<CoverpointSymbol>();
         if (!cp) continue;
         CgCpDef c;
@@ -274,10 +285,16 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         }
         if (c.isReal && std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0; }))
             unsupported("a real coverpoint without bins: there are no automatic bins for reals (19.5.3)");
-        cpIdx[cp] = (int)d.cps.size();
-        d.cps.push_back(std::move(c));
+        if (auto it = cpByName.find(c.name); it != cpByName.end()) {   // replaces the base's (19.4.1)
+            cpIdx[cp] = it->second;
+            d.cps[(size_t)it->second] = std::move(c);
+        } else {
+            cpIdx[cp] = cpByName[c.name] = (int)d.cps.size();
+            d.cps.push_back(std::move(c));
+        }
     }
-    for (const auto& m : body.members()) {
+    for (const CovergroupType* g : chain)
+    for (const auto& m : g->getBody().members()) {
         const auto* x = m.as_if<CoverCrossSymbol>();
         if (!x) continue;
         CgCrossDef cd;
@@ -304,7 +321,11 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             }
         };
         bins(*x);
-        d.crosses.push_back(std::move(cd));
+        if (auto it = xByName.find(cd.name); it != xByName.end()) d.crosses[(size_t)it->second] = std::move(cd);
+        else {
+            xByName[cd.name] = (int)d.crosses.size();
+            d.crosses.push_back(std::move(cd));
+        }
     }
     cgDefs().push_back(std::move(d));
     int idx = (int)cgDefs().size() - 1;
