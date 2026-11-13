@@ -2770,7 +2770,7 @@ private:
         if (!armIns_.empty()) {
             o << "static void armSet(uint32_t k) {\n    switch (k) {\n";
             for (size_t k = 0; k < armSet_.size(); k++) o << "    case " << k << ":" << assign(*armSet_[k]) << "    break;\n";
-            o << "    }\n}\n";
+            o << "    }\n    S.markFast();   // the block's comb pass runs again, now armed\n}\n";
             o << "static void armChk() {\n"
                  "    for (uint32_t k = 0; k < " << armIns_.size() << "; k++) {\n"
                  "        if (ARMST[k] != 1) continue;\n"
@@ -3225,13 +3225,15 @@ private:
                     for (auto* in : unitIns[j]) privW |= isPriv(in->sig);
                 }
                 std::vector<std::string> callsC = shareChunks(o, "combC", coneUnits, combStmts, unitProc, unitIns, procs, kChunk);
-                o << "static void combCone(const void*) {\n";
+                o << "static void combCone(const void*) {\n" << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
                 for (auto& c : callsC) o << "    " << c << ";\n";
                 if (privW) o << "    scanP();\n";
                 o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
             }
         }
-        o << "static void combAll(const void*) {\n";
+        // armChk before the pass (a testbench write to a private input) and
+        // after it (a private comb output read by a later @* block).
+        o << "static void combAll(const void*) {\n" << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
         if (two) {
             o << "    if (twoNow()) {\n        cdirty = false;\n";
             for (auto& c : callsQ) o << "        " << c << "; if (cdirty) goto slow;\n";
