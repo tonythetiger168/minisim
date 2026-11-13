@@ -230,8 +230,12 @@ or single rules.
 | `STY010` | info | off | A string literal carried over the line with a backslash | forbid-line-continuations |
 | `STY011` | info | off | A semicolon after a UVM macro (`` `uvm_info(...); ``) | uvm-macro-semicolon |
 | `STY012` | info | off | `disable name` where the name is not a `begin` block around the statement | disable-statement |
+| `STY013` | info | off | An `if`, `else`, loop, `always` or `initial` body with no `begin ... end` (`else if` is fine) | explicit-begin |
+| `STY014` | info | off | `parameter` outside a `#(...)` list (module body, package, class body) | proper-parameter-declaration |
+| `STY015` | info | off | `"%h"` or `"%b"` with no `0x`/`0b` prefix, or `"0x%d"` | numeric-format-string-style |
 | `SUS002` | warning | off | `void'()` around `randomize()` or `uvm_hdl_read()` | void-cast |
 | `SUS003` | info | off | `$psprintf`, `$random`, `$srandom` or a `$dist_` function | invalid-system-task-function |
+| `SUS004` | info | off | `$test$plusargs`: `+NAME=0` still reads as given | plusarg-assignment |
 | `NAME014` | warning | off | A macro name does not match `name.macro` | macro-name-style |
 | `NAME015` | warning | off | An interface name does not match `name.interface` | interface-name-style |
 | `NAME016` | warning | off | A constraint name does not match `name.constraint` | constraint-name-style |
