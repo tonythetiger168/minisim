@@ -405,3 +405,17 @@ file(READ ${page} html)
 if(NOT html MATCHES "mlint report" OR NOT html MATCHES "FML002" OR NOT html MATCHES "mem\\[wild\\] <= d")
   message(FATAL_ERROR "-html: the page lacks the findings or their source")
 endif()
+
+# -html schematic: the signal of a finding with its drivers and readers. In
+# starc.sv the divided clock div2 is driven by a flop clocked by clk and read
+# (as a clock) by the flop of q2.
+set(page2 ${CMAKE_CURRENT_BINARY_DIR}/mlint_schematic.html)
+run(rules/starc.sv "-top;starc;-only;CLK004;-q;-html;${page2}")
+file(READ ${page2} html2)
+if(NOT html2 MATCHES "\"starc.div2\":\\{\"port\":\"\",\"d\":\\[\\{\"k\":\"flop\",\"at\":\"[^\"]*starc.sv:52\",\"clk\":\"clk\""
+   OR NOT html2 MATCHES "\"r\":\\[\\{\"k\":\"flop\",\"at\":\"[^\"]*starc.sv:56\",\"clk\":\"div2\"")
+  message(FATAL_ERROR "-html: no schematic data for div2")
+endif()
+if(NOT html2 MATCHES "function sch\\(")
+  message(FATAL_ERROR "-html: no schematic view")
+endif()

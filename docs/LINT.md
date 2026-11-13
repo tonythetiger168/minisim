@@ -590,6 +590,15 @@ source lines around it, a filter box, and clicks on a severity or a rule
 that show only those. Waived findings are hidden until "show waived" is
 ticked, and then carry their reason.
 
+A finding about one signal (unused, undriven, multiple drivers, latches,
+divided clocks, formal findings, ...) has a **schematic** button: the
+processes and assigns that drive the signal, with what they read (a flop
+shows its clock), the signal, then what reads it and what that drives.
+Input and output ports are marked. A blue name has a schematic of its own:
+click it to walk one step back or forward through the logic. The page holds
+the signals the findings name and their neighbours; `mdebug -lint` gives the
+full design.
+
 ## Speed
 
 mlint uses every logical CPU by default; `-threads N` sets the count

@@ -480,6 +480,7 @@ struct Cand {
     std::string name;
     SourceLocation loc;
     uint8_t port;  // 0 not a port, 1 input, 2 output, 3 inout
+    std::string path;   // for the report's schematic
 };
 
 // What one body's check hands back for the rules that need every body.
@@ -906,7 +907,8 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             rep.add("LAT001", p.location,
                     "'" + shown(*t) +
                         "' is not assigned on every path of this combinational block, so it holds its old value "
-                        "(a latch); add an else or a default");
+                        "(a latch); add an else or a default",
+                    path(*t));
         }
         for (const Symbol* t : tmp.nba)
             rep.add("SEQ003", p.location,
@@ -1206,7 +1208,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         bool arg = rhs.kind == ExpressionKind::EmptyArgument;
         if (!arg && !a.isCompound()) {
             if (isName(lhs) && isName(rhs) && nameOf(lhs) == nameOf(rhs))
-                rep.add("EXP001", loc, "'" + shown(*nameOf(lhs)) + "' is assigned to itself");
+                rep.add("EXP001", loc, "'" + shown(*nameOf(lhs)) + "' is assigned to itself", path(*nameOf(lhs)));
             if (!inPort && lhs.type->isIntegral() && rhs.type->isIntegral()) {
                 bitwidth_t lw = lhs.type->getBitWidth();
                 bitwidth_t rw = bitsOf(rhs, body);
@@ -1416,7 +1418,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         for (auto& [s, u] : use)
             if ((u.bits & UseBlk) && (u.bits & UseNba))
                 rep.add("SEQ001", s->location,
-                        "'" + shown(*s) + "' has both blocking and non-blocking assignments");
+                        "'" + shown(*s) + "' has both blocking and non-blocking assignments", path(*s));
         for (auto& [s, blk] : seqBlocking) {
             const Use& u = use[s];
             auto pd = portDir.find(s);
@@ -1434,7 +1436,7 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
             if (!s->location || P.unusedOk.ok(s->name)) continue;
             auto pd = portDir.find(s);
             outp.cands.push_back({locKey(s->location), shown(*s), s->location,
-                                  pd == portDir.end() ? uint8_t(0) : pd->second});
+                                  pd == portDir.end() ? uint8_t(0) : pd->second, path(*s)});
         }
     }
 };
@@ -1831,12 +1833,13 @@ struct Global : ASTVisitor<Global, VisitFlags::Symbols> {
                 if (fr.f.clk && outs.count(find(fr.f.clk)) && said.insert(find(fr.f.clk)).second)
                     rep.add("CLK004", fr.loc,
                             "this flop is clocked by '" + shown(*fr.f.clk) +
-                                "', which a flop drives (a divided or ripple clock); make it an enable, or a clock from a clock generator");
+                                "', which a flop drives (a divided or ripple clock); make it an enable, or a clock from a clock generator",
+                            path(*fr.f.clk));
         }
         for (const Symbol* s : dataOrder)
             if (clocks.count(find(s)))
                 rep.add("CLK001", dataRead[s],
-                        "clock '" + shown(*s) + "' is used as data; keep clock gating and muxing in dedicated cells");
+                        "clock '" + shown(*s) + "' is used as data; keep clock gating and muxing in dedicated cells", path(*s));
         loops(rep);
     }
 
@@ -2022,13 +2025,13 @@ inline void checkUnused(std::vector<BodyOut>& outs, Report& rep) {
             bool r = b & UseR, w = b & UseW;
             const std::string q = "'" + c.name + "'";
             if (c.port == 1) {
-                if (!r) rep.add("UNU004", c.loc, "input " + q + " is never read");
+                if (!r) rep.add("UNU004", c.loc, "input " + q + " is never read", c.path);
             } else if (c.port == 2) {
-                if (!w) rep.add("UNU005", c.loc, "output " + q + " is never driven");
+                if (!w) rep.add("UNU005", c.loc, "output " + q + " is never driven", c.path);
             } else if (c.port == 0) {
-                if (!r && !w) rep.add("UNU001", c.loc, q + " is declared but never used");
-                else if (!r) rep.add("UNU002", c.loc, q + " is driven but never read");
-                else if (!w) rep.add("UNU003", c.loc, q + " is read but never driven");
+                if (!r && !w) rep.add("UNU001", c.loc, q + " is declared but never used", c.path);
+                else if (!r) rep.add("UNU002", c.loc, q + " is driven but never read", c.path);
+                else if (!w) rep.add("UNU003", c.loc, q + " is read but never driven", c.path);
             }
         }
 }
