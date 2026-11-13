@@ -564,6 +564,53 @@ inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
     if (t.kind == SymbolKind::ScalarType) return t.isFourState() ? DT_LOGIC : DT_BIT;
     return t.isFourState() ? DT_LOGICVEC : DT_BITVEC;
 }
+// An unpacked struct argument of a DPI import (35.5.6, H.7.6): the scalars
+// of the C struct with natural alignment, members in declared order, arrays
+// leftmost element first. lo is the bit of the SV value (held packed, the
+// first member at the top) where the value of type t starts.
+inline size_t dpiCAlign(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    if (t.isUnpackedStruct()) {
+        size_t a = 1;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) a = std::max(a, dpiCAlign(f.getType()));
+        return a;
+    }
+    if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) return dpiCAlign(t.as<FixedSizeUnpackedArrayType>().elementType);
+    int w; bool sg;
+    DpiType d = dpiType(t, w, sg);
+    switch (d) {
+        case DT_BYTE: case DT_BIT: case DT_LOGIC: return 1;
+        case DT_SHORT: return 2;
+        case DT_INT: case DT_SHORTREAL: case DT_BITVEC: case DT_LOGICVEC: return 4;
+        default: return 8;
+    }
+}
+inline void dpiStructFields(const slang::ast::Type& t0, int lo, size_t& cur, std::vector<DpiField>& out) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    size_t al = dpiCAlign(t);
+    cur = (cur + al - 1) / al * al;
+    if (t.isUnpackedStruct()) {
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>())
+            dpiStructFields(f.getType(), lo + uField(t, f).first, cur, out);
+        cur = (cur + al - 1) / al * al;
+        return;
+    }
+    if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+        const auto& a = t.as<FixedSizeUnpackedArrayType>();
+        int n = (int)a.range.width(), ew = uWidth(a.elementType);
+        for (int k = 0; k < n; k++) dpiStructFields(a.elementType, lo + (n - 1 - k) * ew, cur, out);
+        return;
+    }
+    if (t.isUnpackedUnion() || t.isString()) throw std::runtime_error("lower: unsupported DPI struct member of type " + t0.toString());
+    DpiField f;
+    f.t = dpiType(t, f.w, f.sgn);
+    f.lo = lo;
+    f.off = cur;
+    out.push_back(f);
+    cur += f.t == DT_BITVEC ? 4 * (size_t)((f.w + 31) / 32) : f.t == DT_LOGICVEC ? 8 * (size_t)((f.w + 31) / 32) : al;
+}
 // ---------- classes (8) ----------
 // An object is a block of signals laid out like a frame: slot 0 holds its
 // class id, then the base class's properties, then its own. A non-static
@@ -12255,7 +12302,18 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 }
                 a.uarr = true;
             }
-            if (t->isUnpackedStruct()) Lowerer::unsupported("DPI unpacked struct argument");
+            if (t->isUnpackedStruct()) {
+                if (a.uarr) Lowerer::unsupported("DPI array of unpacked structs");
+                if (f.isExport) Lowerer::unsupported("unpacked struct argument of a DPI export");
+                a.t = DT_STRUCT;
+                a.w = uWidth(*t);
+                if (a.w <= 0) Lowerer::unsupported("DPI unpacked struct argument with members of this kind");
+                size_t cur = 0;
+                dpiStructFields(*t, 0, cur, a.fields);
+                a.cSize = cur;
+                const Type& named = formal->getType();
+                a.cName = named.name.empty() ? "void" : std::string(named.name);
+            } else
             a.t = dpiType(*t, a.w, a.sgn);
             if (!a.uarr) {
                 auto it = sigmap.find(formal);
