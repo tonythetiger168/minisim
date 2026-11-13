@@ -370,6 +370,10 @@ size); a write to an existing element does not.
 so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
 `cbStartOfReset` and `cbEndOfReset` register (with a handle) and never run.
 
+**Data read API (41).** Annex M declares no data read routines or
+constants, so there is nothing to implement; recorded data is read with the
+waveform tools (`mwave`, the FST and VCD readers).
+
 ## Not yet
 
 The non-static property
