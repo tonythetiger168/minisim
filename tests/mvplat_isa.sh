@@ -1,7 +1,7 @@
 #!/bin/bash
 # mvplat_isa.sh - the RISC-V architecture tests (riscv-tests, BSD-3-Clause:
 # github.com/riscv-software-src/riscv-tests) on mvplat: every ui, um, ua, uc,
-# si and mi test, for RV32 and RV64, in its "p" environment (physical memory),
+# uf, ud, si and mi test, for RV32 and RV64, in its "p" environment (physical memory),
 # and the user-level ones again in the "v" environment, which runs them in
 # user mode under Sv32 or Sv39 paging with a small supervisor that maps pages
 # on demand. A test ends through HTIF tohost with the number of the first
@@ -33,6 +33,12 @@ if ! fetch rt https://github.com/riscv-software-src/riscv-tests $REV ||
 fi
 RT=$OUT/rt
 pass=0; failed=""
+# The tests of a suite, as its Makefrag lists them (rv32ud leaves out move).
+tests_of() {
+  awk -v v="$1_sc_tests" '$1 == v { on = 1; next }
+    on { l = $0; more = (l ~ /\\[ \t]*$/); gsub(/\\/, "", l); print l; if (!more) on = 0 }' \
+    "$RT/isa/$1/Makefrag" | tr -s ' \t' '\n' | grep -v '^$'
+}
 # clang's assembler refuses a weak symbol made global later in the file; the
 # tests that define their own trap handler do exactly that.
 unweak() {
@@ -60,11 +66,12 @@ printf '#include <stddef.h>\nvoid *memcpy(void *, const void *, size_t);\nvoid *
 sed 's/^  \.bss : { \*(\.bss) }/  .bss : { *(.bss) }\n  .sbss : { *(.sbss) }/' "$RT/env/v/link.ld" > v-link.ld
 
 for X in 32 64; do
-  if [ $X = 32 ]; then CL="$CLANG --target=riscv32-unknown-elf -march=rv32imac_zicsr_zifencei -mabi=ilp32"; VM=rv32imafc_zicsr_zifencei
-  else CL="$CLANG --target=riscv64-unknown-elf -march=rv64imac_zicsr_zifencei -mabi=lp64 -mcmodel=medany"; VM=rv64imafc_zicsr_zifencei; fi
-  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}si rv${X}mi; do
-    for f in "$RT"/isa/$suite/*.S; do
-      t=$suite-p-$(basename "$f" .S)
+  if [ $X = 32 ]; then CL="$CLANG --target=riscv32-unknown-elf -march=rv32imafdc_zicsr_zifencei -mabi=ilp32"; VM=rv32imafdc_zicsr_zifencei
+  else CL="$CLANG --target=riscv64-unknown-elf -march=rv64imafdc_zicsr_zifencei -mabi=lp64 -mcmodel=medany"; VM=rv64imafdc_zicsr_zifencei; fi
+  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}uf rv${X}ud rv${X}si rv${X}mi; do
+    for n in $(tests_of $suite); do
+      f=$RT/isa/$suite/$n.S
+      t=$suite-p-$n
       $CL -E -I"$RT/env/p" -I"$RT/isa/macros/scalar" "$f" -o $t.s
       unweak $t.s
       sed -i 's/\btcontrol\b/0x7a5/g' $t.s   # a CSR name clang 18 does not know
@@ -79,9 +86,10 @@ for X in 32 64; do
   VCC="$CL -O2 -mcmodel=medany -fvisibility=hidden -nostdlib -ffreestanding -fno-builtin -Ilibc -I$RT/env/v -I$RT/isa/macros/scalar"
   $VCC -c "$RT/env/v/string.c" -o v$X-string.o 2> v$X-string.err || failed="$failed v$X-string(build)"
   $VCC -c "$RT/env/v/entry.S" -o v$X-entry.o 2> v$X-entry.err || failed="$failed v$X-entry(build)"
-  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc; do
-    for f in "$RT"/isa/$suite/*.S; do
-      t=$suite-v-$(basename "$f" .S)
+  for suite in rv${X}ui rv${X}um rv${X}ua rv${X}uc rv${X}uf rv${X}ud; do
+    for n in $(tests_of $suite); do
+      f=$RT/isa/$suite/$n.S
+      t=$suite-v-$n
       $CL -E -I"$RT/env/v" -I"$RT/isa/macros/scalar" "$f" -o $t.s
       unweak $t.s
       # As upstream: the supervisor's page placement is seeded from the test name.

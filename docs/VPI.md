@@ -369,6 +369,20 @@ has `vpiPathType` (`vpiPathFull` for `*>`, `vpiPathParallel` for `=>`),
 path, `vpi_iterate(vpiModDataPathIn)` (the data source) with
 `vpiDataPolarity`.
 
+**Parameters (37.28).** `vpi_iterate(vpiParameter, module)` gives the
+value parameters and the type parameters (`vpiTypeParameter`, with
+`vpiLocalParam`, `vpiLineNo` and `vpi_handle(vpiTypespec)`: its type as
+written). `vpi_handle(vpiExpr, parameter)` gives its default (detail 3): an
+expression for a value parameter, a typespec for a type parameter.
+`vpi_iterate(vpiParamAssign, module)` gives the overrides of the module's
+`#(...)`, in the order written: `vpiLhs` is the parameter (detail 4),
+`vpiRhs` the override expression (for a type parameter its typespec),
+`vpiConnByName` whether it was named. `vpi_iterate(vpiDefParam, module)`
+gives the `defparam`s written in a module, with `vpiLhs` and `vpiRhs`.
+A net declaration assignment (`wire w = a + 1;`) is in
+`vpi_iterate(vpiContAssign, module)` with `vpiNetDeclAssign` 1, its `vpiLhs`
+the net and its `vpiRhs` and `vpiDelay` from the declaration.
+
 **Instance arrays (37.11).** `vpi_iterate(vpiModuleArray, module)` gives
 a module's module instance arrays; `vpiInterfaceArray`, `vpiProgramArray`,
 `vpiPrimitiveArray` (or `vpiGateArray`, `vpiSwitchArray`, `vpiUdpArray`)
@@ -385,6 +399,10 @@ elements through `vpi_iterate(vpiInstance)`, `vpiModule`, `vpiInterface`,
 `vpiInstanceArray`) its array; both are NULL outside an array. An element
 is named with its indices, `u[2]` or `m[1][0]` (23.3.3), and the elements
 of a primitive array are also in `vpi_iterate(vpiPrimitive, module)`.
+`vpi_handle(vpiExpr, array)` gives the connections as written (detail 1):
+a `vpiOperation` with `vpiOpType` `vpiListOp` whose `vpiOperand`s are the
+port connections in port order; `vpi_iterate(vpiParamAssign, array)` gives
+the overrides of its `#(...)`.
 
 **Primitives (37, 38.10).** `vpi_iterate(vpiPrimitive, module)` gives the
 gate, switch and UDP instances of a module; `vpiGate`, `vpiSwitch` and
@@ -486,8 +504,7 @@ waveform tools (`mwave`, the FST and VCD readers).
 
 ## Not yet
 
-The connection list of an instance array (`vpiExpr`, a
-`vpiListOp` operation) and its `vpiParamAssign`, the per-source
+The per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
 callbacks. A call to something not
@@ -496,7 +513,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `37.18-vpi-nested-containers.sv`, `37.31-vpi-class-defn.sv`, `37.35-vpi-expr-values.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `37.18-vpi-nested-containers.sv`, `37.31-vpi-class-defn.sv`, `37.35-vpi-expr-values.sv`, `37.28-vpi-param-assign.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same

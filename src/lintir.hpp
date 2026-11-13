@@ -400,6 +400,7 @@ struct Gather : ASTVisitor<Gather> {
     // ...and the symbols some driver writes as a whole word. Drivers of
     // separate bits (assign x[i] = ... in a generate loop) are not a conflict.
     std::set<const Symbol*> wholeDriven;
+    std::set<const Symbol*> resolved;
 
     Gather(Report& r, Join& j, std::vector<Block>& b) : rep(r), join(j), blocks(b) {}
 
@@ -440,7 +441,15 @@ struct Gather : ASTVisitor<Gather> {
         const auto& a = e.as<AssignmentExpression>();
         if (const Symbol* t = lhsSymbol(a.left())) {
             drivers[t].push_back(ca.location);
-            if (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue)
+            // assign x = x__drvN: a resolved VHDL signal (std_logic, a
+            // tri-state bus); each process drives its own copy (src/vhdl/sv.hpp).
+            const Expression& r = a.right().kind == ExpressionKind::Conversion
+                                      ? a.right().as<ConversionExpression>().operand()
+                                      : a.right();
+            if (r.kind == ExpressionKind::NamedValue &&
+                r.as<NamedValueExpression>().symbol.name.starts_with(std::string(t->name) + "__drv"))
+                resolved.insert(t);
+            else if (a.left().kind == ExpressionKind::NamedValue || a.left().kind == ExpressionKind::HierarchicalValue)
                 wholeDriven.insert(t);
         }
     }
@@ -491,6 +500,8 @@ struct FrontEnd {
     protfront::Options prot;        // -keyfile / -keyring / -license, filled by the tool
     protfront::ProtectedCode pc;
     const char* tool = "mlint";
+    // Runs after the sources are parsed: mlint adds its translated VHDL here.
+    std::function<bool(driver::Driver&)> afterParse;
 
     // `own` holds the options the tool itself took out of the command line.
     int run(const std::vector<std::string>& fwd, const char* helpTitle) {
@@ -507,6 +518,7 @@ struct FrontEnd {
         if (!protfront::preload(driver, prot, pc, tool)) return 1;
         protfront::redact(driver, pc);
         if (!driver.parseAllSources()) return 1;
+        if (afterParse && !afterParse(driver)) return 1;
         comp = driver.createCompilation();
         vendor::declare(*comp);  // $fsdbDumpvars, $vcdpluson, $shm_probe, ... compile as in msim
         driver.reportCompilation(*comp, /*quiet*/ true);
@@ -527,6 +539,7 @@ struct Design {
         comp.getRoot().visit(g);
         drivers = std::move(g.drivers);
         wholeDriven = std::move(g.wholeDriven);
+        for (const Symbol* r : g.resolved) wholeDriven.erase(r);
     }
 };
 
