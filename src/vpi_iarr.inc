@@ -151,9 +151,11 @@ inline bool iarrIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
             if (type == vpiInstance || type == vpiPrimitive || x->type == type) items.push_back(H(x));
     return true;
 }
+inline Obj* listOpObj(const Obj* arr);   // vpi_param.inc
 inline Obj* iarrHandle(int type, const Obj* o) {
     const auto& a = o->sym->as<InstanceArraySymbol>();
     switch (type) {
+        case vpiExpr: return listOpObj(o);   // detail 1: a vpiListOp of the connections
         case vpiLeftRange: return constObj(a.range.left);    // the leftmost dimension (37.11 detail 2)
         case vpiRightRange: return constObj(a.range.right);
         case vpiScope: return scopeOfSym(a);

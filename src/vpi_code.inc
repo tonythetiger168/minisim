@@ -377,6 +377,17 @@ inline vpiHandle codeHandle(int type, const Obj* o) {
         const auto& p = o->sym->as<ProceduralBlockSymbol>();
         return type == vpiStmt ? H(stmtNode(&p.getBody(), o)) : nullptr;
     }
+    if (o->kind == Obj::ContAssign && o->sym->kind == SymbolKind::Net) {   // wire w = expr; (vpiNetDeclAssign)
+        const auto& n = o->sym->as<NetSymbol>();
+        if (type == vpiLhs) return H(valueObj(&n));
+        if (type == vpiRhs) return H(exprNode(n.getInitializer(), o));
+        if (type == vpiDelay) {
+            const TimingControl* t = n.getDelay();
+            if (t && t->kind == TimingControlKind::Delay) return H(exprNode(&t->as<DelayControl>().expr, o));
+            if (t && t->kind == TimingControlKind::Delay3) return H(exprNode(&t->as<Delay3Control>().expr1, o));
+        }
+        return nullptr;
+    }
     if (o->kind == Obj::ContAssign) {
         const Expression& a = *stripConv(&o->sym->as<ContinuousAssignSymbol>().getAssignment());
         if (a.kind != EK::Assignment) return nullptr;
@@ -570,11 +581,14 @@ inline bool codeIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
     return false;
 }
 // Processes and continuous assignments of a scope (37.10, 37.32, 37.40).
+inline Obj* netDeclAsgObj(const NetSymbol& n);   // vpi_param.inc
 inline bool scopeCode(int type, const Scope& sc, std::vector<vpiHandle>& items) {
     if (type != vpiProcess && type != vpiContAssign) return false;
     eachMember(sc, [&](const Symbol& m) {
         if (type == vpiProcess && m.kind == SymbolKind::ProceduralBlock) items.push_back(H(processObj(m.as<ProceduralBlockSymbol>())));
         if (type == vpiContAssign && m.kind == SymbolKind::ContinuousAssign) items.push_back(H(contAssignObj(m.as<ContinuousAssignSymbol>())));
+        if (type == vpiContAssign && m.kind == SymbolKind::Net && m.as<NetSymbol>().getInitializer())
+            items.push_back(H(netDeclAsgObj(m.as<NetSymbol>())));   // a net declaration assignment (37.40)
     });
     return true;
 }
@@ -595,7 +609,7 @@ inline int64_t codeGet(int prop, const Obj* o) {
         }
     }
     if (o->kind == Obj::ContAssign) {
-        return prop == vpiNetDeclAssign ? 0 : vpiUndefined;
+        return prop == vpiNetDeclAssign ? (o->sym->kind == SymbolKind::Net ? 1 : 0) : vpiUndefined;
     }
     if (o->kind == Obj::Expr) {
         const Expression& e = *static_cast<const Expression*>(o->node);
