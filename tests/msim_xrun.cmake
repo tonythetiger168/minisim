@@ -1,7 +1,7 @@
 # The xrun / irun front end (src/xrun.inc, docs/XRUN.md): msim run as xrun
 # (a link), as irun, and as msim -xrun, with -f / -F files, -incdir, -define,
 # -top, -timescale, ignored options, the log file, -input Tcl, -elaborate,
-# and VHDL refused.
+# and VHDL files passed to msim's VHDL front end.
 #   cmake -DMSIM=<msim> -DSRC=<source dir> -DOUT=<dir> -P msim_xrun.cmake
 set(D ${SRC}/tests/xrun)
 file(REMOVE_RECURSE ${OUT})
@@ -53,9 +53,9 @@ if(out MATCHES "seed-ok")
   message(FATAL_ERROR "-elaborate ran the design:\n${out}")
 endif()
 
-# VHDL is refused with a message, not passed on.
-run(2 ${MSIM} -xrun tb.sv x.vhd -nolog)
-expect("${err}" "VHDL is not supported")
+# VHDL files go to the VHDL front end: an SV testbench around a VHDL entity.
+run(0 ${MSIM} -xrun -v200x ${SRC}/tests/vhdl/counter.vhd ${SRC}/tests/vhdl/mixed_sv_top.sv -top mixed_sv_top -nolog)
+expect("${out}" "count=10\n")
 
 # The same front end with --compat=cadence (compat.hpp), anywhere on the line,
 # and Cadence options in any case: -SV, -ACCESS +rwc and -NOCOPYRIGHT are

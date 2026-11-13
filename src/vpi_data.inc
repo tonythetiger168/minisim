@@ -295,6 +295,33 @@ inline std::vector<const ClassType*> allClasses() {
     v.erase(std::unique(v.begin(), v.end()), v.end());
     return v;
 }
+// A property as declared in its class (37.31): its type and name, no value.
+inline Obj* paramObj(const Symbol* sym);   // vpi.inc
+inline Obj* propDeclObj(const Obj* defn, const ClassPropertySymbol& p) {
+    auto& slot = st().pairObjs[{&p, defn}];
+    if (slot) return slot;
+    const Type& t = p.getType().getCanonicalType();
+    int t05 = 0, type = 0;
+    if (t.isEvent()) type = vpiNamedEvent;
+    else if (t.isClass()) type = vpiClassVar;
+    else if (t.isUnpackedStruct()) type = vpiStructVar;
+    else if (t.isUnpackedUnion()) type = vpiUnionVar;
+    else if (t.isUnpackedArray()) type = vpiArrayVar;
+    else type = varType(t, false, t05);
+    if (!type) return nullptr;
+    Obj* o = mkObj(Obj::Signal, type);
+    o->t05 = t05;
+    o->sym = &p;
+    o->ty = &t;
+    o->parent = defn;
+    o->decl = true;
+    o->w = t.isIntegral() ? (int)t.getBitWidth() : 64;
+    o->sgn = t.isIntegral() && t.isSigned();
+    o->real = t.isFloating();
+    o->str = t.isString();
+    slot = o;
+    return o;
+}
 inline bool classIterate(int type, const Obj* o, std::vector<vpiHandle>& items) {
     const auto* c = static_cast<const ClassType*>(o->ty);
     if (type == vpiMethods) {   // the tasks and functions the class declares (not built-in ones; pure virtual prototypes too)
@@ -310,10 +337,28 @@ inline bool classIterate(int type, const Obj* o, std::vector<vpiHandle>& items) 
             if (classTypeOf(d->getBaseClass()) == c) items.push_back(H(classDefnObj(d)));
         return true;
     }
-    if (type == vpiVariables) {   // the static properties (the others live in objects)
+    // 37.31 detail 1: the static and the automatic properties, as
+    // declarations without a value (detail 2); events through vpiNamedEvent.
+    if (type == vpiVariables || type == vpiNamedEvent) {
         for (const auto& p : c->membersOfType<ClassPropertySymbol>())
-            if (p.lifetime == VariableLifetime::Static)
-                if (Obj* v = valueObj(&p)) items.push_back(H(v));
+            if (p.getType().isEvent() == (type == vpiNamedEvent))
+                if (Obj* v = propDeclObj(o, p)) items.push_back(H(v));
+        return true;
+    }
+    if (type == vpiParameter) {   // detail 7: port list and body parameters
+        for (const Symbol& m : c->members())
+            if (m.kind == SymbolKind::Parameter) items.push_back(H(paramObj(&m)));
+        return true;
+    }
+    if (type == vpiTypedef) {
+        for (const Symbol& m : c->members())
+            if (m.kind == SymbolKind::TypeAlias) items.push_back(H(typespecObj(&m.as<TypeAliasType>())));
+        return true;
+    }
+    if (type == vpiInternalScope) {   // its tasks and functions
+        for (const Symbol& m : c->members())
+            if (m.kind == SymbolKind::Subroutine && !(m.as<SubroutineSymbol>().flags & MethodFlags::BuiltIn))
+                if (Obj* x = scopeObj(m)) items.push_back(H(x));
         return true;
     }
     return false;
@@ -322,6 +367,7 @@ inline int64_t classGet(int prop, const Obj* o) {
     if (prop == vpiType) return o->type;
     const Symbol* s = o->kind == Obj::ClassDefn ? o->sym : static_cast<const Symbol*>(o->ty);
     if (prop == vpiVirtual && o->kind == Obj::ClassDefn) return s->as<ClassType>().isAbstract;
+    if (prop == vpiAutomatic && o->kind == Obj::ClassDefn) return 1;   // its methods and properties default to automatic (37.31, 37.3.7)
     if (prop == vpiLineNo) return srcMgr() ? (int64_t)srcMgr()->getLineNumber(o->sym->location) : 0;
     return vpiUndefined;
 }

@@ -51,7 +51,7 @@ struct Pat {
 
 // What `set` can change, resolved once.
 struct Params {
-    Pat module, signal, param, clock, reset, activeLow, instance, portIn, portOut, typedefName, unusedOk, macro, interface, constraint;
+    Pat module, signal, param, clock, reset, activeLow, instance, portIn, portOut, typedefName, unusedOk, macro, interface, constraint, dff;
     size_t lineLength = 100;
     size_t maxLen = 40;
     std::vector<std::string> tbGlobs;
@@ -80,6 +80,7 @@ struct Params {
         pat(p.macro, "name.macro", "^[A-Z_][A-Z0-9_]*$");
         pat(p.interface, "name.interface", "_if$");
         pat(p.constraint, "name.constraint", "_c$");
+        pat(p.dff, "name.dff", "(_q|_ff|_reg|_r)[0-9]*$");
         p.lineLength = (size_t)std::max(20, std::atoi(cfg.param("fmt.line_length", "100").c_str()));
         pat(p.unusedOk, "unused.ignore", "^_?unused|_unused$|^_?nc_|_nc$", true);
         p.maxLen = (size_t)std::max(1, std::atoi(cfg.param("name.max_length", "40").c_str()));
@@ -87,7 +88,7 @@ struct Params {
         static const std::set<std::string> keys = {
             "name.module", "name.signal", "name.param", "name.clock", "name.reset", "name.active_low",
             "name.instance", "name.port_in", "name.port_out", "name.typedef", "unused.ignore",
-            "name.max_length", "tb.modules", "name.macro", "fmt.line_length", "name.interface", "name.constraint", "formal.max_bits", "formal.reg_bits",
+            "name.max_length", "tb.modules", "name.macro", "fmt.line_length", "name.interface", "name.constraint", "name.dff", "formal.max_bits", "formal.reg_bits",
             // slang-tidy's settings (linttidy.hpp)
             "tidy.clock", "tidy.reset", "tidy.reset_active_high", "tidy.enum", "tidy.struct", "tidy.union",
             "tidy.covergroup", "tidy.coverpoint", "tidy.cross"};

@@ -1,0 +1,11 @@
+structure.vhd:79:5:@1ns:(report note): s=82 co='0' m=129
+structure.vhd:82:5:@2ns:(report note): s=00 co='1'
+structure.vhd:86:7:@3ns:(report note): sel=00 y=0001 z=A
+structure.vhd:86:7:@4ns:(report note): sel=01 y=0010 z=B
+structure.vhd:86:7:@5ns:(report note): sel=10 y=0100 z=B
+structure.vhd:86:7:@6ns:(report note): sel=11 y=1000 z=F
+structure.vhd:88:5:@6ns:(report note): bus=ZZZZ
+structure.vhd:90:5:@7ns:(report note): bus=0101
+structure.vhd:92:5:@8ns:(report note): bus=XXXX
+structure.vhd:94:5:@9ns:(report note): bus=1010
+structure.vhd:97:5:@10ns:(report note): ones(s)=3
