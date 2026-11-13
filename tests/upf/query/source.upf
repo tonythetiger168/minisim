@@ -1,0 +1,15 @@
+# Appended to source.upf: create_abstract_power_source in the information model (10.6.1).
+proc expect {what got want} { if {$got ne $want} { error "query $what: got {$got}, want {$want}" } }
+proc prop {h p} { return [upf_query_object_properties $h -property $p] }
+expect type     [upf_query_object_type PS]               upfAbstractPowerSourceT
+expect extent   [upf_object_in_class PS -class upfExtentClassT] 1
+expect out      [prop PS upf_output_supply_set]          /u_dut/PS.out
+expect ins      [prop PS upf_input_supply_sets]          {/u_dut/PS.hi /u_dut/PS.lo}
+expect ctrls    [prop PS upf_control_ports]              {/u_dut/PS/c_hi /u_dut/PS/c_lo}
+expect states   [prop PS upf_power_source_states]        {/u_dut/PS.RUN /u_dut/PS.SLOW}
+expect st_type  [upf_query_object_type PS.RUN]           upfPowerSourceStateT
+expect st_expr  [prop [prop PS.SLOW upf_power_source_expr] upf_expr_string] {c_lo && !c_hi}
+expect ctrl_sig [prop PS/c_hi upf_hiconn]                /u_dut/hi
+expect ack      [upf_query_object_type PS/a]             upfAckPortT
+expect ack_dly  [prop PS/a upf_ack_delay]                2
+expect out_set  [upf_query_object_type PS.out]           upfSupplySetT

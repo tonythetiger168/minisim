@@ -94,8 +94,12 @@ int main() {
         assert(h2u("VHDL_SL2UPF", 'W') == S_UNDETERMINED && h2u("VHDL_SL2UPF", '-') == S_UNDETERMINED);
         assert(h2u("VHDL_SL2UPF_GNDZERO", 'L') == S_FULL_ON && h2u("VHDL_SL2UPF_GNDZERO", '1') == S_OFF);
         assert(u2h("UPF2VHDL_SL", S_FULL_ON) == '1' && u2h("UPF_GNDZERO2VHDL_SL", S_FULL_ON) == '0');
-        for (char v : std::string("01XZ")) assert(h2u("SV_TIED_HI", v) == S_FULL_ON && h2u("SV_TIED_LO", v) == S_OFF);
-        for (char v : std::string("UX01ZWLH-")) assert(h2u("VHDL_TIED_HI", v) == S_FULL_ON && h2u("VHDL_TIED_LO", v) == S_OFF);
+        // the TIED tables are upf2hdl (1801-2024 Annex B): the tie value only while FULL_ON
+        assert(!pre.at("SV_TIED_HI").hdl2upf && !pre.at("VHDL_TIED_LO").hdl2upf);
+        assert(u2h("SV_TIED_HI", S_FULL_ON) == '1' && u2h("SV_TIED_LO", S_FULL_ON) == '0');
+        for (int st : {S_OFF, S_PARTIAL_ON, S_UNDETERMINED}) assert(u2h("SV_TIED_HI", st) == 'X' && u2h("SV_TIED_LO", st) == 'X');
+        assert(u2h("VHDL_TIED_HI", S_FULL_ON) == '1' && u2h("VHDL_TIED_HI", S_OFF) == 'X');
+        assert(u2h("VHDL_TIED_LO", S_FULL_ON) == '0' && u2h("VHDL_TIED_LO", S_PARTIAL_ON) == '0' && u2h("VHDL_TIED_LO", S_OFF) == 'X');
         Model m = load("create_supply_net VR\n"
                        "create_hdl2upf_vct H -hdl_type {vhdl std_logic} -table {{'1' FULL_ON} {'H' PARTIAL_ON} {'0' off}}\n"
                        "create_upf2hdl_vct U -hdl_type {sv} -table {{FULL_ON 1} {OFF z}}\n"
@@ -131,6 +135,7 @@ int main() {
                     {"u_dut.g[0].u_b", "blk"}, {"u_dut.u_c", "cell"}};
         dv.portsOf["u_dut.u_a"] = {{"clk", 0}, {"q", 1}, {"io", 2}};
         dv.signals = {"u_dut.n1", "u_dut.u_a.n1", "u_dut.u_a.q"};
+        dv.range["u_dut.u_a.q"] = {3, 0};
         std::string path = "test_upf_find.upf";
         auto run = [&](const std::string& text) {
             std::ofstream(path) << "set_scope u_a\nset_scope ..\nset r [" << text << "]\nputs $r\n";
@@ -146,8 +151,19 @@ int main() {
         assert(run("find_objects . -pattern u_*") == "u_a u_c");
         assert(run("find_objects . -pattern u_* -transitive") == "u_a u_c {g[0]/u_b} u_a/u_leaf");
         assert(run("find_objects . -pattern blk -object_type model -transitive") == "u_a {g[0]/u_b}");
-        assert(run("find_objects . -pattern * -leaf_only") == "u_c");
-        assert(run("find_objects . -pattern * -non_leaf") == "u_a");
+        assert(run("find_objects . -pattern * -leaf_only -object_type inst") == "u_c");
+        assert(run("find_objects . -pattern * -non_leaf -object_type inst") == "u_a");
+        // 6.33: by default instances, logic ports and nets; -leaf_only / -non_leaf by the owner's kind
+        assert(run("find_objects . -pattern *") == "u_a u_c n1");
+        assert(run("find_objects . -pattern * -non_leaf") == "u_a n1");
+        assert(run("find_objects u_a -pattern * -object_type port -leaf_only") == "");
+        // 6.33.2: [chars] with ranges, \x and {a,b,c}
+        assert(run("find_objects . -pattern {u_[a-b]}") == "u_a");
+        assert(run("find_objects . -pattern {u_{a,c}}") == "u_a u_c");
+        assert(run("find_objects . -pattern {g\\[0\\]} -object_type inst") == "");
+        assert(run("find_objects g\\[0\\] -pattern u_? -object_type inst") == "{g[0]/u_b}");
+        // -expand_to_bits: each bit of a multi-bit port or net
+        assert(run("find_objects u_a -pattern q -object_type port -expand_to_bits") == "{u_a/q[3]} {u_a/q[2]} {u_a/q[1]} {u_a/q[0]}");
         assert(run("find_objects u_a -pattern * -object_type port -direction out") == "u_a/q");
         assert(run("find_objects u_a -pattern * -object_type port") == "u_a/clk u_a/q u_a/io");
         assert(run("find_objects . -pattern n1 -object_type net -transitive") == "n1 u_a/n1");
@@ -157,10 +173,32 @@ int main() {
         for (const char* bad : {"find_objects . -pattern * -object_type wire", "find_objects nope -pattern *",
                                 "find_objects . -pattern * -direction in", "find_objects .",
                                 "find_objects . -pattern * -bogus", "find_objects . -pattern * -regexp -exact",
-                                "find_objects . -pattern * -object_type process"}) {
+                                "find_objects . -pattern * -object_type process",
+                                "find_objects . -pattern * -traverse_macros -leaf_only",
+                                "find_objects . -pattern * -traverse_macros -transitive FALSE", "find_objects .. -pattern *",
+                                "find_objects . -pattern * -object_type net -direction in"}) {
             bool threw = false;
             try { run(bad); } catch (const Error& e) { threw = std::string(e.what()).find(path + ":3: find_objects") != std::string::npos; }
             assert(threw);
+        }
+        // a hard macro is a leaf cell (4.9.2.5): a transitive search stops at it, -traverse_macros goes in
+        {
+            auto mrun = [&](const std::string& q) {
+                std::ofstream(path) << "set_design_attributes -models blk -is_hard_macro TRUE\nputs [" << q << "]\n";
+                Model m;
+                m.dv = &dv;
+                std::ostringstream out;
+                m.out = &out;
+                m.load(path, "u_dut");
+                std::string r = out.str();
+                if (!r.empty()) r.pop_back();
+                return r;
+            };
+            assert(mrun("find_objects . -pattern u_* -object_type inst -transitive") == "u_a u_c {g[0]/u_b}");
+            assert(mrun("find_objects . -pattern u_* -object_type inst -traverse_macros") == "u_a u_c {g[0]/u_b} u_a/u_leaf");
+            assert(mrun("find_objects . -pattern * -object_type inst -leaf_only") == "u_a u_c");
+            assert(mrun("find_objects . -pattern q -object_type port -transitive") == "u_a/q");
+            assert(mrun("find_objects . -pattern n1 -object_type net -transitive") == "n1");
         }
         // without a design, find_objects is an error; supply objects need none
         std::ofstream(path) << "create_supply_net VDD\ncreate_supply_port P -direction out\n"
@@ -171,6 +209,93 @@ int main() {
         m.out = &out;
         m.load(path, "");
         assert(out.str() == "VDD\nP\n");
+        std::remove(path.c_str());
+    }
+    // The information model (clause 10) and its queries (11.1)
+    {
+        DesignView dv;
+        dv.instances = {"u_dut", "u_dut.u_a", "u_dut.u_a.u_leaf", "u_dut.u_c"};
+        dv.model = {{"", "tb"}, {"u_dut", "dut"}, {"u_dut.u_a", "blk"}, {"u_dut.u_a.u_leaf", "cell"}, {"u_dut.u_c", "cell"}};
+        dv.portsOf["u_dut.u_a"] = {{"clk", 0}, {"q", 1}};
+        dv.signals = {"u_dut.iso_en", "u_dut.sw_en", "u_dut.u_a.q", "u_dut.u_a.clk", "u_dut.save"};
+        dv.width["u_dut.u_a.q"] = 8;
+        std::string path = "test_upf_query.upf";
+        const std::string intent =
+            "create_supply_port VDD\ncreate_supply_net VDD\ncreate_supply_net VDD_A\n"
+            "connect_supply_net VDD -ports VDD\n"
+            "create_supply_set SS -function {power VDD} -function {ground VSS}\n"
+            "create_power_domain PD_TOP -include_scope -supply {primary SS}\n"
+            "create_power_domain PD_A -elements {u_a}\n"
+            "create_power_switch sw -domain PD_TOP -input_supply_port {vin VDD} -output_supply_port {vout VDD_A} "
+            "-control_port {en sw_en} -on_state {on vin {en}} -off_state {off {!en}}\n"
+            "set_isolation iso -domain PD_A -isolation_signal iso_en -clamp_value 1 -applies_to outputs -isolation_supply SS\n"
+            "set_retention ret -domain PD_A -save_signal {save posedge} -restore_signal {save negedge}\n"
+            "add_port_state VDD -state {on 0.9} -state {off off}\n"
+            "add_power_state PD_A -state {RUN -logic_expr {iso_en == 0}}\n";
+        auto run = [&](const std::string& text) {
+            std::ofstream(path) << intent << "set r [" << text << "]\nputs $r\n";
+            Model m;
+            m.dv = &dv;
+            std::ostringstream out;
+            m.out = &out;
+            m.load(path, "u_dut");
+            std::string r = out.str();
+            if (!r.empty()) r.pop_back();
+            return r;
+        };
+        assert(run("upf_query_object_type PD_A") == "upfPowerDomainT");
+        assert(run("upf_query_object_type /u_dut/PD_A.iso") == "upfIsolationStrategyT");
+        assert(run("upf_query_object_type VDD") == "upfSupplyPortT");
+        assert(run("upf_query_object_type VDD@upfSupplyNetT") == "upfSupplyNetT");
+        assert(run("upf_query_object_type sw/en") == "upfLogicPortT");
+        assert(run("upf_query_object_type sw.on") == "upfPowerSwitchStateT");
+        assert(run("upf_query_object_type PD_A.RUN") == "upfPowerStateT");
+        assert(run("upf_query_object_type u_a/q") == "upfHdlPortMultiBitT");
+        assert(run("upf_query_object_type .") == "upfHdlScopeT");
+        assert(run("upf_query_object_type #UPFEXTENT1#") == "upfExtentT");
+        assert(run("upf_object_in_class PD_A.iso -class upfBoundaryStrategyT") == "1");
+        assert(run("upf_object_in_class PD_A -class upfStrategyT") == "0");
+        assert(run("upf_query_object_properties PD_A -property upf_isolation_strategies") == "/u_dut/PD_A.iso");
+        assert(run("upf_query_object_properties PD_A -property upf_pd_states") == "/u_dut/PD_A.RUN");
+        assert(run("upf_query_object_properties PD_A -property upf_repeater_strategies") == "");
+        assert(run("upf_query_object_properties PD_A.iso -property upf_clamp_values") == "1");
+        assert(run("upf_query_object_properties PD_A.iso -property upf_applies_to") == "UPF_FILTER_OUTPUTS");
+        assert(run("upf_query_object_properties PD_A.iso.isolation_signal -property upf_ref_object") == "/u_dut/iso_en");
+        assert(run("upf_query_object_properties PD_A.ret -property upf_retention_parameters") == "RET_SUP_COR SAV_RES_COR");
+        assert(run("upf_query_object_properties VDD -property upf_loconn") == "/u_dut/VDD@upfSupplyNetT");
+        assert(run("upf_query_object_properties VDD_A -property upf_root_driver") == "/u_dut/sw/vout");
+        assert(run("upf_query_object_properties VDD.on -property upf_volt_nom") == "0.9");
+        assert(run("upf_query_object_properties sw/en -property upf_hiconn") == "/u_dut/sw_en");
+        assert(run("upf_query_object_properties u_a/q -property upf_hdl_width") == "8");
+        assert(run("upf_query_object_properties #UPFSIGSENSE1#") ==
+               "{upf_signal_sensitivity UPF_SENSE_HIGH} {upf_control_signal /u_dut/iso_en}");
+        assert(run("upf_query_object_properties [upf_query_object_properties PD_A.ret -property upf_save_signal]"
+                   " -property upf_signal_sensitivity") == "UPF_SENSE_POSEDGE");
+        assert(run("upf_query_object_properties [upf_query_object_properties sw.on -property upf_switch_expr]"
+                   " -property upf_expr_string") == "en");
+        assert(run("upf_query_object_pathname PD_A.iso -relative_to /u_dut") == "PD_A.iso");
+        assert(run("upf_query_object_pathname u_a/q -relative_to u_a") == "q");
+        assert(run("upf_query_object_pathname u_a -relative_to u_c") == "");
+        assert(run("upf_query_object_pathname #UPFEXTENT1#") == "");
+        assert(run("query_upf . -pattern * -object_type inst -transitive") == "u_a u_c u_a/u_leaf");
+        assert(run("query_upf PD_A -pattern *") == "u_a u_a/u_leaf u_a/clk u_a/q PD_A.primary");
+        assert(run("query_upf . -pattern VDD* -object_type supply_net") == "VDD VDD_A");
+        assert(run("query_upf . -pattern S* -object_type supply_set") == "SS");
+        for (const char* bad : {"upf_query_object_type NOPE", "upf_query_object_properties PD_A -property upf_port_dir",
+                                "upf_query_object_properties PD_A -property upf_bogus",
+                                "upf_query_object_properties PD_A -property upf_current_state",
+                                "upf_object_in_class PD_A -class upfBogusT", "upf_query_object_type #bad",
+                                "query_upf ../x -pattern *", "query_upf . -pattern * -object_type wire",
+                                "query_upf . -pattern * -inst_type nand"}) {
+            bool threw = false;
+            try { run(bad); } catch (const Error& e) { threw = std::string(e.what()).find(path + ":13: ") != std::string::npos; }
+            assert(threw);
+        }
+        // phase 5 (11.1.1): after a query only set_scope, bind_checker, find_objects and load_upf
+        bool threw = false;
+        try { run("upf_query_object_type PD_A]\nset_scope u_a\nset_scope ..\nset r [find_objects . -pattern u_a]\ncreate_supply_net LATE\nputs [list"); }
+        catch (const Error& e) { threw = std::string(e.what()).find(":17: create_supply_net after a UPF query") != std::string::npos; }
+        assert(threw);
         std::remove(path.c_str());
     }
     // Expressions: precedence, unknowns, supply comparisons

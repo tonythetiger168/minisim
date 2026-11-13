@@ -25,6 +25,7 @@ set(CASES
   "examples/loopreset.sv"
   "-cfiles 3 examples/loopreset.sv"
   "examples/seqtemp.sv"
+  "examples/seqtmpidx.sv +define+LFSR"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
   "examples/manygroups.sv"

@@ -9,12 +9,17 @@ proc expect {what got want} {
     if {$got ne $want} { error "find_objects $what: got {$got}, want {$want}" }
 }
 # instances: by name, by module, leaf only, none
-expect inst      [find_objects . -pattern u_*]                         u_core
+expect inst      [find_objects . -pattern u_* -object_type inst]       u_core
 expect model     [find_objects . -pattern core -object_type model]     u_core
-expect leaf      [find_objects . -pattern * -leaf_only]                u_core
-expect non_leaf  [find_objects . -pattern * -non_leaf]                 {}
-expect regexp    [find_objects . -pattern {^u_c.r} -regexp]            u_core
-expect exact     [find_objects . -pattern U_CORE -exact -ignore_case]  u_core
+expect leaf      [find_objects . -pattern * -leaf_only -object_type inst] u_core
+expect non_leaf  [find_objects . -pattern * -non_leaf -object_type inst] {}
+# by default instances, logic ports and nets (6.33)
+expect default   [find_objects . -pattern {[u]*}]                      u_core
+expect braces    [find_objects . -pattern {{iso,sw}_en} -object_type port] {iso_en sw_en}
+expect bits      [find_objects u_core -pattern hi -object_type port -expand_to_bits] u_core/hi
+expect bits8     [llength [find_objects u_core -pattern cnt -object_type port -expand_to_bits]] 8
+expect regexp    [find_objects . -pattern {^u_c.r} -regexp -object_type inst] u_core
+expect exact     [find_objects . -pattern U_CORE -exact -ignore_case -object_type inst] u_core
 # ports of the design top and of the core, by direction
 expect top_ports [lsort [find_objects . -pattern *_en -object_type port]]          {iso_en sw_en}
 expect core_out  [find_objects u_core -pattern * -object_type port -direction out] {u_core/cnt u_core/q u_core/hi u_core/lat}

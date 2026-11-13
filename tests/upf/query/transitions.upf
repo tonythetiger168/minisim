@@ -1,0 +1,12 @@
+# Appended to transitions.upf: state transitions and power state groups (10.6.1).
+proc expect {what got want} { if {$got ne $want} { error "query $what: got {$got}, want {$want}" } }
+proc prop {h p} { return [upf_query_object_properties $h -property $p] }
+expect pd_states [prop PD0 upf_pd_states]                {/u_dut/PD0.OFF /u_dut/PD0.SLEEP /u_dut/PD0.RUN}
+expect tr_type   [upf_query_object_type PD0.suspend]     upfPowerStateTransitionT
+expect tr_from   [prop PD0.suspend upf_from_states]      /u_dut/PD0.RUN
+expect tr_to     [prop PD0.suspend upf_to_states]        /u_dut/PD0.SLEEP
+expect tr_legal  [prop PD0.suspend upf_is_illegal]       false
+expect grp_type  [upf_query_object_type CLUSTER]         upfPowerStateGroupT
+expect grp_st    [prop CLUSTER upf_group_states]         {/u_dut/CLUSTER.NONE /u_dut/CLUSTER.ONE /u_dut/CLUSTER.BOTH}
+expect grp_tr    [prop CLUSTER upf_group_state_transitions] {/u_dut/CLUSTER.more /u_dut/CLUSTER.less}
+expect ss_tr     [prop SS upf_ss_transitions]            /u_dut/SS.up
