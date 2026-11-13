@@ -1,5 +1,6 @@
 // 7.4 / 6.20.2: a parameter unpacked array (a ROM table) read with an index
 // known only at run time.
+//! icarus-skip: Icarus 13 does not support unpacked array parameters
 module top;
   localparam logic [7:0] ROM [0:5] = '{8'h10, 8'h21, 8'h32, 8'h43, 8'h54, 8'h65};
   localparam int DESC [3:0] = '{40, 30, 20, 10};
