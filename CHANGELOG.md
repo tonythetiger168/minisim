@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
+  acknowledge back gets an assertion that it changes only once the
+  acknowledge has caught up (two- and four-phase). The one-bit stability
+  check no longer counts the reset value as a change.
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
@@ -19,6 +23,8 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- The `minisimCore` package installs `compat.hpp`, so a tool built against the
+  installed kernel can register its vendor command-line rules too.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
@@ -32,6 +38,12 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
   object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
   `vpiRefObj` has `vpiName` and `vpiFullName`.
+- VPI threads and frames (38.36.1): `vpi_handle(vpiThread / vpiFrame, NULL)`
+  in a calltf, thread objects (`vpiParent`, `vpiFrame`, child threads) and
+  frame objects (`vpiScope`, `vpiParent`, `vpiThread`, `vpiAutomatic`), both
+  with `vpiValid`, and the callbacks `cbStartOfThread`, `cbEndOfThread`,
+  `cbEnterThread`, `cbStartOfFrame` and `cbEndOfFrame`. The value of a
+  system task argument that is an automatic variable no longer crashes.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -52,6 +64,9 @@ Spec references are IEEE 1800-2023 clauses.
   - IMC batch commands with `--compat=cadence`: `-exec`, `-execcmd`, `load`, `merge -out`, `report`, `rank`
   - `vcover merge`, `report` and `ranktest` with `--compat=siemens`
   - the same through a symlink named `urg`, `imc` or `vcover`
+
+  The engine is mcov's own, and it reads mcov's own databases.
+  A database that does not exist is now a one-line error instead of a traceback.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -101,9 +116,11 @@ Spec references are IEEE 1800-2023 clauses.
   when no proxy can be reached.
 
 ### Added
-
-  The engine is mcov's own, and it reads mcov's own databases.
-  A database that does not exist is now a one-line error instead of a traceback.
+- UPF `find_objects` (IEEE 1801-2024 6.33): a UPF file can search the
+  design for instances, instances of a module, ports by direction, nets and
+  its own supply ports and nets (`-transitive`, `-regexp`, `-exact`,
+  `-ignore_case`, `-leaf_only`, `-non_leaf`). msim and mlint share the
+  design walk and the power top lookup (`src/upf_design.hpp`).
 - `msim -cm <metrics>` now selects the code coverage metrics written. It takes
   three notations: VCS `line+branch+cond+tgl+fsm`, Xcelium `b:e:t:f` or
   `all`, and Questa `bcesftx`. `msim -cm_hier <file>` selects the part of

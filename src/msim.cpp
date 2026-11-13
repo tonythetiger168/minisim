@@ -1,3 +1,5 @@
+#include <condition_variable>
+#include <mutex>
 #include <csignal>
 #include <unistd.h>
 // msim.cpp - one-step compile, elaborate and simulate, in the style of
@@ -172,6 +174,7 @@
 #define MINISIM_NO_MAIN
 #include "minisim.cpp"
 #include "upf_rt.inc"
+#include "upf_design.hpp"
 #include "upf_hdl.hpp"
 #include "dpi.inc"
 #include "vpi.inc"
@@ -469,6 +472,7 @@ static void unrollSeqLoops(LowerResult& lowered) {
                     Instr x = code[b];
                     x.e = sub(x.e, var, v);
                     for (auto& ai : x.aidx) ai = sub(ai, var, v);
+                    x.bidx = sub(x.bidx, var, v);   // v[i*8 +: 8] <= ...: the bit index too
                     if (x.k == IK::Jmp || x.k == IK::JmpIfNot) {
                         if (x.target == E) breaks.push_back(out.size());
                         else x.target = base + (x.target - (top + 1));   // the step: the end of this copy
@@ -1499,6 +1503,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
         std::filesystem::remove(dir + "/simv.stamp", ec);
         std::vector<std::string> jobs, objs;
+        std::vector<double> jobMB;   // the compiler's estimated memory for each job
         for (auto& [name, text] : files) {
             std::string path = dir + "/" + name;
             bool same = slurp(path) == text;
@@ -1513,6 +1518,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             if (same && hdrSame && sameFlags && std::filesystem::exists(obj, ec)) continue;
             std::filesystem::remove(obj, ec);
             jobs.push_back(shq(cc) + cflags + " -c " + shq(path) + " -o " + shq(obj));
+            jobMB.push_back(300 + 600.0 * (text.size() + files[0].second.size()) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
         }
         // Remove parts left from an earlier, larger split.
         for (int k = (int)files.size() - 2;; k++) {
@@ -1521,13 +1527,43 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             std::filesystem::remove(old + ".cpp", ec);
             std::filesystem::remove(old + ".o", ec);
         }
+        // The compiler takes about 0.6 GB per MB of a large generated file:
+        // four of them at once ran a 16 GB machine out of memory (16 Ibex
+        // cores). Jobs start while their estimates fit in the memory free
+        // now; one always runs.
+        double budget = 0;
+        {
+            std::ifstream mi("/proc/meminfo");
+            std::string k;
+            double kb;
+            std::string unit;
+            while (mi >> k >> kb >> unit)
+                if (k == "MemAvailable:") { budget = kb / 1024 * 0.85; break; }
+        }
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::vector<std::thread> pool;
+        std::mutex memMu;
+        std::condition_variable memCv;
+        double inUse = 0;
+        int running = 0;
         for (int t = 0; t < std::min<int>(maxThreads(), (int)jobs.size()); t++)
             pool.emplace_back([&] {
-                for (size_t j; (j = next++) < jobs.size();)
+                for (size_t j; (j = next++) < jobs.size();) {
+                    {
+                        std::unique_lock<std::mutex> lk(memMu);
+                        memCv.wait(lk, [&] { return budget <= 0 || running == 0 || inUse + jobMB[j] <= budget; });
+                        inUse += jobMB[j];
+                        running++;
+                    }
                     if (std::system(jobs[j].c_str()) != 0) { failed = true; std::cerr << "msim: -compile: C++ build failed: " << jobs[j] << "\n"; }
+                    {
+                        std::lock_guard<std::mutex> lk(memMu);
+                        inUse -= jobMB[j];
+                        running--;
+                    }
+                    memCv.notify_all();
+                }
             });
         for (auto& t : pool) t.join();
         if (failed) return 1;
@@ -2795,33 +2831,8 @@ int main(int argc, char** argv) {
     if (!upfPath.empty()) {
         auto& rt = upfrt::rt();
         try {
-            rt.m.load(upfPath, "");
-            std::string top = powerTopSet ? powerTop : rt.m.designTop;
-            for (char& c : top) if (c == '/') c = '.';
-            while (!top.empty() && top[0] == '.') top.erase(0, 1);
-            // a path may start with the simulation top's own name (tb.u_dut)
-            if (!S.vcdTop.empty() && (top == S.vcdTop || top.starts_with(S.vcdTop + "."))) top = top.substr(std::min(top.size(), S.vcdTop.size() + 1));
-            // set_design_top may name the module the UPF was written for
-            if (!powerTopSet && !top.empty() && top.find('.') == std::string::npos) {
-                std::string found;
-                std::function<void(const slang::ast::InstanceSymbol&, const std::string&)> walk =
-                    [&](const slang::ast::InstanceSymbol& in, const std::string& path) {
-                        if (!found.empty()) return;
-                        if (in.getDefinition().name == top && !path.empty()) { found = path; return; }
-                        for (auto& m : in.body.members())
-                            if (m.kind == slang::ast::SymbolKind::Instance) {
-                                auto& ch = m.as<slang::ast::InstanceSymbol>();
-                                walk(ch, path.empty() ? std::string(ch.name) : path + "." + std::string(ch.name));
-                            }
-                    };
-                for (auto* t : comp->getRoot().topInstances) {
-                    if (t->getDefinition().name == top) { found = "."; break; }
-                    walk(*t, "");
-                }
-                if (found == ".") top.clear();
-                else if (!found.empty()) top = found;
-            }
-            rt.m.top = top;
+            upf::DesignView dv = upf::designView(*comp);
+            upf::loadWithDesign(rt.m, upfPath, *comp, dv, powerTop, powerTopSet);
             rt.m.addHdlAttrs(upfHdlAttrs(*comp));   // (* UPF_... *) in the HDL (5.6)
             // the simulation top: a checker module nothing instantiates yet is a top too
             std::string simTop = S.vcdTop;

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 
 #include "upf.hpp"
 
@@ -121,6 +122,56 @@ int main() {
             }
             assert(threw);
         }
+    }
+    // find_objects (6.33) against a design view
+    {
+        DesignView dv;
+        dv.instances = {"u_dut", "u_dut.u_a", "u_dut.u_a.u_leaf", "u_dut.g[0]", "u_dut.g[0].u_b", "u_dut.u_c"};
+        dv.model = {{"", "tb"}, {"u_dut", "dut"}, {"u_dut.u_a", "blk"}, {"u_dut.u_a.u_leaf", "cell"},
+                    {"u_dut.g[0].u_b", "blk"}, {"u_dut.u_c", "cell"}};
+        dv.portsOf["u_dut.u_a"] = {{"clk", 0}, {"q", 1}, {"io", 2}};
+        dv.signals = {"u_dut.n1", "u_dut.u_a.n1", "u_dut.u_a.q"};
+        std::string path = "test_upf_find.upf";
+        auto run = [&](const std::string& text) {
+            std::ofstream(path) << "set_scope u_a\nset_scope ..\nset r [" << text << "]\nputs $r\n";
+            Model m;
+            m.dv = &dv;
+            std::ostringstream out;
+            m.out = &out;
+            m.load(path, "u_dut");
+            std::string r = out.str();
+            if (!r.empty()) r.pop_back();
+            return r;
+        };
+        assert(run("find_objects . -pattern u_*") == "u_a u_c");
+        assert(run("find_objects . -pattern u_* -transitive") == "u_a u_c {g[0]/u_b} u_a/u_leaf");
+        assert(run("find_objects . -pattern blk -object_type model -transitive") == "u_a {g[0]/u_b}");
+        assert(run("find_objects . -pattern * -leaf_only") == "u_c");
+        assert(run("find_objects . -pattern * -non_leaf") == "u_a");
+        assert(run("find_objects u_a -pattern * -object_type port -direction out") == "u_a/q");
+        assert(run("find_objects u_a -pattern * -object_type port") == "u_a/clk u_a/q u_a/io");
+        assert(run("find_objects . -pattern n1 -object_type net -transitive") == "n1 u_a/n1");
+        assert(run("find_objects . -pattern {^u_[ac]$} -regexp") == "u_a u_c");
+        assert(run("find_objects . -pattern U_A -exact -ignore_case") == "u_a");
+        assert(run("find_objects . -pattern U_A -exact") == "");
+        for (const char* bad : {"find_objects . -pattern * -object_type wire", "find_objects nope -pattern *",
+                                "find_objects . -pattern * -direction in", "find_objects .",
+                                "find_objects . -pattern * -bogus", "find_objects . -pattern * -regexp -exact",
+                                "find_objects . -pattern * -object_type process"}) {
+            bool threw = false;
+            try { run(bad); } catch (const Error& e) { threw = std::string(e.what()).find(path + ":3: find_objects") != std::string::npos; }
+            assert(threw);
+        }
+        // without a design, find_objects is an error; supply objects need none
+        std::ofstream(path) << "create_supply_net VDD\ncreate_supply_port P -direction out\n"
+                               "puts [find_objects . -pattern * -object_type supply_net]\n"
+                               "puts [find_objects . -pattern * -object_type supply_port -direction out]\n";
+        Model m;
+        std::ostringstream out;
+        m.out = &out;
+        m.load(path, "");
+        assert(out.str() == "VDD\nP\n");
+        std::remove(path.c_str());
     }
     // Expressions: precedence, unknowns, supply comparisons
     {
