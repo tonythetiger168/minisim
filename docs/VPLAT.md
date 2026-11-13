@@ -133,6 +133,7 @@ it). It is the address map most RISC-V bare-metal software already targets.
 | `finisher` | `0x5555` passes, `0x3333 \| code << 16` fails with `code` | the SiFive test device |
 | `virtio-blk` | virtio over MMIO, version 2 (VIRTIO 1.2, 4.2), one queue | a disk: `file` is a raw image, `irq` its PLIC source; writes stay in the run unless `"write": true`, `"readonly": true` refuses them. See "Disks" |
 | `virtio-net` | virtio over MMIO, version 2, a receive and a transmit queue | an Ethernet interface: `mac`, `irq`, `backend` (`user` or `dgram` with `local` and `remote` socket paths), `pcap`. See "Networks" |
+| `virtio-console` | virtio over MMIO, version 2, one port | a console (Linux's `hvc0`): output to stdout, `input` typed once the guest has printed and been quiet for 100 ms of simulated time |
 | `mvp` | the library's own map (`mvp_add_device`) | see below |
 | `rtl` | whatever the RTL decodes | see below |
 
@@ -341,6 +342,17 @@ reaches the gateway. `tests/vplat/vnet.c` is a bare-metal driver that
 checks the device itself (ARP, ICMP checksums, the interrupt, the dgram
 link). A platform with a `dgram` interface cannot be checkpointed.
 
+### A virtio console
+
+`-vcon` adds a `virtio-console` in the next virtio-mmio slot and sends
+`-input` to it instead of the first UART. Linux uses it with
+`console=hvc0`. Input waits until the guest has printed something and then
+been quiet for 100 ms of simulated time, as a person types at a prompt:
+characters that arrive while a system is still starting are lost to it, and
+virtio has no register that says the driver is ready to read, as the 16550's
+receive interrupt enable does. `tests/vplat/vcon.c` is a bare-metal driver
+for it.
+
 ## Options
 
 | Option | |
@@ -357,6 +369,7 @@ link). A platform with a `dgram` interface cannot be checkpointed.
 | `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
 | `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |
 | `-disk FILE`, `-disk-write` | a raw disk image on virtio-blk; let writes reach the file (see "Disks") |
+| `-vcon` | a virtio console; `-input` goes to it (see "A virtio console") |
 | `-net user`, `-net dgram:LOCAL,REMOTE`, `-net-pcap FILE` | a virtio-net interface and its back end; record its frames (see "Networks") |
 | `-profile FILE` | profile (`-`: stdout) *(extension)* |
 | `-gdb PORT`, `-gdb-portfile FILE` | gdb server *(extension)* |
@@ -401,8 +414,8 @@ simulation time.
   to integers; other RMM results round as ties-to-even (differs only for a
   value exactly half way). Bare-metal software, RTOSes (FreeRTOS, Zephyr),
   OpenSBI, Linux with an rv64gc user space and the architecture tests run.
-- Of virtio, the block and network devices: no virtio console, entropy or
-  9p yet, and no indirect descriptors, `EVENT_IDX`, checksum or segmentation
+- Of virtio, the block, network and console devices: no entropy, 9p,
+  GPU or input devices yet, no console multiport, and no indirect descriptors, `EVENT_IDX`, checksum or segmentation
   offload, or multiqueue. Disk images are raw (no qcow2). The `user` network
   answers ARP and ping only; there is no NAT to the host or a TAP back end.
 - No hardware triggers, no Smepmp (`mseccfg`).

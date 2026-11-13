@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: virtio-console (VIRTIO 1.2, 5.3). `-vcon` adds one and sends
+  `-input` to it; Linux runs its console on `hvc0`. Input is typed once the
+  guest has printed and been quiet for 100 ms of simulated time.
 - mvplat: virtio-net over virtio-mmio (VIRTIO 1.2, 5.1). `-net user` gives a
   built-in gateway at 10.0.2.2 that answers ARP and ping; `-net
   dgram:LOCAL,REMOTE` links platforms (or a host program) over Unix datagram
