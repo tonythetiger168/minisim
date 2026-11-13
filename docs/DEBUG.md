@@ -499,6 +499,11 @@ tb.head.next.id = 32'h2
 | `where`, `stack` | the statement stopped at (or last run) and its process |
 | `listing [N]`, `listing -file F -line L` | the source around the current statement |
 | `dump -file F`, `dump -add NAMES [-depth N]`, `probe -create NAMES`, `dump -off/-on/-flush/-close` | write a VCD from the next time slot: scopes (everything below, `-depth` levels) and signals, as `$dumpvars` |
+| `drivers SIG ...`, `loads SIG ...` | the statements of the simulation that write or read the signal: file, line, source and process (an `assign`, a port, an `always`, a task) |
+| `call TASK(ARGS)`, `call TASK ARG ...` | run a task or function of the design (static or automatic) from the current scope; prints what it returns and its `output` arguments. While stopped at a line it runs when the simulation goes on |
+| `save FILE` (`checkpoint FILE`) | write a checkpoint: as `$save`, by replay; it records the commands given so far |
+| `restore FILE` | go back to a `save` checkpoint: msim starts again, runs the saved command line and commands quietly up to it, and reads the next command after `restore` (from the same `-do` file, or the standard input) |
+| `restart` | start the simulation again from time 0, reading the next command after `restart` |
 | `senv [time\|scope\|top\|timescale\|file\|line\|stopped]` | the state of the simulation |
 | `alias NAME COMMAND ...` | a new command |
 | `time`, `help`, `quit`, `exit`, `finish` | `quit` ends the simulation now; final blocks still run |
@@ -507,9 +512,12 @@ Values are decimal or sized literals (`8'h40`, `4'b10x1`). Names can leave
 out the top module (`cnt` for `tb.cnt`). `-i` and `-do` use the
 interpreter, so they turn off `-compile`, and they run on one thread so that
 a stop can pause a process in the middle. Lines that start with `#` are
-comments. Not here yet: `save` / `restore` (use `$save`, docs/CHECKPOINT.md),
-`call` of a task from the prompt, `drivers` / `loads` (use `mdebug -trace`
-on the waveform), and `restart`.
+comments.
+
+`msim -restore FILE` also takes a checkpoint written by `save`; the commands
+then come from the standard input. A restore costs a run up to the
+checkpoint (docs/CHECKPOINT.md), and a command typed into a pipe after
+`restore` is lost (a file or a terminal goes on where it was).
 
 ## Limits
 

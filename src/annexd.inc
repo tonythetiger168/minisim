@@ -230,13 +230,26 @@ inline void annexStartup(int argc, char** argv) {
         std::ifstream in(argv[2]);
         std::string magic, ln, cwd, state;
         long seq = 0;
+        bool ucli = false;   // written by msim -i save: the commands replay it (interactive.inc)
         std::vector<std::string> args;
         std::getline(in, magic);
         while (std::getline(in, ln)) {
+            if (ln == "save 0") ucli = true;
             if (ln.rfind("save ", 0) == 0) seq = strtol(ln.c_str() + 5, nullptr, 10);
             else if (ln.rfind("state ", 0) == 0) state = ln.substr(6);
             else if (ln.rfind("cwd ", 0) == 0) cwd = ln.substr(4);
             else if (ln.rfind("arg ", 0) == 0) args.push_back(ln.substr(4));
+        }
+        if (magic == "msim checkpoint" && ucli && !args.empty()) {
+            char* full = realpath(argv[2], nullptr);
+            if (!cwd.empty() && chdir(cwd.c_str()) != 0) {
+                std::cerr << "msim: -restore: cannot go to " << cwd << ": " << strerror(errno) << "\n";
+                std::exit(2);
+            }
+            setenv("MSIM_UCLI_RESTORE", full ? full : argv[2], 1);
+            for (int k = 3; k < argc; k++) args.push_back(argv[k]);
+            annexd::argv0() = args;
+            annexd::again();
         }
         if (magic != "msim checkpoint" || seq <= 0 || args.empty()) {
             std::cerr << "msim: " << argv[2] << " is not a checkpoint written by $save (or it is from an older msim)\n";

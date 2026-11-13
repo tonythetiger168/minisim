@@ -702,6 +702,7 @@ struct LowerResult {
     std::unordered_map<const slang::ast::Symbol*, int> sigOf;   // variable / net -> signal (VPI, 37)
     std::vector<LoweredProc> procs;
     std::vector<std::unique_ptr<Prog>> subs;
+    std::vector<std::unique_ptr<Subr>> subrs;   // every task and function with its arguments (msim -i call)
     std::vector<LoweredProc> finals;  // final blocks (9.2.3), run once at the end
     int programs = 0;                 // program instances (24.3)
     LayoutList layouts;   // frame shapes of automatic subroutines and fork branches
@@ -13243,5 +13244,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         }
     }
     out.sigOf = sigmap;
+    out.subrs = std::move(owned);
     return out;
 }

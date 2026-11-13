@@ -381,6 +381,10 @@ Spec references are IEEE 1800-2023 clauses.
   (next/previous time the selected signal takes it), Del to remove a row,
   Ctrl+arrows to step changes; the view lives in the page address, so a
   reload or a copied link opens on it.
+- `msim -i`: `drivers` / `loads` of a signal, `call` of a task or function
+  (static or automatic, with its return value and outputs), `save` /
+  `restore` checkpoints by replay of the run and its commands (also read by
+  `msim -restore`), and `restart` from time 0.
 - `msim -i` / `-do` is a UCLI on the shared Tcl interpreter: `set`, `if`,
   `foreach`, `proc`, `source` around the commands; stops at a line
   (`stop -line N -file F`), at a time, on a condition, with `-command`,
