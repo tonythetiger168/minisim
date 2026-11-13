@@ -296,6 +296,7 @@ protected:
     std::vector<std::set<std::string>> globals_;
     // upvar / variable links of each frame: local name -> {frame, name there}
     std::vector<std::unordered_map<std::string, std::pair<size_t, std::string>>> links_;
+    std::string errInfo_, errCode_;   // set by error ?info? ?code?, read by catch
     std::map<std::string, Proc> procs_;   // by qualified name, without the leading ::
     std::vector<std::string> ns_{""};     // the current namespace ("" global, "a::b")
     std::set<std::string> namespaces_;
@@ -1261,11 +1262,22 @@ protected:
             }
             for (size_t i = before; i < diags.size(); i++)
                 if (diags[i].sev == Diag::ErrorSev) { err = true; res = diags[i].text; }
-            if (err) diags.resize(before);
+            if (err) {
+                diags.resize(before);
+                // the global errorInfo and errorCode after an error (UPF 1801-2024 5.12)
+                setVar("::errorInfo", errInfo_.empty() ? res + "\n    while executing\n\"" + w[1] + "\"" : errInfo_);
+                setVar("::errorCode", errCode_.empty() ? std::string("NONE") : errCode_);
+                errInfo_.clear();
+                errCode_.clear();
+            }
             if (w.size() > 2) setVar(w[2], res);
             return err ? "1" : "0";
         }
-        if (c == "error") fail(w.size() > 1 ? w[1] : "error");
+        if (c == "error") {   // error message ?info? ?code?
+            errInfo_ = w.size() > 2 ? w[2] : "";
+            errCode_ = w.size() > 3 ? w[3] : "";
+            fail(w.size() > 1 ? w[1] : "error");
+        }
         if (c == "exit" || c == "quit") throw Exit{w.size() > 1 ? atoi(w[1].c_str()) : 0};
         if (c == "source") {
             std::string path;

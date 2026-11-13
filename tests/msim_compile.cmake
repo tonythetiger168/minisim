@@ -116,8 +116,9 @@ endforeach()
 # power intent from msim's snapshot (upf_rt.inc). Domains switched off and
 # on, isolation, corruption, retention of flops and latches, isolation cells
 # by their functional model (HDL ports on supply nets), replayed initial
-# blocks, and the low-power coverage report.
-foreach(t gating retlatch isomodel replay)
+# blocks, a process whose domain powers down in the middle of its body, and
+# the low-power coverage report.
+foreach(t gating retlatch isomodel replay restart)
   math(EXPR mine "${n} % ${SHARDS}")
   if(NOT mine EQUAL SHARD)
     math(EXPR n "${n} + 1")
