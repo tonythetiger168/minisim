@@ -103,7 +103,8 @@ tmerge and `4'bxxxx` under xmerge.
   keep a shadow of its own. If an unbounded loop ends early, the targets
   of the tasks it calls with `<=` become `x` too.
 - **`break` and `continue`** in `for`, `foreach`, `repeat`, `while`,
-  `do ... while` and `forever` loops. Under an unknown condition the rest
+  `do ... while` and `forever` loops, and **`disable`** of a named block
+  from inside it (9.6.2), which also ends the loops between. Under an unknown condition the rest
   of the loop merges with "not run". This is pessimistic: each unknown
   step merges with the state before it, so values that every path agrees
   on can still come out `x`. A `while`, `do` or `forever` loop has no
@@ -147,7 +148,7 @@ report names each one:
 ```
 xprop tmerge: 16 of 19 if / case / edge constructs merged
 dut.sv:27: loop body: merged
-dut.sv:57: if: not merged, it holds a jump out of the branch (break, continue, return or disable)
+dut.sv:57: if: not merged, it holds a delay or event control
 dut.sv:61: if: not merged, it holds a task or function call statement
 dut.sv:44: case: merged
 ```
@@ -156,9 +157,10 @@ dut.sv:44: case: merged
 - a call of a task or function that has a delay (`<= #1` included), an
   event control or a `fork`, or that writes an array element, a container
   or a net;
-- `break` or `continue` out of a `while`, `do ... while` or `forever` loop
-  whose body has a nonblocking assignment or writes an array element, and
-  `disable` of a block outside the branch;
+- `break`, `continue` or `disable` out of a `while`, `do ... while` or
+  `forever` loop whose body has a nonblocking assignment or writes an array
+  element, and `disable` of a task, of a block with a `fork`, or of a block
+  another process runs;
 - a blocking assignment to a queue, dynamic or associative array, a real, a
   string or a class property;
 - `case ... matches`, `if ... matches`, a `case ... inside` item with a

@@ -20,15 +20,15 @@ static void set_cmp(uint64_t t) {
 }
 
 __attribute__((interrupt("machine"), aligned(4))) void handler(void) {
-    uint32_t cause = csr_read(mcause);
-    if (cause == 0x80000007u) {          // machine timer
+    uintptr_t cause = csr_read(mcause);
+    if (cause == MCAUSE_INT(7)) {          // machine timer
         ticks++;
         if (ticks < 5) set_cmp(mtime() + 1000);
         else set_cmp(~0ull);
-    } else if (cause == 0x80000003u) {   // machine software
+    } else if (cause == MCAUSE_INT(3)) {   // machine software
         soft++;
         REG32(CLINT) = 0;
-    } else if (cause == 0x8000000bu) {   // machine external
+    } else if (cause == MCAUSE_INT(11)) {   // machine external
         uint32_t id = REG32(PLIC + 0x200004);
         if (id == 10) {
             while (REG8(UART0 + 5) & 1) { if (rx < 7) got[rx] = (char)REG8(UART0); rx++; }
@@ -36,7 +36,7 @@ __attribute__((interrupt("machine"), aligned(4))) void handler(void) {
         REG32(PLIC + 0x200004) = id;
     } else {
         puts_("unexpected trap ");
-        putx(cause);
+        putx((uint32_t)cause);
         putc_('\n');
         exit_(9);
     }
@@ -44,7 +44,7 @@ __attribute__((interrupt("machine"), aligned(4))) void handler(void) {
 
 int main(int hart) {
     (void)hart;
-    csr_write(mtvec, (uint32_t)(uintptr_t)handler);
+    csr_write(mtvec, (uintptr_t)handler);
     // PLIC: source 10 (the UART) at priority 1, enabled for hart 0, threshold 0.
     REG32(PLIC + 4 * 10) = 1;
     REG32(PLIC + 0x2000) = 1u << 10;

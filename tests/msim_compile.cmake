@@ -2,7 +2,15 @@
 # with only event-driven processes, on one thread. The default interpreter
 # (static schedule, clocked functions, partitions, every hardware thread),
 # the same on one thread, and msim -compile must match it.
-# -O1 keeps the twelve C++ builds quick. Called with -DMSIM=<msim> -DSRC=<source dir> -DOUT=<scratch dir>.
+# -O1 keeps the C++ builds quick. Called with -DMSIM=<msim> -DSRC=<source dir> -DOUT=<scratch dir>,
+# and -DSHARD=<k> -DSHARDS=<n> to run only every n-th case from the k-th
+# (CMakeLists.txt registers msim_compile_0 .. _<n-1>: each build compiles
+# the kernel, about 20 s, so the cases run in parallel test processes).
+if(NOT DEFINED SHARDS)
+  set(SHARDS 1)
+  set(SHARD 0)
+endif()
+set(ran 0)
 set(CASES
   "examples/compound.sv"
   "examples/div.sv"
@@ -47,6 +55,12 @@ set(CASES
   "bench/lanes.sv +define+END_TIME=2000")
 set(n 0)
 foreach(c IN LISTS CASES)
+  math(EXPR mine "${n} % ${SHARDS}")
+  if(NOT mine EQUAL SHARD)
+    math(EXPR n "${n} + 1")
+    continue()
+  endif()
+  math(EXPR ran "${ran} + 1")
   separate_arguments(args UNIX_COMMAND "${c}")
   set(files "")
   foreach(a IN LISTS args)
@@ -105,6 +119,12 @@ endforeach()
 # blocks, a process whose domain powers down in the middle of its body, and
 # the low-power coverage report.
 foreach(t gating retlatch isomodel replay restart)
+  math(EXPR mine "${n} % ${SHARDS}")
+  if(NOT mine EQUAL SHARD)
+    math(EXPR n "${n} + 1")
+    continue()
+  endif()
+  math(EXPR ran "${ran} + 1")
   set(files ${SRC}/tests/upf/${t}.sv -upf ${SRC}/tests/upf/${t}.upf)
   execute_process(COMMAND ${MSIM} ${files} OUTPUT_VARIABLE want RESULT_VARIABLE r1)
   execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/upf_${t} ${files}
@@ -120,12 +140,16 @@ foreach(t gating retlatch isomodel replay restart)
   endif()
   math(EXPR n "${n} + 1")
 endforeach()
-execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/upf_lpcov ${SRC}/tests/upf/retlatch.sv -upf ${SRC}/tests/upf/lpcov.upf
-                        -upf_cov ${OUT}/lpcov.cov
-                RESULT_VARIABLE rc ERROR_VARIABLE err)
-file(READ ${SRC}/tests/upf/lpcov.cov want)
-file(READ ${OUT}/lpcov.cov got)
-if(NOT rc EQUAL 0 OR NOT want STREQUAL got)
-  message(FATAL_ERROR "upf lpcov: -compile coverage differs: ${rc}\n${err}--- got\n${got}--- want\n${want}")
+math(EXPR mine "${n} % ${SHARDS}")
+if(mine EQUAL SHARD)
+  execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/upf_lpcov ${SRC}/tests/upf/retlatch.sv -upf ${SRC}/tests/upf/lpcov.upf
+                          -upf_cov ${OUT}/lpcov.cov
+                  RESULT_VARIABLE rc ERROR_VARIABLE err)
+  file(READ ${SRC}/tests/upf/lpcov.cov want)
+  file(READ ${OUT}/lpcov.cov got)
+  if(NOT rc EQUAL 0 OR NOT want STREQUAL got)
+    message(FATAL_ERROR "upf lpcov: -compile coverage differs: ${rc}\n${err}--- got\n${got}--- want\n${want}")
+  endif()
+  math(EXPR ran "${ran} + 1")
 endif()
-message(STATUS "${n} designs match")
+message(STATUS "${ran} of ${n} designs match (shard ${SHARD} of ${SHARDS})")

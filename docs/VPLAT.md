@@ -38,8 +38,10 @@ names what is missing. Sections marked *(extension)* describe these parts.
 
 ## What it simulates
 
-**Harts.** RV32IMAC with Zicsr and Zifencei, in machine, supervisor and
-user mode:
+**Harts.** RV32IMAC or RV64IMAC with Zicsr and Zifencei, in machine,
+supervisor and user mode. The program's ELF class picks the width: a 64-bit
+ELF file runs on RV64 harts (`misa.MXL` 2, `UXL` and `SXL` fixed at 64), with
+the W instructions, LD/SD/LWU, 64-bit atomics (`.D`) and RV64C. The CSRs:
 `mstatus`, `mtvec` (direct and vectored), `mepc`, `mcause`, `mtval`, `mie`,
 `mip`, `mscratch`, `mcounteren`, `mcountinhibit`, the cycle, time and
 instret counters, `mhartid`, physical memory protection (16 entries, 4-byte grain: OFF, TOR,
@@ -53,18 +55,21 @@ and interrupts to supervisor mode; `sstatus`, `sie` and `sip` are the
 supervisor's views of the machine registers, with `stvec`, `sscratch`,
 `sepc`, `scause`, `stval`, `scounteren` and `satp`. SRET, SFENCE.VMA and the
 `mstatus` bits SUM, MXR, TVM, TW and TSR work as the privileged
-specification says. `satp` selects Sv32 paging: two-level page tables,
-4 MiB megapages, a 256-entry TLB per hart, and page faults (causes 12, 13
-and 15). Accessed and dirty bits follow Svade: a page whose A bit is clear,
+specification says. `satp` selects Sv32 paging on RV32 (two levels, 4 MiB
+megapages) and Sv39 on RV64 (three levels, 2 MiB and 1 GiB pages; a virtual
+address not sign-extended from bit 38 faults), with a 256-entry TLB per hart
+and page faults (causes 12, 13 and 15). No ASIDs (`satp.ASID` reads 0), no
+Svnapot or Svpbmt (those PTE bits fault). Accessed and dirty bits follow Svade: a page whose A bit is clear,
 or a store to a page whose D bit is clear, faults and the supervisor sets
 them, as spike and QEMU do by default. The page walk is checked by PMP.
 The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
 interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
 (SEIP).
 
-The RISC-V architecture tests all pass, 144 programs: rv32ui, rv32um,
-rv32ua and rv32uc both bare (`p`) and under the riscv-tests supervisor with
-paging on (`v`), and rv32mi and rv32si. `tests/mvplat_isa.sh` runs them.
+The RISC-V architecture tests all pass, 342 programs: ui, um, ua and uc for
+RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
+paging on (`v`, Sv32 and Sv39), and mi and si for both. `tests/mvplat_isa.sh`
+runs them.
 
 **Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000) on
 its own and then the platform synchronises: devices see time move and
@@ -206,7 +211,7 @@ compared line by line with another simulator.
 
 *(extension)* `-gdb PORT` waits for gdb before the first instruction (`-gdb 0` takes any
 free port and `-gdb-portfile FILE` writes it down). gdb sees one thread per
-hart and needs no setup: the server sends the `riscv:rv32` target
+hart and needs no setup: the server sends the `riscv:rv32` or `riscv:rv64` target
 description, with the machine CSRs. Supported: breakpoints (`Z0`, `Z1`),
 watchpoints on write, read and access (`Z2`, `Z3`, `Z4`), single step,
 continue, Ctrl-C, register and memory reads and writes, detach and kill. An `ebreak` in the program stops in gdb rather
@@ -270,11 +275,11 @@ simulation time.
 
 ## Limits / Not yet
 
-- RV32 only: no RV64 (so no Sv39), no F/D (floating point), no V, no B
-  (bit-manipulation) extensions, and no Svadu (hardware A/D update). No
-  Linux boot yet: that needs RV64, a device tree and SBI firmware. Bare-metal
-  software, RTOSes (FreeRTOS, Zephyr), supervisor-mode kernels with Sv32
-  paging and the architecture tests run.
+- No F/D (floating point), no V, no B (bit-manipulation) extensions, no
+  Sv48/Sv57, no Svadu (hardware A/D update), and every hart of a platform has
+  the program's width. No Linux boot yet: that needs a device tree and SBI
+  firmware. Bare-metal software, RTOSes (FreeRTOS, Zephyr), supervisor-mode
+  kernels with Sv32 or Sv39 paging and the architecture tests run.
 - No hardware triggers, no Smepmp (`mseccfg`).
 - One instruction per cycle: no pipeline or cache timing model.
 - No Spike or QEMU back end yet (Spike is BSD-licensed and could be linked;

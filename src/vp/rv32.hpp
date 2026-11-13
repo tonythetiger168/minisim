@@ -1,5 +1,9 @@
-// rv32.hpp - the RISC-V hart: RV32IMAC with Zicsr, Zifencei, machine and user
-// modes, and the compressed-instruction expander.
+// rv32.hpp - the RISC-V hart: RV32IMAC or RV64IMAC with Zicsr, Zifencei,
+// machine, supervisor and user modes, and the compressed-instruction expander.
+//
+// Registers and CSRs are 64 bits wide. An RV32 hart keeps every register
+// sign-extended from bit 31 (as an RV64 hart running RV32 code would), so
+// most instructions need no separate 32-bit form.
 //
 // The hart's state is plain data; the instruction loop that runs it is in
 // machine.hpp, because memory access belongs to the platform (devices, the
@@ -117,21 +121,30 @@ enum : uint32_t { MIP_MSIP = 1u << 3, MIP_MTIP = 1u << 7, MIP_MEIP = 1u << 11,
 
 struct Hart {
     unsigned id = 0;
-    uint32_t x[32] = {};
-    uint32_t pc = 0;
+    bool rv64 = false;
+    uint64_t x[32] = {};
+    uint64_t pc = 0;
     uint64_t cycle = 0, instret = 0;
     int64_t cycleAdj = 0, instretAdj = 0;  // what software wrote to mcycle / minstret
     uint8_t priv = 3;
-    uint32_t mstatus = 0, mie = 0, mip = 0, mtvec = 0, mscratch = 0, mepc = 0, mcause = 0,
-             mtval = 0, mcounteren = 0, mcountinhibit = 0;
-    uint32_t pmpcfg[4] = {}, pmpaddr[16] = {};
+    uint64_t mstatus = 0, mtvec = 0, mscratch = 0, mepc = 0, mcause = 0, mtval = 0;
+    uint32_t mie = 0, mip = 0, mcounteren = 0, mcountinhibit = 0;
+    uint8_t pmpcfg[16] = {};
+    uint64_t pmpaddr[16] = {};
     // Supervisor mode.
-    uint32_t stvec = 0, sscratch = 0, sepc = 0, scause = 0, stval = 0, satp = 0, scounteren = 0;
+    uint64_t stvec = 0, sscratch = 0, sepc = 0, scause = 0, stval = 0, satp = 0;
+    uint32_t scounteren = 0;
     uint32_t medeleg = 0, mideleg = 0;
     uint32_t mipSw = 0;  // SSIP, STIP, SEIP as software wrote them
-    // Sv32 translations, by virtual page (direct mapped); flushed by
-    // SFENCE.VMA and by a write to satp.
-    struct Tlb { uint32_t vpn, ppn; uint8_t pte; bool valid; };
+    // Is paging on (Sv32 on RV32, Sv39 on RV64)?
+    bool paging() const { return rv64 ? (satp >> 60) == 8 : (satp >> 31) != 0; }
+    // Values as the hart's XLEN sees them: sign-extended from bit 31 on RV32.
+    uint64_t sx(uint64_t v) const { return rv64 ? v : (uint64_t)(int64_t)(int32_t)v; }
+    // Addresses and the pc: zero-extended from bit 31 on RV32.
+    uint64_t ax(uint64_t v) const { return rv64 ? v : (uint32_t)v; }
+    // Translations, by virtual page (direct mapped); flushed by SFENCE.VMA
+    // and by a write to satp.
+    struct Tlb { uint64_t vpn, ppn; uint8_t pte; bool valid; };
     static constexpr unsigned TLB_SIZE = 256;
     Tlb tlb[TLB_SIZE] = {};
     void flushTlb() { for (auto& t : tlb) t.valid = false; }
@@ -143,7 +156,7 @@ struct Hart {
     bool pmpLock = false;
     bool wfi = false;
     bool resv = false;
-    uint32_t resvAddr = 0;
+    uint64_t resvAddr = 0;
 
     // Run state.
     bool par = false;       // in the parallel phase of a round
@@ -151,7 +164,7 @@ struct Hart {
     bool stepping = false;  // the debugger asked for one instruction
     bool skipBp = false;    // resume over the breakpoint at pc
     int stopSig = 0;        // signal the debugger reports (5 = SIGTRAP)
-    uint32_t watchAddr = 0; // the address a watchpoint hit
+    uint64_t watchAddr = 0; // the address a watchpoint hit
     int watchKind = 0;      // 0 none, 2 write, 3 read, 4 access (gdb Z types)
     Overlay ov;
 
@@ -159,7 +172,8 @@ struct Hart {
     // stores to code only after FENCE.I, as the ISA allows; loading a
     // program, a debugger write and a restore empty it too.
     struct Decoded {
-        uint32_t pc, insn, raw;
+        uint64_t pc;
+        uint32_t insn, raw;
         int32_t immI;
         uint8_t len, op, rd, f3, rs1, rs2, f7;
         bool xlat;  // fetched through the MMU (the same pc means another page bare)
@@ -179,7 +193,7 @@ struct Hart {
     char traceHead[64] = {};
     // -profile.
     uint64_t nClass[12] = {};
-    std::unordered_map<uint32_t, uint64_t> pcHist;
+    std::unordered_map<uint64_t, uint64_t> pcHist;
 };
 
 // Instruction classes for -profile.
@@ -189,7 +203,7 @@ inline const char* className(int c) {
     return n[c];
 }
 
-// ----------------------------------------------------------------- RV32C
+// ----------------------------------------------------------------- C
 // A compressed instruction becomes the 32-bit instruction it stands for, so
 // one decoder runs both. Returns 0 for a reserved or illegal encoding.
 namespace rvc {
@@ -216,7 +230,7 @@ inline uint32_t R(uint32_t f7, uint32_t rs2, uint32_t rs1, uint32_t f3, uint32_t
 }
 inline int32_t sext(uint32_t v, int b) { return (int32_t)(v << (32 - b)) >> (32 - b); }
 
-inline uint32_t expand(uint32_t c) {
+inline uint32_t expand(uint32_t c, bool rv64) {
     uint32_t op = c & 3, f3 = bits(c, 15, 13);
     uint32_t rdp = bits(c, 4, 2) + 8, rs1p = bits(c, 9, 7) + 8;
     uint32_t rd = bits(c, 11, 7), rs2 = bits(c, 6, 2);
@@ -236,7 +250,13 @@ inline uint32_t expand(uint32_t c) {
                 uint32_t imm = bits(c, 12, 10) << 3 | bits(c, 6, 6) << 2 | bits(c, 5, 5) << 6;
                 return S(0x23, 2, rs1p, rdp, (int32_t)imm);
             }
-            default: return 0;  // C.FLD, C.FLW, C.FSD, C.FSW: no F/D
+            case 3:
+            case 7: {  // C.LD, C.SD (RV64); C.FLW, C.FSW (RV32) need F
+                if (!rv64) return 0;
+                uint32_t imm = bits(c, 12, 10) << 3 | bits(c, 6, 5) << 6;
+                return f3 == 3 ? I(0x03, rdp, 3, rs1p, (int32_t)imm) : S(0x23, 3, rs1p, rdp, (int32_t)imm);
+            }
+            default: return 0;  // C.FLD, C.FSD: no D
         }
     }
     if (op == 1) {
@@ -244,7 +264,12 @@ inline uint32_t expand(uint32_t c) {
         switch (f3) {
             case 0: return I(0x13, rd, 0, rd, imm6);  // C.ADDI / C.NOP
             case 1:
-            case 5: {  // C.JAL, C.J
+                if (rv64) {  // C.ADDIW
+                    if (!rd) return 0;
+                    return I(0x1b, rd, 0, rd, imm6);
+                }
+                [[fallthrough]];
+            case 5: {  // C.JAL (RV32), C.J
                 uint32_t u = bits(c, 12, 12) << 11 | bits(c, 11, 11) << 4 | bits(c, 10, 9) << 8 |
                              bits(c, 8, 8) << 10 | bits(c, 7, 7) << 6 | bits(c, 6, 6) << 7 |
                              bits(c, 5, 3) << 1 | bits(c, 2, 2) << 5;
@@ -264,12 +289,19 @@ inline uint32_t expand(uint32_t c) {
             case 4: {
                 uint32_t f2 = bits(c, 11, 10);
                 if (f2 == 0 || f2 == 1) {  // C.SRLI, C.SRAI
-                    if (bits(c, 12, 12)) return 0;
-                    uint32_t sh = bits(c, 6, 2);
+                    if (bits(c, 12, 12) && !rv64) return 0;
+                    uint32_t sh = bits(c, 12, 12) << 5 | bits(c, 6, 2);
                     return I(0x13, rs1p, 5, rs1p, (int32_t)(sh | (f2 == 1 ? 0x400 : 0)));
                 }
                 if (f2 == 2) return I(0x13, rs1p, 7, rs1p, imm6);  // C.ANDI
-                if (bits(c, 12, 12)) return 0;
+                if (bits(c, 12, 12)) {
+                    if (!rv64) return 0;
+                    switch (bits(c, 6, 5)) {
+                        case 0: return R(0x20, rdp, rs1p, 0, rs1p) ^ 0x33 ^ 0x3b;  // C.SUBW
+                        case 1: return R(0, rdp, rs1p, 0, rs1p) ^ 0x33 ^ 0x3b;     // C.ADDW
+                        default: return 0;
+                    }
+                }
                 switch (bits(c, 6, 5)) {
                     case 0: return R(0x20, rdp, rs1p, 0, rs1p);  // C.SUB
                     case 1: return R(0, rdp, rs1p, 4, rs1p);     // C.XOR
@@ -289,8 +321,8 @@ inline uint32_t expand(uint32_t c) {
     if (op == 2) {
         switch (f3) {
             case 0:  // C.SLLI
-                if (bits(c, 12, 12)) return 0;
-                return I(0x13, rd, 1, rd, (int32_t)bits(c, 6, 2));
+                if (bits(c, 12, 12) && !rv64) return 0;
+                return I(0x13, rd, 1, rd, (int32_t)(bits(c, 12, 12) << 5 | bits(c, 6, 2)));
             case 2: {  // C.LWSP
                 if (!rd) return 0;
                 uint32_t u = bits(c, 12, 12) << 5 | bits(c, 6, 4) << 2 | bits(c, 3, 2) << 6;
@@ -307,6 +339,16 @@ inline uint32_t expand(uint32_t c) {
             case 6: {  // C.SWSP
                 uint32_t u = bits(c, 12, 9) << 2 | bits(c, 8, 7) << 6;
                 return S(0x23, 2, 2, rs2, (int32_t)u);
+            }
+            case 3: {  // C.LDSP (RV64)
+                if (!rv64 || !rd) return 0;
+                uint32_t u = bits(c, 12, 12) << 5 | bits(c, 6, 5) << 3 | bits(c, 4, 2) << 6;
+                return I(0x03, rd, 3, 2, (int32_t)u);
+            }
+            case 7: {  // C.SDSP (RV64)
+                if (!rv64) return 0;
+                uint32_t u = bits(c, 12, 10) << 3 | bits(c, 9, 7) << 6;
+                return S(0x23, 3, 2, rs2, (int32_t)u);
             }
             default: return 0;
         }

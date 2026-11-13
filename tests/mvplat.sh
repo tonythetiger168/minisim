@@ -47,6 +47,18 @@ for t in 1 3; do
 done
 cmp -s bench1.out bench3.out && ok "bench: the same on 1 and 3 threads" || bad "bench depends on the thread count"
 
+# RV64: the same programs built as 64-bit ELF files run on 64-bit harts.
+"$MVPLAT" "$E/hello64.elf" -q > hello64.out 2>&1; rc=$?
+expect "RV64: hello" 0 hello64.out "hello from mvplat"
+"$MVPLAT" "$E/irq64.elf" -input abc -q > irq64.out 2>&1; rc=$?
+expect "RV64: timer, software and external interrupts" 0 irq64.out "timer ticks 5, software 1, received 'abc'"
+for t in 1 4; do
+  "$MVPLAT" "$E/smp64.elf" -harts 4 -threads $t -q -trace smp64_$t.log > smp64_$t.out 2>&1; rc=$?
+  expect "RV64: 4 harts on $t thread(s)" 0 smp64_$t.out "harts 4 atomic 8000 locked 8000"
+done
+cmp -s smp64_1.log smp64_4.log && ok "RV64: the same run on 1 and 4 threads" || bad "RV64: the run depends on the thread count"
+head -1 smp64_1.log | grep -q "^core   0: 3 0x0000000080000000 (0x" && ok "RV64: 64-bit commit log" || { bad "RV64 -trace"; head -3 smp64_1.log; }
+
 "$MVPLAT" "$E/irq.elf" -input abc -q -max-cycles 20000 > part1.out 2>&1; rc=$?
 expect "-max-cycles stops with exit code 4" 4 part1.out "stopped at cycle 20000"
 
