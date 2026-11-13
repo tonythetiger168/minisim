@@ -15,7 +15,7 @@
 //   L003  a non-blocking assignment in an always_comb.
 //   L004  one variable or net is assigned by more than one process.
 //   CDC001..CDC005, RDC001..RDC004  clock- and reset-domain crossings (cdc.hpp).
-//   UPF001..UPF007  with -upf: power intent checks (upf.hpp check()).
+//   UPF001..UPF012  with -upf: power intent checks (upf.hpp check()).
 #include "upf_hdl.hpp"
 #include <unistd.h>
 
