@@ -970,6 +970,8 @@ struct Lowerer {
     int sigFind(const slang::ast::Symbol* sym) const {
         if (auto ov = symOverride.find(sym); ov != symOverride.end()) return ov->second;
         if (cgItemSig >= 0 && sym->kind == slang::ast::SymbolKind::Iterator && sym->name == "item") return cgItemSig;
+        if (!cgIterSigs.empty() && sym->kind == slang::ast::SymbolKind::Iterator)   // a cross with filter's coverpoint (19.6.1.2)
+            if (auto it = cgIterSigs.find(std::string(sym->name)); it != cgIterSigs.end()) return it->second;
         if (auto rf = refFormals().find(sym); rf != refFormals().end())
             return rf->second.kind == 0 ? indThrough(refSlot(sym)) : -1;
         if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
