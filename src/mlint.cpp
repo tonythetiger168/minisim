@@ -28,6 +28,7 @@
 #include "cpu.hpp"
 #include "lintir.hpp"
 #include "lintrules.hpp"
+#include "lintformal.hpp"
 #include "lintsrc.hpp"
 #ifdef MINISIM_TIDY
 #include "linttidy.hpp"
@@ -470,6 +471,14 @@ int main(int argc, char** argv) {
         cdc::check(*fe.comp, rep, cdcOpt);
     }
     lap("clock and reset crossings");
+    // Formal-assisted checks (lintformal.hpp).
+    {
+        lintformal::Options fo;
+        fo.maxBits = (unsigned)std::clamp(std::atoi(cfg.param("formal.max_bits", "16").c_str()), 1, 30);
+        fo.maxRegBits = (unsigned)std::clamp(std::atoi(cfg.param("formal.reg_bits", "8").c_str()), 1, 12);
+        lintformal::run(*fe.comp, rep, fo, threads);
+    }
+    lap("formal-assisted checks");
     // The source text and the syntax trees (lintsrc.hpp).
     lintsrc::run(*fe.comp, rep, params, threads, [&](std::string_view f) { return !pkgFile.empty() && f == pkgFile; });
     lap("text and syntax rules");

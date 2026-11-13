@@ -243,6 +243,47 @@ warning, which mlint already prints, and its always-comb, case-missing-default,
 generate-label and name-style rules are `SYN`, `CASE`, `STY` and `NAME`
 rules above.
 
+### Formal-assisted checks (`formal`)
+
+These rules answer questions about the values the logic can take, and only
+report what they prove. Each question is a few conditions over a few
+signals: the signals are enumerated over every value they can hold and each
+combination is evaluated by slang's own expression evaluator, so the
+results follow the language exactly.
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `FML001` | warning | on | An `if` condition or `case` item that can never be true where it stands: the enclosing conditions or the earlier branches rule it out (dead code) |
+| `FML002` | warning | on | An index or indexed part select (`a[i]`, `a[i +: 4]`) that can fall outside the array or vector on a path that reaches it; the message gives one such value and the signal values that produce it |
+| `FML003` | warning | on | A register that never leaves its reset value: no assignment after reset can change it |
+
+What makes the answers precise:
+
+- A net with a single continuous assignment is replaced by its driver, so
+  the free signals are the inputs and registers of the cone
+  (`assign idx = sel; ... mem[idx]` is checked against `sel`).
+- A register of up to `formal.reg_bits` bits (default 8) with a reset gets
+  the set of values it can reach from reset, by a fixed point over its
+  next-state assignments. A counter that wraps at 5 is known to stay below
+  6, so `mem[cnt]` on a 6-entry memory is not reported. The fixed point runs
+  on all threads.
+- A signal assigned again in the same block (a blocking assignment, a loop
+  body) drops the conditions that read it, so a stale condition never
+  proves anything.
+
+What they leave alone, by design:
+
+- A question that needs more than `formal.max_bits` free bits (default 16)
+  is not answered.
+- Code whose outcome a parameter decides (a condition, driver or register
+  that reads a parameter, or a driver inside a generate block) is not
+  reported: it is written for one configuration and is dead in another.
+- `else` and `default` branches that can never be taken are defensive code
+  and are not reported.
+- Values are two-state: X and Z are not enumerated. Register values are
+  those reachable after reset. Initial and final blocks, and blocks that
+  wait inside their body, are not checked.
+
 ### State machines (`fsm`)
 
 Found by the extractor FSM coverage uses (`msim -cov`), so lint and coverage
@@ -354,6 +395,8 @@ Severities: an `error` finding makes mlint exit 1; a `warning` does with
 | `name.interface` | `_if$` | `NAME015` |
 | `name.constraint` | `_c$` | `NAME016` |
 | `fmt.line_length` | `100` | `FMT001` |
+| `formal.max_bits` | `16` | `FML001`..`FML003`: free bits one question may enumerate |
+| `formal.reg_bits` | `8` | widest register that gets a reachable-value set |
 | `tb.modules` | empty | module names (globs) to treat as testbench code |
 
 Patterns are regular expressions (ECMAScript), matched anywhere in the name

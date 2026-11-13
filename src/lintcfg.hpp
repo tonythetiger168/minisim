@@ -270,6 +270,18 @@ inline const std::vector<RuleInfo>& table() {
         {"SUS003", "suspicious", Sev::Info, false, "$psprintf, $random, $srandom or a $dist_ function",
          "Verible rule invalid-system-task-function."},
         {"W009", "width", Sev::Info, false, "a sized binary literal with fewer digits than its width (8'b101)", "Verible rule undersized-binary-literal."},
+        // ------------------------------------------------------------------ formal
+        // lintformal.hpp: answered by enumerating the values the logic can take.
+        {"FML001", "formal", Sev::Warning, true, "an if condition or case item that can never be true where it stands",
+         "Dead code: the enclosing conditions or the earlier branches rule the branch out, for every value of the "
+         "signals involved. Proved by enumeration up to formal.max_bits free bits; else and default branches are "
+         "not reported (defensive code)."},
+        {"FML002", "formal", Sev::Warning, true, "an index or part select that can fall outside its array or vector",
+         "Some value the index can take on a path that reaches the select is outside the declared range: the read "
+         "gives X (or the default) and the write is lost. The message gives one such value."},
+        {"FML003", "formal", Sev::Warning, true, "a register that never leaves its reset value",
+         "Every assignment after reset gives it the value it already has: a constant, so the logic it feeds is "
+         "fixed too."},
         // --------------------------------------------------------------------- fsm
         {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
          "The state is named or tested, but the machine can never be in it: dead logic, or a transition that was forgotten."},

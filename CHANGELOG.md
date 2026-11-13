@@ -1112,6 +1112,12 @@ Spec references are IEEE 1800-2023 clauses.
   (`void'(x.randomize())`), `SUS003` (`$psprintf`, `$random`, `$dist_*`),
   `STY010`..`STY012` (string line continuations, a semicolon after a UVM
   macro, `disable` of something other than an enclosing block).
+- `mlint` formal-assisted checks (`FML001`..`FML003`, `src/lintformal.hpp`):
+  dead `if`/`case` branches, indexes and part selects that can fall out of
+  range, and registers that never leave their reset value, each proved by
+  enumerating the values of the signals involved through single-driver nets
+  and the reachable values of small registers. Multithreaded; settings
+  `formal.max_bits` and `formal.reg_bits`.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar
