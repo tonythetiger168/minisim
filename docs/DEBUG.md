@@ -440,7 +440,7 @@ written instead, and msim says so once:
 | Tasks | What msim does |
 |---|---|
 | `$fsdbDumpfile`, `$vcdplusfile`, `$shm_open`, `$fsdbAutoSwitchDumpfile`, `$recordfile` | name the file (`.fst`); without one, `novas.fst`, `vcdplus.fst` or `waves.fst` |
-| `$fsdbDumpvars`, `$fsdbDumpvarsES`, `$fsdbDumpSingle`, `$vcdpluson`, `$shm_probe`, `$recordvars` | as `$dumpvars`: a depth, instances or signals (by name or as strings, `"tb.dut"`); `+fsdbfile+NAME` names the file, `+all` and `+mda` add memories, `+sva` and `+power` add assertions and power states (below), other `+` options are accepted |
+| `$fsdbDumpvars`, `$fsdbDumpvarsES`, `$fsdbDumpSingle`, `$vcdpluson`, `$shm_probe`, `$recordvars` | as `$dumpvars`: a depth, instances or signals (by name or as strings, `"tb.dut"`); `+fsdbfile+NAME` names the file, `+all` and `+mda` add memories, `+sva` and `+power` add assertions and power states (`-vcd-sva`, `-vcd-power` above), other `+` options are accepted |
 | `$fsdbDumpMDA`, `$fsdbDumpMem`, `$vcdplusmemon` | memories too, as `-vcd-arrays` |
 | `$fsdbDumpon` / `off`, `$vcdpluson` / `off`, `$recordon` / `off` | as `$dumpon` / `$dumpoff` |
 | `$fsdbDumpflush`, `$vcdplusflush` | as `$dumpflush` |

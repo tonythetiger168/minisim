@@ -141,6 +141,7 @@ struct State {
     std::map<std::pair<const ProcCtl*, size_t>, Obj*> frameObjs;      // live frames with a handle
     std::unordered_set<const Obj*> softObjs;   // constraint items that are soft (vpiSoft, 37.31)
     std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
+    std::vector<Cb*> interCbs;            // cbEnterInteractive, cbExitInteractive, cbInteractiveScopeChange (38.36.3)
     std::vector<Cb*> featCbs;             // save, restart and reset callbacks (38.36.3)
     std::map<int, std::vector<Cb*>> sigCbs;   // cbSignal, by signal number (38.36.3)
     bool resetDue = false;                // vpi_control(vpiReset) in a calltf: on its return (38.6)
@@ -1344,6 +1345,24 @@ inline int ctlReason(int ctl, bool sys) {
         default: return 0;
     }
 }
+// cbEnterInteractive / cbExitInteractive (38.36.3): msim -i starts or
+// stops reading commands (at the start, at a stop, when a run or step goes
+// on, when the commands end); cbInteractiveScopeChange: its scope command
+// changed the scope, obj the new scope.
+inline void interactiveCb(int reason, const std::string& scope) {
+    auto& s = st();
+    if (!s.active || s.interCbs.empty()) return;
+    auto list = s.interCbs;   // a callback may register or remove others
+    for (Cb* c : list) {
+        if (!c->live || c->d.reason != reason) continue;
+        s_cb_data d = c->d;
+        s_vpi_time t{vpiSimTime, (PLI_UINT32)(S.now >> 32), (PLI_UINT32)S.now, (double)S.now};
+        d.time = &t;
+        d.value = nullptr;
+        d.obj = reason == cbInteractiveScopeChange ? vpi_handle_by_name((PLI_BYTE8*)scope.c_str(), nullptr) : nullptr;
+        d.cb_rtn(&d);
+    }
+}
 inline void fireSys(int reason) {
     auto list = st().assertSys;   // a callback may register or remove others
     for (Cb* c : list) {
@@ -2199,6 +2218,9 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             if (d->reason == cbError) g_errHook = vpi::onRunError;
             break;
         case cbEndOfCompile: s.endCompile.push_back(c); break;
+        case cbEnterInteractive:
+        case cbExitInteractive:
+        case cbInteractiveScopeChange: s.interCbs.push_back(c); break;   // 38.36.3: msim -i
         case cbUnresolvedSystf: s.unresolved.push_back(c); break;   // runs before elaboration (declare)
         case cbStartOfSimulation: s.start.push_back(c); break;
         case cbEndOfSimulation: s.endSim.push_back(c); break;
@@ -3608,10 +3630,45 @@ inline bool imDelayCount(p_vpi_delay d, const char* who) {
     }
     return true;
 }
+// The driver of the load's net that the path's source port reaches, when
+// the net has several sources (its delay is then per source, as an SDF
+// INTERCONNECT, 32.4.4); -1 for a net with one source.
+inline int imSourceDriver(const Obj* o, int* netOut) {
+    const Obj* src = o->parent;
+    const Symbol* is = src && src->sym ? src->sym->as<PortSymbol>().internalSymbol : nullptr;
+    const Obj* sv = is && ValueSymbol::isKind(is->kind) ? valueObj(is) : nullptr;
+    int net = sdfa::loadNet(o->sig);
+    if (netOut) *netOut = net;
+    if (!sv || sv->sig < 0 || net < 0 || S.sigs[(size_t)net].drv.size() < 2) return -1;
+    return sdfa::sourceDriver(sv->sig, net);
+}
+// The delay of an inter-module path: from its source alone when the load
+// has per-source delays, else the load's delay from every source. `make`
+// creates it (per source when the net has several).
+inline Delay12* imDelay(const Obj* o, bool make) {
+    int net = -1;
+    int drv = imSourceDriver(o, &net);
+    auto sh = S.shadowOf.find(o->sig);
+    if (drv >= 0 && (make || sh != S.shadowOf.end())) {
+        Sim::Shadow* x;
+        if (sh == S.shadowOf.end()) {
+            x = &S.addShadow(o->sig, net);
+            auto ic = S.icDelay.find(o->sig);   // a delay from every source set before
+            if (ic != S.icDelay.end()) { x->all = ic->second; S.icDelay.erase(ic); }
+        } else x = &sh->second;
+        auto f = x->from.find(drv);
+        if (f != x->from.end()) return &f->second;
+        return make ? &x->from.try_emplace(drv, x->all).first->second : &x->all;
+    }
+    if (sh != S.shadowOf.end()) return &sh->second.all;
+    auto it = S.icDelay.find(o->sig);
+    if (it != S.icDelay.end()) return &it->second;
+    return make ? &S.icDelay[o->sig] : nullptr;
+}
 inline void imGetDelays(const Obj* o, p_vpi_delay d) {
     Delay12 z;
-    auto it = S.icDelay.find(o->sig);
-    const Delay12& v = it == S.icDelay.end() ? z : it->second;
+    const Delay12* p = imDelay(o, false);
+    const Delay12& v = p ? *p : z;
     int per = (d->mtm_flag ? 3 : 1) * (d->pulsere_flag ? 3 : 1);
     for (int k = 0; k < d->no_of_delays; k++) {
         uint64_t vals[3] = {v.d[k], v.rj[k], v.er[k]};
@@ -3639,7 +3696,7 @@ inline void imPutDelays(const Obj* o, p_vpi_delay d) {
         ev.push_back(d->pulsere_flag ? at(2) : x * (uint64_t)std::max(pulseOpts().errorPct, pulseOpts().rejectPct) / 100);
     }
     auto D = expand12(dv), R = expand12(rv), E = expand12(ev);
-    Delay12& v = S.icDelay[o->sig];
+    Delay12& v = *imDelay(o, true);
     for (int k = 0; k < 12; k++) {
         v.d[k] = d->append_flag ? v.d[k] + D[(size_t)k] : D[(size_t)k];
         v.rj[k] = d->append_flag ? v.rj[k] + R[(size_t)k] : R[(size_t)k];
