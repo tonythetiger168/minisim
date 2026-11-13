@@ -166,6 +166,12 @@ inline void setLimb(Val& a, int i, uint64_t v, uint64_t x, uint64_t z) {
     a.hi[i - 1] = Limb{v, x, z};
 }
 // Enforce the make() invariant on every limb and drop limbs past w.
+// x and z bits made 0: a 4-state value converted to a 2-state type (6.11.2).
+inline Val v_to_2state(Val a) {
+    a.x = 0; a.z = 0;
+    for (auto& l : a.hi) { l.v &= ~l.x; l.x = 0; l.z = 0; }
+    return a;
+}
 inline Val finish(Val a) {
     if (a.w <= 64) {
         uint64_t m = mask(a.w);
@@ -1468,7 +1474,8 @@ enum SysFnId : int {
     // certainly happened.
     SF_XPROP_EDGE,
     SF_ANNEXD,           // Annex D optional tasks and functions: lo is the AnnexOp, run by g_annexHook
-    SF_VALUE_WIDTH       // the width in bits of kid0's value, which may be known only at run time (a stream)
+    SF_VALUE_WIDTH,      // the width in bits of kid0's value, which may be known only at run time (a stream)
+    SF_TO_2STATE         // kid0 with every x and z bit made 0: a 4-state value converted to a 2-state type (6.11.2)
 };
 // Annex D (annexd.inc): $countdrivers (kid0 the net signal, kid1 the bit;
 // AD_COUNT_GET k reads count k of the last call), $log / $nolog, $key /
@@ -2294,6 +2301,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             return sint(0);
         }
         case SF_VALUE_WIDTH: return mk((uint64_t)a[0].w, 32);
+        case SF_TO_2STATE: return v_to_2state(a[0]);
         case SF_BITS2SR: { uint32_t b = (uint32_t)u64(a[0]); float f; memcpy(&f, &b, 4); return mkreal(f); }
         case SF_TIMEFORMAT: {
             TimeFmt& t = timeFmt();
