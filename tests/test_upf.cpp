@@ -316,6 +316,15 @@ int main() {
         assert(t("vdd == FULL_ON") == 1 && t("vdd == {FULL_ON 0.9}") == 1 && t("vdd == {FULL_ON 1.0}") == 0);
         assert(t("vdd != OFF") == 1);
         assert(t("!(a & b) | b") == 1 && t("a ^ a") == 0);
+        // 5.4 Table 6: relational operators, real literals and supply voltages
+        // (5.13: in volts); precedence logical < bit-wise < relational < negation
+        assert(t("vdd.voltage > 0.8") == 1 && t("vdd.voltage >= 0.9") == 1 && t("vdd.voltage < 0.85") == 0);
+        assert(t("vdd.voltage <= 0.9 && vdd.state == FULL_ON") == 1 && t("vdd.state != FULL_ON") == 0);
+        assert(t("vdd > 0.5") == 1 && t("2 < 3") == 1 && t("3 <= 2") == 0 && t("x < 1") == 2);
+        assert(t("a == 1 | b == 1") == 1);        // relational before bit-wise: (a==1) | (b==1)
+        assert(t("!b == 1") == 1);                 // negation before relational: (!b) == 1
+        assert(t("b & a || a") == 1 && t("a || a & b") == 1 && t("b && a | a") == 0);   // bit-wise before logical
+        assert(t("b < a && a > b") == 1);
     }
     // Model: scopes, handles, switches, strategies, power states, PSTs
     {
