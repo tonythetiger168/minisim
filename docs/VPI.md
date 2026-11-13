@@ -233,10 +233,15 @@ it and the input (or inout) ports of child instances it connects to.
 the hierarchy (the simulated net) and give the continuous assignments of
 every part of it, plus ports whose connection is only part of an
 expression. `vpiPortInst` gives the ports of the instances the signal
-connects to. Procedural assignments are neither drivers nor loads, and the
-signal's own module ports are not local drivers or loads. These rules were
-written from memory of the standard and still need checking against the
-text.
+connects to. Gate, switch and UDP terminals count too: an output terminal
+drives the net it connects to, an input terminal loads it (37.46). The
+ports of the signal's own module are local drivers (input, inout) and
+local loads (output, inout) of it (37.16 detail 17). On a bit or part
+select handle, only the drivers and loads that touch those bits count
+(detail 18); a select with a non-constant index counts as touching every
+bit. Procedural assignments are neither drivers nor loads. Checked against
+the 1800-2023 text of 37.16, 37.21 and 37.46; forces and procedural
+continuous assignments (`assign` / `force` statements) are not listed yet.
 
 **Processes, statements and expressions (37.32 to 37.51).**
 `vpi_iterate(vpiProcess, module)` gives the `initial`, `always` (with
@@ -399,7 +404,7 @@ so `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`,
 The non-static property
 declarations of a class definition, containers of structs,
 classes or containers, the value of a non-constant expression, drivers and
-loads of a bit or part of a signal and of primitive terminals,
+loads that are force or procedural continuous assign statements,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
