@@ -182,6 +182,7 @@
 #include "interactive.inc"
 #include "objview.inc"
 #include "xrun.inc"
+#include "vhdl/front.hpp"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
 
@@ -2459,6 +2460,8 @@ int main(int argc, char** argv) {
     bool powerTopSet = false, upfVerbose = false;
     std::string upfCov;   // -upf_cov: the low-power coverage report
     std::vector<std::string> svLibs, cFiles, soFiles;
+    std::vector<std::string> vhdlFiles;
+    std::string vhdlSv;
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
     std::string uvmHome;    // -uvm / -uvmhome: a uvm-core checkout
@@ -2714,6 +2717,10 @@ int main(int argc, char** argv) {
         if (a == "-LDFLAGS") { ldflags += " " + next("flags"); continue; }
         if (a.size() && a[0] != '-' && hasExt(a, {".c", ".cc", ".cpp", ".cxx", ".C", ".o", ".a"})) { cFiles.push_back(a); continue; }
         if (a.size() && a[0] != '-' && hasExt(a, {".so"})) { soFiles.push_back(a); continue; }
+        // VHDL sources (docs/VHDL.md): translated for the same engine after slang reads the SV files
+        if (a.size() && a[0] != '-' && vhdl::isVhdlFile(a)) { vhdlFiles.push_back(a); continue; }
+        if (a == "-vhdl-sv") { vhdlSv = next("a file name"); continue; }
+        if (a == "-v93" || a == "-v2008" || a == "-vhdl2008" || a == "-v200x" || a == "-vhdl93" || a == "-vhdl87") continue;
         fwd.push_back(a);
     }
     if (uvmWanted) {   // -uvm: the package first, then its C code (regex, command line, HDL backdoor)
@@ -2753,6 +2760,17 @@ int main(int argc, char** argv) {
         fwd.insert(fwd.begin() + 1, upfPkgFile);
     }
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{upfPkgFile};
+    // VHDL only: slang wants at least one SystemVerilog source; an empty one stands in
+    std::string vhdlStub;
+    if (!vhdlFiles.empty()) {
+        char tmpl[] = "/tmp/msim_vhdlXXXXXX.sv";
+        int fd = mkstemps(tmpl, 3);
+        if (fd < 0) { std::cerr << "msim: cannot write a temporary file\n"; return 1; }
+        close(fd);
+        vhdlStub = tmpl;
+        fwd.push_back(vhdlStub);
+    }
+    struct RmStub { std::string f; ~RmStub() { if (!f.empty()) std::remove(f.c_str()); } } rmStub{vhdlStub};
     // The language is IEEE 1800-2023 unless --std says otherwise (slang's
     // default is 1800-2017, which rejects e.g. weak_reference, 8.30).
     if (!saifForward.empty() && saifPath.empty()) saifPath = "dump.saif";   // -saif_forward implies -saif
@@ -2826,6 +2844,10 @@ int main(int argc, char** argv) {
         hideMsgIf() = [&pc](slang::SourceLocation l) { return pc.hidden(l); };
     }
     if (!driver.parseAllSources()) return 1;
+    if (!vhdlFiles.empty()) {
+        vhdl::Translator vtr;
+        if (!vhdl::addVhdl(driver, vhdlFiles, vhdlSv, "msim", vtr)) return 1;
+    }
     // A design element with no `timescale or timeunit, in a design where
     // others have one, gets 1ns/1ps instead of an error (--timescale sets
     // another default). A design with no timescale at all keeps 1ns/1ns.

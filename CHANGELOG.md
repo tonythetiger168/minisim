@@ -33,6 +33,14 @@ Spec references are IEEE 1800-2023 clauses.
   element `vpiIndex` and its array. Array elements are now named `u[2]`, and
   `vpi_handle_by_name` picks the right element of a descending array
   (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
+- msim simulates VHDL and mixed VHDL/SystemVerilog designs (`docs/VHDL.md`):
+  `.vhd`/`.vhdl` files are translated in memory into SystemVerilog for the
+  same engine, so SV can instantiate VHDL entities and VHDL can instantiate
+  SV modules. Covers entities, packages, processes, generate, components,
+  numeric_std, std_logic_1164, textio, math_real, std.env and common
+  VHDL-2008 additions; results are checked against GHDL goldens
+  (`tests/vhdl`). `msim -xrun` passes VHDL files on; `vhdl2sv` and
+  `msim -vhdl-sv` print the translation.
 - `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
   flop, the nets and logic between it and the reader (a glitch source for
   CDC003), the synchronizer stages, and the qualifier of an enable-qualified

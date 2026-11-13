@@ -64,7 +64,7 @@ are always on in msim; coverage files and snapshot names have no counterpart.
 
 | xrun / irun | why |
 |---|---|
-| `.vhd`, `.vhdl`, `-v93` | VHDL is not supported yet |
+| `.vhd`, `.vhdl`, `-v93`, `-v200x` | VHDL files go to msim's VHDL front end ([VHDL.md](VHDL.md)); the version options are accepted |
 | `-R`, `-r snapshot` | msim keeps no snapshot between runs; give the sources again |
 | `-gui` | no GUI; the run goes on, open the waveform with mdebug (docs/DEBUG.md) |
 | Tcl `database`, `simvision`, `dumptcf`, `assertion` in `-input` | ignored with a note; `probe` writes a VCD (`dump`), not an SHM database |
