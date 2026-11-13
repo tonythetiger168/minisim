@@ -1,0 +1,30 @@
+# Power intent for isomodel.sv: isolation cells simulated by their
+# functional model (use_interface_cell -force_function, 6.62).
+create_supply_port VDD
+create_supply_port VSS
+create_supply_port VAON
+create_supply_net VDD
+create_supply_net VSS
+create_supply_net VAON
+connect_supply_net VDD -ports VDD
+connect_supply_net VSS -ports VSS
+connect_supply_net VAON -ports VAON
+create_supply_set SS_AON -function {power VAON} -function {ground VSS}
+
+create_power_domain PD_A -elements {u_a}
+create_supply_net VA
+create_power_switch SW_A -output_supply_port {o VA} -input_supply_port {i VDD} -control_port {c en_a} -on_state {on i {c}}
+set_domain_supply_net PD_A -primary_power_net VA -primary_ground_net VSS
+
+# Tcl namespaces, upvar and regsub in power intent
+namespace eval lp {
+    variable iso_sig iso
+    proc sig {} { variable iso_sig; return $iso_sig }
+    proc name_of {dom var} { upvar $var n; regsub {^PD_} $dom ISO_ n }
+}
+lp::name_of PD_A iso_name
+set_isolation $iso_name -domain PD_A -applies_to outputs -isolation_supply SS_AON -clamp_value 0 \
+    -isolation_signal [lp::sig] -isolation_sense high
+use_interface_cell ISO_CELL -strategy ISO_A -domain PD_A -lib_cells {iso_and iso_and_x2} \
+    -force_function -exclude_elements {u_a/z} \
+    -port_map {{EN ~isolation_signal} {VDD isolation_supply.power}}
