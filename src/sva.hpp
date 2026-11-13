@@ -36,6 +36,11 @@ struct AssertInfo {
     bool vacOn = true;                   // VacuousOff clears it, PassOn sets it
     bool hidden = false;                 // tracks a sequence's end points (16.13.6): not an assertion
     bool prot = false;                   // declared in protected code (34): kept out of the coverage database
+    // Declared in protected code a tool's own messages may not describe
+    // (IEEE 1735 9.2.1). Unlike prot, which follows the coverage right, this
+    // follows visibility: a tool that names assertions in its output, as
+    // mformal names properties, shows redactedName() instead.
+    bool msgProt = false;
     // VPI per-attempt control (39.5.2), by attempt start time: the attempts
     // whose clock steps are reported, and the attempts to discard.
     std::set<uint64_t> stepAt, killAt;
@@ -56,6 +61,12 @@ struct AssertInfo {
     // Statistics (16.3: a cover counts evaluations and successes).
     uint64_t evals = 0, passes = 0, fails = 0;
 };
+// What a tool may call this assertion in its own output: its name, or, for
+// one declared in protected code the rights keep closed, the instance it is
+// in and a placeholder. The same text the kernel's own failure message uses.
+inline std::string shownName(const AssertInfo& a) {
+    return a.msgProt ? a.inst + ".<protected assertion>" : a.name;
+}
 inline std::vector<AssertInfo>& asserts() { static std::vector<AssertInfo> v; return v; }
 
 // What happens to an assertion, for the VPI assertion callbacks (39.4).
