@@ -410,6 +410,7 @@ SampleClock& gclkSampler() {
 // Atom e of an assertion that uses future functions, read one global clock
 // tick late: each sampled value is replaced by its copy from the tick before
 // (a $past stage one further back), and a future value by the value now.
+bool futureProc = false;   // shifting a procedural assertion (16.14.6)
 E futureShift(const E& e) {
     if (!e || e->op == Op::Const) return e;
     if (e->op == Op::Future) return e->kids[0];
@@ -425,6 +426,9 @@ E futureShift(const E& e) {
         // A local variable is assigned from shifted values too (16.10), so
         // it is read as it is.
         if (svaLocalSigs().count(e->sig) && !e->at) return e;
+        // In a procedure, an automatic variable is captured per instance when
+        // it is queued (16.14.6.1): a constant of the attempt.
+        if (futureProc && !e->at && (isRel(e->sig) || automaticSigs().count(e->sig))) return e;
         if (e->at || isRel(e->sig) || automaticSigs().count(e->sig) || svaLiveSigs().count(e->sig))
             unsupported("a future sampled value function with automatic, local or class values (16.9.4)");
         SampleClock& g = gclkSampler();
@@ -1253,14 +1257,17 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         if (b.matchItems)   // 16.9.4: not allowed at all (local formals and initializers are)
             throw std::runtime_error(whereStr() + "lower: a global clocking future sampled value function shall not be used "
                                                   "in an assertion with sequence match items (16.9.4)");
-        if (!c.more.empty() || !staticAssert)
-            unsupported("a future sampled value function with several clocks or in a procedure (16.9.4)");
+        if (!c.more.empty())
+            unsupported("a future sampled value function with several clocks (16.9.4)");
+        c.future = !staticAssert;
+        futureProc = !staticAssert;
         for (auto& act : c.acts)
             for (auto& item : act) {
                 item.rhs = futureShift(item.rhs);
             }
         for (auto& at : c.atoms) at = futureShift(at);
         if (c.clkIff) c.clkIff = futureShift(c.clkIff);
+        futureProc = false;
         // No attempt at the first tick: nothing was sampled before it.
         SampleClock::Line ln;
         ln.src = konst(mk(1, 1));

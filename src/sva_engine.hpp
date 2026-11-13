@@ -705,6 +705,10 @@ struct ConcAssert {
     struct Pending { std::shared_ptr<void> ctl; uint64_t epoch; Caps caps; std::shared_ptr<void> wait = nullptr; };
     std::vector<Pending> pending;
     std::vector<Pending> matured;
+    // A procedural assertion with future functions (16.9.4) is checked one
+    // global clock tick late: its instances start at the tick after.
+    bool future = false;
+    std::vector<Attempt> delayed;
     bool expect = false;   // an expect statement (16.17)
     // Local variables (16.10): each is a hidden signal, set from an
     // environment before the atoms that read it are evaluated. acts[i] is a
