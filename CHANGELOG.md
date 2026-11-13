@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI class definitions (37.31): `vpiVariables` of a class defn gives its
+  automatic properties too (before only static ones), as declarations
+  with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);
+  `vpiNamedEvent`, `vpiParameter` (with `vpiLocalParam`), `vpiTypedef` and
+  `vpiInternalScope` iterate its events, parameters, typedefs and methods.
+  `tests/spec/37.31-vpi-class-defn.sv`.
 - VPI containers of structs, classes and containers (37.18): an element of
   a queue, dynamic or associative array of unpacked structs is a
   `vpiStructVar` whose members read and write the element; one of class
