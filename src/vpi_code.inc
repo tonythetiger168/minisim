@@ -693,11 +693,76 @@ inline bool codeGetStr(int prop, const Obj* o, std::string& r, bool& have) {
     }
     return prop != vpiType;
 }
-// The value of a constant (or constant-valued) expression.
+// A value as a slang constant of type t: integral (4-state bits kept),
+// real, shortreal or string.
+inline bool valConst(const Val& v, const Type& t0, slang::ConstantValue& cv) {
+    const Type& t = t0.getCanonicalType();
+    if (t.isFloating()) {
+        double d;
+        uint64_t b = v.v;
+        std::memcpy(&d, &b, 8);
+        if (t.as<FloatingType>().floatKind == FloatingType::ShortReal) cv = slang::ConstantValue(slang::shortreal_t((float)d));
+        else cv = slang::ConstantValue(slang::real_t(d));
+        return true;
+    }
+    if (t.isString()) {
+        Val s = v;
+        s.str = true;
+        cv = slang::ConstantValue(v_str(s));
+        return true;
+    }
+    if (!t.isIntegral()) return false;
+    int w = (int)t.getBitWidth();
+    if (w <= 0) return false;
+    std::string lit = std::to_string(w) + (t.isSigned() ? "'sb" : "'b");
+    for (int i = w - 1; i >= 0; i--) {
+        int b = bitAt(v, i);
+        lit += b == 0 ? '0' : b == 1 ? '1' : b == 3 ? 'z' : 'x';
+    }
+    cv = slang::SVInt::fromString(lit);
+    return true;
+}
+// The value an object has now as a slang constant: a variable or net, or a
+// one-dimensional fixed-size array of them.
+inline bool objConst(Obj* x, const Type& t0, slang::ConstantValue& cv) {
+    const Type& t = t0.getCanonicalType();
+    if (!x->arr) return valConst(readObj(x), t, cv);
+    if (t.kind != SymbolKind::FixedSizeUnpackedArrayType || !t.getArrayElementType()) return false;
+    const Type& et = t.getArrayElementType()->getCanonicalType();
+    if (et.isUnpackedArray()) return false;
+    slang::ConstantRange r = t.getFixedRange();
+    std::vector<slang::ConstantValue> el(r.width());
+    for (int32_t i = r.lower(); i <= r.upper(); i++) {
+        Obj* w = wordObj(x, i);
+        size_t k = (size_t)(r.left <= r.right ? i - r.left : r.left - i);   // slang keeps the leftmost element first
+        if (!w || !valConst(readObj(w), et, el[k])) return false;
+    }
+    cv = slang::ConstantValue(std::move(el));
+    return true;
+}
+// The value of an expression now (37.35, 38.15): slang evaluates it with
+// each variable or net it reads set to the value that variable has now.
+// Parameters and enum constants are constants; an expression that reads an
+// automatic variable, a class property or a hierarchical name has no value
+// here.
 inline bool codeValue(const Obj* o, Val& v) {
     if (o->kind != Obj::Expr) return false;
     const Expression& e = *static_cast<const Expression*>(o->node);
-    EvalContext ctx(ASTContext(st().comp->getRoot(), LookupLocation::max));
+    EvalContext ctx(ASTContext(st().comp->getRoot(), LookupLocation::max), EvalFlags::IsScript);
+    bool ok = true;
+    std::set<const ValueSymbol*> seen;
+    auto vis = slang::ast::makeVisitor([&](auto&, const NamedValueExpression& n) {
+        const ValueSymbol& s = n.symbol;
+        if (s.kind != SymbolKind::Net && s.kind != SymbolKind::Variable) return;
+        if (!seen.insert(&s).second) return;
+        if (s.kind == SymbolKind::Variable && s.as<VariableSymbol>().lifetime == VariableLifetime::Automatic) { ok = false; return; }
+        Obj* x = valueObj(&s);
+        slang::ConstantValue cv;
+        if (!x || !objConst(x, s.getType(), cv)) { ok = false; return; }
+        ctx.createLocal(&s, std::move(cv));
+    });
+    e.visit(vis);
+    if (!ok) return false;
     slang::ConstantValue cv = e.eval(ctx);
     return cv && constVal(cv, v);
 }
