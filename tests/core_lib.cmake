@@ -19,7 +19,8 @@ foreach(want lib/cmake/minisimCore/minisimCoreConfig.cmake
              lib/cmake/minisimCore/minisimCoreTargets.cmake
              include/minisim/lintir.hpp include/minisim/prog.hpp
              include/minisim/parallel.hpp include/minisim/lower.hpp
-             include/minisim/version.hpp)
+             include/minisim/version.hpp
+             include/minisim/vp/machine.hpp)
   if(NOT EXISTS ${prefix}/${want})
     message(FATAL_ERROR "the minisimCore package did not install ${want}")
   endif()
@@ -36,14 +37,19 @@ foreach(path ${ours})
   get_filename_component(name ${path} NAME)
   list(APPEND our_names ${name})
 endforeach()
-file(GLOB installed ${prefix}/include/minisim/*)
+file(GLOB_RECURSE installed ${prefix}/include/minisim/*)
 foreach(header ${installed})
   file(STRINGS ${header} includes REGEX "^[ \t]*#[ \t]*include[ \t]*\"")
+  get_filename_component(dir ${header} DIRECTORY)
   foreach(line ${includes})
     string(REGEX REPLACE "^.*#[ \t]*include[ \t]*\"([^\"]+)\".*$" "\\1" sibling "${line}")
     get_filename_component(name ${sibling} NAME)
     list(FIND our_names ${name} found)
-    if(NOT found EQUAL -1 AND NOT EXISTS ${prefix}/include/minisim/${name})
+    # A quoted name resolves beside the header that quotes it, and otherwise
+    # through the package's include directory, so a header in vp/ may quote
+    # either one of its own siblings or something at the top.
+    if(NOT found EQUAL -1 AND NOT EXISTS ${dir}/${name}
+       AND NOT EXISTS ${prefix}/include/minisim/${name})
       get_filename_component(from ${header} NAME)
       message(FATAL_ERROR
               "${from} is installed but includes \"${name}\", which the "
