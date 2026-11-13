@@ -428,9 +428,12 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             unsupported("a real coverpoint without bins: there are no automatic bins for reals (19.5.3)");
         cgWideW = 0;
         if (c.wide) {   // wider than 64 bits: explicit value bins only
-            for (const auto& b : c.bins)
-                if ((b.array && (!b.trans.empty() || b.wildcard)) || (b.wildcard && !b.trans.empty()) || b.with || b.setIdx >= 0 || b.dfltSeq)
-                    unsupported("with, set, wildcard transition or array bins with transitions or wildcards of a coverpoint wider than 64 bits");
+            for (const auto& b : c.bins) {
+                if (b.setIdx >= 0 || b.dfltSeq)
+                    unsupported("a set bin or default sequence bin of a coverpoint wider than 64 bits");
+                if (b.with && (b.allValues || b.wildcard))   // every value of the type: 2^w of them
+                    unsupported("a with bin over all values, or a wildcard with bin, of a coverpoint wider than 64 bits (19.5.1.1)");
+            }
         }
         if (auto it = cpByName.find(c.name); it != cpByName.end()) {   // replaces the base's (19.4.1)
             cpIdx[cp] = it->second;
