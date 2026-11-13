@@ -41,7 +41,6 @@ expect("${log}" "n=10 at 100\n")
 
 # msim -xrun with an -input Tcl script: run with units, value, exit; -nolog.
 run(0 ${MSIM} -xrun -f run.f -input run.tcl -nolog -linedebug)
-file(REMOVE ${D}/xrun.do)
 expect("${out}" "time 50: [^\n]*\ntb.n = 32'h5\ntime 70: [^\n]*\nquit at time 70\n")
 if(EXISTS ${D}/xrun.log)
   message(FATAL_ERROR "-nolog wrote xrun.log")

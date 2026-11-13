@@ -267,6 +267,16 @@ foreach(want
     message(FATAL_ERROR "-cdc-html page missing: ${want}\n${err}")
   endif()
 endforeach()
+if(NOT page MATCHES "\"qual\":\"cdc_clean.req_b_q\"")
+  message(FATAL_ERROR "-cdc-html page: no qualifier on the enable-qualified crossing")
+endif()
+# The schematic shows the logic between a source and its reader.
+execute_process(COMMAND ${MLINT} ${SRC}/tests/lint/cdc_bad.sv -top cdc_bad -only cdc -cdc-html cdc_bad.html
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+file(READ cdc_bad.html bad)
+if(NOT bad MATCHES "\"via\":\\[{\"n\":\"cdc_bad.glitchy\",\"g\":1}\\]")
+  message(FATAL_ERROR "-cdc-html page: no logic on the path of the CDC003 crossing\n${err}")
+endif()
 if(page MATCHES "(src|href)=\"?https?:|url\\(https?:|@import")
   message(FATAL_ERROR "-cdc-html page loads something from the network")
 endif()
