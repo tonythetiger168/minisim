@@ -1,6 +1,6 @@
 // msim -xprop: unique / priority if, casex, nested case, negedge, a for loop
 // with break, a while loop with break, a task call; constructs that are not
-// merged (disable of an outer block, a task with a nonblocking assignment)
+// merged (disable of an outer block, a task with an intra-assignment delay)
 // keep the standard behavior.
 //! args: -xprop
 module top;
@@ -8,7 +8,7 @@ module top;
   logic [7:0] req; logic [1:0] st; logic clk; logic [3:0] f1, f2, f3; int n;
   logic [3:0] m, f4, m2;
   task automatic bump(inout logic [3:0] x); x = x + 1; endtask
-  task automatic later(input logic [3:0] v); f4 <= v; endtask
+  task automatic later(input logic [3:0] v); f4 <= #1 v; endtask
   always_comb begin   // unique if
     unique if (a) y = 4'd1;
     else if (b) y = 4'd3;
@@ -68,7 +68,7 @@ module top;
       end
     end
   end
-  always @(posedge clk) if (b) later(4'h5);   // a task with <= is not merged
+  always @(posedge clk) if (b) later(4'h5);   // a task with <= #1 is not merged
   always @(negedge clk) begin   // negedge, and two blocks of one process
     if (a) f1 <= 4'hc; else f1 <= 4'h3;
     f2 <= f1;
