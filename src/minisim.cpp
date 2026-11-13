@@ -302,6 +302,7 @@ struct Wheel {
 };
 
 struct Sim {
+    uint64_t resumeN = 1;   // kernel resumes of a process so far (VPI cbEnterThread)
     vector<Sig> sigs;
     vector<vector<Waiter>> waiters;                  // dynamic sensitivity
     vector<Handle> lateBuf;                          // set(): woken always blocks, queued last
@@ -2799,6 +2800,7 @@ struct Sim {
                 if (!reactive.empty()) {                   // reactive (4.4.2.6)
                     Handle h = reactive.front(); reactive.pop_front();
                     region = R_REACTIVE;
+                    if (!h.done()) ++resumeN;   // VPI cbEnterThread
                     if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
                     else if (!h.done()) h.resume();
                     region = R_ACTIVE;
@@ -2991,6 +2993,7 @@ struct Sim {
             for (;;) {                                         // one time slot
                 if (!active.empty()) {                         // active
                     Handle h = active.front(); active.pop_front();
+                    if (!h.done()) ++resumeN;   // VPI cbEnterThread
                     if (prof::P().on) [[unlikely]] { if (!h.done()) profResume(h); }
                     else if (!h.done()) h.resume();
                 } else if (!seqq.empty()) {                    // clocked processes, one parallel batch

@@ -38,6 +38,12 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
   object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
   `vpiRefObj` has `vpiName` and `vpiFullName`.
+- VPI threads and frames (38.36.1): `vpi_handle(vpiThread / vpiFrame, NULL)`
+  in a calltf, thread objects (`vpiParent`, `vpiFrame`, child threads) and
+  frame objects (`vpiScope`, `vpiParent`, `vpiThread`, `vpiAutomatic`), both
+  with `vpiValid`, and the callbacks `cbStartOfThread`, `cbEndOfThread`,
+  `cbEnterThread`, `cbStartOfFrame` and `cbEndOfFrame`. The value of a
+  system task argument that is an automatic variable no longer crashes.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction

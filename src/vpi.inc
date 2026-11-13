@@ -41,7 +41,7 @@ struct Cb;
 struct Obj {
     enum Kind { Systf, Call, Module, Signal, Word, Bit, Arg, Param, Port, Iter, Callback, Event,
                 Scope, Typespec, Member, EnumConst, Const, Range, Modport, Assertion, Fsm, FsmState, SchedEvent,
-                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem } kind;
+                Process, ContAssign, Stmt, Expr, ExprStmt, CaseItem, Dyn, DynElem, ClassObj, ClassDefn, Extends, InterModPath, Tchk, TchkTerm, ModPath, PathTerm, Prim, PrimTerm, Constraint, ConstrItem, Thread, Frame } kind;
     int type = 0;                         // the vpi object type it reports
     int t05 = 0, t01 = 0;                 // what it reports instead to an IEEE 1364 (t05), 1364-1995 / 2001 (t01) application
     bool arr = false;                     // Signal: an unpacked array
@@ -63,6 +63,9 @@ struct Obj {
     bool sched = false;                   // SchedEvent: still scheduled (vpiScheduled)
     const void* node = nullptr;           // Stmt: slang Statement; Expr, ExprStmt: Expression; CaseItem: the item group
     Cb* cb = nullptr;                     // Callback
+    ProcCtl* thr = nullptr;               // Thread, Frame: the process (not used once gone)
+    size_t depth = 0;                     // Frame: the frames below it in its thread
+    bool gone = false;                    // Thread, Frame: it ended (vpiValid 0)
 };
 struct Cb {
     s_cb_data d{};
@@ -122,6 +125,9 @@ struct State {
     std::map<std::pair<uint32_t, uint32_t>, std::vector<Cb*>> stmtCbs;   // cbStmt: by source file id and line
     std::vector<Cb*> tchkCbs;             // cbTchkViolation (38.36.1)
     std::vector<Cb*> createCbs, sizeCbs;  // cbCreateObj, cbSizeChange (38.36.1)
+    std::vector<Cb*> thrCbs, frameCbs;    // thread and frame callbacks (38.36.1)
+    std::unordered_map<const ProcCtl*, Obj*> thrObjs;                 // live threads with a handle
+    std::map<std::pair<const ProcCtl*, size_t>, Obj*> frameObjs;      // live frames with a handle
     std::unordered_set<const Obj*> softObjs;   // constraint items that are soft (vpiSoft, 37.31)
     std::vector<Cb*> errCbs;              // cbError, cbPLIError (38.36.3)
     bool inErrCb = false;
@@ -161,6 +167,8 @@ inline void fireErrorCbs(int reason);
 inline void onTchk(int id);
 inline void onNewObj(int obj);
 inline void onSizeChange(int sig);
+inline void onThread(int what, ProcCtl& c);
+inline void onFrame(int what, ProcCtl& c, size_t depth, const Prog* callee);
 inline void error(int level, const std::string& msg) {
     auto& s = st();
     s.err = true;
@@ -665,7 +673,12 @@ inline Val readObj(const Obj* o) {
         return v_slice(v, o->off + o->w - 1, o->off);
     }
     if (o->sig < 0) return make(0, ~0ULL, std::max(1, o->w));
-    Val v = S.get(o->sig);
+    int sg = o->sig;
+    if (isRel(sg)) {   // an argument that is an automatic variable (13.3.2): in the caller's frame, while its calltf runs
+        if (!st().cur || !g_fr) return make(0, ~0ULL, std::max(1, o->w));
+        sg = R(sg);
+    }
+    Val v = S.get(sg);
     if (!o->real && !o->str && v.w != o->w) v = maskWidth(v, o->w);
     v.w = o->real || o->str ? 64 : o->w;
     if (o->str) { v = make(v.v, v.x, 64); v.str = true; }   // a string variable holds the string's id
@@ -1867,6 +1880,20 @@ vpiHandle vpi_register_cb(p_cb_data d) {
             s.sizeCbs.push_back(c);
             g_sizeHook = vpi::onSizeChange;
             break;
+        case cbStartOfThread:
+        case cbEndOfThread:
+        case cbEnterThread:
+        case cbStartOfFrame:
+        case cbEndOfFrame:   // 38.36.1: on any thread (obj NULL), one thread (or its children), or one frame
+            if (c->obj && c->obj->kind != Obj::Thread && !(d->reason == cbEndOfFrame && c->obj->kind == Obj::Frame)) {
+                s.cbs.pop_back();
+                vpi::error(vpiError, "vpi_register_cb: a thread or frame callback needs NULL, a thread handle or (cbEndOfFrame) a frame handle");
+                return nullptr;
+            }
+            (d->reason == cbStartOfFrame || d->reason == cbEndOfFrame ? s.frameCbs : s.thrCbs).push_back(c);
+            g_threadHook = vpi::onThread;
+            if (d->reason == cbStartOfFrame || d->reason == cbEndOfFrame) g_frameHook = vpi::onFrame;
+            break;
         case cbStartOfSave:
         case cbEndOfSave:
         case cbStartOfRestart:
@@ -2124,7 +2151,7 @@ inline const char* typeName(int type) {
         {vpiClassDefn, "vpiClassDefn"}, {vpiExtends, "vpiExtends"}, {vpiInterModPath, "vpiInterModPath"}, {vpiTchk, "vpiTchk"}, {vpiTchkTerm, "vpiTchkTerm"}, {vpiModPath, "vpiModPath"}, {vpiPathTerm, "vpiPathTerm"},
         {vpiGate, "vpiGate"}, {vpiSwitch, "vpiSwitch"}, {vpiUdp, "vpiUdp"}, {vpiPrimTerm, "vpiPrimTerm"},
         {vpiConstraint, "vpiConstraint"}, {vpiImplication, "vpiImplication"}, {vpiConstrIf, "vpiConstrIf"},
-        {vpiConstrIfElse, "vpiConstrIfElse"}, {vpiConstrForEach, "vpiConstrForEach"}, {vpiSoftDisable, "vpiSoftDisable"}, {vpiDistribution, "vpiDistribution"}, {vpiDistItem, "vpiDistItem"}, {vpiValueRange, "vpiValueRange"},
+        {vpiConstrIfElse, "vpiConstrIfElse"}, {vpiConstrForEach, "vpiConstrForEach"}, {vpiSoftDisable, "vpiSoftDisable"}, {vpiDistribution, "vpiDistribution"}, {vpiDistItem, "vpiDistItem"}, {vpiValueRange, "vpiValueRange"}, {vpiThread, "vpiThread"}, {vpiFrame, "vpiFrame"},
         {vpiConstraintOrdering, "vpiConstraintOrdering"}};
     auto it = names.find(type);
     return it == names.end() ? nullptr : it->second;
@@ -2134,6 +2161,7 @@ inline const char* typeName(int type) {
 #include "vpi_prim.inc"
 #include "vpi_constr.inc"
 #include "vpi_svcb.inc"
+#include "vpi_thread.inc"
 }   // namespace vpi
 extern "C" {
 
@@ -2145,12 +2173,14 @@ vpiHandle vpi_handle(PLI_INT32 type, vpiHandle ref) {
         if (!s.cur) { vpi::error(vpiError, "vpi_handle(vpiSysTfCall, NULL) outside a calltf or compiletf"); return nullptr; }
         return H(vpi::callObj(s.cur));
     }
+    if ((type == vpiThread || type == vpiFrame) && !o) return H(vpi::curThreadHandle(type));   // 37.? threads and frames
     if (!o) { vpi::error(vpiError, "vpi_handle: null reference handle"); return nullptr; }
     if (vpi::denied(o, "vpi_handle")) return nullptr;
     using slang::ast::SymbolKind;
     if (vpi::isCode(o)) return vpi::codeHandle(type, o);   // processes, statements, expressions (37.32-37.51)
     if (type == vpiClassObj && o->type == vpiClassVar) return H(vpi::classObjOf(o));   // 37.29
     if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return H(vpi::constrHandle(type, o));   // 37.31
+    if (o->kind == Obj::Thread || o->kind == Obj::Frame) return H(vpi::thrHandle(type, o));
     if (type == vpiClassDefn || o->kind == Obj::ClassDefn || o->kind == Obj::Extends) return H(vpi::classHandle(type, o));
     if (o->kind == Obj::InterModPath) return nullptr;
     if (o->kind == Obj::Tchk || o->kind == Obj::TchkTerm) return H(vpi::tchkHandle(type, o));   // timing checks
@@ -2321,6 +2351,7 @@ vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle ref) {
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return nullptr;   // drivers, loads (37.16, 37.17)
     if (vpi::constrIterate(type, o, items)) return vpi::iter(std::move(items));   // constraints (37.31)
     if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return nullptr;
+    if (o->kind == Obj::Thread || o->kind == Obj::Frame) return vpi::thrIterate(type, o, items) ? vpi::iter(std::move(items)) : nullptr;
     if (type == vpiMember) {   // the members of a struct or union variable (37.17)
         if (!vpi::isStructObj(o)) return nullptr;
         vpi::members(o, items);
@@ -2752,6 +2783,7 @@ PLI_INT32 vpi_get(PLI_INT32 prop, vpiHandle h) {
     if (o->kind == Obj::ModPath || o->kind == Obj::PathTerm) return (PLI_INT32)vpi::pathGet(prop, o);
     if (o->kind == Obj::Prim || o->kind == Obj::PrimTerm) return (PLI_INT32)vpi::primGet(prop, o);
     if (o->kind == Obj::Constraint || o->kind == Obj::ConstrItem) return (PLI_INT32)vpi::constrGet(prop, o);
+    if (o->kind == Obj::Thread || o->kind == Obj::Frame) return (PLI_INT32)vpi::thrGet(prop, o);
     if (prop == vpiVirtual && vpi::isMethod(o))
         return o->sym->kind == SymbolKind::MethodPrototype || o->sym->as<slang::ast::SubroutineSymbol>().isVirtual();
     if (o->kind == Obj::ClassObj) {   // 37.29
