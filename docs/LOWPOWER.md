@@ -86,7 +86,7 @@ turned on.
 | `map_retention_cell -lib_model_name` (6.39) | each mapped register (a variable, or every register an instance's clocked blocks assign) is simulated by the model: its canonical interface is inferred from the always block that assigns it (`UPF_GENERIC_CLOCK` from the clock edge, `UPF_GENERIC_DATA` from the clocked branch, with `if` conditions as `?:`, `UPF_GENERIC_ASYNC_SET_RESET` / `_ASYNC_LOAD` from the edges the `if` chain tests, `UPF_GENERIC_OUTPUT`, `~` to invert), and `-port_map` also takes `save_signal`, `restore_signal`, logic nets and supplies (`retention_supply.f`, `primary_supply.f`, a supply net or port, converted as `connect_supply_net` would). The register follows the model's output; neither corruption nor the strategy's retention applies to it. An unmapped input, a missing module or port, a port mapped twice and a block whose interface cannot be inferred (two clocks, a `case`) are errors |
 | `use_interface_cell -force_function` (6.62) | each port the isolation strategy isolates (narrowed by `-elements`, `-exclude_elements` and `-applies_to_clamp`) is simulated by the first of `-lib_cells`, an HDL module: its one input and one output that `-port_map` leaves open are the data input and output, and `-port_map` connects `isolation_signal`, `isolation_signal[i]` (with `~` to invert), `isolation_supply.f`, `input_supply.f` / `output_supply.f` of the level-shifter strategy, supply nets and logic nets. A one-bit model is used once for each bit of a wider port. The strategy's `-isolation_sense` does not apply; the output is still corrupted while the isolation supply is not NORMAL. A cell with no HDL module (`define_isolation_cell` or Liberty only) is simulated as 9.8 describes, with a warning. Errors: a model that clamps (`define_isolation_cell -clamp_cell`) to another value than the strategy, an input left open beside the data input, an output in `-port_map`, a port mapped twice or missing, `~` on anything but the isolation signal, an index past the strategy's signals, a supply reference the strategies do not have |
 | `upf_version`, `set_scope`, `set_design_top`, `load_upf` | yes |
-| Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
+| Tcl (5.1) | the tool line's Tcl interpreter (`src/tcl.hpp`): variables and arrays, `[command]` substitution, `expr`, `if`, `foreach`, `for`, `while`, `proc`, `upvar`, `uplevel`, `namespace eval` and `variable`, `regexp` / `regsub`, `list` / `string` commands, `catch`, `error`, `source`, `puts`. A bus index in a name (`gen[0]`, `d[7:0]`) is text, not a command. The first error stops the read, with its file and line |
 
 `initial` blocks are never gated, so testbench and model initialization code
 keeps running in a powered-off domain (9.2.1). Errors print as
@@ -135,7 +135,8 @@ port through a table has a state and no voltage.
 `create_upf_library` makes no Tcl namespace. `find_objects -object_type process` is not supported (msim does not name
 processes), and `mdebug -upf` reads files without a design, so it does not
 run `find_objects` on HDL objects. Tcl
-has no `namespace`, `upvar`, `regexp` or file I/O.
+has `namespace eval`, `variable`, `upvar`, `uplevel`, `regexp` and `regsub`
+(ECMAScript regular expressions), and no file I/O.
 
 ## Low-power coverage: `msim -upf_cov <file>`
 

@@ -47,6 +47,52 @@ int main() {
         u.busBrackets = true;
         assert(u.parse("set x d[3]/q[*] ; set y [expr 1+2]") == "3" && *u.get("x") == "d[3]/q[*]");
     }
+    // upvar, uplevel, namespaces and regular expressions.
+    {
+        Interp t;
+        std::string r = t.parse(
+            "proc bump {name {by 1}} { upvar $name v; incr v $by }\n"
+            "set n 5\n"
+            "bump n 3\n"
+            "proc setarr {a} { upvar 1 $a arr; set arr(k) 7 }\n"
+            "setarr cfg\n"
+            "proc outer {} { set x 1; inner; return $x }\n"
+            "proc inner {} { uplevel 1 {set x 42} }\n"
+            "set o [outer]\n"
+            "proc deep {} { upvar #0 g gg; set gg top }\n"
+            "deep\n"
+            "namespace eval pm {\n"
+            "  variable count 0\n"
+            "  proc add {} { variable count; incr count; return $count }\n"
+            "  proc twice {} { add; add }\n"
+            "}\n"
+            "pm::twice\n"
+            "set c [::pm::add]\n"
+            "set q [namespace qualifiers ::a::b::c]\n"
+            "set tl [namespace tail ::a::b::c]\n"
+            "set ex [namespace exists pm]\n"
+            "set hit [regexp {^(u_\\w+)/(\\w+)$} u_core/clk all inst pin]\n"
+            "set miss [regexp -nocase {^VDD} gnd]\n"
+            "set nums [regexp -all -inline {[0-9]+} a1b22c333]\n"
+            "set cnt [regexp -all {o} foo/boo]\n"
+            "set s [regsub -all {/} u_a/u_b/q .]\n"
+            "regsub {(\\w+)_(\\w+)} PD_TOP {\\2_\\1} sw\n"
+            "set amp [regsub {b+} abbbc {[&]}]\n",
+            "ns.tcl");
+        (void)r;
+        assert(t.diags.empty());
+        assert(*t.get("n") == "8" && *t.get("cfg(k)") == "7" && *t.get("o") == "42" && *t.get("g") == "top");
+        assert(*t.get("pm::count") == "3" && *t.get("c") == "3");
+        assert(*t.get("q") == "::a::b" && *t.get("tl") == "c" && *t.get("ex") == "1");
+        assert(*t.get("hit") == "1" && *t.get("all") == "u_core/clk" && *t.get("inst") == "u_core" && *t.get("pin") == "clk");
+        assert(*t.get("miss") == "0");
+        assert(*t.get("nums") == "1 22 333" && *t.get("cnt") == "4");
+        assert(*t.get("s") == "u_a.u_b.q" && *t.get("sw") == "TOP_PD" && *t.get("amp") == "a[bbb]c");
+        // errors: a bad level, a bad pattern
+        t.parse("proc f {} { upvar 5 x y }\nf\nregexp {(} x\n", "bad.tcl");
+        assert(t.diags.size() == 2 && t.diags[0].text.find("bad level") != std::string::npos &&
+               t.diags[1].text.find("couldn't compile") != std::string::npos);
+    }
     // complete(): what a prompt needs to know before it runs a line.
     {
         assert(Interp::complete("set a 1\n"));

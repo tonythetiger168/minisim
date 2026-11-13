@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- The Tcl interpreter of the tool line (`src/tcl.hpp`, used by UPF, SDC and
+  the tool shells) has `upvar`, `uplevel`, `namespace eval` with `variable`
+  and namespace procs, `namespace current / exists / qualifiers / tail /
+  which / delete`, `regexp` and `regsub` (ECMAScript syntax), and
+  `info level / procs`. `tests/test_tcl.cpp` now runs in ctest.
 - `msim -upf_cov <file>`: a low-power coverage report of power states,
   named state transitions, isolation enables and retention saves and
   restores, with the bins not hit marked.
