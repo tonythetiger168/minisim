@@ -53,9 +53,47 @@ public:
     }
 };
 
+// Transaction recording (expr.hpp trrec, lower.hpp trCall): Questa's API
+// and Verdi's FSDB transaction tasks. The three that make a stream or a
+// transaction are functions giving its handle (an integer); the rest are
+// tasks. Arguments are ordinary expressions.
+inline const std::vector<std::string>& trFunctions() {
+    static const std::vector<std::string> v = {"$create_transaction_stream", "$begin_transaction", "$fsdbTrans_begin"};
+    return v;
+}
+inline const std::vector<std::string>& trTasks() {
+    static const std::vector<std::string> v = {"$add_attribute", "$end_transaction", "$free_transaction", "$add_relation",
+                                               "$add_color", "$fsdbTrans_add_attribute", "$fsdbTrans_set_label",
+                                               "$fsdbTrans_end", "$fsdbTrans_add_relation", "$fsdbTrans_add_tag"};
+    return v;
+}
+
+class TrCall : public slang::ast::SystemSubroutine {
+public:
+    TrCall(const std::string& n, bool fn)
+        : SystemSubroutine(n, fn ? slang::ast::SubroutineKind::Function : slang::ast::SubroutineKind::Task), fn(fn) {}
+    bool allowEmptyArgument(size_t) const final { return true; }
+    const slang::ast::Type& checkArguments(const slang::ast::ASTContext& context, const Args&, slang::SourceRange,
+                                           const slang::ast::Expression*) const final {
+        return fn ? context.getCompilation().getIntegerType() : context.getCompilation().getVoidType();
+    }
+    slang::ConstantValue eval(slang::ast::EvalContext& context, const Args&, slang::SourceRange range,
+                              const slang::ast::CallExpression::SystemCallInfo&) const final {
+        notConst(context, range);
+        return nullptr;
+    }
+
+private:
+    bool fn;
+};
+
 inline void declare(slang::ast::Compilation& comp) {
     for (const std::string& n : waveTasks())
         if (!comp.getSystemSubroutine(n)) comp.addSystemSubroutine(std::make_shared<WaveTask>(n));
+    for (const std::string& n : trFunctions())
+        if (!comp.getSystemSubroutine(n)) comp.addSystemSubroutine(std::make_shared<TrCall>(n, true));
+    for (const std::string& n : trTasks())
+        if (!comp.getSystemSubroutine(n)) comp.addSystemSubroutine(std::make_shared<TrCall>(n, false));
 }
 
 }   // namespace vendor
