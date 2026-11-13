@@ -2,7 +2,7 @@
 #   cmake -DMSIM=<msim> -DMLINT=<mlint> -DSRC=<source dir> -P upf.cmake
 # Each tests/upf/<name>.sv runs with <name>.upf and must print <name>.out.
 set(D ${SRC}/tests/upf)
-foreach(t gating retention states vct)
+foreach(t gating retention states vct restart)
   execute_process(COMMAND ${MSIM} ${D}/${t}.sv -upf ${D}/${t}.upf
                   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
   if(NOT rc EQUAL 0)
