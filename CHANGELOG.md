@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- VPI instance arrays (37.11): `vpi_iterate(vpiModuleArray /
+  vpiInterfaceArray / vpiProgramArray / vpiPrimitiveArray /
+  vpiInstanceArray, module)`, an array's name, size, ranges and elements,
+  `vpi_handle_by_index` / `vpi_handle_by_multi_index` on it, and from an
+  element `vpiIndex` and its array. Array elements are now named `u[2]`, and
+  `vpi_handle_by_name` picks the right element of a descending array
+  (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
 - `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
   flop, the nets and logic between it and the reader (a glitch source for
   CDC003), the synchronizer stages, and the qualifier of an enable-qualified

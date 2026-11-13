@@ -350,6 +350,23 @@ has `vpiPathType` (`vpiPathFull` for `*>`, `vpiPathParallel` for `=>`),
 path, `vpi_iterate(vpiModDataPathIn)` (the data source) with
 `vpiDataPolarity`.
 
+**Instance arrays (37.11).** `vpi_iterate(vpiModuleArray, module)` gives
+a module's module instance arrays; `vpiInterfaceArray`, `vpiProgramArray`,
+`vpiPrimitiveArray` (or `vpiGateArray`, `vpiSwitchArray`, `vpiUdpArray`)
+select the others and `vpiInstanceArray` gives all of them. An array has
+`vpiName`, `vpiFullName`, `vpiSize` (all its elements), `vpiLineNo`,
+`vpi_handle(vpiLeftRange / vpiRightRange)` (the leftmost dimension),
+`vpi_iterate(vpiRange)` (one range per dimension, leftmost first) and its
+elements through `vpi_iterate(vpiInstance)`, `vpiModule`, `vpiInterface`,
+`vpiProgram` or `vpiPrimitive` (the leftmost index first).
+`vpi_handle_by_index` and `vpi_handle_by_multi_index` give one element, and
+`vpi_handle_by_name("top.u")` the array. From an element,
+`vpi_handle(vpiIndex)` gives its index in the innermost dimension and
+`vpi_handle(vpiModuleArray)` (or the array's own type, or
+`vpiInstanceArray`) its array; both are NULL outside an array. An element
+is named with its indices, `u[2]` or `m[1][0]` (23.3.3), and the elements
+of a primitive array are also in `vpi_iterate(vpiPrimitive, module)`.
+
 **Primitives (37, 38.10).** `vpi_iterate(vpiPrimitive, module)` gives the
 gate, switch and UDP instances of a module; `vpiGate`, `vpiSwitch` and
 `vpiUdp` select one class. Each has `vpiName`, `vpiFullName`, `vpiDefName`
@@ -453,7 +470,8 @@ waveform tools (`mwave`, the FST and VCD readers).
 The non-static property
 declarations of a class definition, containers of structs,
 classes or containers, the value of a non-constant expression,
-instance arrays as objects, the per-source
+the connection list of an instance array (`vpiExpr`, a
+`vpiListOp` operation) and its `vpiParamAssign`, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
 callbacks. A call to something not
@@ -462,7 +480,7 @@ implemented returns NULL or `vpiUndefined` and sets an error that
 
 ## Tests
 
-`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
+`tests/spec/37-vpi-walk.sv`, `37-vpi-sv-objects.sv`, `37-vpi-statements.sv`, `37-vpi-containers.sv`, `37-vpi-drivers.sv`, `37-vpi-classes.sv`, `37-vpi-constraints.sv`, `37-vpi-constraint-modes.sv`, `39-vpi-assertions.sv`, `39.5-vpi-assert-step.sv`, `40-vpi-coverage.sv`, `40-vpi-coverage-merge.sv`, `40.5-vpi-cov-instance.sv`, `38.10-vpi-delays.sv`, `38.35-vpi-sched-events.sv`, `38.36-vpi-cbstmt.sv`, `38.36-vpi-cberror.sv`, `38.36-vpi-tchk.sv`, `38.36-vpi-sv-callbacks.sv`, `38.36-vpi-threads.sv`, `38.36-vpi-unresolved-systf.sv`, `38.10-vpi-modpath.sv`, `38.10-vpi-primitives.sv`, `37.11-vpi-instance-arrays.sv`, `38.10-vpi-assign-delay.sv`, `38.21-vpi-handle-multi.sv`, `38.16-vpi-value-array.sv`, `38.34-vpi-put-value.sv`, `39.4-vpi-fail-expr.sv`,
 `38.36-vpi-callbacks.sv` and `38.37-user-systf.sv` with their C files in
 `tests/spec/data/vpi/`; `K-vpi-user-h.sv`, `L-vpi-compatibility.sv` and
 `M-sv-vpi-user-h.sv` check the headers. When Icarus Verilog is installed, CI builds the same
