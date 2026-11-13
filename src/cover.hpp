@@ -78,10 +78,11 @@ struct CgCpDef {
 // A cross bin's select expression (19.6.1), as a tree.
 struct CgSel {
     int kind = 0;   // 0 binsof(cp[.bin]) [intersect items], 1 !, 2 &&, 3 ||, 4 every tuple (the cross's name),
-                    // 5 kids[0] with (expr) [matches n] (19.6.1.2)
+                    // 5 kids[0] with (expr) [matches n] (19.6.1.2), 6 a set of value tuples [matches n] (19.6.1.3)
     E with, matches;          // kind 5: matches null is 1; a matches of $ sets all
     bool all = false;
     std::vector<int> valSigs;   // kind 5: each coverpoint's value, as the with expression reads it
+    std::vector<std::vector<Val>> tuples;   // kind 6: a cross set expression's value tuples (19.6.1.3)
     int cp = -1;    // the index in the cross's coverpoint list
     std::string bin;   // empty: any bin of cp
     std::vector<CgItem> isect;

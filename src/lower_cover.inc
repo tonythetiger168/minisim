@@ -159,6 +159,38 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             }
             return s;
         }
+        case BinsSelectExprKind::SetExpr: {   // a CrossQueueType value: its tuples (19.6.1.3)
+            const auto& se = b.as<SetExprBinsSelectExpr>();
+            s->kind = 6;
+            slang::ConstantValue cv = tryConst(se.expr);
+            if (!cv) unsupported("a cross set expression that is not constant (19.6.1.3)");
+            auto one = [&](const slang::ConstantValue& v) -> Val {
+                if (v.isInteger()) {
+                    E k = svLit(v.integer(), v.integer().isSigned(), {});
+                    if (k->op != Op::Const) unsupported("cross set expression value");
+                    return k->k;
+                }
+                if (v.isReal()) return mkreal(v.real());
+                unsupported("cross set expression value of this kind");
+            };
+            auto addTuple = [&](const slang::ConstantValue& t) {
+                std::vector<Val> vals;
+                if (t.isUnpacked()) for (const auto& f : t.elements()) vals.push_back(one(f));
+                else vals.push_back(one(t));
+                if (vals.size() != x.targets.size()) unsupported("cross set expression tuple of another size");
+                s->tuples.push_back(std::move(vals));
+            };
+            if (cv.isQueue()) for (const auto& t : *cv.queue()) addTuple(t);
+            else if (cv.isUnpacked()) for (const auto& t : cv.elements()) addTuple(t);
+            else unsupported("cross set expression of this kind");
+            if (const Expression* m = se.matchesExpr) {
+                const Expression* q = m;
+                while (q->kind == ExpressionKind::Conversion) q = &q->as<ConversionExpression>().operand();
+                if (q->kind == ExpressionKind::UnboundedLiteral) s->all = true;
+                else s->matches = resize(expr(*m), 64, false, false);
+            }
+            return s;
+        }
         default: unsupported("this cross bin select expression (19.6.1)");
     }
 }

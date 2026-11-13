@@ -564,6 +564,34 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
             }
             return s.all ? true : yes >= need;
         }
+        case 6: {   // the tuples of the cross whose bins hold enough of the set's value tuples (19.6.1.3)
+            size_t n = tuple.size();
+            uint64_t need = 1;
+            if (s.matches) { Val m = eval(s.matches, rd); need = m.x ? 1 : m.v; }
+            uint64_t yes = 0;
+            for (const auto& vt : s.tuples) {
+                bool in = true;
+                for (size_t j = 0; j < n && in; j++) {
+                    const CgCpDef& c = cx.d->cps[cx.xd->cps[j]];
+                    int bi = cx.xi->dims[j][tuple[j]];
+                    uint64_t key = keyOf(c, vt[j]);
+                    in = false;
+                    for (auto& r : cx.in->cps[cx.xd->cps[j]].bins[bi].ranges)
+                        if (r.first <= key && key <= r.second) { in = true; break; }
+                }
+                if (in) yes++;
+            }
+            if (s.all) {   // matches $: every value tuple of the bins is in the set
+                uint64_t total = 1;
+                for (size_t j = 0; j < n; j++) {
+                    uint64_t c = 0;
+                    for (auto& r : cx.in->cps[cx.xd->cps[j]].bins[cx.xi->dims[j][tuple[j]]].ranges) c += r.second - r.first + 1;
+                    total *= c;
+                }
+                return yes > 0 && yes >= total;
+            }
+            return yes >= need;
+        }
         default: break;
     }
     int bi = cx.xi->dims[s.cp][tuple[s.cp]];
