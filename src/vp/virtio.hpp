@@ -13,6 +13,7 @@
 //               copy unless the platform says "write": true.
 //   virtio-net  an Ethernet interface: a built-in gateway that answers ARP and
 //               ping, or Unix datagram sockets to another platform.
+//   virtio-console  a console port (Linux's hvc0).
 #pragma once
 
 #include <fcntl.h>
@@ -569,6 +570,84 @@ private:
     std::string local_, remote_;
     FILE* pcap_ = nullptr;
     uint64_t now_ = 0, sent_ = 0, received_ = 0;
+};
+
+
+// virtio-console (5.3): one port, queue 0 receives, queue 1 transmits; no
+// multiport, no size. What the guest writes goes to the platform's console
+// output (Linux: console=hvc0). `held` is what it receives: like a person
+// at a terminal, the device types it once the guest has printed something
+// and then been quiet for 100 ms of simulated time (a prompt waiting), since
+// characters that arrive while a system is still starting are lost to it.
+// `rx` goes to the driver as soon as it has buffers for it.
+class VirtioConsole : public VirtioMmio {
+public:
+    VirtioConsole() : VirtioMmio(2) { type = "virtio-console"; }
+    std::deque<uint8_t> rx, held;
+    uint64_t transmitted() const { return tx_; }
+
+    bool live() const override { return !held.empty(); }
+    uint64_t nextEventPs(uint64_t now) const override {
+        if (held.empty() || !tx_) return held.empty() ? UINT64_MAX : now + IDLE_PS;
+        return std::max(now + 1, lastTxPs_ + IDLE_PS);
+    }
+    void advance(uint64_t now) override {
+        now_ = now;
+        if (!held.empty() && tx_ && now >= lastTxPs_ + IDLE_PS) {
+            rx.insert(rx.end(), held.begin(), held.end());
+            held.clear();
+            deliver();
+        }
+    }
+
+protected:
+    uint32_t deviceId() const override { return 3; }
+    uint64_t features() const override { return F_VERSION_1; }
+    uint32_t request(unsigned, const std::vector<Buf>&) override { return 0; }
+    void notify(unsigned qi) override {
+        if (qi == 1) {
+            uint16_t head;
+            std::vector<Buf> chain;
+            while (pop(1, head, chain)) {
+                std::vector<uint8_t> b = gather(chain);
+                push(1, head, 0);
+                if (!b.empty()) { p->out(std::string(b.begin(), b.end())); lastTxPs_ = now_; }
+                tx_ += b.size();
+            }
+            kick(1);
+        }
+        deliver();
+    }
+    void saveDevice(Writer& w) const override {
+        w.u64(tx_);
+        w.u64(lastTxPs_);
+        w.str(std::string(rx.begin(), rx.end()));
+        w.str(std::string(held.begin(), held.end()));
+    }
+    void loadDevice(Reader& r) override {
+        tx_ = r.u64();
+        lastTxPs_ = r.u64();
+        std::string s = r.str();
+        rx.assign(s.begin(), s.end());
+        s = r.str();
+        held.assign(s.begin(), s.end());
+    }
+
+private:
+    void deliver() {
+        uint16_t head;
+        std::vector<Buf> chain;
+        while (!rx.empty() && pop(0, head, chain)) {
+            uint32_t room = 0;
+            for (const Buf& b : chain) if (b.write) room += b.len;
+            std::vector<uint8_t> d;
+            while (!rx.empty() && d.size() < room) { d.push_back(rx.front()); rx.pop_front(); }
+            push(0, head, fill(chain, d.data(), (uint32_t)d.size()));
+        }
+        kick(0);
+    }
+    static constexpr uint64_t IDLE_PS = 100000000000ull;  // 100 ms
+    uint64_t tx_ = 0, lastTxPs_ = 0, now_ = 0;
 };
 
 }  // namespace vp

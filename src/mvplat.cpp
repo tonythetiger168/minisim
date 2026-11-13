@@ -88,6 +88,7 @@ void usage() {
         "  -net dgram:LOCAL,REMOTE  a virtio-net interface on Unix datagram sockets: frames\n"
         "                     go to REMOTE, and come in on LOCAL (another platform's link)\n"
         "  -net-pcap FILE     write the first interface's frames to a pcap file\n"
+        "  -vcon              a virtio console (Linux: console=hvc0); -input then goes to it\n"
         "  -dump-dtb FILE     write the platform's device tree blob and exit\n"
         "  -map               print the memory map\n"
         "  -q                 no summary line on stderr\n"
@@ -102,6 +103,7 @@ struct Options {
     std::string bios, kernel, initrd, append, dtb, dumpDtb;
     std::vector<std::string> disks, nets;
     std::string netPcap;
+    bool vcon = false;
     bool diskWrite = false;
     bool haveAppend = false;
     int harts = -1;
@@ -188,7 +190,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             u->size = d.get("size") ? d.get("size")->u64() : (8ull << u->shift);
             u->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             std::string in = d.get("input") ? d.get("input")->str() : "";
-            if (firstUart && o.haveInput) in = o.input;
+            if (firstUart && o.haveInput && !o.vcon) in = o.input;
             for (char c : in) u->rx.push_back((uint8_t)c);
             firstUart = false;
             dev = std::move(u);
@@ -221,6 +223,13 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             bool ro = d.get("readonly") && d.get("readonly")->b;
             v->open(rel(d.get("file")->str()), w || o.diskWrite, ro);
             dev = std::move(v);
+        } else if (type == "virtio-console") {
+            auto v = std::make_unique<VirtioConsole>();
+            v->name = name;
+            v->base = base();
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            for (char c : d.get("input") ? d.get("input")->str() : std::string()) v->held.push_back((uint8_t)c);
+            dev = std::move(v);
         } else if (type == "virtio-net") {
             auto v = std::make_unique<VirtioNet>();
             v->name = name;
@@ -241,7 +250,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             Ext* x = loadExt(g_argc, g_argv, ("device type '" + type + "'").c_str());
             if (x && x->device(m, d, type, name, dir)) continue;
             throw std::runtime_error(d.where() + "unknown device type '" + type +
-                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net" +
+                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console" +
                                      (x ? "" : "; mvp and rtl need the mvplat extension library") + ")");
         }
         m.bus.add(std::move(dev));
@@ -285,6 +294,18 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
         nic++;
     }
     if (!o.netPcap.empty() && !nic) throw std::runtime_error("-net-pcap needs -net");
+    // -vcon: a virtio console in the next slot; -input goes to it.
+    if (o.vcon) {
+        uint64_t b;
+        do b = 0x10001000ull + 0x1000ull * slot++; while (m.bus.find(b) && slot < 64);
+        auto v = std::make_unique<VirtioConsole>();
+        v->name = "vcon";
+        v->base = b;
+        v->irq = slot;
+        if (m.plic && v->irq > m.plic->nsrc) throw std::runtime_error("-vcon: no PLIC source left");
+        if (o.haveInput) for (char c : o.input) v->held.push_back((uint8_t)c);
+        m.bus.add(std::move(v));
+    }
 }
 
 std::vector<uint8_t> readFile(const std::string& path) {
@@ -471,6 +492,7 @@ int main(int argc, char** argv) {
         else if (s == "-disk-write") o.diskWrite = true;
         else if (s == "-net") o.nets.push_back(next("user or dgram:LOCAL,REMOTE"));
         else if (s == "-net-pcap") o.netPcap = next("a file");
+        else if (s == "-vcon") o.vcon = true;
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
         else if (!s.empty() && s[0] == '-') {

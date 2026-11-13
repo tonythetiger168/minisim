@@ -203,7 +203,7 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
                 f.propU32("interrupts", {u->irq});
             }
             f.end();
-        } else if (d->type == "virtio-blk" || d->type == "virtio-net") {
+        } else if (d->type.rfind("virtio-", 0) == 0) {
             auto* v = static_cast<const VirtioMmio*>(d.get());
             f.begin(hexName("virtio_mmio", d->base));
             f.propStr("compatible", {"virtio,mmio"});

@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: virtio-console (VIRTIO 1.2, 5.3). `-vcon` adds one and sends
+  `-input` to it; Linux runs its console on `hvc0`. Input is typed once the
+  guest has printed and been quiet for 100 ms of simulated time.
 - Transaction recording without UVM: Questa's `$create_transaction_stream`,
   `$begin_transaction`, `$add_attribute`, `$end_transaction` and Verdi's
   `$fsdbTrans_begin`, `$fsdbTrans_add_attribute`, `$fsdbTrans_end` write

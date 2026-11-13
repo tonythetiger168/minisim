@@ -126,6 +126,12 @@ print(n)" 2> /dev/null)
   wait
   expect "virtio-net over -net dgram to a peer on the host" 0 dgram.out "vnet: echo peer ok"
 fi
+# virtio-console (-vcon): a bare-metal driver prints through it, and -input
+# arrives once the console has been quiet.
+"$MVPLAT" "$E/vcon.elf" -vcon -q -input "typed line
+" > vcon.out 2>&1; rc=$?
+expect "virtio-console: output, and -input once the console is quiet" 0 vcon.out "^vcon: got typed line"
+grep -q "^vcon: hello over virtio-console" vcon.out && ok "virtio-console output reaches the console" || bad "virtio-console output"
 "$MVPLAT" "$E/vnet.elf" -net tap0 -q > p.out 2>&1; rc=$?
 expect "-net with an unknown back end" 2 p.out "unknown back end 'tap0'"
 
@@ -154,7 +160,7 @@ J
 [ $rc -ne 0 ] && ok "a program with no CLINT does not hang (exit $rc)" || bad "wfi with no interrupt source"
 
 # The device tree made from the platform, as firmware and Linux read it.
-"$MVPLAT" "$E/hello.elf" -harts 2 -disk "$E/hello.elf" -net user -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
+"$MVPLAT" "$E/hello.elf" -harts 2 -disk "$E/hello.elf" -net user -vcon -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
 if [ $rc = 0 ] && [ "$(od -An -tx1 -N4 board.dtb | tr -d ' ')" = d00dfeed ]; then ok "-dump-dtb writes a device tree blob"
 else bad "-dump-dtb (exit $rc)"; fi
 if command -v dtc > /dev/null 2>&1; then
@@ -234,6 +240,11 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
       -input "ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up; ping -c 2 10.0.2.2; poweroff -f
 " > net.out 2>&1; rc=$?
     expect "Linux pings the gateway over virtio-net" 0 net.out "2 packets transmitted, 2 packets received"
+    # Linux's console on virtio-console (hvc0) instead of the 16550.
+    "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio -q \
+      -append "console=hvc0 rdinit=/init quiet" -vcon -input "echo on hvc \$((6*7)); poweroff -f
+" > hvc.out 2>&1; rc=$?
+    expect "Linux runs a shell on hvc0 (virtio-console)" 0 hvc.out "^on hvc 42"
   else
     echo "skip  BusyBox: set MVPLAT_BUSYBOX (tests/vplat/get-linux.sh fetches it)"
   fi
