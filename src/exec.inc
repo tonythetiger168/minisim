@@ -41,6 +41,13 @@ static bool target(const Instr& i, int& sig, int& hi, int& lo, Val& val) {
     return true;
 }
 
+// A temporary's store (Instr::tmp): no change event, but the same bits as a
+// normal write, a run-time index (w[i] = b, w[i +: 4] = v) included.
+static void pokeTmp(const Instr& i, Val v) {
+    int sig = i.sig, hi = i.hi, lo = i.lo;
+    if (target(i, sig, hi, lo, v)) S.poke(sig, v, hi, lo);
+}
+
 // $writememh / $writememb (21.5): one word per line, every digit written
 // (x and z as x and z), no @ addresses. The default range is the whole
 // memory, lowest address first; start and finish pick a range and order.
@@ -1481,7 +1488,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Assign:
             case IK::Nba: {
                 Val v = eval(i.e, rd);
-                if (i.tmp) { S.poke(i.sig, v, i.hi, i.lo); pc++; break; }   // a temporary of its own (msim -xprop)
+                if (i.tmp) { pokeTmp(i, v); pc++; break; }   // a temporary of its own (msim -xprop, localizeSeqBlocking)
                 if (__builtin_expect(g_upf, 0) && entry->pd >= 0 && g_pdMode[(size_t)entry->pd] > 0 && i.sig >= 0 && !isRel(i.sig) && !i.arr)
                     v = upfWrite(entry, i.sig, i.hi, i.lo, v);
                 if (i.drv >= 0) {
@@ -1906,7 +1913,7 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
                 else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
                 break;
             case IK::Jmp: pc = i.target; break;
-            case IK::Assign: S.poke(i.sig, eval(i.e, rd), i.hi, i.lo); pc++; break;   // a temporary of its own
+            case IK::Assign: pokeTmp(i, eval(i.e, rd)); pc++; break;   // a temporary of its own (msim.cpp: localizeSeqBlocking)
             default: pc++; break;  // seqShape admits nothing else
         }
     }
@@ -1936,7 +1943,7 @@ static void execComb(const void* ctx) {
         pc++;
         if (g_cov) covHit(i.hits);
         Val v = eval(i.e, rd);
-        if (i.tmp) { S.poke(i.sig, v, i.hi, i.lo); continue; }   // a temporary of its own
+        if (i.tmp) { pokeTmp(i, v); continue; }   // a temporary of its own
         if (i.bidx) {   // v[i] = ...: the bits are chosen now; an invalid index writes nothing
             int sg = i.sig, hi = i.hi, lo = i.lo;
             if (target(i, sg, hi, lo, v)) S.set(sg, hi >= 0 ? v_insert(S.get(sg), v, hi, lo) : v);

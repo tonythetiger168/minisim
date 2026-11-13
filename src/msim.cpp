@@ -758,7 +758,10 @@ static void localizeSeqBlocking(LowerResult& lowered) {
             if (dbg && !cand.empty()) std::cerr << "seqtmp kept: line " << q.code[1].line << "\n";
             continue;
         }
+        static const long lim = std::getenv("MSIM_SEQTMPMAX") ? std::atol(std::getenv("MSIM_SEQTMPMAX")) : -1;   // debug: bisect
+        if (lim >= 0 && (long)procsDone >= lim) continue;
         for (size_t pc : cand) q.code[pc].tmp = true;
+        if (dbg) for (size_t pc : cand) std::cerr << "seqtmp: line " << q.code[pc].line << " " << S.sigs[q.code[pc].sig].name << "\n";
         done += cand.size();
         procsDone++;
     }
@@ -3145,6 +3148,12 @@ int main(int argc, char** argv) {
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
     for (size_t i = 0; i < lowered.procs.size(); i++) {
+        // A process run as a function (static comb or clocked) still takes
+        // its generator seed in start order (18.14.2), so every later
+        // process draws the same $urandom values as with -no-static-comb
+        // -no-static-seq: which blocks the static schedule takes over never
+        // changes a test's random stimulus.
+        if (pl.rank[i] >= 0 || pl.seq[i]) { ProcCtl unused; seedProc(unused); }
         if (pl.rank[i] >= 0) continue;
         if (lowered.procs[i].kind == "init") {
             // Declaration initializers take effect before the simulation
