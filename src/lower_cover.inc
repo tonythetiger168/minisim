@@ -151,7 +151,6 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             for (size_t k = 0; k < x.targets.size(); k++) {
                 const Type& t = x.targets[k]->getType();
                 if (t.isFloating() || !t.isIntegral()) unsupported("a cross with filter over a real coverpoint (19.6.1.2)");
-                if (t.getBitWidth() > 64) unsupported("a cross with filter over a coverpoint wider than 64 bits (19.6.1.2)");
                 int sg = mkSig(x.getHierarchicalPath() + "$with" + std::to_string(cgWithSeq++) + "." + std::string(x.targets[k]->name),
                                (int)t.getBitWidth(), false);
                 s->valSigs.push_back(sg);
@@ -465,14 +464,6 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
                     const BinsSelectExpr* sel = b->getCrossSelectExpr();
                     if (!sel) unsupported("this cross bin");
                     xb.sel = cgSel(*sel, *x);
-                    std::function<bool(const CgSel&)> setSel = [&](const CgSel& q) {
-                        if (q.kind == 6) return true;
-                        for (const auto& k : q.kids) if (setSel(*k)) return true;
-                        return false;
-                    };
-                    for (int c : cd.cps)
-                        if (d.cps[(size_t)c].wide && setSel(*xb.sel))
-                            unsupported("a cross set expression over a coverpoint wider than 64 bits (19.6.1.3)");
                     cd.bins.push_back(std::move(xb));
                 } else if (const auto* body = bm.as_if<CoverCrossBodySymbol>())
                     bins(*body);
