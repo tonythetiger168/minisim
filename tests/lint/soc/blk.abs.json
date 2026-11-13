@@ -1,0 +1,20 @@
+{
+  "format": "mlint-abstract-1",
+  "blocks": [
+    {
+      "name": "blk",
+      "errors": 0,
+      "warnings": 1,
+      "findings": {"UNU004": 1, "UNU005": 1},
+      "parameters": [{"name": "W", "value": 8}],
+      "ports": [
+        {"name": "clk", "dir": "in", "width": 1, "used": true, "clock": true},
+        {"name": "rst_n", "dir": "in", "width": 1, "used": true},
+        {"name": "d", "dir": "in", "width": 8, "used": true},
+        {"name": "spare", "dir": "in", "width": 1, "used": false},
+        {"name": "q", "dir": "out", "width": 8, "driven": true},
+        {"name": "nc", "dir": "out", "width": 1, "driven": false}
+      ]
+    }
+  ]
+}

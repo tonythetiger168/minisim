@@ -282,6 +282,26 @@ inline const std::vector<RuleInfo>& table() {
         {"FML003", "formal", Sev::Warning, true, "a register that never leaves its reset value",
          "Every assignment after reset gives it the value it already has: a constant, so the logic it feeds is "
          "fixed too."},
+        // ---------------------------------------------------------------- soc flow
+        // lintsoc.hpp: the top checked against block abstracts (-abstract).
+        {"ABS001", "soc", Sev::Warning, true, "a block output the block never drives is connected at the top",
+         "The block's abstract says nothing inside drives the output, so whatever reads it at the top floats."},
+        {"ABS002", "soc", Sev::Info, true, "the top drives a block input the block never reads",
+         "Logic at the top feeds an input the block ignores. Tie it off, or check the block uses it."},
+        {"ABS003", "soc", Sev::Warning, true, "a block clock input is left open or tied to a constant",
+         "The block clocks registers on this input."},
+        {"ABS004", "soc", Sev::Warning, true, "a block was signed off with errors or warnings not waived",
+         "From the counts in its abstract (-abstract-out at block level)."},
+        // ---------------------------------------------------------------- soc flow
+        // lintsoc.hpp: the top checked against block abstracts (-abstract).
+        {"ABS001", "soc", Sev::Warning, true, "a block output the block never drives is connected at the top",
+         "The block's abstract says nothing inside drives the output, so whatever reads it at the top floats."},
+        {"ABS002", "soc", Sev::Info, true, "the top drives a block input the block never reads",
+         "Logic at the top feeds an input the block ignores. Tie it off, or check the block uses it."},
+        {"ABS003", "soc", Sev::Warning, true, "a block clock input is left open or tied to a constant",
+         "The block clocks registers on this input."},
+        {"ABS004", "soc", Sev::Warning, true, "a block was signed off with errors or warnings not waived",
+         "From the counts in its abstract (-abstract-out at block level)."},
         // --------------------------------------------------------------------- fsm
         {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
          "The state is named or tested, but the machine can never be in it: dead logic, or a transition that was forgotten."},

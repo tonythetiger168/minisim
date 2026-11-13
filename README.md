@@ -554,6 +554,7 @@ About 80 rules in groups, each with a severity and an on/off default:
 | `clock`, `reset` | `CLK001`..`CLK003`, `RST001`..`RST007` | clock used as data, reset used with both polarities or both styles, a flop left out of its block's reset, non-constant reset values |
 | `naming`, `style` | `NAME001`..`NAME013`, `STY001`..`STY003`, `FUNC001` | name patterns for modules, signals, clocks, resets, instances (off until enabled), case-only clashes, unlabelled generate blocks |
 | `formal` | `FML001`..`FML003` | proved by enumeration: dead branches, indexes that can go out of range, registers stuck at their reset value |
+| `soc` | `ABS001`..`ABS004` | SoC flow: block abstracts (`-abstract-out`, `-abstract`) and black boxes (`-bbox`); floating block outputs, unread inputs, clock inputs tied off, blocks signed off with open findings |
 | `fsm` | `FSM001`..`FSM004` | states never entered, states with no way out, a state case with no default, no reset state |
 | `format`, `suspicious` | `FMT001`..`FMT004`, `SUS001`..`SUS003`, `STY004`..`STY012`, `NAME014`..`NAME017`, `W009` | Verible-style text and syntax rules (off until enabled): line length, tabs, trailing spaces, stray semicolons, `` `endif `` comments, explicit lifetimes and parameter types, range direction |
 | `tidy` | `TIDY001`..`TIDY021` | slang-tidy's checks, built in: registers assigned only in reset, undriven bit ranges, struct fields split over processes, port and typedef style |

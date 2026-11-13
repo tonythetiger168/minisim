@@ -29,6 +29,7 @@
 #include "lintir.hpp"
 #include "lintrules.hpp"
 #include "lintformal.hpp"
+#include "lintsoc.hpp"
 #include "lintsrc.hpp"
 #ifdef MINISIM_TIDY
 #include "linttidy.hpp"
@@ -117,6 +118,9 @@ void usage() {
                  "  -waivers FILE    the same format; by habit the file with the waive lines\n"
                  "  -show-waived     also print the waived findings, with the reason\n"
                  "  -json FILE       write the findings (waived ones too) as JSON\n"
+                 "  -abstract-out F  write the top block's abstract (ports, open findings) for the SoC flow\n"
+                 "  -abstract FILE   check the top against a block abstract, without the block's RTL\n"
+                 "  -bbox PATTERN    treat matching modules as black boxes: nothing inside is reported\n"
                  "  -Werror          exit 1 on any warning (errors always do; info findings never do)\n"
                  "  -quiet           print findings only, no summary\n"
                  "  -stats           print where the time went, on stderr\n"
@@ -262,6 +266,8 @@ int main(int argc, char** argv) {
     lintcfg::Config cfg;
     bool werror = false, quiet = false, powerTopSet = false, showWaived = false, list = false, stats = false;
     std::string upfPath, powerTop, jsonPath, explainRule;
+    std::vector<std::string> bboxPats, abstractIn;  // the SoC flow (lintsoc.hpp)
+    std::string abstractOut;
     unsigned threads = par::defaultThreads();
     FrontEnd fe;
     cdc::Options cdcOpt;
@@ -308,6 +314,9 @@ int main(int argc, char** argv) {
         if (a == "-show-waived") { showWaived = true; continue; }
         if (a == "-stats") { stats = true; continue; }
         if (a == "-json") { jsonPath = next("a file"); continue; }
+        if (a == "-bbox") { bboxPats.push_back(next("a module name pattern")); continue; }
+        if (a == "-abstract") { abstractIn.push_back(next("a block abstract")); continue; }
+        if (a == "-abstract-out") { abstractOut = next("a file"); continue; }
         if (a == "-threads") {
             std::string n = next("a count");
             if (n == "all") { threads = par::defaultThreads(); continue; }
@@ -362,6 +371,30 @@ int main(int argc, char** argv) {
         fwd.insert(fwd.begin() + 1, pkgFile);
     }
     struct RmPkg { std::string f; ~RmPkg() { if (!f.empty()) std::remove(f.c_str()); } } rmPkg{pkgFile};
+
+    // Block abstracts: the blocks become empty modules the top elaborates against.
+    std::vector<lintsoc::BlockFact> blocks;
+    std::string stubFile;
+    for (auto& f : abstractIn) {
+        std::string err;
+        if (!lintsoc::readAbstract(f, blocks, err)) {
+            std::cerr << "mlint: " << err << "\n";
+            return 2;
+        }
+    }
+    if (!blocks.empty()) {
+        char tmpl[] = "/tmp/mlint_abstractXXXXXX.sv";
+        int fd = mkstemps(tmpl, 3);
+        std::string text = lintsoc::stubs(blocks);
+        if (fd < 0 || write(fd, text.data(), text.size()) != (ssize_t)text.size()) {
+            std::cerr << "mlint: cannot write the block stubs\n";
+            return 2;
+        }
+        close(fd);
+        stubFile = tmpl;
+        fwd.insert(fwd.begin() + 1, stubFile);
+    }
+    RmPkg rmStub{stubFile};
 
     // Where the time goes, for -stats.
     using Clock = std::chrono::steady_clock;
@@ -486,7 +519,34 @@ int main(int argc, char** argv) {
     if (tidy) linttidy::run(*fe.comp, *am, fe.driver.diagEngine, rep, threads);
     lap("slang-tidy checks");
 #endif
+    // The SoC flow: connections to abstracted blocks; nothing from inside a black box.
+    if (!blocks.empty()) lintsoc::checkTop(*fe.comp, blocks, rep);
+    {
+        lintsoc::Boxes boxes;
+        boxes.add(*fe.comp, bboxPats);
+        // The stub file may be named relative to the working directory.
+        std::erase_if(rep.out, [&](const Finding& f) {
+            return (!stubFile.empty() && f.file.ends_with(stubFile.substr(stubFile.rfind('/') + 1))) || boxes.inside(f);
+        });
+    }
     std::vector<Final> fs = resolve(rep.out, cfg);
+    if (!abstractOut.empty()) {
+        std::vector<lintsoc::BlockFact> out;
+        for (auto* top : fe.comp->getRoot().topInstances) {
+            lintsoc::BlockFact b = lintsoc::facts(*top);
+            for (const Final& x : fs) {
+                if (x.waived) continue;
+                b.findings[x.f.rule]++;
+                b.errors += x.sev == lintcfg::Sev::Error;
+                b.warnings += x.sev == lintcfg::Sev::Warning;
+            }
+            out.push_back(std::move(b));
+        }
+        if (!lintsoc::writeAbstract(abstractOut, out)) {
+            std::cerr << "mlint: cannot write '" << abstractOut << "'\n";
+            return 2;
+        }
+    }
     printText(std::cout, fs, cfg, quiet, showWaived);
     if (hidden)
         std::cout << "mlint: " << hidden << (hidden == 1 ? " finding" : " findings")

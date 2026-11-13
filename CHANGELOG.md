@@ -1118,6 +1118,10 @@ Spec references are IEEE 1800-2023 clauses.
   enumerating the values of the signals involved through single-driver nets
   and the reachable values of small registers. Multithreaded; settings
   `formal.max_bits` and `formal.reg_bits`.
+- `mlint` SoC flow (`src/lintsoc.hpp`): `-abstract-out` writes a block
+  abstract (ports and what the block does with them, parameters, open
+  findings); `-abstract` checks the top against it without the block's RTL
+  (rules `ABS001`..`ABS004`); `-bbox` makes modules black boxes.
 - `mspice`, a SPICE circuit simulator: `.op`, `.dc`, `.ac` and `.tran` on
   netlists with R, C, L, coupled inductors, independent and controlled
   sources (E, G, F, H), diodes, level-1 MOSFETs and Gummel-Poon bipolar

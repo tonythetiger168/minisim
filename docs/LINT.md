@@ -284,6 +284,40 @@ What they leave alone, by design:
   those reachable after reset. Initial and final blocks, and blocks that
   wait inside their body, are not checked.
 
+### SoC flow: block abstracts and black boxes (`soc`)
+
+Large designs are signed off a block at a time. Each block is checked on
+its own and writes an abstract; the top is then checked with the blocks as
+black boxes, without their RTL:
+
+```sh
+mlint blk.sv -top blk -abstract-out blk.abs.json        # block sign-off
+mlint top.sv -top top -abstract blk.abs.json            # top, no blk RTL
+```
+
+An abstract (`mlint-abstract-1`, JSON) holds the block's parameters, its
+ports (direction, packed width, unpacked dimensions) with what the block
+does with each one (an input it never reads, an output it never drives, an
+input it uses only as a clock, also through its children), and the findings
+left after waivers, counted by rule. At the top mlint writes an empty
+module for each abstract so the top elaborates, reports nothing inside it,
+and checks every instance's connections against what the block said:
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `ABS001` | warning | on | A block output the block never drives is connected at the top: it floats |
+| `ABS002` | info | on | The top drives a block input the block never reads (a constant tie-off is fine) |
+| `ABS003` | warning | on | A block clock input is left open or tied to a constant |
+| `ABS004` | warning | on | The block was signed off with errors or warnings not waived (once per block) |
+
+`-bbox PATTERN` (repeatable, glob on module names) makes modules black
+boxes without an abstract: their RTL is read so the top elaborates, but no
+finding inside them is reported.
+
+Port widths in an abstract are those of the block's default parameters; an
+instance that overrides a width parameter needs an abstract made with the
+same values (`-G` style overrides on the block run, or a wrapper).
+
 ### State machines (`fsm`)
 
 Found by the extractor FSM coverage uses (`msim -cov`), so lint and coverage
