@@ -781,6 +781,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: blocking writes to an element of an array of 64 elements or
+  fewer chosen at run time merge exactly: the branch saves, puts back and
+  merges the array's elements like variables, so two branches that write
+  the same element no longer merge with its old value.
 - `-xprop`: `case ... inside` is merged: an item may match when its `==?`
   or range compare is unknown. The merging code of a combinational block
   now writes without change events and publishes each final value once, so
