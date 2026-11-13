@@ -2423,12 +2423,11 @@ int main(int argc, char** argv) {
     std::vector<char*> xargv;
     if (xrun::wanted(argc, argv, xo)) {
         for (auto& s : xo.out) xargv.push_back(s.data());
-        if (!xo.tclIn.empty()) {   // -input run.tcl: as an msim -do file
-            static std::string doFile = xo.tool + ".do";
-            if (!xrun::tclToDo(xo.tclIn, doFile, xo.tool)) { std::cerr << xo.tool << ": cannot read " << xo.tclIn << "\n"; return 2; }
+        if (!xo.tclIn.empty()) {   // -input run.tcl: msim -do runs Tcl with the xrun commands (interactive.inc)
+            if (!std::ifstream(xo.tclIn)) { std::cerr << xo.tool << ": cannot read " << xo.tclIn << "\n"; return 2; }
             static std::string doOpt = "-do";
             xargv.push_back(doOpt.data());
-            xargv.push_back(doFile.data());
+            xargv.push_back(xo.tclIn.data());
         }
         xargv.push_back(nullptr);
         argc = (int)xargv.size() - 1;
@@ -3218,6 +3217,7 @@ int main(int argc, char** argv) {
         return prof::P().add(k == kinds.end() ? lp.kind : k->second, lp.scope.empty() ? top : top + "." + lp.scope, loc);
     };
     if (prof::P().on) { S.threads = 1; staticPart = false; prof::P().t0 = std::chrono::steady_clock::now(); }
+    if (interactiveMode) S.threads = 1;   // a stop at a line pauses inside a process: one thread
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
         if (pl.rank[i] >= 0) byRank[pl.rank[i]] = (int)i;
@@ -3294,6 +3294,7 @@ int main(int argc, char** argv) {
         interactive::Session ses;
         ses.comp = comp.get();
         ses.maxTime = maxTime;
+        ses.lr = &lowered;
         if (doPath.empty()) { ses.prompt = isatty(0); ses.loop(std::cin); }
         else {
             std::ifstream df(doPath);
