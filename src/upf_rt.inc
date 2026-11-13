@@ -448,8 +448,35 @@ struct Rt {
             if (!wr.empty() && kept == wr.size()) continue;
             lp.prog.pd = pd;
             lp.prog.pstate = st;
+            // Level-sensitive logic re-evaluates at power-up (9.5.3) even when
+            // no input changed while the domain was off: it also waits on the
+            // domain's power-up signal.
+            if (!st)
+                for (auto& in : lp.prog.code)
+                    if (in.k == IK::WaitEdge) {
+                        std::vector<std::pair<int, Edge>> ev = in.events.size() > 1 ? in.events : std::vector<std::pair<int, Edge>>{{in.sig, in.edge}};
+                        bool level = std::all_of(ev.begin(), ev.end(), [](auto& x) { return x.second == ANY; });
+                        if (!level || in.sig < 0 && in.events.empty()) continue;
+                        ev.push_back({g_pdSig[(size_t)pd], ANY});
+                        in = waitInstr(ev);
+                    }
             for (int s : wr) owned[(size_t)pd].insert(s);
-            if (st) {
+            // latches (set_retention -applies_to latch, 6.54): always_latch,
+            // and a level-sensitive always that leaves a variable unassigned
+            // on some path from one wait to the next (an inferred latch)
+            std::set<int> lat;
+            if (k == "AlwaysLatch")
+                for (auto& in : lp.prog.code)
+                    if ((in.k == IK::Nba || in.k == IK::Assign) && in.sig >= 0 && !isRel(in.sig) && !in.arr) lat.insert(in.sig);
+            if (k == "Always" && !st) lat = inferredLatches(lp.prog);
+            if (!lat.empty()) {
+                for (int s : lat) {
+                    stateSigs[(size_t)pd].insert(s);
+                    latchSigs.insert(s);
+                    if (doms[(size_t)pd].region && !dn.empty()) stateSigs[(size_t)domIdx.at(dn)].insert(s);
+                }
+            }
+            if (st && k != "AlwaysLatch") {
                 std::set<int> w;
                 for (auto& in : lp.prog.code)
                     if ((in.k == IK::Nba || in.k == IK::Assign) && in.sig >= 0 && !isRel(in.sig) && !in.arr) w.insert(in.sig);
@@ -524,6 +551,56 @@ struct Rt {
         g_upfHook = [](int op, const std::vector<Val>& a) { return rt().hook(op, a); };
     }
     std::vector<std::set<int>> stateSigs;
+    std::set<int> latchSigs;   // the state elements that are latches
+    // The variables a level-sensitive process does not assign on every path
+    // from one event wait to the next: they hold their value, as a latch.
+    std::set<int> inferredLatches(const Prog& p) {
+        size_t N = p.code.size();
+        std::set<int> wr, out;
+        for (auto& in : p.code)
+            if ((in.k == IK::Assign || in.k == IK::Nba) && in.sig >= 0 && !isRel(in.sig) && !in.arr && in.drv < 0 && in.gate < 0)
+                wr.insert(in.sig);
+        if (wr.empty()) return out;
+        for (auto& in : p.code)   // only plain code: a call, fork or delay is not followed
+            if (in.k == IK::Call || in.k == IK::Fork || in.k == IK::WaitDelay || in.k == IK::Force) return out;
+        std::vector<std::optional<std::set<int>>> st(N + 1);
+        std::vector<size_t> work;
+        auto flow = [&](size_t j, const std::set<int>& v) {
+            if (j > N) return;
+            if (!st[j]) { st[j] = v; work.push_back(j); return; }
+            std::set<int> x;
+            std::set_intersection(st[j]->begin(), st[j]->end(), v.begin(), v.end(), std::inserter(x, x.begin()));
+            if (x.size() != st[j]->size()) { st[j] = x; work.push_back(j); }
+        };
+        for (size_t i = 0; i < N; i++)   // from each wait (not from the start: nothing ran before the first wait)
+            if (p.code[i].k == IK::WaitEdge) flow(i + 1, {});
+        while (!work.empty()) {
+            size_t i = work.back();
+            work.pop_back();
+            std::set<int> v = *st[i];
+            if (i == N) continue;
+            const Instr& in = p.code[i];
+            switch (in.k) {
+                case IK::WaitEdge:
+                    for (int s : wr) if (!v.count(s)) out.insert(s);
+                    break;
+                case IK::Jmp: flow(in.target, v); break;
+                case IK::JmpIfNot:
+                    flow(in.target, v);
+                    if (in.xt != Instr::NOX) flow(in.xt, v);
+                    flow(i + 1, v);
+                    break;
+                case IK::Finish: break;
+                case IK::Assign:
+                case IK::Nba:
+                    if (in.sig >= 0 && !in.arr) v.insert(in.sig);
+                    flow(i + 1, v);
+                    break;
+                default: flow(i + 1, v);
+            }
+        }
+        return out;
+    }
 
     // ------------------------------------- simulation controls (6.58, 6.59)
     std::set<int> noCorr;   // signals sim_corruption_control keeps from corruption
@@ -2130,7 +2207,8 @@ struct Rt {
                 bool in = r.elements.empty();
                 for (auto& e : r.elements) in |= DomainMap::within(n, m.design(e));
                 for (auto& e : r.exclude) if (DomainMap::within(n, m.design(e))) in = false;
-                // -applies_to flop / latch is not told apart: both are state elements
+                if (r.appliesTo == "flop" && latchSigs.count(s)) in = false;   // -applies_to (6.54)
+                if (r.appliesTo == "latch" && !latchSigs.count(s)) in = false;
                 if (in) rr.els.push_back({s, allx(S.sigs[(size_t)s].w), false});
             }
             bool modelled = std::any_of(retModelEls.begin(), retModelEls.end(), [&](const RetModelEl& e) { return e.strategy == r.name; });

@@ -30,8 +30,9 @@ endforeach()
 # connected by pg_type (4.5.4.6.2, 6.14, 6.15); table VCMs on fields of
 # packed and unpacked struct ports (6.30 -field); a retention register
 # simulated by its verification model (6.39 -lib_model_name); isolation
-# cells simulated by their functional model (6.62 -force_function).
-foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield retmodel isomodel)
+# cells simulated by their functional model (6.62 -force_function);
+# retention of flip-flops or latches only (6.54 -applies_to).
+foreach(t logic transitions attributes simctl pmodel bindchk replay hdlattr source vcm vcmfn pgconn vcmfield retmodel isomodel retlatch)
   set(flags)
   if(t STREQUAL "transitions")
     set(flags -upf_verbose)
@@ -410,3 +411,4 @@ upf_error_in(isomodel e_ifc5 "${uic} -lib_cells iso_and -port_map {{EN isolation
 upf_error_in(isomodel e_ifc6 "${uic} -lib_cells iso_and -port_map {{VDD input_supply.power}}" "input_supply.power needs a level-shifter strategy in -strategy (6.62)")
 upf_error_in(isomodel e_ifc7 "${uic} -lib_cells iso_and -port_map {{XX isolation_signal}}" "iso_and has no port XX (6.62)")
 upf_error_in(isomodel e_ifc8 "${uic} -lib_cells iso_and -port_map {{EN isolation_signal} {EN isolation_signal}}" "-port_map maps model port EN twice (6.62)")
+upf_error_in(retlatch e_rl1 "set_retention RET_X -domain PD_A -applies_to flops -save_signal {sf high} -restore_signal {sf low}" "-applies_to flops is not flop, latch or any (6.54)")

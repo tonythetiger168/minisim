@@ -59,7 +59,7 @@ turned on.
 | power-up (9.6.7) | the holds are released; combinational logic (`assign`, `always_comb`, `always @*`) re-evaluates; flops stay `x` until their next clock or reset edge |
 | `set_isolation` (9.8) | on each port connection that crosses the domain boundary: `-applies_to`, `-applies_to_boundary`, `-elements`, `-exclude_elements`, `-source`, `-sink`, `-diff_supply_only`, `-no_isolation`; `-clamp_value 0`, `1`, `Z`, `latch`; one or more `-isolation_signal`s with `-isolation_sense`; `x` when the isolation supply is not `NORMAL` or the control is unknown |
 | `set_level_shifter` (9.9) | `x` when its input or output supply (by default the two domains' primary supplies) is not `NORMAL` |
-| `set_retention` (9.7) | single control (`{ret high}` / `{ret low}`: saved on entry, held through power-down, shown again at power-up, released when the control falls), or separate save and restore signals (edge or level), `-save_event_condition`, `-restore_event_condition`, `-restore_period_condition`, `-powerdown_period_condition`, `-retention_supply` with `RET_SUP_COR` / `NO_RET_SUP_COR`, `SAV_RES_COR`, `-use_retention_as_primary` |
+| `set_retention` (9.7) | single control (`{ret high}` / `{ret low}`: saved on entry, held through power-down, shown again at power-up, released when the control falls), or separate save and restore signals (edge or level), `-save_event_condition`, `-restore_event_condition`, `-restore_period_condition`, `-powerdown_period_condition`, `-retention_supply` with `RET_SUP_COR` / `NO_RET_SUP_COR`, `SAV_RES_COR`, `-use_retention_as_primary`, `-applies_to flop | latch | any` (a latch: `always_latch`, or a variable a level-sensitive `always` leaves unassigned on some path) |
 | `set_repeater` (6.52, 9.10) | a buffer on each port connection the strategy applies to (`-applies_to`, `-applies_to_boundary`, `-elements`, `-exclude_elements`, `-source`, `-sink`, `-update`): its output is `x` while `-repeater_supply` is not `NORMAL` |
 | `create_logic_net`, `create_logic_port`, `connect_logic_net` (6.13, 6.19, 6.20) | one-bit nets and ports made by the power intent, and their connections to HDL ports (`-reconnect` replaces a constant on an input). The net can be an isolation, retention or switch control |
 | `add_state_transition` (6.7, 9.4) | named transitions of a supply set, domain or group (`-from` / `-to`, `-paired`, `-update`): an `-illegal` transition is an error, and with `-complete` so is one that is not named; `UNDEFINED` is passed through; `-upf_verbose` prints each named transition |
@@ -128,8 +128,9 @@ and a library cell is not checked against a Liberty file.
 with an HDL model are simulated (see the table).
 Isolation and level shifters sit on port connections between a parent and a
 child instance; a strategy on a port of the simulation top itself, or on a
-hierarchical reference, has no cell. `-applies_to flop` / `latch` of a
-retention strategy are not told apart. A supply net driven from a one-bit HDL
+hierarchical reference, has no cell. A latch inferred from a level-sensitive
+`always` is found per process (a variable not assigned on some path from one
+wait to the next); one inside a called task or function is not. A supply net driven from a one-bit HDL
 port through a table has a state and no voltage.
 `create_upf_library` makes no Tcl namespace. `find_objects -object_type process` is not supported (msim does not name
 processes), and `mdebug -upf` reads files without a design, so it does not

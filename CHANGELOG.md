@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- UPF `set_retention -applies_to flop | latch` (IEEE 1801-2024 6.54) selects
+  flip-flops or latches: `always_latch` and latches inferred from a
+  level-sensitive `always` that leaves a variable unassigned on some path.
+  Level-sensitive logic of a domain now re-evaluates at power-up (9.5.3)
+  even when no input changed while the domain was off.
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
