@@ -83,9 +83,70 @@ partition yet (an edit to one module does not yet rebuild only that module's
 part), and partition configuration files are not read. msim prints one note
 saying so (`tests/msim_partcomp.cmake`).
 
+## msim: the Siemens and Synopsys multi-step flows
+
+The three-step flows run on msim's one engine (`src/mstep.inc`). msim takes
+them when it runs under the tool's name (a link you create; minisim ships
+none) or with `-vlog`, `-vcom`, `-vsim`, `-vlib`, `-vmap`, `-vlogan`,
+`-vhdlan` or `-vcs` as its first option.
+
+```
+vlib work; vlib pkgs; vmap pkgs pkgs
+vlog -work pkgs pkg.sv
+vcom -2008 ctr.vhd
+vlog -sv +incdir+inc +define+W=8 tb.sv -l comp.log
+vsim -c -L pkgs -do "run -all; quit -f" -sv_seed 5 work.tb +more -l run.log
+
+vlogan -full64 -sverilog -work PKGS pkg.sv      # synopsys_sim.setup maps PKGS
+vhdlan ctr.vhd
+vlogan -sverilog -timescale=1ns/1ps +incdir+inc +define+W=8 tb.sv
+vcs -full64 -debug_access+all tb -o simv -l comp.log
+./simv +ntb_random_seed=5 +more -l run.log
+
+vcs -sverilog +incdir+inc pkg.sv ctr.vhd tb.sv -R +more   # one step
+```
+
+- **Libraries.** A library is a directory (`./work` by default) holding one
+  text file, `msim.lib`: the analysed sources in analysis order, each with
+  the options it was analysed with. Analysing a file again replaces its
+  line. Names map to directories through `modelsim.ini` (`[Library]`,
+  `name = dir`; `$MODELSIM`, `-modelsimini`) and `synopsys_sim.setup`
+  (`NAME : dir`, `WORK > NAME`; `$SYNOPSYS_SIM_SETUP`). `vlib` creates a
+  library, `vmap` reads and edits `modelsim.ini`; `vlogan` and `vhdlan`
+  create the work directory when it is missing.
+- **Analysis** (`vlog`, `vcom`, `vlogan`, `vhdlan`) checks the files'
+  syntax (`msim -parse`) and records them. A file with errors is not added.
+  Kept per file: `+define+`, `-define`, `+incdir+`, `-y`, `-v`, `+libext+`,
+  `-timescale`, `-ntb_opts uvm`. `-f`/`-F` files are read. Language-version,
+  lint, debug-access and message options are accepted and ignored. VHDL
+  files go to msim's VHDL front end (docs/VHDL.md), checked with the
+  library's earlier VHDL in front of them.
+- **vsim** runs msim on the sources of the `-L` libraries and the tops'
+  libraries (`lib.top`; `-lib` names the default). `-do` commands or a
+  `-do` file: a script of only `run -all` and `quit` just runs; anything
+  else becomes an msim `-do` Tcl script. `-c` with no `-do` reads commands
+  from the terminal. `-sv_seed` (also `random`), `-gNAME=V`/`-GNAME=V`,
+  `-sv_lib`, `-sv_root`, `-pli`, `-coverage`, `-l` are translated;
+  msim's own options and plusargs pass through.
+- **vcs** in one step (source files on the line) or after `vlogan` /
+  `vhdlan` (design unit names: every library the setup file maps is
+  searched). It checks the design at once (`msim -elab`), then writes
+  `simv` (`-o` names it): a script that runs msim on the recorded command
+  line, kept in `simv.daidir/msim.args`. `-R` runs it at once with the
+  plusargs. `simv` takes `-l`, `-ucli`, `-do`, `+vcs+finish+<t>`,
+  `+ntb_random_seed=` and plusargs.
+- **Compiled mode.** `vsim -compile` or `vcs -partcomp` builds in
+  `<library>/_msim/<top>` (one-step vcs: `simv.daidir/msim.d`), so the
+  generated parts are reused from the library. The kernel cache stays
+  user-wide (`$MSIM_KCACHE`).
+- **Not here:** precompiled vendor libraries (`-L uvm` of Questa's own
+  install: analyse the UVM sources, or use `-ntb_opts uvm` / msim `-uvm`),
+  `vopt` as a separate step, per-file compilation units for macros (all
+  sources of one simulation share one set of `+define+`s), and `.db`
+  snapshot files.
+
 ## Limits / Not yet
 
-- No tool uses the layer yet. Each tool's owner adds its own rule table.
 - Option abbreviations (xrun accepts any unique prefix of an option) are not
   expanded; write the full option name.
 - `-opt=value` and `-opt value` are separate rules; a tool registers both if
