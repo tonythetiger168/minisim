@@ -262,6 +262,59 @@ inline void setArgs(const CgInst& in) {
 constexpr size_t kMaxBins = 1u << 20;
 [[noreturn]] inline void fail(const std::string& m) { throw std::runtime_error("msim: covergroup: " + m); }
 
+// The values of a bin, one by one, for a cross with filter (19.6.1.2): its
+// keys in order; for a coverpoint wider than 64 bits each key is a bound
+// (odd) or the values strictly between two bounds (even).
+struct WideValIt {
+    const CgCpDef* c = nullptr;
+    const std::vector<std::pair<uint64_t, uint64_t>>* rs = nullptr;
+    const std::vector<Val>* wb = nullptr;
+    size_t ri = 0;
+    uint64_t k = 0;
+    Val cur, end;   // wide: offsets from the lowest value, w + 2 bits
+    WideValIt() = default;
+    WideValIt(const CgCpDef& c0, const std::vector<std::pair<uint64_t, uint64_t>>& r, const std::vector<Val>& b) : c(&c0), rs(&r), wb(&b) {}
+    int W() const { return c->w + 2; }
+    Val off(Val v) const {
+        v = v_resize(v, c->w, false);
+        if (c->sgn) v = v_insert(v, mk(~v_slice(v, c->w - 1, c->w - 1).v & 1, 1), c->w - 1, c->w - 1);
+        v.sgn = false;
+        return v_resize(v, W(), false);
+    }
+    bool lt(const Val& a, const Val& b) const { return (v_lt(a, b).v & 1) != 0; }
+    bool enter() {   // the values of key k; false: none
+        if (!c->wide) return true;
+        size_t i = (size_t)(k / 2);
+        if (k & 1) { cur = end = off((*wb)[i]); return true; }
+        cur = i == 0 ? mk(0, W()) : v_resize(v_add(off((*wb)[i - 1]), mk(1, W())), W(), false);
+        end = i == wb->size() ? v_sub(v_shl(mk(1, W()), mk((uint64_t)c->w, 32)), mk(1, W()))
+                              : v_resize(v_sub(off((*wb)[i]), mk(1, W())), W(), false);
+        return !lt(end, cur) && !(i < wb->size() && i > 0 && !lt(off((*wb)[i - 1]), off((*wb)[i])));
+    }
+    bool nextKey() {
+        for (;;) {
+            if (k < (*rs)[ri].second) k++;
+            else if (++ri < rs->size()) k = (*rs)[ri].first;
+            else return false;
+            if (enter()) return true;
+        }
+    }
+    bool reset() {
+        ri = 0;
+        k = (*rs)[0].first;
+        return enter() || nextKey();
+    }
+    bool next() {
+        if (c->wide && lt(cur, end)) { cur = v_resize(v_add(cur, mk(1, W())), W(), false); return true; }
+        return nextKey();
+    }
+    Val value() const {
+        if (!c->wide) return make((uint64_t)valOfKey(*c, k) & kmask(c->w), 0, c->w, 0);
+        Val v = v_resize(cur, c->w, false);
+        if (c->sgn) v = v_insert(v, mk(~v_slice(v, c->w - 1, c->w - 1).v & 1, 1), c->w - 1, c->w - 1);
+        return v;
+    }
+};
 // The values of an item list of a coverpoint wider than 64 bits, one by one,
 // in order and once each, for bins that need each value as a key of its own:
 // a `with` bin keeps those for which the expression is true (19.5.1.1); in a
@@ -877,25 +930,22 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
             uint64_t need = 1;
             if (s.matches) { Val m = eval(s.matches, rd); need = m.x ? 1 : m.v; }
             uint64_t yes = 0, tried = 0;
-            std::vector<size_t> ri(n, 0);
-            std::vector<uint64_t> k(n);
-            for (size_t j = 0; j < n; j++) k[j] = rs[j][0].first;
+            std::vector<WideValIt> it(n);
+            for (size_t j = 0; j < n; j++) {
+                it[j] = WideValIt(cx.d->cps[cx.xd->cps[j]], rs[j], cx.in->cps[cx.xd->cps[j]].wb);
+                if (!it[j].reset()) return s.all;   // a wide bin with no values
+            }
             for (;;) {
                 if (++tried > (1u << 22)) fail("too many value tuples for a cross with filter");
-                for (size_t j = 0; j < n; j++) {
-                    const CgCpDef& c = cx.d->cps[cx.xd->cps[j]];
-                    S.set(s.valSigs[j], make((uint64_t)valOfKey(c, k[j]) & kmask(c.w), 0, c.w, 0));
-                }
+                for (size_t j = 0; j < n; j++) S.set(s.valSigs[j], it[j].value());
                 bool t = truth(eval(s.with, rd)) == 1;
                 if (t) yes++;
                 if (!s.all && yes >= need) return true;
                 if (s.all && !t) return false;
                 size_t j = n;
                 while (j-- > 0) {   // the next value tuple
-                    if (k[j] < rs[j][ri[j]].second) { k[j]++; break; }
-                    if (++ri[j] < rs[j].size()) { k[j] = rs[j][ri[j]].first; break; }
-                    ri[j] = 0;
-                    k[j] = rs[j][0].first;
+                    if (it[j].next()) break;
+                    it[j].reset();
                 }
                 if (j == (size_t)-1) break;
             }
@@ -911,7 +961,10 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
                 for (size_t j = 0; j < n && in; j++) {
                     const CgCpDef& c = cx.d->cps[cx.xd->cps[j]];
                     int bi = cx.xi->dims[j][tuple[j]];
+                    const std::vector<Val>* saved = g_cgWide;
+                    g_cgWide = c.wide ? &cx.in->cps[cx.xd->cps[j]].wb : nullptr;   // a wide value's key among its bounds
                     uint64_t key = keyOf(c, vt[j]);
+                    g_cgWide = saved;
                     in = false;
                     for (auto& r : cx.in->cps[cx.xd->cps[j]].bins[bi].ranges)
                         if (r.first <= key && key <= r.second) { in = true; break; }
@@ -921,9 +974,17 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
             if (s.all) {   // matches $: every value tuple of the bins is in the set
                 uint64_t total = 1;
                 for (size_t j = 0; j < n; j++) {
+                    const CgCpDef& cd = cx.d->cps[cx.xd->cps[j]];
+                    const auto& rs = cx.in->cps[cx.xd->cps[j]].bins[cx.xi->dims[j][tuple[j]]].ranges;
                     uint64_t c = 0;
-                    for (auto& r : cx.in->cps[cx.xd->cps[j]].bins[cx.xi->dims[j][tuple[j]]].ranges) c += r.second - r.first + 1;
+                    if (!cd.wide)
+                        for (auto& r : rs) c += r.second - r.first + 1;
+                    else {   // the values, not the keys: count them, up to more than the set has
+                        WideValIt it(cd, rs, cx.in->cps[cx.xd->cps[j]].wb);
+                        for (bool ok = it.reset(); ok && c <= s.tuples.size(); ok = it.next()) c++;
+                    }
                     total *= c;
+                    if (total > s.tuples.size()) return false;
                 }
                 return yes > 0 && yes >= total;
             }
