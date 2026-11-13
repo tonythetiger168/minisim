@@ -4,8 +4,9 @@
 // The EDA file formats that are Tcl (SDC, UPF) and the shells of the tools
 // (timing, synthesis, place and route) all run on this one interpreter. It is
 // a subset: variables and arrays, [command] substitution, braces and quotes,
-// expr, if / foreach / for / while, proc, list and string commands, format,
-// catch, source. There is no namespace, upvar, regexp or file I/O.
+// expr, if / foreach / for / while, proc, upvar / uplevel, namespace eval
+// with namespace variables and procs, list and string commands, regexp /
+// regsub (ECMAScript syntax), format, catch, source. There is no file I/O.
 //
 //   tcl::Interp t;
 //   t.addCommand("report_timing", [&](const std::vector<std::string>& w) { ...; return std::string(); });
@@ -25,6 +26,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -285,14 +287,22 @@ protected:
     struct Ret { std::string v; };
     struct Brk {};
     struct Cont {};
-    struct Proc { std::vector<std::pair<std::string, std::optional<std::string>>> params; std::string body; std::string file; int line; };
+    struct Proc { std::vector<std::pair<std::string, std::optional<std::string>>> params; std::string body; std::string file; int line; std::string ns; };
 
     std::string file_;
     int line_ = 0;  // of the command being run
     int depth_ = 0;
     std::vector<std::unordered_map<std::string, std::string>> frames_;  // [0] is global
     std::vector<std::set<std::string>> globals_;
-    std::map<std::string, Proc> procs_;
+    // upvar / variable links of each frame: local name -> {frame, name there}
+    std::vector<std::unordered_map<std::string, std::pair<size_t, std::string>>> links_;
+    std::map<std::string, Proc> procs_;   // by qualified name, without the leading ::
+    std::vector<std::string> ns_{""};     // the current namespace ("" global, "a::b")
+    std::set<std::string> namespaces_;
+    std::string qualify(const std::string& n) const {   // a name in the current namespace
+        if (n.rfind("::", 0) == 0) return n.substr(2);
+        return ns_.back().empty() ? n : ns_.back() + "::" + n;
+    }
 
     // ------------------------------------------------------------ diagnostics
     void diag(Diag::Sev sev, const char* code, const Loc& loc, std::string text) {
@@ -304,8 +314,46 @@ protected:
     // -------------------------------------------------------------- variables
     std::unordered_map<std::string, std::string>& scopeOf(std::string& name) {
         if (name.rfind("::", 0) == 0) { name.erase(0, 2); return frames_[0]; }
+        if (links_.size() < frames_.size()) links_.resize(frames_.size());
+        size_t par = name.find('(');
+        std::string base = par == std::string::npos ? name : name.substr(0, par);
+        auto& lk = links_[frames_.size() - 1];
+        if (auto it = lk.find(base); it != lk.end()) {   // upvar / variable (an array element follows its array)
+            name = it->second.second + (par == std::string::npos ? "" : name.substr(par));
+            return frames_[it->second.first];
+        }
         if (frames_.size() > 1 && globals_.back().count(name)) return frames_[0];
+        // at the top level of a namespace eval, a plain name is a namespace variable
+        if (frames_.size() == 1 && !ns_.back().empty() && base.find("::") == std::string::npos) name = ns_.back() + "::" + name;
         return frames_.back();
+    }
+    // Where a variable of frame t lives: {frame, name}, following its links.
+    std::pair<size_t, std::string> resolveIn(size_t t, std::string name) {
+        if (name.rfind("::", 0) == 0) return {0, name.substr(2)};
+        if (links_.size() < frames_.size()) links_.resize(frames_.size());
+        if (auto it = links_[t].find(name); it != links_[t].end()) return it->second;
+        if (t > 0 && globals_[t].count(name)) return {0, name};
+        if (t == 0 && frames_.size() == 1 && !ns_.back().empty() && name.find("::") == std::string::npos) return {0, ns_.back() + "::" + name};
+        return {t, name};
+    }
+    // The frame `level` names (upvar, uplevel): 1 the caller, #0 global.
+    size_t levelFrame(const std::string& level) {
+        size_t cur = frames_.size() - 1;
+        if (!level.empty() && level[0] == '#') {
+            long n = strtol(level.c_str() + 1, nullptr, 10);
+            if (n < 0 || (size_t)n > cur) fail("bad level \"" + level + "\"");
+            return (size_t)n;
+        }
+        long n = strtol(level.c_str(), nullptr, 10);
+        if (n < 0 || (size_t)n > cur) fail("bad level \"" + level + "\"");
+        return cur - (size_t)n;
+    }
+    static bool isLevel(const std::string& s) {
+        if (s.empty()) return false;
+        size_t k = s[0] == '#' ? 1 : 0;
+        if (k >= s.size()) return false;
+        for (; k < s.size(); k++) if (!isdigit((unsigned char)s[k])) return false;
+        return true;
     }
     std::string getVar(std::string name) {
         if (name.rfind("env(", 0) == 0 || name.rfind("::env(", 0) == 0) {
@@ -855,6 +903,113 @@ protected:
                 for (size_t i = 1; i < w.size(); i++) globals_.back().insert(w[i]);
             return "";
         }
+        if (c == "upvar") {
+            size_t i = 1;
+            std::string level = "1";
+            if (w.size() % 2 == 0 && i < w.size() && isLevel(w[1])) level = w[i++];
+            if (w.size() - i < 2 || (w.size() - i) % 2) fail("wrong # args: should be \"upvar ?level? otherVar localVar ?otherVar localVar ...?\"");
+            size_t t = levelFrame(level), cur = frames_.size() - 1;
+            if (links_.size() < frames_.size()) links_.resize(frames_.size());
+            for (; i + 1 < w.size(); i += 2) {
+                auto r = resolveIn(t, w[i]);
+                if (r.first == cur && r.second == w[i + 1]) fail("can't upvar from variable to itself");
+                links_[cur][w[i + 1]] = r;
+            }
+            return "";
+        }
+        if (c == "uplevel") {
+            size_t i = 1;
+            std::string level = "1";
+            if (w.size() > 2 && isLevel(w[1])) level = w[i++];
+            if (i >= w.size()) fail("wrong # args: should be \"uplevel ?level? command ?arg ...?\"");
+            size_t t = levelFrame(level);
+            std::string script;
+            for (size_t k = i; k < w.size(); k++) script += (k > i ? " " : "") + w[k];
+            if (links_.size() < frames_.size()) links_.resize(frames_.size());
+            // run in frame t: the frames above it step aside until it returns
+            std::vector<std::unordered_map<std::string, std::string>> fr(std::make_move_iterator(frames_.begin() + t + 1), std::make_move_iterator(frames_.end()));
+            std::vector<std::set<std::string>> gl(std::make_move_iterator(globals_.begin() + t + 1), std::make_move_iterator(globals_.end()));
+            std::vector<std::unordered_map<std::string, std::pair<size_t, std::string>>> lk(std::make_move_iterator(links_.begin() + t + 1), std::make_move_iterator(links_.end()));
+            frames_.resize(t + 1);
+            globals_.resize(t + 1);
+            links_.resize(t + 1);
+            struct Back {
+                Interp& r;
+                decltype(fr)& f;
+                decltype(gl)& g;
+                decltype(lk)& l;
+                ~Back() {
+                    for (auto& x : f) r.frames_.push_back(std::move(x));
+                    for (auto& x : g) r.globals_.push_back(std::move(x));
+                    for (auto& x : l) r.links_.push_back(std::move(x));
+                }
+            } back{*this, fr, gl, lk};
+            return eval(script, line_);
+        }
+        if (c == "variable") {   // namespace variables, linked into a proc's frame
+            if (w.size() < 2) fail("wrong # args: should be \"variable ?name value...? name ?value?\"");
+            for (size_t i = 1; i < w.size(); i += 2) {
+                std::string q = qualify(w[i]);
+                if (frames_.size() > 1) {
+                    if (links_.size() < frames_.size()) links_.resize(frames_.size());
+                    links_.back()[w[i]] = {0, q};
+                }
+                if (i + 1 < w.size()) frames_[0][q] = w[i + 1];
+            }
+            return "";
+        }
+        if (c == "namespace") {
+            if (w.size() < 2) fail("wrong # args: should be \"namespace subcommand ?arg ...?\"");
+            const std::string& sc = w[1];
+            if (sc == "eval") {
+                if (w.size() < 4) fail("wrong # args: should be \"namespace eval name arg ?arg...?\"");
+                std::string q = qualify(w[2]);
+                for (size_t k = 0; (k = q.find("::", k)) != std::string::npos; k += 2) namespaces_.insert(q.substr(0, k));
+                namespaces_.insert(q);
+                std::string script;
+                for (size_t k = 3; k < w.size(); k++) script += (k > 3 ? " " : "") + w[k];
+                ns_.push_back(q);
+                struct Pop { Interp& r; ~Pop() { r.ns_.pop_back(); } } pop{*this};
+                return eval(script, line_);
+            }
+            if (sc == "current") return "::" + ns_.back();
+            if (sc == "exists") {
+                if (w.size() != 3) fail("wrong # args: should be \"namespace exists name\"");
+                std::string q = qualify(w[2]);
+                return q.empty() || namespaces_.count(q) ? "1" : "0";
+            }
+            if (sc == "qualifiers") {
+                if (w.size() != 3) fail("wrong # args: should be \"namespace qualifiers string\"");
+                size_t k = w[2].rfind("::");
+                return k == std::string::npos ? "" : w[2].substr(0, k);
+            }
+            if (sc == "tail") {
+                if (w.size() != 3) fail("wrong # args: should be \"namespace tail string\"");
+                size_t k = w[2].rfind("::");
+                return k == std::string::npos ? w[2] : w[2].substr(k + 2);
+            }
+            if (sc == "which") {
+                std::string n = w.back();
+                if (n.rfind("::", 0) == 0) return procs_.count(n.substr(2)) ? n : "";
+                if (!ns_.back().empty() && procs_.count(ns_.back() + "::" + n)) return "::" + ns_.back() + "::" + n;
+                return procs_.count(n) ? "::" + n : "";
+            }
+            if (sc == "delete") {
+                for (size_t k = 2; k < w.size(); k++) {
+                    std::string q = qualify(w[k]);
+                    for (auto it = procs_.begin(); it != procs_.end();)
+                        it = it->first.rfind(q + "::", 0) == 0 ? procs_.erase(it) : std::next(it);
+                    for (auto it = frames_[0].begin(); it != frames_[0].end();)
+                        it = it->first.rfind(q + "::", 0) == 0 ? frames_[0].erase(it) : std::next(it);
+                    namespaces_.erase(q);
+                }
+                return "";
+            }
+            // export, import, path, ensemble ...: names stay reachable by their qualified form
+            return "";
+        }
+        if (c == "regexp") return cmdRegexp(w);
+        if (c == "regsub") return cmdRegsub(w);
         if (c == "expr") {
             std::string e;
             for (size_t i = 1; i < w.size(); i++) e += (i > 1 ? " " : "") + w[i];
@@ -946,10 +1101,18 @@ protected:
             p.body = w[3];
             p.file = file_;
             p.line = line_;
-            procs_[w[1]] = std::move(p);
+            std::string q = qualify(w[1]);
+            p.ns = q.rfind("::") == std::string::npos ? "" : q.substr(0, q.rfind("::"));
+            procs_[q] = std::move(p);
             return "";
         }
-        if (auto it = procs_.find(c); it != procs_.end()) {
+        auto pit = procs_.end();
+        if (c.rfind("::", 0) == 0) pit = procs_.find(c.substr(2));
+        else {
+            if (!ns_.back().empty()) pit = procs_.find(ns_.back() + "::" + c);
+            if (pit == procs_.end()) pit = procs_.find(c);
+        }
+        if (auto it = pit; it != procs_.end()) {
             const Proc p = it->second;
             std::unordered_map<std::string, std::string> f;
             size_t ai = 1;
@@ -964,8 +1127,21 @@ protected:
             if (ai < w.size()) fail("wrong # args: too many arguments to \"" + c + "\"");
             frames_.push_back(std::move(f));
             globals_.emplace_back();
+            links_.resize(frames_.size() - 1);
+            links_.emplace_back();
+            ns_.push_back(p.ns);
             int savedLine = line_;
-            struct Pop { Interp& r; int l; ~Pop() { r.frames_.pop_back(); r.globals_.pop_back(); r.line_ = l; } } pop{*this, savedLine};
+            struct Pop {
+                Interp& r;
+                int l;
+                ~Pop() {
+                    r.frames_.pop_back();
+                    r.globals_.pop_back();
+                    r.links_.resize(r.frames_.size());
+                    r.ns_.pop_back();
+                    r.line_ = l;
+                }
+            } pop{*this, savedLine};
             try {
                 return eval(p.body, p.line);
             } catch (const Ret& r) {
@@ -1063,6 +1239,13 @@ protected:
         if (c == "info") {
             if (w.size() >= 3 && w[1] == "exists") return hasVar(w[2]) ? "1" : "0";
             if (w.size() >= 2 && w[1] == "script") return file_;
+            if (w.size() >= 2 && w[1] == "level") return std::to_string(frames_.size() - 1);
+            if (w.size() >= 2 && (w[1] == "procs" || w[1] == "commands")) {
+                std::vector<std::string> o;
+                for (auto& [n, p] : procs_)
+                    if (w.size() < 3 || globMatch(w[2].c_str(), n.c_str(), true)) o.push_back(n);
+                return joinList(o);
+            }
             fail("info " + (w.size() > 1 ? w[1] : std::string()) + ": not supported");
         }
         if (c == "catch") {
@@ -1107,7 +1290,7 @@ protected:
             try { eval(ss.str(), 1); } catch (const Ret&) {}
             return "";
         }
-        if (c == "namespace" || c == "package" || c == "suppress_message" || c == "unsuppress_message" ||
+        if (c == "package" || c == "suppress_message" || c == "unsuppress_message" ||
             c == "set_message_info" || c == "redirect" || c == "date" || c == "pid") return "";
         if (onUnknown) {
             std::string res;
@@ -1115,6 +1298,92 @@ protected:
         }
         diag(Diag::ErrorSev, "unknown-command", here(), "unknown command '" + c + "'");
         return "";
+    }
+
+    // regexp ?switches? exp string ?matchVar? ?subMatchVar ...? (ECMAScript
+    // syntax, which covers the common Tcl patterns).
+    std::string cmdRegexp(const std::vector<std::string>& w) {
+        size_t i = 1;
+        bool nocase = false, all = false, inl = false, indices = false;
+        size_t start = 0;
+        for (; i < w.size() && w[i].size() > 1 && w[i][0] == '-'; i++) {
+            if (w[i] == "--") { i++; break; }
+            if (w[i] == "-nocase") nocase = true;
+            else if (w[i] == "-all") all = true;
+            else if (w[i] == "-inline") inl = true;
+            else if (w[i] == "-indices") indices = true;
+            else if (w[i] == "-start" && i + 1 < w.size()) start = (size_t)strtol(w[++i].c_str(), nullptr, 10);
+            else if (w[i] == "-line" || w[i] == "-linestop" || w[i] == "-lineanchor" || w[i] == "-expanded") {}
+            else fail("bad switch \"" + w[i] + "\": must be -all, -indices, -inline, -line, -nocase, -start or --");
+        }
+        if (w.size() - i < 2) fail("wrong # args: should be \"regexp ?-switch ...? exp string ?matchVar? ?subMatchVar ...?\"");
+        if (inl && w.size() - i > 2) fail("regexp match variables not allowed when using -inline");
+        std::regex re;
+        try { re = std::regex(w[i], nocase ? std::regex::ECMAScript | std::regex::icase : std::regex::ECMAScript); }
+        catch (const std::regex_error& e) { fail("couldn't compile regular expression pattern: " + std::string(e.what())); }
+        const std::string& str = w[i + 1];
+        std::vector<std::string> vars(w.begin() + (long)i + 2, w.end());
+        auto value = [&](const std::smatch& m, size_t k, size_t off) {
+            if (k >= m.size() || !m[k].matched) return indices ? std::string("-1 -1") : std::string();
+            if (indices) return std::to_string(off + m.position(k)) + " " + std::to_string(off + m.position(k) + m.length(k) - 1);
+            return m[k].str();
+        };
+        std::vector<std::string> inlineOut;
+        long count = 0;
+        size_t pos = std::min(start, str.size());
+        std::smatch m;
+        while (pos <= str.size()) {
+            if (!std::regex_search(str.cbegin() + (long)pos, str.cend(), m, re,
+                                   pos > 0 ? std::regex_constants::match_prev_avail : std::regex_constants::match_default)) break;
+            count++;
+            if (inl) for (size_t k = 0; k < m.size(); k++) inlineOut.push_back(value(m, k, pos));
+            else for (size_t k = 0; k < vars.size(); k++) setVar(vars[k], value(m, k, pos));
+            if (!all) break;
+            size_t adv = (size_t)m.position(0) + (size_t)m.length(0);
+            pos += adv == 0 ? 1 : adv;
+            if (m.length(0) == 0 && pos > str.size()) break;
+        }
+        if (!count && !inl) for (auto& v : vars) setVar(v, indices ? "-1 -1" : "");
+        if (inl) return joinList(inlineOut);
+        return std::to_string(count);
+    }
+    // regsub ?switches? exp string subSpec ?varName?: & and \0 to \9 in subSpec.
+    std::string cmdRegsub(const std::vector<std::string>& w) {
+        size_t i = 1;
+        bool nocase = false, all = false;
+        for (; i < w.size() && w[i].size() > 1 && w[i][0] == '-'; i++) {
+            if (w[i] == "--") { i++; break; }
+            if (w[i] == "-nocase") nocase = true;
+            else if (w[i] == "-all") all = true;
+            else if (w[i] == "-line" || w[i] == "-linestop" || w[i] == "-lineanchor" || w[i] == "-expanded") {}
+            else fail("bad switch \"" + w[i] + "\": must be -all, -line, -nocase or --");
+        }
+        if (w.size() - i < 3 || w.size() - i > 4) fail("wrong # args: should be \"regsub ?-switch ...? exp string subSpec ?varName?\"");
+        std::regex re;
+        try { re = std::regex(w[i], nocase ? std::regex::ECMAScript | std::regex::icase : std::regex::ECMAScript); }
+        catch (const std::regex_error& e) { fail("couldn't compile regular expression pattern: " + std::string(e.what())); }
+        // Tcl's subSpec as an ECMAScript format: & -> $&, \n -> $n, $ -> $$
+        std::string fmt;
+        const std::string& sp = w[i + 2];
+        for (size_t k = 0; k < sp.size(); k++) {
+            if (sp[k] == '&') fmt += "$&";
+            else if (sp[k] == '$') fmt += "$$";
+            else if (sp[k] == '\\' && k + 1 < sp.size() && isdigit((unsigned char)sp[k + 1])) { fmt += sp[k + 1] == '0' ? std::string("$&") : std::string("$") + sp[k + 1]; k++; }
+            else if (sp[k] == '\\' && k + 1 < sp.size() && (sp[k + 1] == '&' || sp[k + 1] == '\\')) { fmt += sp[k + 1]; k++; }
+            else fmt += sp[k];
+        }
+        const std::string& str = w[i + 1];
+        long n = 0;
+        for (auto it = std::sregex_iterator(str.begin(), str.end(), re); it != std::sregex_iterator(); ++it) {
+            n++;
+            if (!all) break;
+        }
+        std::string out = std::regex_replace(str, re, fmt, all ? std::regex_constants::format_default : std::regex_constants::format_first_only);
+        if (w.size() - i == 4) {
+            setVar(w[i + 3], out);
+            return std::to_string(n);
+        }
+        return out;
     }
 
     std::string cmdString(const std::vector<std::string>& w) {

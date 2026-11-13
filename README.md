@@ -27,6 +27,7 @@ lower to a flat process IR, run on an event-driven kernel, dump waveforms for GT
 - **`msim` command line**: compile and run your own `.sv` files in one step, irun / vcs style
 - **UVM**: the Accellera UVM library (IEEE 1800.2-2020, uvm-core 2020.3.1) compiles and runs agent testbenches, with its C code (regular expressions, command line, HDL backdoor) via `msim -uvm`; see [`docs/UVM.md`](docs/UVM.md)
 - **DPI-C**: call C from SystemVerilog and SystemVerilog from C (clause 35), with `svdpi.h`
+- **Verification IP**: AXI4, AXI4-Lite, APB4 and memory UVM VIPs in `vip/`, and `tools/mvip.py` to run the 146 VIPs of open-vip-portfolio on msim; see [`docs/VIP.md`](docs/VIP.md)
 - **VPI**: user system tasks and functions, the design's object model, values and callbacks from C (clauses 36-38), with `vpi_user.h`; see [docs/VPI.md](docs/VPI.md)
 
 The implementation and signoff tools — synthesis, place and route, timing,
@@ -301,6 +302,31 @@ did not cover; an item the tests did cover is reported instead:
 mformal rtl/*.sv -top dut -app toggle -json formal.json
 mcov exclude all.json -formal formal.json -o unreachable.el      # finds tb.dut from the names, or -formal-scope tb.dut
 mcov report all.json -elfile unreachable.el -el-review
+```
+
+**UCIS XML.** A database whose name ends in `.xml` is UCIS XML (Accellera
+UCIS 1.0, its XML interchange format), the open format other simulators'
+coverage tools import and export. `mcov merge` writes one, and every `mcov`
+command reads one, with JSON databases mixed in. Proprietary binary
+databases are not read.
+
+```sh
+mcov merge all.json -o all.xml                 # for another tool
+mcov report other.xml -detail                  # another tool's coverage, with mcov
+mcov merge other.xml cov/*.json -o all.json    # both together
+```
+
+**Other vendors' coverage commands.** `mcov --compat=synopsys` takes URG
+options, `--compat=cadence` IMC batch commands (`-exec`, `-execcmd`: load,
+merge, report, rank) and `--compat=siemens` `vcover merge`, `report` and
+`ranktest`. A symlink named `urg`, `imc` or `vcover` that you make to mcov
+does the same. The engine is mcov's own; the databases are mcov's (JSON or
+UCIS XML, or a directory of them):
+
+```sh
+mcov --compat=synopsys -dir runs -dbname all.json -report urgReport -format both -grade
+mcov --compat=cadence -execcmd "merge runs -out all.json; load all.json; report -detail -out cov.txt"
+mcov --compat=siemens report -details -output cov.txt all.json
 ```
 
 **Which test covers what.** With one database per test, `mcov rank` orders
