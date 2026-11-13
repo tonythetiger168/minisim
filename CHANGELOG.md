@@ -159,6 +159,10 @@ Spec references are IEEE 1800-2023 clauses.
   clock domain (virtual clocks included), so an input read without a
   synchronizer, or an output launched on another clock, is a crossing.
   `set_case_analysis 0/1` makes a signal static.
+- UPF table VCMs convert a field of a struct port (`create_vcm -field`,
+  IEEE 1801-2024 6.30): packed and unpacked structs, nested fields, and one
+  upf2hdl VCM per field of a struct input.
+
 - `msim -upf` and `mlint -upf` check the implementation commands of IEEE
   1801-2024 instead of ignoring them: `map_power_switch`, `map_repeater_cell`,
   `map_retention_cell`, `map_retention_clamp_cell`, `name_format`,
@@ -1060,6 +1064,8 @@ Spec references are IEEE 1800-2023 clauses.
   caller's variable in `randomize() with`, or a class property), no longer
   makes randomize() fail: the solver narrows x to the container's elements
   (11.4.13, 18.5.4). Found by the CCIX VIP's data sequence.
+- A port of an unpacked struct type is one vector, as a variable of that
+  type is; it was "unsupported port width".
 - msim memory on big VIP benches: a 2-state unpacked array with more than
   64 elements gets its 0 defaults (6.8) from a loop instead of one
   instruction per element (a 1 MiB `bit [7:0] mem[]` cost about 1 GB), and
