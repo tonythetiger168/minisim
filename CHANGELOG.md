@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- Verdi, VCS and Xcelium waveform tasks: `$fsdbDumpfile`, `$fsdbDumpvars`,
+  `$fsdbDumpon` / `off`, `$fsdbDumpMDA`, `$vcdpluson`, `$vcdplusfile`,
+  `$vcdplusmemon`, `$shm_open`, `$shm_probe`, `$recordvars` and the rest
+  compile on msim and write FST under the same name (the vendor formats are
+  closed); msim, mdebug and mlint all accept them, and `msim -i` takes the
+  UCLI commands `fsdbDumpfile` / `fsdbDumpvars` / `fsdbDumpoff`.
+  `docs/DEBUG.md`, `tests/msim_vendor_dump.cmake`.
+- VPI assertion steps list their matched expressions
+  (`matched_expression_count`, `matched_exprs`, 39.5.2), and `failExpr` of a
+  concurrent assertion with sequence operators is the boolean that did not
+  hold (39.4.2). `vpiDecompile` of a net, variable or parameter is its name.
 - VPI parameters (37.28): type parameters (`vpiTypeParameter`) in
   `vpi_iterate(vpiParameter, module)`, a parameter's default through
   `vpiExpr`, param assigns (`vpiParamAssign`: the `#(...)` overrides with
@@ -38,8 +49,14 @@ Spec references are IEEE 1800-2023 clauses.
   QEMU's virt board, a device tree made from the platform (`-dump-dtb`), and
   OpenSBI's `fw_dynamic` hand-off. OpenSBI 1.7 and Ubuntu 24.04's stock
   riscv64 kernel boot to user space on 1 to 4 harts. Instruction fetch with
-  paging on keeps the last page translated: 25 to 43 MIPS under Linux.
-  Extension ABI 4.
+  paging on keeps the last page translated, and loads and stores keep the
+  last 64 pages each: 25 to 50 MIPS under Linux. Extension ABI 6.
+- msim VHDL: protected types (classes), access types (`new`, `null`,
+  `.all`, `deallocate`, linked lists through incomplete types, growable
+  arrays), generic packages and package instantiation, VHDL-2019
+  `std.env` queries, enumeration literals overloaded with functions, and
+  procedures as void functions so VHDL functions can call them.
+  `tests/vhdl/protected.vhd`, `access.vhd`, `generic_pkg.vhd` (GHDL goldens).
 - VPI class definitions (37.31): `vpiVariables` of a class defn gives its
   automatic properties too (before only static ones), as declarations
   with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);

@@ -399,6 +399,36 @@ automatic variables or only inside other objects (a UVM component tree;
 use `msim -i` and `print tb.h.next.id`, or `mdebug -tr` for transactions).
 `-compile` runs the interpreter when `-vcd-class` is given.
 
+## Verdi, VCS and Xcelium waveform tasks
+
+A testbench written for Verdi, VCS or Xcelium dumps with their own tasks.
+msim compiles them and writes FST: the vendors' formats (FSDB, VPD, SHM)
+are their own and closed, so the file of the same name with `.fst` is
+written instead, and msim says so once:
+
+    msim: wave.fsdb: FSDB, VPD and SHM are the vendors' own formats; writing wave.fst (open it with mdebug, GTKWave or Surfer)
+
+| Tasks | What msim does |
+|---|---|
+| `$fsdbDumpfile`, `$vcdplusfile`, `$shm_open`, `$fsdbAutoSwitchDumpfile`, `$recordfile` | name the file (`.fst`); without one, `novas.fst`, `vcdplus.fst` or `waves.fst` |
+| `$fsdbDumpvars`, `$fsdbDumpvarsES`, `$fsdbDumpSingle`, `$vcdpluson`, `$shm_probe`, `$recordvars` | as `$dumpvars`: a depth, instances or signals (by name or as strings, `"tb.dut"`); `+fsdbfile+NAME` names the file, `+all` and `+mda` add memories, other `+` options are accepted |
+| `$fsdbDumpMDA`, `$fsdbDumpMem`, `$vcdplusmemon` | memories too, as `-vcd-arrays` |
+| `$fsdbDumpon` / `off`, `$vcdpluson` / `off`, `$recordon` / `off` | as `$dumpon` / `$dumpoff` |
+| `$fsdbDumpflush`, `$vcdplusflush` | as `$dumpflush` |
+| `$fsdbDumpFinish`, `$vcdplusclose`, `$shm_close`, `$recordclose` | flush and stop |
+| `$fsdbDumpSVA`, `$fsdbSuppress`, `$fsdbLog`, `$vcdplusautoflushon`, ... | accepted, nothing to do |
+
+`msim -i` and `-do` take Verdi's UCLI commands the same way:
+`fsdbDumpfile`, `fsdbDumpvars [DEPTH] [SCOPES] [+all]`, `fsdbDumpon`,
+`fsdbDumpoff`, `fsdbDumpflush`, `fsdbDumpFinish`, `fsdbDumpMDA`. `-vcd` /
+`-fst` on the command line wins over all of them, as over `$dumpvars`.
+mdebug, mlint and the other tools compile the same sources.
+
+A Verdi PLI library loaded with `-load` / `-loadvpi` that registers these
+names itself keeps them. A second `$fsdbDumpvars` with more scopes after the
+dump has started adds none (an FST's signals are fixed when it starts);
+msim says so once.
+
 ## Tasks, calls and force
 
 A task or function declared in a module drives the signals it assigns, as
