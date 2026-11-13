@@ -223,6 +223,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_interactive
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_interactive.cmake)
+  # The UCLI commands of msim -i: line stops, step/next, Tcl, scopes, dump.
+  add_test(NAME msim_ucli
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_ucli -P ${CMAKE_SOURCE_DIR}/tests/msim_ucli.cmake)
   # mlint findings in mdebug's page (mdebug -lint).
   add_test(NAME mdebug_lint
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMLINT=$<TARGET_FILE:mlint> -DSRC=${CMAKE_SOURCE_DIR}

@@ -351,6 +351,15 @@ Spec references are IEEE 1800-2023 clauses.
   (next/previous time the selected signal takes it), Del to remove a row,
   Ctrl+arrows to step changes; the view lives in the page address, so a
   reload or a copied link opens on it.
+- `msim -i` / `-do` is a UCLI on the shared Tcl interpreter: `set`, `if`,
+  `foreach`, `proc`, `source` around the commands; stops at a line
+  (`stop -line N -file F`), at a time, on a condition, with `-command`,
+  `-continue` and `-once`, and `-delete/-disable/-enable`; `step` and `next`
+  one statement at a time; `run -posedge/-negedge/-change SIG`, `run -slot N`
+  (was `step N`), `run T -absolute`; `get -radix`, `change`, `scope`, `show`,
+  `describe`, `search`, `where`, `listing`, `dump` / `probe`, `senv`, `alias`.
+  `xrun -input` runs its Tcl file as it is (no translation), and `xrun -tcl`
+  is `-i`.
 - `mdebug -lint FILE`: mlint's findings (`mlint -json`) in the page: a list
   with a severity filter, marks on the source lines, and a click that opens
   the line and selects the signal the finding names; script command `lint`.
