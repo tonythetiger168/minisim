@@ -562,11 +562,17 @@ int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
         if (!t.isIntegral()) unsupported("a local variable that is not integral (16.10)");
         int w = (int)t.getBitWidth();
         if (!mkSig) unsupported("local variable here");
-        int sg = mkSig(scopePath(scope) + ".$lv_" + std::string(lv->name) + std::to_string(tempSeq ? (*tempSeq)++ : 0), w, false);
-        sigmap[lv] = sg;
-        svaLocalSigs().insert(sg);
-        int k = (int)svb->localSigs.size();
-        svb->localSigs.push_back(sg);
+        int sg, k;
+        if (auto f = sigmap.find(lv); f != sigmap.end()) {   // made early (levelLocals)
+            sg = f->second;
+            k = (int)(std::find(svb->localSigs.begin(), svb->localSigs.end(), sg) - svb->localSigs.begin());
+        } else {
+            sg = mkSig(scopePath(scope) + ".$lv_" + std::string(lv->name) + std::to_string(tempSeq ? (*tempSeq)++ : 0), w, false);
+            sigmap[lv] = sg;
+            svaLocalSigs().insert(sg);
+            k = (int)svb->localSigs.size();
+            svb->localSigs.push_back(sg);
+        }
         const Expression* from = nullptr;
         if (lv->formalPort) {
             for (auto& [port, actual] : ai.arguments)
@@ -580,6 +586,23 @@ int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
     svb->acts.push_back(std::move(init));
     return (int)svb->acts.size() - 1;
 }
+// The local variables of a property level reached through a recursive
+// instance before the level itself is built (16.12.17): their signals, made
+// now; instLocals takes them over.
+void levelLocals(const slang::ast::AssertionInstanceExpression& lvl) {
+    using namespace slang::ast;
+    for (const LocalAssertionVarSymbol* lv : lvl.localVars) {
+        if (sigmap.count(lv)) continue;
+        if (lv->formalPort && lv->formalPort->direction && *lv->formalPort->direction != ArgumentDirection::In) continue;
+        const Type& t = lv->getType();
+        if (!t.isIntegral()) unsupported("a local variable that is not integral (16.10)");
+        int sg = mkSig(scopePath(scope) + ".$lv_" + std::string(lv->name) + std::to_string(tempSeq ? (*tempSeq)++ : 0),
+                       (int)t.getBitWidth(), false);
+        sigmap[lv] = sg;
+        svaLocalSigs().insert(sg);
+        svb->localSigs.push_back(sg);
+    }
+}
 // The recursive instance `ai` of a property whose level `lvl` recurs
 // (16.12.17): the level's local variables take their new values, as an act
 // run before the level's body is entered again. Local formals take the
@@ -587,20 +610,22 @@ int instLocals(const slang::ast::AssertionInstanceExpression& ai) {
 // current level, through temporaries (the new values must not see each
 // other). -1: nothing to set.
 int recLocals(const slang::ast::AssertionInstanceExpression& ai, const slang::ast::AssertionInstanceExpression& lvl,
-              const slang::ast::AssertionInstanceExpression& outer) {
+              const slang::ast::AssertionInstanceExpression& outer, const slang::ast::AssertionInstanceExpression& cur) {
     using namespace slang::ast;
     if (lvl.localVars.empty()) return -1;
     // slang leaves the recursive instance unbound. Its actual arguments are
-    // the level's own, written the same way one level further in: lowered
-    // with the outer level's local variables standing for this level's.
-    if (!ai.syntax || !lvl.syntax || ai.syntax->toString() != lvl.syntax->toString() ||
-        outer.localVars.size() != lvl.localVars.size())
-        unsupported("a recursive property with local variables, instanced in more than one way (16.12.17)");
+    // those of `lvl`, the expansion of the same instance one level out (the
+    // same syntax): written in `outer`, they are lowered with the local
+    // variables of `cur`, the level the instance is in, standing for
+    // outer's.
+    (void)ai;
+    if (outer.localVars.size() != cur.localVars.size())
+        unsupported("a recursive property with local variables (16.12.17)");
     std::vector<ConcAssert::Item> act, copy;
     std::vector<std::pair<const Symbol*, std::optional<int>>> saved;
     for (const LocalAssertionVarSymbol* ov : outer.localVars) {   // matched by name: the order may differ
         const LocalAssertionVarSymbol* lv = nullptr;
-        for (const LocalAssertionVarSymbol* x : lvl.localVars)
+        for (const LocalAssertionVarSymbol* x : cur.localVars)
             if (x->name == ov->name) lv = x;
         auto it = lv ? sigmap.find(lv) : sigmap.end();
         if (it == sigmap.end()) unsupported("a recursive property with local variables (16.12.17)");
@@ -874,11 +899,47 @@ bool isSeq(const slang::ast::AssertionExpr& a) {
 // the REC term each one became the target of (-1: none).
 struct RecEnt { const slang::ast::AssertionInstanceExpression* ai; int idx; };
 std::vector<RecEnt> recStack;
+// Levels built or reached so far: the REC term each became the target of,
+// and the body built for it.
+std::map<const slang::ast::AssertionInstanceExpression*, int> recIdxOf;
+std::map<const slang::ast::AssertionInstanceExpression*, const sva::Node*> recLevelBody;
+int recPushIdx(const slang::ast::AssertionInstanceExpression* ai) {
+    auto it = recIdxOf.find(ai);
+    return it == recIdxOf.end() ? -1 : it->second;
+}
+void recPop(const RecEnt& e, const sva::Node* body) {
+    recLevelBody[e.ai] = body;
+    if (e.idx >= 0) {
+        sva::store().recBody[(size_t)e.idx] = body;
+        recIdxOf[e.ai] = e.idx;
+    }
+}
+// The expansion slang made of the property instance written at `syn`, inside
+// the body of `outer` (null: none).
+static const slang::ast::AssertionInstanceExpression* expansionAt(const slang::ast::AssertionExpr& body,
+                                                                  const slang::syntax::SyntaxNode* syn,
+                                                                  const slang::ast::Symbol& sym) {
+    using namespace slang::ast;
+    const AssertionInstanceExpression* found = nullptr;
+    auto vis = makeVisitor([&](auto& v, const AssertionInstanceExpression& x) {
+        if (found) return;
+        if (&x.symbol == &sym && !x.isRecursiveProperty && x.syntax == syn) { found = &x; return; }
+        v.visitDefault(x);
+    });
+    body.visit(vis);
+    return found;
+}
 // Whether two expressions are the same, as far as can be told without
 // evaluating them (false when unsure).
 static bool sameExpr(const slang::ast::Expression& a, const slang::ast::Expression& b) {
     using namespace slang::ast;
     if (&a == &b) return true;
+    // An argument converted to its formal's type at one level is passed on
+    // already converted at the next: compare what was converted.
+    if (a.kind == ExpressionKind::Conversion && b.kind != ExpressionKind::Conversion)
+        return sameExpr(a.as<ConversionExpression>().operand(), b);
+    if (b.kind == ExpressionKind::Conversion && a.kind != ExpressionKind::Conversion)
+        return sameExpr(a, b.as<ConversionExpression>().operand());
     if (a.kind != b.kind || !a.type->isMatching(*b.type)) return false;
     switch (a.kind) {
         case ExpressionKind::NamedValue: case ExpressionKind::HierarchicalValue:
@@ -937,23 +998,47 @@ const sva::Node* propTerm(const slang::ast::AssertionExpr& a, bool strong) {
             // for the instance inside the second expansion. With the same
             // arguments at both levels, the placeholder is the second
             // expansion again: a REC term for it.
+            // The placeholder stands for the expansion of the same instance
+            // (the same syntax) in the outer level: with an instance written
+            // in more than one place, each place has its own expansion.
             std::vector<size_t> same;
             for (size_t k = recStack.size(); k-- > 0 && same.size() < 2;)
                 if (&recStack[k].ai->symbol == &ai->symbol) same.push_back(k);
             if (same.size() < 2) unsupported("recursive property (16.12.17)");
-            if (!sameArgs(*recStack[same[0]].ai, *recStack[same[1]].ai, true))
+            const AssertionInstanceExpression* cur = recStack[same[0]].ai;
+            const AssertionInstanceExpression* outer = recStack[same[1]].ai;
+            const AssertionInstanceExpression* tgt = ai->syntax ? expansionAt(outer->body, ai->syntax, ai->symbol) : nullptr;
+            if (!tgt) {
+                if (!ai->syntax || !cur->syntax || ai->syntax->toString() != cur->syntax->toString())
+                    unsupported("a recursive property instance whose expansion is not found (16.12.17)");
+                tgt = cur;
+            }
+            if (!sameArgs(*tgt, *outer, true))
                 unsupported("a recursive property whose arguments change from one level to the next (16.12.17)");
-            RecEnt& e = recStack[same[0]];
-            if (e.idx < 0) e.idx = st.recNew();
-            return st.init(recLocals(*ai, *e.ai, *recStack[same[1]].ai), st.rec(e.idx));
+            int* idx = nullptr;
+            for (auto& r : recStack)
+                if (r.ai == tgt) idx = &r.idx;
+            int off = -1;
+            if (!idx) {   // a level not being built now: built before, or still to come
+                auto it = recIdxOf.find(tgt);
+                off = it == recIdxOf.end() ? -1 : it->second;
+                idx = &off;
+            }
+            if (*idx < 0) {
+                *idx = st.recNew();
+                if (auto b = recLevelBody.find(tgt); b != recLevelBody.end()) st.recBody[(size_t)*idx] = b->second;
+                recIdxOf[tgt] = *idx;
+            }
+            levelLocals(*tgt);
+            return st.init(recLocals(*ai, *tgt, *outer, *cur), st.rec(*idx));
         }
-        recStack.push_back({ai, -1});
+        recStack.push_back({ai, recPushIdx(ai)});
         int init = instLocals(*ai);
         const sva::Node* body = propTerm(ai->body, strong);
         const sva::Node* r = st.init(init, body);
         RecEnt e = recStack.back();
         recStack.pop_back();
-        if (e.idx >= 0) st.recBody[(size_t)e.idx] = body;   // each level sets its locals before it (recLocals)
+        recPop(e, body);   // each level sets its locals before it (recLocals)
         return r;
     }
     if (isSeq(a)) return st.pseq(seqTerm(a), strong);
@@ -1093,6 +1178,8 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     if (b.clk.empty()) unsupported("an end point of a sequence with no clock (16.13.6)");
     svb = &b;
     sva::store().localAtoms = &b.atomLocal;
+    recIdxOf.clear();   // levels of recursive properties are per assertion
+    recLevelBody.clear();
     int savedClk = sva::store().clk;
     sva::store().clk = 0;
     sampleEv = b.clk;
@@ -1189,11 +1276,13 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     const Expression* dis = nullptr;
     std::vector<int> inits;   // the local variables of the leading property instances
     sva::store().localAtoms = &b.atomLocal;
+    recIdxOf.clear();   // levels of recursive properties are per assertion
+    recLevelBody.clear();
     sva::store().clk = 0;
     struct Reset { ~Reset() { sva::store().localAtoms = nullptr; sva::store().clk = 0; } } reset;
     for (;;) {
         if (const auto* ai = instanceOf(*a); ai && ai->symbol.kind == SymbolKind::Property) {
-            recStack.push_back({ai, -1});
+            recStack.push_back({ai, recPushIdx(ai)});
             inits.push_back(instLocals(*ai));
             a = &ai->body;
         } else if (a->kind == AssertionExprKind::Clocking) {
@@ -1229,7 +1318,7 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
         c.root = sva::store().init(inits[k], c.root);
         RecEnt e = recStack.back();   // a leading instance that recurs (16.12.17)
         recStack.pop_back();
-        if (e.idx >= 0) sva::store().recBody[(size_t)e.idx] = body;
+        recPop(e, body);
     }
     sva::store().localAtoms = nullptr;
     if (dis) c.disable = expr(*dis);   // current values, not sampled (16.12)
