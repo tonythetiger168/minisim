@@ -1977,6 +1977,14 @@ inline Task cbLater(int s, Val v, int hi, int lo, uint64_t d) {
     S.reNbaq.push_back({s, v, hi, lo});
     S.rare = true;
 }
+// An output with an edge skew: at the next such edge of the clock, then the
+// delay (14.3).
+inline Task cbAtEdge(int s, Val v, int hi, int lo, int clk, int edge, uint64_t d) {
+    co_await Wait{clk, (Edge)edge};
+    if (d) co_await Delay{d};
+    S.reNbaq.push_back({s, v, hi, lo});
+    S.rare = true;
+}
 static void cbSchedule(ClockingRT& c, int out, const Val& v, int hi, int lo) {
     const ClockingRT::Out& o = c.outs[out];
     if (hi < 0) { hi = o.w - 1; lo = 0; }
@@ -1987,7 +1995,8 @@ static void cbSchedule(ClockingRT& c, int out, const Val& v, int hi, int lo) {
             Val part = v_slice(v, b - lo, a - lo);
             int dhi = p.lo + (b - pl), dlo = p.lo + (a - pl);
             if (dlo == 0 && dhi == S.sigs[p.sig].w - 1) dhi = -1;
-            if (o.skew == 0) { S.reNbaq.push_back({p.sig, part, dhi, dlo}); S.rare = true; }
+            if (o.edgeSig >= 0) S.spawn(cbAtEdge(p.sig, part, dhi, dlo, o.edgeSig, o.edge, o.skew));
+            else if (o.skew == 0) { S.reNbaq.push_back({p.sig, part, dhi, dlo}); S.rare = true; }
             else S.spawn(cbLater(p.sig, part, dhi, dlo, o.skew));
         }
         pl += p.w;
@@ -2042,6 +2051,16 @@ inline Task cbHist(int k, int j, shared_ptr<vector<pair<int, Edge>>> ev) {
         else in.hist.push_back({S.now, v});
     }
 }
+// An input with an edge skew keeps its value at each such edge of the clock.
+inline Task cbEdgeSample(int k, int j) {
+    for (;;) {
+        auto& in0 = clockings()[k].ins[j];
+        co_await Wait{in0.edgeSig, (Edge)in0.edge};
+        auto& in = clockings()[k].ins[j];
+        in.last = eval(in.src, rd);
+        in.lastAt = S.now;
+    }
+}
 // A net output is driven from its hidden variable (14.16).
 inline Task cbNetDriver(int var, int net, int drv, int lo) {
     for (;;) {
@@ -2065,6 +2084,15 @@ inline Task cbProc(int k) {
             auto& in = c.ins[j];
             if (in.kind == 0) S.set(in.cv, eval(in.src, rd));
             else if (in.kind == 2) S.set(in.cv, S.now >= in.skew ? cbHistAt(in, S.now - in.skew) : in.hist.front().second);
+            else if (in.kind == 3) {   // the value at the last such edge; one at this very step is read now
+                // The clocking event is an edge of the same signal: is it the skew's edge too?
+                Val cv = S.get(in.edgeSig);
+                int cur = (cv.x & 1) ? 2 : (int)(cv.v & 1);
+                bool now = in.lastAt == S.now || in.edge == ANY || in.edge == c.ev[0].second ||
+                           (c.ev[0].second == ANY && ((in.edge == POS && cur == 1) || (in.edge == NEG && cur == 0)));
+                if (now) S.set(in.cv, eval(in.src, rd));
+                else if (in.lastAt != ~0ull) S.set(in.cv, in.last);
+            }
         }
         // Drives due at this clocking event.
         if (!c.drives.empty()) {
@@ -2093,6 +2121,7 @@ inline void startClockings() {
         S.set(c.evSig + 1, mk(0, 64));
         for (size_t j = 0; j < c.ins.size(); j++) {
             auto& in = c.ins[j];
+            if (in.kind == 3) { S.spawn(cbEdgeSample((int)k, (int)j)); continue; }
             if (in.kind != 2) continue;
             in.hist.push_back({0, eval(in.src, rd)});   // cbHist updates it once the initializers have run
             if (in.refs.empty()) continue;

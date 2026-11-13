@@ -28,9 +28,10 @@ add_executable(minisim src/minisim.cpp)
 target_include_directories(minisim PRIVATE src)
 
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
-# net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
+# net initial value (test_net), the demo VCD's time-0 $dumpvars sample (test_vcd),
+# and the Tcl interpreter of the tool line (test_tcl).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_tcl)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
@@ -302,6 +303,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_ucis
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_ucis.cmake)
+    add_test(NAME mcov_compat
+             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_compat
+                     -P ${CMAKE_SOURCE_DIR}/tests/mcov_compat.cmake)
     add_test(NAME msim_cov_select
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_select
