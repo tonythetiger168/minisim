@@ -1986,6 +1986,24 @@ struct Lowerer {
         for (size_t n = 0; n < args.size(); n++) {
             const DpiArg& formal = f->args[n];
             const Expression& a = *args[n];
+            if (formal.popen && formal.udims.empty()) {   // bit [] (35.5.6.1): the vector as a one-element array
+                const Expression* x = &a;
+                if (formal.dir != 0) {
+                    if (a.kind != ExpressionKind::Assignment) unsupported("DPI output argument");
+                    x = &a.as<AssignmentExpression>().left();
+                }
+                if (!x->type->isIntegral()) unsupported("DPI packed open array argument that is not a packed value");
+                int W = (int)x->type->getBitWidth();
+                auto A = std::make_shared<ArrShape>();
+                A->base = freshStatic(W);
+                A->count = 1;
+                A->elemW = W;
+                A->twoState = !x->type->isFourState();
+                if (formal.dir != 1) { Instr i; i.k = IK::Assign; i.sig = A->base; i.e = resize(expr(*x), W, false, false); prog.emit(i); }
+                c.dact[n].arr = A;
+                c.dact[n].pw = W;
+                continue;
+            }
             if (formal.uarr) {
                 const Expression* x = &a;
                 if (formal.dir != 0) {
@@ -1993,6 +2011,12 @@ struct Lowerer {
                     x = &a.as<AssignmentExpression>().left();
                 }
                 x = &peel(*x);
+                if (formal.popen) {   // logic [] v []: the elements' packed width
+                    const Type* et = x->type;
+                    while (et->getCanonicalType().isUnpackedArray()) et = et->getCanonicalType().getArrayElementType();
+                    if (!et->isIntegral()) unsupported("DPI packed open array argument that is not packed");
+                    c.dact[n].pw = (int)et->getBitWidth();
+                }
                 if (!ValueExpressionBase::isKind(x->kind)) unsupported("DPI array argument that is not a variable");
                 const Symbol* as = &x->as<ValueExpressionBase>().symbol;
                 if (auto it = arrMap().find(as); it != arrMap().end()) c.dact[n].arr = it->second;
@@ -2034,6 +2058,13 @@ struct Lowerer {
         prog.emit(c);
         for (size_t n = 0; n < args.size(); n++) {
             const DpiArg& formal = f->args[n];
+            if (formal.popen && formal.udims.empty() && formal.dir != 0) {   // bit []: the vector back
+                Instr i; i.k = IK::Assign;
+                lhs(args[n]->as<AssignmentExpression>().left(), i);
+                i.e = ref(c.dact[n].arr->base);
+                prog.emit(i);
+                continue;
+            }
             if (formal.dir == 0 || formal.uarr) continue;
             const Expression& a = *args[n];
             if (a.kind == ExpressionKind::EmptyArgument) continue;
@@ -12289,7 +12320,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             while (t->kind == SymbolKind::FixedSizeUnpackedArrayType || t->kind == SymbolKind::DPIOpenArrayType) {
                 if (t->kind == SymbolKind::DPIOpenArrayType) {
                     const auto& o = t->as<DPIOpenArrayType>();
-                    if (o.isPacked) Lowerer::unsupported("DPI packed open array argument (bit [])");
+                    if (o.isPacked) {   // bit [] / logic []: the element's width comes from the actual
+                        if (f.isExport) Lowerer::unsupported("open array argument of a DPI export");
+                        a.popen = true;
+                        a.open = true;
+                        a.uarr = true;
+                        a.t = o.elementType.isFourState() ? DT_LOGICVEC : DT_BITVEC;
+                        a.w = 0;
+                        break;
+                    }
                     a.open = true;
                     a.udims.push_back({0, 0});
                     a.uopen.push_back(true);
@@ -12313,7 +12352,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 a.cSize = cur;
                 const Type& named = formal->getType();
                 a.cName = named.name.empty() ? "void" : std::string(named.name);
-            } else
+            } else if (!a.popen)
             a.t = dpiType(*t, a.w, a.sgn);
             if (!a.uarr) {
                 auto it = sigmap.find(formal);

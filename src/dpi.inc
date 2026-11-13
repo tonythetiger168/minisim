@@ -236,9 +236,10 @@ struct ArrBuf {
 // actual's own order: row-major, each dimension from its left bound).
 inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<std::string>& strs,
                   std::vector<size_t>& map) {
+    int w = f.popen ? a.pw : f.w;
     b.oa.t = f.t;
-    b.oa.w = f.w;
-    b.oa.elemSize = elemBytes(f.t, f.w);
+    b.oa.w = w;
+    b.oa.elemSize = elemBytes(f.t, w);
     std::vector<Val> vals;
     std::vector<std::pair<int64_t, int64_t>> act;
     if (a.arr) {
@@ -271,11 +272,11 @@ inline void arrIn(ArrBuf& b, const DpiArg& f, const DpiActual& a, std::vector<st
     b.bytes.assign(b.oa.count * b.oa.elemSize + 8, 0);
     b.oa.data = b.bytes.data();
     if (f.t == DT_STRING) strs.reserve(strs.size() + vals.size());
-    for (size_t k = 0; k < vals.size(); k++) toC(b.oa.data + k * b.oa.elemSize, f.t, f.w, vals[map[k]], strs);
+    for (size_t k = 0; k < vals.size(); k++) toC(b.oa.data + k * b.oa.elemSize, f.t, w, vals[map[k]], strs);
 }
 inline void arrOut(const ArrBuf& b, const DpiArg& f, const DpiActual& a, const std::vector<size_t>& map) {
     for (size_t k = 0; k < b.oa.count; k++) {
-        Val v = fromC(b.oa.data + k * b.oa.elemSize, f.t, f.w, f.sgn);
+        Val v = fromC(b.oa.data + k * b.oa.elemSize, f.t, b.oa.w, f.sgn);
         if (a.arr) {
             if (a.arr->twoState) { v.x = 0; v.z = 0; for (auto& h : v.hi) { h.x = h.z = 0; } }
             S.set(a.arr->base + (int)map[k], v);
