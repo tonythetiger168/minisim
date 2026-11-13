@@ -78,6 +78,25 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI assertion control as 39.5 reads: `vpiAssertionEnableStep` /
+  `DisableStep` and `vpiAssertionKill` act on one attempt, named by its
+  start time (`vpiAssertionClockSteps` accepted); kill no longer disables
+  the assertion. System control takes a scope handle (NULL: all);
+  `vpiAssertionSysReset` removes the step callbacks, `vpiAssertionSysEnd`
+  every assertion callback.
+- VPI save, restart and reset (38.6, 38.36.3): `vpi_control(vpiReset)`;
+  `cbStartOfSave` / `cbEndOfSave`, `cbStartOfRestart` / `cbEndOfRestart`
+  and `cbStartOfReset` / `cbEndOfReset` now run around `$save`,
+  `$restart` and `$reset`; `cbSignal` runs at the next time slot after the
+  signal. `cbUnresolvedSystf` now also passes the name in `user_data`.
+- VPI coverage stop and start on one instance below the top (40.5.1):
+  its statement, toggle or FSM counts freeze until `vpiCoverageStart`.
+- VPI coverage control as 40.5 reads: `vpi_control` returns the
+  `SV_COV_*` codes of the system functions (`vpiCoverageCheck` is 1 when
+  coverage is available, not when all is covered; errors are -1), and
+  `vpiCovered` of an assertion needs an attempt, a success and no failure.
+- VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
+  immediate assertion, or the boolean of a single-expression property.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
