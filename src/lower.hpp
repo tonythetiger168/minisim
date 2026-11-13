@@ -4260,13 +4260,15 @@ struct Lowerer {
         assignInto(d, x);
         return d;
     }
-    int fixedAsQueue(const slang::ast::Expression& x) {
+    // anyRange: the method neither returns nor reads indices, so the
+    // declared range of the array does not matter.
+    int fixedAsQueue(const slang::ast::Expression& x, bool anyRange = false) {
         using namespace slang::ast;
         const Type& at = x.type->getCanonicalType();
         if (!isFixedArr(x)) unsupported("array method of this array");
         if (!stmtDepth) unsupported("array method of a fixed-size array outside a procedural statement");
         auto r = at.as<FixedSizeUnpackedArrayType>().range;
-        if (r.left != 0 || r.right < 0) unsupported("array method of an array not declared [N] or [0:N-1]");
+        if (!anyRange && (r.left != 0 || r.right < 0)) unsupported("array method of an array not declared [N] or [0:N-1]");
         int q = keyQueue(*at.getArrayElementType());
         dynAppend(q, x);
         lastFixedQueue = q;
@@ -4511,13 +4513,15 @@ struct Lowerer {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
         auto args = call.arguments();
-        int d = dynValue(*args[0]);
-        if (d < 0) d = fixedAsQueue(*args[0]);
-        const DynObj& o = dynShape(d);
         const Expression* withE = nullptr;
         const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
             std::tie(withE, itSym) = sci->getIteratorInfo();
+        int d = dynValue(*args[0]);
+        if (d < 0)
+            d = fixedAsQueue(*args[0], !withE && (n == "sort" || n == "rsort" || n == "reverse" || n == "shuffle" ||
+                                                  n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor"));
+        const DynObj& o = dynShape(d);
         if (withE && consDepth) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
             static const std::pair<const char*, int> red[] = {{"sum", 0}, {"product", 1}, {"and", 2}, {"or", 3}, {"xor", 4}};
             for (auto& [s, id] : red)
@@ -7415,7 +7419,23 @@ struct Lowerer {
                     }
                     return;
                 }
-                if (classMember(x)) unsupported("ordering method of an array property");
+                if (classMember(x)) {   // h.a.sort() (8.4): each element back through the handle
+                    const auto& m = x.as<slang::ast::MemberAccessExpression>();
+                    const PropSlot* ps = memberSlot(m);
+                    if (!ps || ps->kind != 1 || ps->arr->dynElem || ps->arr->count != n)
+                        unsupported("ordering method of this array property");
+                    const ArrShape& P = *ps->arr;
+                    auto A = std::make_shared<ArrShape>(P);
+                    A->base = indSlot(exprH(m.value()), P.base);
+                    auto [lo, ro] = P.dims[0];
+                    for (int k = 0; k < n; k++) {
+                        Instr i; i.k = IK::Assign;
+                        i.sig = A->base; i.arr = A; i.e = resize(parts[(size_t)k], P.elemW, P.sgn, P.sgn);
+                        i.aidx.push_back(konst(make((uint64_t)(lo <= ro ? lo + k : lo - k), 0, 32, 0, true)));
+                        prog.emit(i);
+                    }
+                    return;
+                }
                 Instr i; i.k = IK::Assign;   // held packed (a struct member): all its bits at once
                 i.e = parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
                 lhs(x, i);
