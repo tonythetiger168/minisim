@@ -12500,6 +12500,7 @@ inline void sampledInit(LowerResult& out) {
     for (auto& c : sampleClocks())
         for (auto& ln : c.lines)
             for (int st : ln.stages) {
+                if (ln.noInit) break;
                 Instr i; i.k = IK::Assign; i.sig = st; i.e = ln.src;
                 p.emit(i);
             }

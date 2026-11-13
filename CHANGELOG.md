@@ -15,6 +15,12 @@ Spec references are IEEE 1800-2023 clauses.
   An instance array's `vpiExpr` is its connection list (a `vpiListOp`,
   37.11), and net declaration assignments are `vpiContAssign` objects with
   `vpiNetDeclAssign` (37.40). `tests/spec/37.28-vpi-param-assign.sv`.
+- `mlint -cdc-formal`: formal proof that the source of each bus synchronized
+  bit by bit changes at most one bit per clock, by exhaustive search of its
+  reachable states (slang's evaluator, through assigns, ports, functions and
+  `always_comb`). A proved bus is not CDC002; a Gray-coded bus that can change
+  more bits is the new rule CDC010, with the step. Proves all eight async
+  FIFO pointers of OpenTitan `spi_device` and both of pulp `cdc_fifo_gray`.
 - VPI expression values (37.35, 38.15): `vpi_get_value` on an expression
   object gives its value now, not only for a constant expression. The nets
   and variables it reads (memories too) take their current values, so

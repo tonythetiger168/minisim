@@ -366,6 +366,20 @@ run(cdc_regs.sv "-top;cdc_regs;-only;cdc;-static;u_c.*")
 if(NOT out MATCHES "0 findings")
   message(FATAL_ERROR "cdc_regs.sv -static u_c.*:\n${out}")
 endif()
+# -cdc-formal: a Gray pointer and a Johnson counter are proved to change one
+# bit per clock (no CDC002); a Gray code of a pointer that steps by 2 is
+# CDC010, with the step. Without it the two are CDC002.
+run(cdc_formal.sv "-top;cdc_formal;-only;cdc")
+if(NOT out MATCHES "2 findings \\(CDC002 2\\)")
+  message(FATAL_ERROR "cdc_formal.sv without -cdc-formal:\n${out}")
+endif()
+run(cdc_formal.sv "-top;cdc_formal;-only;cdc;-cdc-formal;-cdc-report;-threads;4")
+if(NOT out MATCHES "\\[CDC010\\] 'cdc_formal.skip_q' \\(clocked by cdc_formal.clk_a\\) is synchronized bit by bit as a Gray code, but 2 bits change in one clock, from 0 to 3"
+   OR NOT out MATCHES "1 finding \\(CDC010 1\\)"
+   OR NOT out MATCHES "gray_q[^\n]*one bit per clock \\(proved, 32 states\\)"
+   OR NOT out MATCHES "john_q[^\n]*one bit per clock \\(proved, 8 states\\)")
+  message(FATAL_ERROR "cdc_formal.sv -cdc-formal:\n${out}")
+endif()
 message(STATUS "mlint: ok")
 
 # SoC flow: a block signed off on its own writes the abstract the top-level
