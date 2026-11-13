@@ -13,6 +13,11 @@ Spec references are IEEE 1800-2023 clauses.
   `$fsdbTrans_begin`, `$fsdbTrans_add_attribute`, `$fsdbTrans_end` write
   the text format of UVM's `uvm_text_tr_database` (`transactions.log`,
   `msim -tr FILE`), which `mdebug -tr` reads. `tests/msim_tr.cmake`.
+- mvplat: virtio-blk over virtio-mmio (VIRTIO 1.2, 4.2 and 5.2). `-disk FILE`
+  puts a raw image on `/dev/vda` (repeat for more), `-disk-write` lets the
+  guest's writes reach the file; platform files take `"type": "virtio-blk"`.
+  Linux mounts an ext4 disk and boots with its root file system on it.
+  Extension ABI 7.
 - `msim -vcd-sva` and `-vcd-power`: assertions and power in the waveform.
   Each assertion and cover gets `.passes` and `.fails` counters; with `-upf`
   each power domain gets `upf.PD.simstate` and each supply net

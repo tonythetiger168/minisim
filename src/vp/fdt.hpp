@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "devices.hpp"
+#include "virtio.hpp"
 
 namespace vp {
 
@@ -200,6 +201,16 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
             if (u->irq) {
                 f.propU32("interrupt-parent", {plicPh});
                 f.propU32("interrupts", {u->irq});
+            }
+            f.end();
+        } else if (d->type == "virtio-blk") {
+            auto* v = static_cast<const VirtioMmio*>(d.get());
+            f.begin(hexName("virtio_mmio", d->base));
+            f.propStr("compatible", {"virtio,mmio"});
+            f.reg(d->base, d->size);
+            if (v->irq) {
+                f.propU32("interrupt-parent", {plicPh});
+                f.propU32("interrupts", {v->irq});
             }
             f.end();
         } else if (d->type == "finisher") {

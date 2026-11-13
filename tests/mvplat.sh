@@ -75,6 +75,35 @@ if [ -z "${MVPLAT_EXT:-}" ]; then
   expect "an rtl device without the extension library" 2 p.out "mvp and rtl need the mvplat extension library"
 fi
 
+# virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
+# image; the file changes only with -disk-write.
+if command -v python3 > /dev/null 2>&1; then
+  python3 - <<'P'
+d = bytearray(64 * 512)
+for s in range(64):
+    d[s * 512:(s + 1) * 512] = bytes([s]) * 512
+d[0:11] = b"MVPLAT-DISK"
+open("disk.img", "wb").write(d)
+open("disk0.img", "wb").write(d)
+P
+  for e in virtio virtio64; do
+    "$MVPLAT" "$E/$e.elf" -disk disk.img -q > $e.out 2>&1; rc=$?
+    expect "$e: virtio-blk read, write, flush, errors and interrupts" 0 $e.out "virtio-blk: all checks passed"
+  done
+  cmp -s disk.img disk0.img && ok "-disk keeps the guest's writes out of the image" || bad "-disk changed the image"
+  "$MVPLAT" "$E/virtio.elf" -disk disk.img -disk-write -q > vw.out 2>&1; rc=$?
+  if [ $rc = 0 ] && [ "$(dd if=disk.img bs=512 skip=2 count=1 2> /dev/null | head -c 20)" = "written by the guest" ]; then
+    ok "-disk-write writes to the image"
+  else bad "-disk-write (exit $rc)"; fi
+  printf '%s\n' '{"devices": [{"type":"finisher","base":"0x100000"},{"type":"uart16550","base":"0x10000000"},{"type":"ram","base":"0x80000000","size":"1M"},{"type":"virtio-blk","name":"vd","base":"0x10001000","irq":1,"file":"disk0.img","readonly":true}]}' > vd.json
+  "$MVPLAT" -platform vd.json "$E/virtio.elf" -q -max-cycles 10000000 > vd.out 2>&1; rc=$?
+  if [ $rc != 0 ] && grep -q "FAIL write sector 2" vd.out && ! grep -q "FAIL read sector 0" vd.out; then
+    ok "a read-only virtio-blk from the platform file reads and refuses writes"
+  else bad "read-only virtio-blk (exit $rc)"; sed 's/^/      /' vd.out; fi
+fi
+"$MVPLAT" "$E/virtio.elf" -disk no_such.img -q > p.out 2>&1; rc=$?
+expect "-disk with a missing image" 2 p.out "cannot open the disk image"
+
 # Platform files that are wrong say what is wrong.
 platform_err() {
   local name=$1 json=$2 pat=$3
@@ -100,13 +129,13 @@ J
 [ $rc -ne 0 ] && ok "a program with no CLINT does not hang (exit $rc)" || bad "wfi with no interrupt source"
 
 # The device tree made from the platform, as firmware and Linux read it.
-"$MVPLAT" "$E/hello.elf" -harts 2 -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
+"$MVPLAT" "$E/hello.elf" -harts 2 -disk "$E/hello.elf" -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
 if [ $rc = 0 ] && [ "$(od -An -tx1 -N4 board.dtb | tr -d ' ')" = d00dfeed ]; then ok "-dump-dtb writes a device tree blob"
 else bad "-dump-dtb (exit $rc)"; fi
 if command -v dtc > /dev/null 2>&1; then
   dtc -I dtb -O dts board.dtb > board.dts 2> dtc.err; rc=$?
   if [ $rc = 0 ] && ! [ -s dtc.err ] && grep -q 'cpu@1' board.dts && grep -q 'riscv,sv32' board.dts &&
-     grep -q 'ns16550a' board.dts && grep -q 'riscv,plic0' board.dts && grep -q 'syscon-poweroff' board.dts; then
+     grep -q 'ns16550a' board.dts && grep -q 'riscv,plic0' board.dts && grep -q 'syscon-poweroff' board.dts && grep -q 'virtio,mmio' board.dts; then
     ok "the device tree decompiles cleanly with dtc and has the harts and devices"
   else bad "dtc on the device tree"; cat dtc.err; fi
 fi
@@ -142,13 +171,37 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
   # An rv64gc user space (floating point included): BusyBox's shell runs
   # what is typed on the console once the kernel's driver is up.
   if [ -n "${MVPLAT_BUSYBOX:-}" ] && command -v python3 > /dev/null 2>&1; then
-    python3 "$T/mkcpio.py" bb.cpio d:dev c:dev/console:5:1 d:bin "f:bin/busybox:$MVPLAT_BUSYBOX" "f:init:$T/busybox_init.sh"
+    python3 "$T/mkcpio.py" bb.cpio d:dev c:dev/console:5:1 d:bin d:mnt "f:bin/busybox:$MVPLAT_BUSYBOX" "f:init:$T/busybox_init.sh"
     "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio \
       -append "console=ttyS0 rdinit=/init quiet" -harts 2 -q \
       -input "echo typed \$((6*7)); busybox printf '%.3f\n' 3.14159; poweroff -f
 " > bb.out 2>&1; rc=$?
     expect "BusyBox shell on Linux: rv64gc user space and console input" 0 bb.out "^typed 42"
     grep -q "^3.142" bb.out && ok "floating point in user space (printf %.3f)" || bad "user-space floating point"
+    # A disk: Linux's virtio-blk driver on -disk, an ext4 file system made
+    # here (mkfs.ext4 -d), mounted, read and written back to the image; then
+    # the same kind of disk as the root file system, with no initramfs.
+    if command -v mkfs.ext4 > /dev/null 2>&1 && command -v debugfs > /dev/null 2>&1; then
+      rm -rf fsroot; mkdir -p fsroot; echo "hello from the disk" > fsroot/hello.txt
+      mkfs.ext4 -q -F -d fsroot data.img 8M > /dev/null 2>&1
+      "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio \
+        -append "console=ttyS0 rdinit=/init quiet" -disk data.img -disk-write -q \
+        -input "mount -t devtmpfs d /dev; mount /dev/vda /mnt; cat /mnt/hello.txt; echo written > /mnt/new.txt; umount /mnt; poweroff -f
+" > ext4.out 2>&1; rc=$?
+      expect "Linux mounts an ext4 disk on virtio-blk and reads a file" 0 ext4.out "^hello from the disk"
+      [ "$(debugfs -R 'cat /new.txt' data.img 2> /dev/null)" = written ] &&
+        ok "a file Linux wrote is in the image (-disk-write)" || bad "the file Linux wrote is not in the image"
+      rm -rf rootfs; mkdir -p rootfs/bin rootfs/dev rootfs/proc
+      cp "$MVPLAT_BUSYBOX" rootfs/bin/busybox; ln -s busybox rootfs/bin/sh
+      mkfs.ext4 -q -F -d rootfs root.img 16M > /dev/null 2>&1
+      "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -disk root.img -q \
+        -append "console=ttyS0 root=/dev/vda rw init=/bin/sh quiet" \
+        -input "/bin/busybox echo root on disk: \$(/bin/busybox ls /bin); /bin/busybox poweroff -f
+" > rootfs.out 2>&1; rc=$?
+      expect "Linux boots with its root file system on virtio-blk" 0 rootfs.out "^root on disk: busybox sh"
+    else
+      echo "skip  ext4 disk: no mkfs.ext4 and debugfs (e2fsprogs)"
+    fi
   else
     echo "skip  BusyBox: set MVPLAT_BUSYBOX (tests/vplat/get-linux.sh fetches it)"
   fi
