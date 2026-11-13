@@ -2361,6 +2361,13 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
                     what = "more than one bit of " + src + " changed at once: " + dst + " can see a value it never had";
                     break;
                 case Qualified: {
+                    // A memory (a FIFO's storage, wider than what the reader
+                    // takes, or an unpacked array) is written one entry at a
+                    // time while the reader takes another: the whole of it is
+                    // not held, so it is not checked as one value.
+                    if (s.bits > f.bits ||
+                        (s.sym && s.sym->isValue() && s.sym->as<ValueSymbol>().getType().isUnpackedArray()))
+                        continue;
                     const Flop* q = c.qual ? m.flopOf(c.qual) : nullptr;
                     if (!q || !ok(m.name(*q))) {
                         skipped++;
@@ -2385,7 +2392,7 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
                 if (!s.plain)
                     for (const Root& r : cones[m.flopIx.at(c.src)].all) {
                         const Flop* af = m.flopOf(r.sym);
-                        if (!af || af->dom != s.dom || r.logic) continue;
+                        if (!af || af->dom != s.dom) continue;
                         const Member& mem = member[af - m.flops.data()];
                         const Flop* from = mem.src ? m.flopOf(mem.src) : nullptr;
                         if (mem.pos < 2 || !from || from->dom != f.dom || mem.pos <= deepest) continue;
@@ -2395,11 +2402,24 @@ const rb=document.getElementById('rst');R.forEach(r=>rb.append(el('tr',{},el('td
                 if (ack && ok(m.name(*ack)) && !seen.count("handshake_" + ident(src))) {
                     std::string hl = "handshake_" + ident(src), a = m.name(*ack);
                     seen.insert(hl);
+                    // Each side changes only after the other side's (synchronized)
+                    // signal changed since its own last change; the first change
+                    // after reset may start. That holds for the side that starts
+                    // a transfer and the side that answers, two- or four-phase.
+                    std::string px = "px_" + hl, py = "py_" + hl, sn = "seen_" + hl, fs = "first_" + hl;
+                    std::string rst = s.arst.empty() || !ok(m.name(s.arst[0])) ? std::string("1'b0")
+                                      : std::string(s.arstHigh ? "" : "!") + m.name(s.arst[0]);
                     props.push_back({hl, "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) +
-                                             "): handshake, acknowledged through " + a + "\n" +
-                                             "  cdc_" + hl + ": assert property (" + clocking(s) + " $changed(" + src +
-                                             ") |-> $past(" + a + ") == $past(" + src + "))\n    else $error(\"[mlint cdc] " +
-                                             src + " changed before " + a + " acknowledged its last change\");\n"});
+                                             "): handshake, answered through " + a + "\n" +
+                                             "  logic " + px + ", " + py + ";\n  bit " + sn + " = 0, " + fs + " = 1;\n" +
+                                             "  always @(" + edge(s) + ") begin\n" +
+                                             "    if (" + rst + ") begin " + fs + " <= 1; " + sn + " <= 0; end\n" +
+                                             "    else if (" + src + " != " + px + ") begin\n" +
+                                             "      cdc_" + hl + ": assert (" + sn + " || " + fs + ") else $error(\"[mlint cdc] " +
+                                             src + " changed again before " + a + " answered its last change\");\n" +
+                                             "      " + fs + " <= 0;\n      " + sn + " <= " + a + " != " + py + ";\n" +
+                                             "    end else if (" + a + " != " + py + ") " + sn + " <= 1;\n" +
+                                             "    " + px + " <= " + src + ";\n    " + py + " <= " + a + ";\n  end\n"});
                 }
             }
             std::string t = "  // " + src + " (" + m.name(s.dom) + ") -> " + dst + " (" + m.name(f.dom) + "): " +

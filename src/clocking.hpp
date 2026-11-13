@@ -33,7 +33,9 @@ struct ClockingRT {
         std::vector<int> refs;                           // kind 2: the signals src reads
         std::deque<std::pair<uint64_t, Val>> hist;       // kind 2: (time, value), oldest first
         // kind 3: an edge skew (input negedge): the value at the last such
-        // edge of the clock signal edgeSig before the clocking event (14.3).
+        // edge of the clock signal edgeSig before the clocking event (14.3);
+        // with a delay (input negedge #N), the value N ticks before that edge,
+        // from hist as for kind 2.
         int edgeSig = -1;
         int edge = 0;
         uint64_t lastAt = ~0ull;

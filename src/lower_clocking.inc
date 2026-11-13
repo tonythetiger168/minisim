@@ -136,7 +136,7 @@ static int skewClock(const ClockingRT& r) {
     return r.ev[0].first;
 }
 static void edgeIn(const ClockingRT& r, ClockingRT::In& x, int e, uint64_t t) {
-    if (t) unsupported("an input edge skew with a delay (14.3)");
+    if (t) collectRefs(x.src, x.refs);   // input negedge #N: the value N before that edge, from the history
     x.edgeSig = skewClock(r);
     x.edge = e;
 }
@@ -193,7 +193,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
                     E src = ref(T->base + n, T->sgn);
                     x.src = ik == 0 ? sampledE(src) : src;
                     if (ik == 2) collectRefs(src, x.refs);
-                    if (ik == 3) edgeIn(r, x, iEdge, it);
+                    if (ik == 3) edgeIn(r, x, iEdge, it);   // after src: a delay reads its signals
                     r.ins.push_back(std::move(x));
                 }
                 if (out) {
