@@ -1127,7 +1127,7 @@ inline std::string Model::query(const Cmd& c, const std::string& scope) {
         if (o.has("-regexp")) return std::regex_search(name, re);
         if (o.has("-exact")) return icase ? lower(name) == lower(pat) : name == pat;
         std::string p = icase ? lower(pat) : pat, nm = icase ? lower(name) : name;
-        return tcl::globMatch(p.c_str(), nm.c_str(), true);
+        return upfGlob(p, nm);
     };
     if (!domainCentric) {
         for (auto& t : want) {

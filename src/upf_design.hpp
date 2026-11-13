@@ -36,7 +36,12 @@ inline void walkDesign(const slang::ast::Scope& sc, const std::string& path, Des
     for (const Symbol& m : sc.members()) {
         if (m.kind == SymbolKind::Variable || m.kind == SymbolKind::Net) {
             dv.signals.insert(in(std::string(m.name)));
-            dv.width[in(std::string(m.name))] = (int)m.as<ValueSymbol>().getType().getBitWidth();
+            const auto& ty = m.as<ValueSymbol>().getType();
+            dv.width[in(std::string(m.name))] = (int)ty.getBitWidth();
+            if (ty.isPackedArray() && ty.getBitWidth() > 1) {   // find_objects -expand_to_bits (6.33)
+                auto r = ty.getFixedRange();
+                dv.range[in(std::string(m.name))] = {(int)r.left, (int)r.right};
+            }
         }
         if (m.kind == SymbolKind::Instance) {
             const auto& ch = m.as<InstanceSymbol>();
