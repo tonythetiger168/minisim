@@ -533,13 +533,19 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
                 ci.wb.push_back(wideAuto.back().second);
             }
         }
-        for (const auto& bd : c.bins)
-            for (const auto& it : bd.items)
-                for (const E& e : {it.range && it.loMin ? E() : it.lo, it.range && !it.hiMax ? it.hi : E()})
-                    if (e) {
-                        Val v = eval(e, rd);
-                        if (!unknownAny(v)) ci.wb.push_back(v);
-                    }
+        auto bounds = [&](const CgItem& it) {
+            for (const E& e : {it.range && it.loMin ? E() : it.lo, it.range && !it.hiMax ? it.hi : E()})
+                if (e) {
+                    Val v = eval(e, rd);
+                    if (!unknownAny(v)) ci.wb.push_back(v);
+                }
+        };
+        for (const auto& bd : c.bins) {
+            for (const auto& it : bd.items) bounds(it);
+            for (const auto& seq : bd.trans)   // transition steps (19.5.2)
+                for (const auto& s : seq)
+                    for (const auto& it : s.items) bounds(it);
+        }
         // name[] and name[N] (19.5.1): the values that start or end a bin
         // become bounds too, so each bin is a run of keys.
         for (size_t bi = 0; bi < c.bins.size(); bi++) {
