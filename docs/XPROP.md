@@ -94,8 +94,13 @@ tmerge and `4'bxxxx` under xmerge.
   part selects and struct members, nested to any depth, in loops, with
   temporaries and function calls in the expressions.
 - **Task and function calls** in a branch, when the task or function (and
-  every one it calls) assigns only with `=`: the static variables it writes
-  are merged like the block's own.
+  every one it calls) has no delay, event control or `fork`: the static
+  variables it writes with `=` are merged like the block's own. A static
+  variable it writes with `<=` (whole, a constant part or a bit) becomes
+  `x` when the branch only might be taken, as for a nonblocking target
+  with no shadow (below): the task is shared by every caller, so it cannot
+  keep a shadow of its own. If an unbounded loop ends early, the targets
+  of the tasks it calls with `<=` become `x` too.
 - **`break` and `continue`** in `for`, `foreach`, `repeat`, `while`,
   `do ... while` and `forever` loops. Under an unknown condition the rest
   of the loop merges with "not run". This is pessimistic: each unknown
@@ -141,9 +146,9 @@ dut.sv:44: case: merged
 ```
 
 - a delay, event control, `wait` or `fork` in a branch;
-- a call of a task or function that has a nonblocking assignment, a delay,
-  an event control or a `fork`, or that writes an array element, a
-  container or a net;
+- a call of a task or function that has a delay (`<= #1` included), an
+  event control or a `fork`, or that writes an array element, a container
+  or a net;
 - `break` or `continue` out of a `while`, `do ... while` or `forever` loop
   whose body has a nonblocking assignment or writes an array element, and
   `disable` of a block outside the branch;
@@ -155,6 +160,7 @@ dut.sv:44: case: merged
 Some assignments are merged pessimistically: in a possible branch they
 make their target `x` instead of merging values.
 
+- a nonblocking assignment in a called task or function;
 - a nonblocking assignment to a bit or part chosen at run time
   (`q[i] <= d`), or with a delay (`q <= #1 d`);
 - a nonblocking assignment to an array element (`mem[addr] <= d`) when one
