@@ -323,6 +323,25 @@ skipped. The exit status is 1 when a command failed.
         for drv in d.drivers("tb.u.state"):
             print(drv["file"], drv["line"], drv["text"])
 
+## Lint findings
+
+    mlint design.sv -top tb -json lint.json
+    mdebug design.sv -top tb -lint lint.json -html debug.html     # or -serve
+
+The page gets a Lint list at the top of the right panel (filter by
+severity, or show the waived ones), and every line with a finding is marked
+in the source: red for an error, amber for a warning, blue for info, with the
+findings as the line's tooltip. A click on a finding opens its line and
+selects the signal it is about, so its drivers, loads, schematic and waves
+are one step away. The signal is the finding's `signal` field (a
+hierarchical name) when mlint gives one, else a name quoted in its text
+(`'q' is driven but never read`) that is declared in the finding's file,
+nearest above its line. A finding in a file that is not part of the design
+is listed with no line to open.
+
+In a script, `lint` answers with every finding, its file, line, rule,
+severity, signal and whether it is waived.
+
 ## Memories
 
 msim leaves unpacked arrays out of the waveform unless asked:

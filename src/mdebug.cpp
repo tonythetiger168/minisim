@@ -2170,6 +2170,89 @@ struct Tool {
         return true;
     }
 
+    // ---------------------------------------------------------------- lint
+    // -lint FILE: the findings of mlint -json FILE, tied to the page's files
+    // and, where the text names one, to a signal: the page lists them, marks
+    // their lines, and a click goes to the line and the signal.
+    struct LintF { std::string file, rule, group, sev, text, signal; int line = 0, col = 0; bool waived = false; };
+    std::vector<LintF> lint;
+    bool readLint(const std::string& file) {
+        std::ifstream is(file, std::ios::binary);
+        if (!is) { std::cerr << "mdebug: cannot read " << file << "\n"; return false; }
+        std::string text((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+        JReader r{text};
+        JVal d = r.val();
+        const JVal* fs = d.get("findings");
+        if (r.bad || d.k != JVal::Obj || !fs || fs->k != JVal::Arr) {
+            std::cerr << "mdebug: " << file << " is not mlint's JSON (mlint -json FILE)\n";
+            return false;
+        }
+        auto str = [](const JVal& o, const char* k) { const JVal* v = o.get(k); return v && v->k == JVal::Str ? v->s : std::string(); };
+        auto num = [](const JVal& o, const char* k) { const JVal* v = o.get(k); return v && v->k == JVal::Num ? (int)v->n : 0; };
+        for (const JVal& f : fs->a) {
+            LintF l;
+            l.file = str(f, "file"); l.rule = str(f, "rule"); l.group = str(f, "group"); l.sev = str(f, "severity");
+            l.text = str(f, "text"); l.signal = str(f, "signal");
+            l.line = num(f, "line"); l.col = num(f, "col"); l.waived = num(f, "waived") != 0;
+            lint.push_back(std::move(l));
+        }
+        return true;
+    }
+    // The page's file of a finding: the same file, else the same name.
+    int lintFile(const std::string& f) {
+        std::error_code ec;
+        auto canon = [&](const std::string& x) { auto p = std::filesystem::weakly_canonical(x, ec); return ec ? x : p.string(); };
+        const std::string cf = canon(f);
+        int byBase = -1, nBase = 0;
+        for (size_t i = 0; i < db.src.files.size(); i++) {
+            const std::string& n = db.src.files[i].name;
+            if (n == f || canon(n) == cf) return (int)i;
+            if (baseName(n) == baseName(f)) { byBase = (int)i; nBase++; }
+        }
+        return nBase == 1 ? byBase : -1;
+    }
+    // The signal a finding is about: its "signal" field, else a name quoted
+    // in its text that is declared in the same file (the nearest declaration
+    // above the finding's line wins). -1: none.
+    int lintSignal(const LintF& l) {
+        if (!l.signal.empty())
+            if (auto it = db.byPath.find(l.signal); it != db.byPath.end())
+                if (auto ix = db.sigIx.find(it->second); ix != db.sigIx.end()) return ix->second;
+        for (auto* s : db.signals) db.src.where(s->location);   // every file the design's signals are in
+        int file = lintFile(l.file);
+        if (file < 0) return -1;
+        for (size_t q = l.text.find('\''); q != std::string::npos; q = l.text.find('\'', q + 1)) {
+            size_t e = l.text.find('\'', q + 1);
+            if (e == std::string::npos) break;
+            std::string nm = l.text.substr(q + 1, e - q - 1);
+            if (size_t d = nm.rfind('.'); d != std::string::npos) nm = nm.substr(d + 1);
+            int best = -1;
+            size_t bestLine = 0;
+            for (size_t i = 0; i < db.signals.size(); i++) {
+                const ValueSymbol* s = db.signals[i];
+                if (s->name != nm) continue;
+                Where w = db.src.where(s->location);
+                if (w.file != file) continue;
+                size_t ln = (size_t)w.line;
+                if (best < 0 || (ln <= (size_t)l.line && (bestLine > (size_t)l.line || ln > bestLine))) { best = (int)i; bestLine = ln; }
+            }
+            if (best >= 0) return best;
+            q = e;
+        }
+        return -1;
+    }
+    std::string lintJson() {
+        std::string o = "[";
+        for (size_t i = 0; i < lint.size(); i++) {
+            const LintF& l = lint[i];
+            int sg = lintSignal(l), f = lintFile(l.file);
+            o += std::string(i ? "," : "") + "[" + std::to_string(f) + "," + std::to_string(l.line) + "," + std::to_string(l.col) + "," +
+                 js(l.rule) + "," + js(l.sev) + "," + js(l.text) + "," + (l.waived ? "1" : "0") + "," + std::to_string(sg) + "," +
+                 js(l.group) + "]";
+        }
+        return o + "]";
+    }
+
     // How often a source line ran; nullopt when the database has no record of it.
     std::optional<uint64_t> hitsOf(const Where& w) {
         if (!haveCov || w.file < 0) return std::nullopt;
@@ -2498,6 +2581,19 @@ struct Tool {
                     first = false;
                 }
                 body += "]";
+            } else if (c == "lint") {   // the findings, each with its page file and signal
+                if (lint.empty()) { std::cerr << "mdebug: lint needs -lint <mlint -json file>\n"; ok = false; }
+                else {
+                    body = "\"findings\":[";
+                    for (size_t i = 0; i < lint.size(); i++) {
+                        const LintF& l = lint[i];
+                        int sg = lintSignal(l), f = lintFile(l.file);
+                        body += std::string(i ? "," : "") + "{\"file\":" + js(f >= 0 ? db.src.files[(size_t)f].name : l.file) + ",\"line\":" +
+                                std::to_string(l.line) + ",\"rule\":" + js(l.rule) + ",\"severity\":" + js(l.sev) + ",\"signal\":" +
+                                js(sg >= 0 ? path(*db.signals[(size_t)sg]) : "") + ",\"waived\":" + (l.waived ? "true" : "false") + "}";
+                    }
+                    body += "]";
+                }
             } else if (c == "end") {
                 if (!haveVcd) { std::cerr << "mdebug: end needs -vcd <file>\n"; ok = false; }
                 else body = "\"end\":" + std::to_string(vcd.end) + ",\"timescale\":" + js(vcd.timescale);
@@ -2649,6 +2745,7 @@ struct Tool {
         }
         os << "],\n\"cases\":" << casesJson() << ",\n\"fsms\":" << fsmText << ",\n\"asserts\":" << assertText;
         if (haveCov) os << ",\n\"cov\":" << covJson();
+        if (!lint.empty()) os << ",\n\"lint\":" << lintJson();
         if (!trStreams.empty()) os << ",\n\"trans\":" << transJson();
         if (haveVcd) {
             os << ",\n\"end\":" << vcd.end << ",\"at\":" << (center ? std::min(*center, vcd.end) : vcd.end) << ",\"timescale\":" << js(vcd.timescale);
@@ -2823,6 +2920,8 @@ void usage() {
                  "                   isolation, level-shifter and retention strategies; with -log (the output\n"
                  "                   of msim -upf ... -upf_verbose) their power states over time, and -active\n"
                  "                   says when a value is x because its domain was off or a port is isolated\n"
+                 "  -lint FILE       mlint's findings (mlint -json FILE): the page lists them, marks their\n"
+                 "                   lines, and a click goes to the line and the signal the finding names\n"
                  "  -cov FILE        a coverage database (msim -cov FILE): driver lines say how often they\n"
                  "                   ran, and the page marks the lines that ran and those that never did\n"
                  "  -uncovered [INST]  with -cov: the assignments that never ran and the signals with bits\n"
@@ -2835,7 +2934,7 @@ void usage() {
                  "  -log FILE        the simulation log with the assertion failures (msim's output)\n"
                  "  -script FILE     run commands from FILE (- for the standard input), one per line, and\n"
                  "                   answer each with one line of JSON: drivers, loads, value, changes,\n"
-                 "                   active, trace, blocks, fsm, scopes, signals, end, help, quit\n"
+                 "                   active, trace, blocks, fsm, scopes, signals, end, lint, help, quit\n"
                  "  -blocks INST     the instances inside INST, their port connections and what feeds what\n"
                  "  -html <file>     write a one-file viewer: hierarchy, source, drivers and\n"
                  "                   loads, a schematic of the cone, and waves when -vcd is given\n"
@@ -2853,7 +2952,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> fwd{argv[0]};
     struct Query { std::string what, arg; int depth; std::optional<uint64_t> at; };
     std::vector<Query> queries;
-    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath, covPath, upfPath, powerTop, trPath;
+    std::string vcdPath, htmlPath, jsonPath, scriptPath, logPath, covPath, upfPath, powerTop, trPath, lintPath;
     bool powerTopSet = false, serve = false;
     int servePort = 8765;
     long serveRequests = 0;
@@ -2904,6 +3003,7 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a == "-cov") { covPath = next("a coverage database"); continue; }
+        if (a == "-lint") { lintPath = next("mlint's JSON findings"); continue; }
         if (a == "-uncovered") {
             std::string arg;
             if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
@@ -2972,6 +3072,7 @@ int main(int argc, char** argv) {
     tool.fsms = extractFsms(fe.comp->getRoot());
     if (!logPath.empty() && !tool.readLog(logPath)) return 2;
     if (!covPath.empty() && !tool.readCov(covPath)) return 2;
+    if (!lintPath.empty() && !tool.readLint(lintPath)) return 2;
     if (!trPath.empty() && !tool.readTr(trPath)) return 2;
     if (!upfPath.empty() && !tool.readUpf(upfPath, powerTop, powerTopSet)) return 2;
     if (!logPath.empty()) tool.readPowerLog(logPath);

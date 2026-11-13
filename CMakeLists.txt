@@ -222,6 +222,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_interactive
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_interactive.cmake)
+  # mlint findings in mdebug's page (mdebug -lint).
+  add_test(NAME mdebug_lint
+           COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMLINT=$<TARGET_FILE:mlint> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_lint -P ${CMAKE_SOURCE_DIR}/tests/mdebug_lint.cmake)
   # Class objects in the waveform (msim -vcd-class), read back by mdebug.
   add_test(NAME msim_vcd_class
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
