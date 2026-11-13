@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-formal`: formal proof that the source of each bus synchronized
+  bit by bit changes at most one bit per clock, by exhaustive search of its
+  reachable states (slang's evaluator, through assigns, ports, functions and
+  `always_comb`). A proved bus is not CDC002; a Gray-coded bus that can change
+  more bits is the new rule CDC010, with the step. Proves all eight async
+  FIFO pointers of OpenTitan `spi_device` and both of pulp `cdc_fifo_gray`.
 - `mlint` CDC on generated register blocks: a register struct written field
   by field through ports on fields or on concatenations of fields, copied
   whole (`assign hw2reg_regtop = hw2reg`) and passed whole down a port, is

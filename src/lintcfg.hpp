@@ -330,6 +330,7 @@ inline const std::vector<RuleInfo>& table() {
         {"CDC007", "cdc", Sev::Warning, true, "a clock read as data by logic", ""},
         {"CDC008", "cdc", Sev::Warning, true, "a clock made by combinational logic of a clock and other signals (glitch)", ""},
         {"CDC009", "cdc", Sev::Warning, true, "a one-cycle pulse from a faster clock into a slower one through a plain synchronizer (SDC periods)", ""},
+        {"CDC010", "cdc", Sev::Warning, true, "a Gray-coded bus that a formal search finds changing more than one bit in one clock (-cdc-formal)", ""},
         {"RDC001", "rdc", Sev::Warning, true, "an asynchronous reset generated in another clock domain", ""},
         {"RDC002", "rdc", Sev::Warning, true, "one asynchronous reset used directly in several clock domains", ""},
         {"RDC003", "rdc", Sev::Warning, true, "a flop feeds a flop with a different asynchronous reset, in one clock domain", ""},
