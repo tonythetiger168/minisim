@@ -262,6 +262,79 @@ inline void setArgs(const CgInst& in) {
 constexpr size_t kMaxBins = 1u << 20;
 [[noreturn]] inline void fail(const std::string& m) { throw std::runtime_error("msim: covergroup: " + m); }
 
+// The values of an item list of a coverpoint wider than 64 bits, one by one,
+// in order and once each, for bins that need each value as a key of its own:
+// a `with` bin keeps those for which the expression is true (19.5.1.1); in a
+// wildcard bin x, z and ? bits take both values (19.5.1); and the single
+// values of a transition step make name[] transition bins (19.5.2).
+inline std::vector<Val> wideValues(const CgCpDef& c, const std::vector<CgItem>& items, const CgBinDef* with, bool wildcard) {
+    int W = c.w + 2;
+    auto off = [&](Val v) {
+        v = v_resize(v, c.w, false);
+        if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+        v.sgn = false;
+        return v_resize(v, W, false);
+    };
+    auto val = [&](const Val& o) {
+        Val v = v_resize(o, c.w, false);
+        if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+        return v;
+    };
+    auto lt = [](const Val& a, const Val& b) { return (v_lt(a, b).v & 1) != 0; };
+    std::vector<Val> out;
+    size_t n = 0;
+    auto take = [&](const Val& v) {
+        if (++n > (with ? (1u << 24) : kMaxBins)) fail(with ? "too many values for a with clause" : "too many bins in an array of a wide coverpoint");
+        if (with) {
+            S.set(with->itemSig, v);
+            if (truth(eval(with->with, rd)) != 1) return;
+        }
+        out.push_back(v);
+    };
+    for (const auto& it : items) {
+        if (!it.range) {
+            Val v = eval(it.lo, rd);
+            if (unknownAny(v)) {
+                if (!wildcard) continue;
+                std::vector<int> free;   // the bits that match anything
+                for (int b = 0; b < c.w; b++)
+                    if (limbX(v, b / 64) >> (b % 64) & 1) free.push_back(b);
+                if (free.size() > 20) fail("too many values in a wildcard bin array");
+                Val base = v_resize(mk(0, 1), c.w, false);
+                for (int b = 0; b < c.w; b++)
+                    if (!(limbX(v, b / 64) >> (b % 64) & 1) && (limbV(v, b / 64) >> (b % 64) & 1)) base = v_insert(base, mk(1, 1), b, b);
+                for (uint64_t m = 0; m < (1ull << free.size()); m++) {
+                    Val x = base;
+                    for (size_t j = 0; j < free.size(); j++)
+                        if (m >> j & 1) x = v_insert(x, mk(1, 1), free[j], free[j]);
+                    x.sgn = c.sgn;
+                    take(x);
+                }
+                continue;
+            }
+            take(v_resize(v, c.w, false));
+            continue;
+        }
+        if (it.loMin || it.hiMax) fail(with ? "too many values for a with clause" : "too many bins in an array of a wide coverpoint");
+        Val lo = off(eval(it.lo, rd)), hi = off(eval(it.hi, rd));
+        if (unknownAny(lo) || unknownAny(hi)) continue;
+        if (lt(hi, lo)) std::swap(lo, hi);
+        for (Val o = lo;; o = v_resize(v_add(o, mk(1, W)), W, false)) {
+            take(val(o));
+            if (!lt(o, hi)) break;
+        }
+    }
+    std::stable_sort(out.begin(), out.end(), [&](const Val& a, const Val& b) { return wideLt(c, a, b); });
+    out.erase(std::unique(out.begin(), out.end(), [&](const Val& a, const Val& b) {
+                  return !wideLt(c, a, b) && !wideLt(c, b, a); }), out.end());
+    return out;
+}
+// A key's name in a bin name: its value, or for a wide coverpoint the bound
+// it stands for.
+inline std::string binKeyName(const CgCpDef& c, uint64_t k) {
+    if (c.wide && g_cgWide && (k & 1) && (k - 1) / 2 < g_cgWide->size()) return wideDec(c, (*g_cgWide)[(size_t)(k - 1) / 2]);
+    return keyName(c, k);
+}
 // The transition bins of `bd` (19.5.2): each sequence of steps is a
 // sequence term over atoms (a step's value set); a bin array gets one bin
 // per sequence of single values.
@@ -280,6 +353,13 @@ inline void transBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci) {
     };
     auto keysOf = [&](const CgStep& s) {
         std::vector<KR> ks;
+        if (c.wide && bd.wildcard) {   // each value it matches is a bound (wideValues)
+            for (auto& v : wideValues(c, s.items, nullptr, true)) {
+                uint64_t k = keyOf(c, v);
+                ks.push_back({k, k});
+            }
+            return ks;
+        }
         std::vector<std::pair<uint64_t, uint64_t>> wild;
         for (auto& it : s.items) itemKeys(c, it, bd.wildcard, ks, nullptr, &wild);
         for (auto& [care, val] : wild) {   // a wildcard step: every value it matches
@@ -322,7 +402,7 @@ inline void transBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci) {
             std::vector<Part> ps;
             if (s.rep != 0) {
                 std::string t;
-                for (auto& r : ks) t += (t.empty() ? "" : ",") + (r.a == r.b ? keyName(c, r.a) : keyName(c, r.a) + ":" + keyName(c, r.b));
+                for (auto& r : ks) t += (t.empty() ? "" : ",") + (r.a == r.b ? binKeyName(c, r.a) : binKeyName(c, r.a) + ":" + binKeyName(c, r.b));
                 std::string rk = s.rep == 1 ? "*" : s.rep == 2 ? "->" : "=";
                 Val f = eval(s.from, rd);
                 t += "[" + rk + std::to_string(f.v) + (s.to ? ":" + std::to_string(eval(s.to, rd).v) : "") + "]";
@@ -330,7 +410,8 @@ inline void transBins(const CgCpDef& c, const CgBinDef& bd, CgCpInst& ci) {
             } else
                 for (auto& r : ks)
                     for (uint64_t k = r.a;; k++) {
-                        ps.push_back({keyName(c, k), &s, {{k, k}}});
+                        if (!c.wide || (k & 1))   // a wide step's values are all bounds: the keys between are empty
+                            ps.push_back({binKeyName(c, k), &s, {{k, k}}});
                         if (ps.size() > kMaxBins) fail("too many transition bins");
                         if (k == r.b) break;
                     }
@@ -512,6 +593,7 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
     bool explicitBins = false;
     std::vector<std::pair<Val, Val>> wideAuto;   // a wide coverpoint's automatic bins, [lo, hi]
     std::unordered_map<size_t, std::vector<std::vector<std::pair<Val, Val>>>> wideParts;   // array bins of a wide coverpoint
+    std::unordered_map<size_t, std::vector<Val>> wideWith;   // with bins of a wide coverpoint: the values kept
     if (c.wide) {   // the bounds of every value bin, in order (keyOf)
         if (std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0 || b.dflt; })) {
             // Automatic bins (19.5.3): the 2^w values in autoBinMax equal parts,
@@ -550,6 +632,18 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
         // become bounds too, so each bin is a run of keys.
         for (size_t bi = 0; bi < c.bins.size(); bi++) {
             const CgBinDef& bd = c.bins[bi];
+            if (bd.with || (bd.array && bd.wildcard)) {   // each value its own bound
+                wideWith[bi] = wideValues(c, bd.items, bd.with ? &bd : nullptr, bd.wildcard);
+                for (auto& v : wideWith[bi]) ci.wb.push_back(v);
+                continue;
+            }
+            if ((bd.array || bd.wildcard) && !bd.trans.empty()) {   // the single values of each step too
+                for (const auto& seq : bd.trans)
+                    for (const auto& st : seq)
+                        if (st.rep == 0 || bd.wildcard)
+                            for (auto& v : wideValues(c, st.items, nullptr, bd.wildcard)) ci.wb.push_back(v);
+                continue;
+            }
             if (!bd.array) continue;
             auto parts = wideArrayParts(c, bd);
             for (auto& p : parts)
@@ -611,7 +705,13 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
                 itemKeys(c, bd.setItem, bd.wildcard, seq, &xv, &wild);
             }
         }
-        if (bd.with) {   // keep the values for which the with expression is true (19.5.1.1)
+        if (c.wide && wideWith.count((size_t)(&bd - c.bins.data()))) {   // the values found with the bounds, one key each
+            seq.clear();
+            for (auto& v : wideWith[(size_t)(&bd - c.bins.data())]) {
+                uint64_t k = keyOf(c, v);
+                seq.push_back({k, k});
+            }
+        } else if (bd.with) {   // keep the values for which the with expression is true (19.5.1.1)
             std::vector<KR> kept;
             size_t n = 0;
             for (auto& r : seq)
@@ -647,7 +747,10 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
             for (auto& r : rs) b.ranges.push_back({r.a, r.b});
             ci.bins.push_back(std::move(b));
         };
-        if (bd.array && c.wide) {   // the parts found with the bounds: each its runs of keys
+        if (bd.array && c.wide && wideWith.count((size_t)(&bd - c.bins.data())) && !bd.count) {   // name[]: a bin per value
+            const auto& kv = wideWith[(size_t)(&bd - c.bins.data())];
+            for (size_t k = 0; k < kv.size(); k++) mkBin(bd.name + "[" + wideDec(c, kv[k]) + "]", {seq[k]});
+        } else if (bd.array && c.wide && !wideWith.count((size_t)(&bd - c.bins.data()))) {   // the parts found with the bounds: each its runs of keys
             const auto& parts = wideParts[(size_t)(&bd - c.bins.data())];
             for (size_t k = 0; k < parts.size(); k++) {
                 std::vector<KR> rs;

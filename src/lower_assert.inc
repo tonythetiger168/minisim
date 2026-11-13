@@ -422,7 +422,10 @@ E futureShift(const E& e) {
         return ref(st, src->sgn);
     };
     if (e->op == Op::Ref) {
-        if (e->at || isRel(e->sig) || automaticSigs().count(e->sig) || svaLocalSigs().count(e->sig) || svaLiveSigs().count(e->sig))
+        // A local variable is assigned from shifted values too (16.10), so
+        // it is read as it is.
+        if (svaLocalSigs().count(e->sig) && !e->at) return e;
+        if (e->at || isRel(e->sig) || automaticSigs().count(e->sig) || svaLiveSigs().count(e->sig))
             unsupported("a future sampled value function with automatic, local or class values (16.9.4)");
         SampleClock& g = gclkSampler();
         for (auto& c : sampleClocks())
@@ -1173,13 +1176,19 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     if (b.future) {   // checked one global clock tick late (16.9.4)
         SampleClock& g = gclkSampler();
         if (c.ev != g.ev) unsupported("a future sampled value function in an assertion not clocked by the global clock (16.9.4)");
-        if (!c.more.empty() || !c.acts.empty() || !c.localSig.empty() || !staticAssert)
-            unsupported("a future sampled value function with local variables, several clocks or in a procedure (16.9.4)");
+        if (!c.more.empty() || !staticAssert)
+            unsupported("a future sampled value function with several clocks or in a procedure (16.9.4)");
+        for (auto& act : c.acts)
+            for (auto& item : act) {
+                if (item.call) unsupported("a future sampled value function with a subroutine call match item (16.9.4)");
+                item.rhs = futureShift(item.rhs);
+            }
         for (auto& at : c.atoms) at = futureShift(at);
         if (c.clkIff) c.clkIff = futureShift(c.clkIff);
         // No attempt at the first tick: nothing was sampled before it.
         SampleClock::Line ln;
         ln.src = konst(mk(1, 1));
+        ln.noInit = true;   // 0 until the first tick has passed
         ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), 1, false));
         E started = ref(ln.stages[0]);
         g.lines.push_back(std::move(ln));

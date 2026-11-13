@@ -482,6 +482,7 @@ endif()
 #   share/minisim/include/   kernel sources that msim -compile builds against
 #   include/svdpi.h          the DPI-C header for C code called from SystemVerilog
 #   include/vpi_user.h       the VPI header (clauses 36-38)
+#   include/msim_upf.h       power states for C/C++ (SystemC) models under -upf
 #   share/doc/minisim/       README, CHANGELOG, LICENSE, COVERAGE
 include(GNUInstallDirs)
 install(TARGETS minisim RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -527,7 +528,7 @@ if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
                 ${FST_SRC}/lz4.c ${FST_SRC}/lz4.h ${FST_SRC}/fst_win_unistd.h ${libfst_SOURCE_DIR}/LICENSE
           DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include/fst)
 endif()
-install(FILES include/svdpi.h include/vpi_user.h include/vpi_compatibility.h include/sv_vpi_user.h include/veriuser.h
+install(FILES include/svdpi.h include/vpi_user.h include/vpi_compatibility.h include/sv_vpi_user.h include/veriuser.h include/msim_upf.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 # UVM's C code for minisim: msim -uvm looks for it next to itself.
 install(FILES uvm/uvm_dpi_minisim.cc DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/uvm)

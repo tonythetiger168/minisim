@@ -351,6 +351,7 @@ it. One-hot registers tested bit by bit are followed too.
 | `CDC007` | warning | on | A clock read as data by logic |
 | `CDC008` | warning | on | A clock made by combinational logic of a clock and other signals (glitch) |
 | `CDC009` | warning | on | A one-cycle pulse from a faster clock into a slower one through a plain synchronizer (SDC periods) |
+| `CDC010` | warning | on | A Gray-coded bus that a formal search finds changing more than one bit in one clock (`-cdc-formal`) |
 
 ### Reset-domain crossings (`rdc`)
 

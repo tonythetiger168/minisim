@@ -135,7 +135,7 @@ inline void assertControl(int ctl, int atype, int dtype, int levels, const std::
 struct SampleClock {
     std::vector<std::pair<int, Edge>> ev;
     E gate;                               // null: always
-    struct Line { E src; std::vector<int> stages; };
+    struct Line { E src; std::vector<int> stages; bool noInit = false; };   // noInit: not set at time 0 (16.5.1)
     std::vector<Line> lines;
 };
 
