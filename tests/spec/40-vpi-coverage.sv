@@ -92,4 +92,4 @@ endmodule
 //> save: 1
 //> saved database: msim-cov
 //> merge: 0
-//> stop under a sub-instance: 0
+//> stop under a sub-instance: 1
