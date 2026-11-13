@@ -83,6 +83,9 @@ Spec references are IEEE 1800-2023 clauses.
   system task argument that is an automatic variable no longer crashes.
 - VPI `cbUnresolvedSystf` (38.36.3): runs before elaboration for each
   unknown system task or function name, which the callback may register.
+- VPI `cbEndOfObject` (38.36.1) on a thread or frame runs when it ends;
+  `cbReclaimObj` and `cbEndOfObject` on class objects register (msim never
+  reclaims class objects).
 - VPI assertion control as 39.5 reads: `vpiAssertionEnableStep` /
   `DisableStep` and `vpiAssertionKill` act on one attempt, named by its
   start time (`vpiAssertionClockSteps` accepted); kill no longer disables

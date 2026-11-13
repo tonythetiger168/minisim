@@ -410,6 +410,13 @@ registered. `user_data` points to the name (as 38.36.3 says), which is
 also in `cb_data->value` (`vpiStringVal`). It may
 register the name with `vpi_register_systf`; the calls then run as usual.
 
+**End of an object (38.36.1).** `cbEndOfObject` on a thread or frame handle
+runs when that thread or call ends, as `cbEndOfThread` / `cbEndOfFrame` on
+it would, with no time passed. `cbReclaimObj` takes a class definition or
+class object handle, and `cbEndOfObject` also takes a class object; msim
+never reclaims a class object (an object lives to the end of the run), so
+those two do not run.
+
 **Save, restart and reset (38.6, 38.36.3).** `cbStartOfSave` and
 `cbEndOfSave` run around each `$save` / `$incsave`, `cbStartOfRestart`
 before `$restart`, `cbStartOfReset` before `$reset` (annex D.8, D.9). msim
@@ -442,8 +449,7 @@ loads of a bit or part of a signal and of primitive terminals,
 instance arrays as objects, the per-source
 delay of an inter-module path on a net with several sources,
 interactive mode
-callbacks, `cbReclaimObj` /
-`cbEndOfObject` (msim does not reclaim objects). A call to something not
+callbacks. A call to something not
 implemented returns NULL or `vpiUndefined` and sets an error that
 `vpi_chk_error` reports.
 
