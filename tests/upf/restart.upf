@@ -1,0 +1,10 @@
+create_supply_port VDD
+create_supply_port VSS
+create_supply_net VDD
+create_supply_net VSS
+connect_supply_net VDD -ports VDD
+connect_supply_net VSS -ports VSS
+create_power_domain PD_S -elements {u_s}
+create_supply_net VS
+create_power_switch SW_S -output_supply_port {o VS} -input_supply_port {i VDD} -control_port {c en} -on_state {on i {c}}
+set_domain_supply_net PD_S -primary_power_net VS -primary_ground_net VSS

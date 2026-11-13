@@ -1,0 +1,96 @@
+# The UPF information model (IEEE 1801-2024 clause 10) and its Tcl queries
+# (11.1), read after gating.upf against gating.sv: tests/upf.cmake joins the
+# two files. The first query starts phase 5 (11.1.1), so the intent of
+# gating.upf is complete; msim must still print gating.out.
+proc expect {what got want} {
+    if {$got ne $want} { error "query $what: got {$got}, want {$want}" }
+}
+proc prop {h p} { return [upf_query_object_properties $h -property $p] }
+
+# object types (11.1.2.2) and handles (10.3.2): relative, absolute, "."
+expect pd_type    [upf_query_object_type PD_CORE]               upfPowerDomainT
+expect abs_type   [upf_query_object_type /u_dut/PD_CORE]        upfPowerDomainT
+expect scope_type [upf_query_object_type .]                     upfHdlScopeT
+expect iso_type   [upf_query_object_type PD_CORE.ISO_0]         upfIsolationStrategyT
+expect ls_type    [upf_query_object_type PD_CORE.LS_IN]         upfLevelShifterStrategyT
+expect sw_type    [upf_query_object_type SW_CORE]               upfPowerSwitchT
+expect port_type  [upf_query_object_type VDD]                   upfSupplyPortT
+expect net_type   [upf_query_object_type VDD@upfSupplyNetT]     upfSupplyNetT
+expect net2_type  [upf_query_object_type VDD_CORE]              upfSupplyNetT
+expect ss_type    [upf_query_object_type SS_CORE]               upfSupplySetT
+expect hdl_type   [upf_query_object_type u_core/cnt]            upfHdlPortMultiBitT
+expect bit_type   [upf_query_object_type u_core/hi]             upfHdlPortBitT
+
+# class membership (11.1.2.3)
+expect in_extent  [upf_object_in_class PD_CORE -class upfExtentClassT]        1
+expect in_strat   [upf_object_in_class PD_CORE -class upfStrategyT]           0
+expect in_bound   [upf_object_in_class PD_CORE.ISO_0 -class upfBoundaryStrategyT] 1
+expect in_port    [upf_object_in_class VDD -class upfPortClassT]              1
+expect in_hdl     [upf_object_in_class u_core -class upfBaseHdlT]             1
+
+# properties (11.1.2.1, 10.6)
+expect pd_name    [prop PD_CORE upf_name]                       PD_CORE
+expect pd_parent  [prop PD_CORE upf_parent]                     /u_dut
+expect pd_upper   [prop PD_CORE upf_upper_boundary]             /u_dut/u_core
+expect pd_isos    [prop PD_CORE upf_isolation_strategies]       {/u_dut/PD_CORE.ISO_0 /u_dut/PD_CORE.ISO_1 /u_dut/PD_CORE.ISO_L}
+expect pd_ls      [prop PD_CORE upf_level_shifter_strategies]   /u_dut/PD_CORE.LS_IN
+expect pd_ssh     [prop PD_CORE upf_supply_set_handles]         /u_dut/PD_CORE.primary
+expect primary    [prop PD_CORE.primary.power upf_ref_object]   /u_dut/VDD_CORE
+expect iso_clamp  [prop PD_CORE.ISO_1 upf_clamp_values]         1
+expect iso_appl   [prop PD_CORE.ISO_0 upf_applies_to]           UPF_FILTER_OUTPUTS
+expect iso_ref    [prop PD_CORE.ISO_0 upf_logic_refs]           /u_dut/PD_CORE.ISO_0.isolation_signal
+expect iso_sig    [prop PD_CORE.ISO_0.isolation_signal upf_ref_object] /u_dut/iso_en
+set ctrl [prop PD_CORE.ISO_0 upf_isolation_controls]
+expect ctrl_type  [upf_query_object_type $ctrl]                 upfSignalSenseT
+expect ctrl_sense [prop $ctrl upf_signal_sensitivity]           UPF_SENSE_HIGH
+expect ctrl_sig   [prop $ctrl upf_control_signal]               /u_dut/iso_en
+expect ls_rule    [prop PD_CORE.LS_IN upf_level_shift_rule]     UPF_LS_BOTH
+expect port_dir   [prop VDD upf_port_dir]                       UPF_DIR_IN
+expect loconn     [prop VDD upf_loconn]                         /u_dut/VDD@upfSupplyNetT
+expect driver     [prop VDD_CORE upf_root_driver]               /u_dut/SW_CORE/vout
+expect sw_out     [prop SW_CORE upf_output_supply_port]         /u_dut/SW_CORE/vout
+expect sw_states  [prop SW_CORE upf_sw_states]                  {/u_dut/SW_CORE.on /u_dut/SW_CORE.off}
+expect sw_on      [prop SW_CORE.on upf_switch_output_state]     FULL_ON
+expect sw_ctrl    [prop SW_CORE/en upf_hiconn]                  /u_dut/sw_en
+expect width      [prop u_core/cnt upf_hdl_width]               8
+expect hdl_dir    [prop u_core/cnt upf_port_dir]                UPF_DIR_OUT
+expect unset      [prop PD_CORE upf_repeater_strategies]        {}
+# effective extents are a linked list of relationship objects (10.6.3)
+set x [prop PD_CORE upf_effective_extents]
+expect ext_type   [upf_query_object_type $x]                    upfExtentT
+expect ext_elem   [prop $x upf_hdl_element]                     /u_dut/u_core
+expect ext_obj    [prop $x upf_object]                          /u_dut/PD_CORE
+# every property, as {name value} pairs
+expect all        [lindex [upf_query_object_properties PD_CORE] 0] {upf_name PD_CORE}
+
+# pathnames (11.1.2.4)
+expect path       [upf_query_object_pathname PD_CORE.ISO_0]     /u_dut/PD_CORE.ISO_0
+expect rel        [upf_query_object_pathname u_core/cnt -relative_to u_core] cnt
+expect not_anc    [upf_query_object_pathname PD_CORE -relative_to u_core] {}
+expect rel_obj    [upf_query_object_pathname $x]                {}
+
+# query_upf (11.1.3.2): scope-centric, then domain-centric
+expect q_inst     [query_upf . -pattern u_* -object_type inst]  u_core
+expect q_snet     [query_upf . -pattern VDD* -object_type supply_net] {VDD VDD_CORE}
+expect q_ss       [query_upf . -pattern SS_* -object_type supply_set] {SS_AON SS_CORE}
+expect q_dom_out  [query_upf PD_CORE -pattern * -object_type port -direction out] {u_core/cnt u_core/q u_core/hi u_core/lat}
+expect q_dom_ss   [query_upf PD_CORE -pattern * -object_type supply_set] PD_CORE.primary
+expect q_cells    [query_upf PD_CORE -pattern * -inst_type isolation_cell -object_type inst] {}
+
+# errors: a handle not in the model, a property not of the class, a dynamic
+# property, a class that does not exist
+foreach bad {
+    {upf_query_object_type NOPE}
+    {upf_query_object_properties PD_CORE -property upf_port_dir}
+    {upf_query_object_properties PD_CORE -property upf_bogus}
+    {upf_query_object_properties PD_CORE -property upf_current_state}
+    {upf_object_in_class PD_CORE -class upfBogusT}
+    {query_upf ../x -pattern *}
+} {
+    if {![catch $bad e]} { error "query: '$bad' did not fail" }
+}
+# after a query only set_scope, bind_checker, find_objects and load_upf may follow
+set_scope u_core
+set_scope ..
+expect find_after [find_objects . -pattern u_*] u_core
+if {![catch {create_supply_net LATE} e]} { error "query: a UPF command after a query did not fail" }

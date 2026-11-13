@@ -114,6 +114,17 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiCovered` of an assertion needs an attempt, a success and no failure.
 - VPI `failExpr` on `cbAssertionFailure` (39.4.2): the condition of an
   immediate assertion, or the boolean of a single-expression property.
+- UPF information model and Tcl queries (IEEE 1801-2024 clause 10, 11.1):
+  `upf_query_object_properties`, `upf_query_object_type`,
+  `upf_object_in_class`, `upf_query_object_pathname` and `query_upf`, with
+  phase 5 enforced after the first query (docs/LOWPOWER.md).
+- The UPF information model also holds abstract power sources, composite
+  domains, power state groups, state transitions, repeater strategies, power
+  models and attributes (IEEE 1801-2024 10.6.1, 10.6.3).
+- `find_objects` follows 1801-2024 6.33 in full: instances, ports and nets
+  by default, `-traverse_macros`, `-expand_to_bits`, transitive searches that
+  stop at leaf cells and macros, `-leaf_only` / `-non_leaf` for every object
+  type, and the glob forms of 6.33.2 (`[a-z]`, `\x`, `{a,b,c}`).
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -137,6 +148,10 @@ Spec references are IEEE 1800-2023 clauses.
 
   The engine is mcov's own, and it reads mcov's own databases.
   A database that does not exist is now a one-line error instead of a traceback.
+
+### Fixed
+- The `SV_TIED_HI`, `SV_TIED_LO`, `VHDL_TIED_HI` and `VHDL_TIED_LO` value
+  conversion tables are upf2hdl tables, as in IEEE 1801-2024 Annex B.
 
 ### Removed
 - `mdft` is now the checks alone. Scan insertion, memory BIST, boundary scan,
@@ -746,6 +761,12 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `case ... inside` is merged: an item may match when its `==?`
+  or range compare is unknown. The merging code of a combinational block
+  now writes without change events and publishes each final value once, so
+  blocks that read each other no longer wake each other forever (the
+  CV32E40P decoder and controller hung at time 0). CV32E40P runs with all
+  753 `if` / `case` / edge constructs merged and the same result.
 - `-xprop`: a write to an element of a multidimensional array whose indexes
   have unknown bits (`m[r][c] <= d`) merges into every element the indexes
   may name. Before, only one-dimensional arrays did, and the write was
