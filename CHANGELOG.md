@@ -14,6 +14,19 @@ Spec references are IEEE 1800-2023 clauses.
   kept field by field, so one field's crossing no longer spreads to every
   register. A clock behind a scan mux is the functional clock. `-static`
   takes patterns. OpenTitan `usbdev` goes from 162 findings to 12.
+- VPI containers of structs, classes and containers (37.18): an element of
+  a queue, dynamic or associative array of unpacked structs is a
+  `vpiStructVar` whose members read and write the element; one of class
+  handles gives its object through `vpiClassObj`; one that is itself a
+  container is a `vpiArrayVar` with its own size and elements.
+  `tests/spec/37.18-vpi-nested-containers.sv`.
+- VPI instance arrays (37.11): `vpi_iterate(vpiModuleArray /
+  vpiInterfaceArray / vpiProgramArray / vpiPrimitiveArray /
+  vpiInstanceArray, module)`, an array's name, size, ranges and elements,
+  `vpi_handle_by_index` / `vpi_handle_by_multi_index` on it, and from an
+  element `vpiIndex` and its array. Array elements are now named `u[2]`, and
+  `vpi_handle_by_name` picks the right element of a descending array
+  (`u[3:1]`). `tests/spec/37.11-vpi-instance-arrays.sv`.
 - `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
   flop, the nets and logic between it and the reader (a glitch source for
   CDC003), the synchronizer stages, and the qualifier of an enable-qualified
@@ -39,6 +52,10 @@ Spec references are IEEE 1800-2023 clauses.
   writes in the generated code. Without `-upf` the generated C++ is
   unchanged. `tests/msim_compile.cmake` runs four UPF designs and the
   low-power coverage report both ways.
+- `mlint -upf` rules `UPF008` to `UPF012`: isolation and retention controls
+  driven from a domain that can be off, isolation or retention powered by
+  the switched supply of the domain itself, a power switch controlled from
+  the domain it powers, and redundant level shifters.
 - `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
@@ -72,6 +89,10 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- `mvplat` runs RV64: RV64IMAC harts (chosen by the program's ELF class),
+  the W instructions, LD/SD/LWU, 64-bit atomics, RV64C and Sv39 paging. The
+  riscv-tests run grows to 342 programs, RV32 and RV64, all passing. The
+  extension ABI is 3.
 - `mvplat` supervisor mode and Sv32 paging: delegation (`medeleg`,
   `mideleg`), the supervisor CSRs, SRET, SFENCE.VMA, SUM/MXR/TVM/TW/TSR, a
   TLB per hart, Svade accessed/dirty faults, and a supervisor-mode PLIC
@@ -791,6 +812,10 @@ Spec references are IEEE 1800-2023 clauses.
   `-lib` takes cell functions from Liberty; `-threads N` with the same
   result for any N. The fault simulator is `src/faultsim.hpp` for the other
   test tools. See `docs/ATPG.md`.
+- `-xprop`: `disable` of a named block from inside it is merged: it sets
+  a flag (and the break flags of the loops between) instead of jumping, and
+  the rest of the block runs under the flag, so an unknown condition around
+  it merges the rest with not running it.
 - `-xprop`: blocking writes to an element of an array of 64 elements or
   fewer chosen at run time merge exactly: the branch saves, puts back and
   merges the array's elements like variables, so two branches that write
