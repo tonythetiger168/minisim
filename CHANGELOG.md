@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: Sv48 and Sv57 paging on RV64. `-mmu sv48|sv57` (or the platform's
+  `"mmu"`) offers them in the device tree; Linux runs with Sv48. riscv-tests
+  run RV64's ui, um, ua and uc under Sv48 too: 675 programs.
 - mvplat: the B extension (Zba, Zbb, Zbs) with Zbc and Zicond on RV32 and
   RV64, in `misa` and the device tree; 588 riscv-tests now (uzba, uzbb, uzbc,
   uzbs, uzicond added, `p` and `v`).

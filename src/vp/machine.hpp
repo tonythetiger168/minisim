@@ -546,7 +546,7 @@ public:
                 if (h.priv == 1 && (h.mstatus & MSTATUS_TVM)) return false;
                 if (h.rv64) {
                     uint64_t mode = v >> 60;
-                    if (mode != 0 && mode != 8) return true;  // not Bare or Sv39: the write has no effect
+                    if (mode != 0 && (mode < 8 || mode > 10)) return true;  // not Bare, Sv39, Sv48 or Sv57: no effect
                     h.satp = (mode << 60) | (v & ((1ull << 44) - 1));  // MODE, PPN; no ASIDs
                 } else {
                     h.satp = v & 0x803fffffu;  // MODE, PPN; no ASIDs
@@ -714,7 +714,7 @@ public:
         return false;
     }
 
-    // ------------------------------------------------------------ Sv32, Sv39
+    // ---------------------------------------------- Sv32, Sv39, Sv48, Sv57
     // Translate `va` for an access of kind 0 read, 1 write, 2 execute at
     // privilege `priv`. Svade: a clear A, or a clear D on a write, is a page
     // fault, which software answers by setting the bit. Page-table reads are
@@ -729,13 +729,15 @@ public:
     }
     Acc translate(Hart& h, uint64_t va, int kind, unsigned priv, uint64_t& pa) {
         if (priv == 3 || !h.paging()) { pa = va; return Acc::Ok; }
-        // Sv39: Sv32 has 2 levels of 10-bit indices and 4-byte entries with a
-        // 22-bit PPN; Sv39 has 3 levels of 9 bits, 8-byte entries, 44 bits.
+        // Sv32 has 2 levels of 10-bit indices and 4-byte entries with a 22-bit
+        // PPN; Sv39, Sv48 and Sv57 (satp.MODE 8, 9, 10) have 3, 4 and 5
+        // levels of 9 bits, 8-byte entries and a 44-bit PPN.
         const bool w = h.rv64;
-        if (w && (uint64_t)((int64_t)(va << 25) >> 25) != va) return Acc::PageFault;  // not sign-extended from bit 38
-        const unsigned levels = w ? 3 : 2, ib = w ? 9 : 10, pteN = w ? 8 : 4;
+        const unsigned levels = w ? (unsigned)(h.satp >> 60) - 5 : 2, ib = w ? 9 : 10, pteN = w ? 8 : 4;
+        const unsigned vab = 12 + 9 * levels;  // 39, 48, 57
+        if (w && (uint64_t)((int64_t)(va << (64 - vab)) >> (64 - vab)) != va) return Acc::PageFault;  // not sign-extended
         const uint64_t ppnMask = w ? (1ull << 44) - 1 : 0x3fffff;
-        uint64_t vpn = w ? (va >> 12) & ((1ull << 27) - 1) : (va >> 12) & 0xfffff;
+        uint64_t vpn = w ? (va >> 12) & ((1ull << (9 * levels)) - 1) : (va >> 12) & 0xfffff;
         Hart::Tlb& t = h.tlb[vpn & (Hart::TLB_SIZE - 1)];
         for (int pass = 0; pass < 2; pass++) {
             if (!(t.valid && t.vpn == vpn)) {
