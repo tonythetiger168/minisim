@@ -147,7 +147,12 @@ struct Hart {
     struct Tlb { uint64_t vpn, ppn; uint8_t pte; bool valid; };
     static constexpr unsigned TLB_SIZE = 256;
     Tlb tlb[TLB_SIZE] = {};
-    void flushTlb() { for (auto& t : tlb) t.valid = false; }
+    void flushTlb() { for (auto& t : tlb) t.valid = false; fpVpn = ~0ull; }
+    // The page instructions were last fetched from, translated and found
+    // executable by PMP as a whole: va >> 12, the physical page, and the
+    // privilege it was checked at. Emptied with the TLB and by PMP writes.
+    uint64_t fpVpn = ~0ull, fpPa = 0;
+    unsigned fpPriv = 0;
     // The active PMP entries, decoded from the CSRs in priority order
     // (Machine::pmpDecode). pmpLock: some entry binds machine mode too.
     struct PmpRegion { uint64_t lo, hi; uint8_t cfg; };

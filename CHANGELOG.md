@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat boots Linux: `-bios`, `-kernel`, `-initrd`, `-append`, `-dtb` as on
+  QEMU's virt board, a device tree made from the platform (`-dump-dtb`), and
+  OpenSBI's `fw_dynamic` hand-off. OpenSBI 1.7 and Ubuntu 24.04's stock
+  riscv64 kernel boot to user space on 1 to 4 harts. Instruction fetch with
+  paging on keeps the last page translated: 25 to 43 MIPS under Linux.
+  Extension ABI 4.
 - VPI class definitions (37.31): `vpiVariables` of a class defn gives its
   automatic properties too (before only static ones), as declarations
   with `vpiAutomatic` and `vpiParent` whose value is refused (detail 2);
