@@ -263,6 +263,11 @@ Spec references are IEEE 1800-2023 clauses.
   `run [T]`, `step`, stops on a signal change, edge or value, `print` of
   signals and class objects (properties, inherited ones, paths through
   handles), `force`, `release`, `deposit` and `signals`.
+- `mdebug` waves: a marker with the time to the cursor (shift+click or `m`),
+  a radix per row (`r`: hex, decimal, signed, binary), find value
+  (next/previous time the selected signal takes it), Del to remove a row,
+  Ctrl+arrows to step changes; the view lives in the page address, so a
+  reload or a copied link opens on it.
 - `mdebug -serve [PORT]`: the viewer from a web server on 127.0.0.1; a
   signal's waves are sent when the page first shows it, so large waveforms
   are not cut to the one-file page's budget.
