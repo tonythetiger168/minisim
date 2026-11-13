@@ -8,6 +8,7 @@ static std::unordered_map<const slang::ast::CovergroupType*, int>& cgIdxMap() {
     return m;
 }
 int cgItemSig = -1;   // the `item` of a bin's with clause (19.5.1.1)
+int cgWideW = 0;      // the width of the coverpoint wider than 64 bits whose bins are being built
 int cgWithSeq = 0;    // numbers the value signals of cross with filters
 std::unordered_map<std::string, int> cgIterSigs;   // a cross with filter's coverpoints, by name
 
@@ -21,6 +22,7 @@ E cgBound(const slang::ast::Expression& x0, bool& sg) {
         x = &x->as<ConversionExpression>().operand();
     if (!x->type->isIntegral()) unsupported("a coverage bin value that is not integral (real coverpoints, 19.5.1)");
     sg = x->type->isSigned();
+    if (cgWideW) return resize(expr(*x), cgWideW, sg, sg);   // a bound of a coverpoint wider than 64 bits
     if (x->type->getBitWidth() > 64) unsupported("a coverage bin value wider than 64 bits");
     return resize(expr(*x), 64, sg, sg);
 }
@@ -119,8 +121,13 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             for (size_t k = 0; k < x.targets.size(); k++)
                 if (x.targets[k] == cp) s->cp = (int)k;
             if (s->cp < 0) unsupported("binsof of a coverpoint not in the cross");
-            bool real = x.targets[s->cp]->getType().isFloating();
+            const Type& ct = x.targets[s->cp]->getType();
+            bool real = ct.isFloating();
+            // intersect values of a coverpoint wider than 64 bits keep its width
+            int savedW = cgWideW;
+            cgWideW = !real && ct.getBitWidth() > 64 ? (int)ct.getBitWidth() : 0;
             for (const Expression* e : c.intersects) s->isect.push_back(real ? cgItemReal(*e) : cgItem(*e));
+            cgWideW = savedW;
             return s;
         }
         case BinsSelectExprKind::Unary:
@@ -144,6 +151,7 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             for (size_t k = 0; k < x.targets.size(); k++) {
                 const Type& t = x.targets[k]->getType();
                 if (t.isFloating() || !t.isIntegral()) unsupported("a cross with filter over a real coverpoint (19.6.1.2)");
+                if (t.getBitWidth() > 64) unsupported("a cross with filter over a coverpoint wider than 64 bits (19.6.1.2)");
                 int sg = mkSig(x.getHierarchicalPath() + "$with" + std::to_string(cgWithSeq++) + "." + std::string(x.targets[k]->name),
                                (int)t.getBitWidth(), false);
                 s->valSigs.push_back(sg);
@@ -159,14 +167,85 @@ std::shared_ptr<CgSel> cgSel(const slang::ast::BinsSelectExpr& b, const slang::a
             }
             return s;
         }
+        case BinsSelectExprKind::SetExpr: {   // a CrossQueueType value: its tuples (19.6.1.3)
+            const auto& se = b.as<SetExprBinsSelectExpr>();
+            s->kind = 6;
+            slang::ConstantValue cv = tryConst(se.expr);
+            if (!cv) unsupported("a cross set expression that is not constant (19.6.1.3)");
+            auto one = [&](const slang::ConstantValue& v) -> Val {
+                if (v.isInteger()) {
+                    E k = svLit(v.integer(), v.integer().isSigned(), {});
+                    if (k->op != Op::Const) unsupported("cross set expression value");
+                    return k->k;
+                }
+                if (v.isReal()) return mkreal(v.real());
+                unsupported("cross set expression value of this kind");
+            };
+            auto addTuple = [&](const slang::ConstantValue& t) {
+                std::vector<Val> vals;
+                if (t.isUnpacked()) for (const auto& f : t.elements()) vals.push_back(one(f));
+                else vals.push_back(one(t));
+                if (vals.size() != x.targets.size()) unsupported("cross set expression tuple of another size");
+                s->tuples.push_back(std::move(vals));
+            };
+            if (cv.isQueue()) for (const auto& t : *cv.queue()) addTuple(t);
+            else if (cv.isUnpacked()) for (const auto& t : cv.elements()) addTuple(t);
+            else unsupported("cross set expression of this kind");
+            if (const Expression* m = se.matchesExpr) {
+                const Expression* q = m;
+                while (q->kind == ExpressionKind::Conversion) q = &q->as<ConversionExpression>().operand();
+                if (q->kind == ExpressionKind::UnboundedLiteral) s->all = true;
+                else s->matches = resize(expr(*m), 64, false, false);
+            }
+            return s;
+        }
         default: unsupported("this cross bin select expression (19.6.1)");
     }
 }
 // The definition of a covergroup type, built on first use.
+// Block events (19.3): the task, function or named block a block event
+// names (null: something else); and the number of its begin or end point.
+static const slang::ast::Symbol* blockEventSub(const slang::ast::Expression& e) {
+    using namespace slang::ast;
+    const Symbol* s = nullptr;
+    if (e.kind == ExpressionKind::ArbitrarySymbol) s = e.as<ArbitrarySymbolExpression>().symbol;
+    else if (ValueExpressionBase::isKind(e.kind)) s = &e.as<ValueExpressionBase>().symbol;
+    return s && (s->kind == SymbolKind::Subroutine || s->kind == SymbolKind::StatementBlock) ? s : nullptr;
+}
+static std::map<std::pair<const slang::ast::Symbol*, bool>, size_t>& blockEventIds() {
+    static std::map<std::pair<const slang::ast::Symbol*, bool>, size_t> m;
+    return m;
+}
+static size_t blockEventId(const slang::ast::Symbol* sub, bool begin) {
+    auto [it, fresh] = blockEventIds().try_emplace({sub, begin}, cgBlockDefs().size());
+    if (fresh) cgBlockDefs().emplace_back();
+    return it->second;
+}
+// Every block event of every covergroup, numbered before any subroutine is
+// lowered, so a subroutine knows to sample at its start or end.
+static void scanBlockEvents(const slang::ast::Symbol& root) {
+    using namespace slang::ast;
+    struct V : ASTVisitor<V, VisitFlags::Symbols> {
+        void handle(const CovergroupType& t) {
+            if (const TimingControl* ev = t.getCoverageEvent(); ev && ev->kind == TimingControlKind::BlockEventList)
+                for (const auto& be : ev->as<BlockEventListControl>().events)
+                    if (const auto* sub = blockEventSub(*be.target)) blockEventId(sub, be.isBegin);
+            visitDefault(t);
+        }
+    } v;
+    root.visit(v);
+}
+// The sampling call at a block event's point, or nothing.
+void blockEventSample(const slang::ast::Symbol* sub, bool begin) {
+    auto it = blockEventIds().find({sub, begin});
+    if (it == blockEventIds().end()) return;
+    Instr i; i.k = IK::Assign; i.sig = fresh(64);
+    i.e = sysFnNode(SF_CG, {konst(make((uint64_t)it->second, 0, 32))}, CG_BLOCK);
+    prog.emit(i);
+}
 int cgDefOf(const slang::ast::CovergroupType& t) {
     using namespace slang::ast;
     if (auto it = cgIdxMap().find(&t); it != cgIdxMap().end()) return it->second;
-    if (t.getBaseGroup()) unsupported("a covergroup that extends another (19.4.1)");
     auto savedScope = scope;
     auto savedUnit = tsUnit, savedPrec = tsPrec;
     setScope(t.getParentScope());
@@ -190,22 +269,41 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         sigmap[&s] = id;
         return id;
     };
-    for (const FormalArgumentSymbol* a : t.getArguments()) {
+    // covergroup extends base (19.4.1): the base's members, then this one's;
+    // a member with a base member's name replaces it.
+    std::vector<const CovergroupType*> chain;
+    for (const CovergroupType* g = &t; g;) {
+        chain.insert(chain.begin(), g);
+        const Type* bt = g->getBaseGroup();
+        g = bt && bt->getCanonicalType().kind == SymbolKind::CovergroupType ? &bt->getCanonicalType().as<CovergroupType>() : nullptr;
+    }
+    const CovergroupType* argT = chain.front();   // arguments and the sampling event: the base's, unless given again
+    for (const CovergroupType* g : chain)
+        if (!g->getArguments().empty() || g->getCoverageEvent()) argT = g;
+    for (const FormalArgumentSymbol* a : argT->getArguments()) {
         d.argSigs.push_back(hidden(*a, a->getType()));
         d.argRef.push_back(a->direction == ArgumentDirection::Ref);
     }
-    for (const auto& m : t.members())
+    for (const auto& m : argT->members())
         if (const auto* a = m.as_if<FormalArgumentSymbol>(); a && (a->flags & VariableFlags::CoverageSampleFormal))
             d.sampleSigs.push_back(hidden(*a, a->getType()));
-    if (const TimingControl* ev = t.getCoverageEvent()) {
-        if (ev->kind != TimingControlKind::SignalEvent && ev->kind != TimingControlKind::EventList)
-            unsupported("this covergroup sampling event (block events, 19.3)");
-        clockOf(*ev, d.ev, d.evIff);
+    std::vector<size_t> blockAt;   // the block events this covergroup samples at
+    if (const TimingControl* ev = argT->getCoverageEvent()) {
+        if (ev->kind == TimingControlKind::BlockEventList) {   // @@(begin f or end g) (19.3)
+            for (const auto& be : ev->as<BlockEventListControl>().events) {
+                const Symbol* sub = blockEventSub(*be.target);
+                if (!sub) unsupported("a block event on something other than a task, function or named block (19.3)");
+                blockAt.push_back(blockEventId(sub, be.isBegin));
+            }
+        } else if (ev->kind != TimingControlKind::SignalEvent && ev->kind != TimingControlKind::EventList)
+            unsupported("this covergroup sampling event (19.3)");
+        else clockOf(*ev, d.ev, d.evIff);
     }
-    const auto& body = t.getBody();
-    cgOpts(body.options, d.opts, &d.realInterval);
+    for (const CovergroupType* g : chain) cgOpts(g->getBody().options, d.opts, &d.realInterval);
     std::unordered_map<const CoverpointSymbol*, int> cpIdx;
-    for (const auto& m : body.members()) {
+    std::unordered_map<std::string, int> cpByName, xByName;
+    for (const CovergroupType* g : chain)
+    for (const auto& m : g->getBody().members()) {
         const auto* cp = m.as_if<CoverpointSymbol>();
         if (!cp) continue;
         CgCpDef c;
@@ -234,7 +332,7 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         } else {
             if (!ty.isIntegral()) unsupported("a coverpoint of this type (19.5)");
             c.w = (int)ty.getBitWidth();
-            if (c.w > 64) unsupported("a coverpoint wider than 64 bits");
+            c.wide = c.w > 64;
             c.sgn = ty.isSigned();
             c.expr = resize(expr(ce), c.w, ce.type->isSigned(), c.sgn);
         }
@@ -257,6 +355,8 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             }
         }
         cgOpts(cp->options, c.opts, &c.realInterval);
+        cgWideW = c.wide ? c.w : 0;
+        struct WideReset { int& w; ~WideReset() { w = 0; } } wideReset{cgWideW};
         for (const auto& bm : cp->members()) {
             const auto* b = bm.as_if<CoverageBinSymbol>();
             if (!b) continue;
@@ -326,10 +426,22 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
         }
         if (c.isReal && std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0; }))
             unsupported("a real coverpoint without bins: there are no automatic bins for reals (19.5.3)");
-        cpIdx[cp] = (int)d.cps.size();
-        d.cps.push_back(std::move(c));
+        cgWideW = 0;
+        if (c.wide) {   // wider than 64 bits: explicit value bins only
+            for (const auto& b : c.bins)
+                if ((b.array && (!b.trans.empty() || b.wildcard)) || (b.wildcard && !b.trans.empty()) || b.with || b.setIdx >= 0 || b.dfltSeq)
+                    unsupported("with, set, wildcard transition or array bins with transitions or wildcards of a coverpoint wider than 64 bits");
+        }
+        if (auto it = cpByName.find(c.name); it != cpByName.end()) {   // replaces the base's (19.4.1)
+            cpIdx[cp] = it->second;
+            d.cps[(size_t)it->second] = std::move(c);
+        } else {
+            cpIdx[cp] = cpByName[c.name] = (int)d.cps.size();
+            d.cps.push_back(std::move(c));
+        }
     }
-    for (const auto& m : body.members()) {
+    for (const CovergroupType* g : chain)
+    for (const auto& m : g->getBody().members()) {
         const auto* x = m.as_if<CoverCrossSymbol>();
         if (!x) continue;
         CgCrossDef cd;
@@ -350,17 +462,30 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
                     const BinsSelectExpr* sel = b->getCrossSelectExpr();
                     if (!sel) unsupported("this cross bin");
                     xb.sel = cgSel(*sel, *x);
+                    std::function<bool(const CgSel&)> setSel = [&](const CgSel& q) {
+                        if (q.kind == 6) return true;
+                        for (const auto& k : q.kids) if (setSel(*k)) return true;
+                        return false;
+                    };
+                    for (int c : cd.cps)
+                        if (d.cps[(size_t)c].wide && setSel(*xb.sel))
+                            unsupported("a cross set expression over a coverpoint wider than 64 bits (19.6.1.3)");
                     cd.bins.push_back(std::move(xb));
                 } else if (const auto* body = bm.as_if<CoverCrossBodySymbol>())
                     bins(*body);
             }
         };
         bins(*x);
-        d.crosses.push_back(std::move(cd));
+        if (auto it = xByName.find(cd.name); it != xByName.end()) d.crosses[(size_t)it->second] = std::move(cd);
+        else {
+            xByName[cd.name] = (int)d.crosses.size();
+            d.crosses.push_back(std::move(cd));
+        }
     }
     cgDefs().push_back(std::move(d));
     int idx = (int)cgDefs().size() - 1;
     cgIdxMap()[&t] = idx;
+    for (size_t b : blockAt) cgBlockDefs()[b].push_back(idx);
     curClass = savedCls;
     frames = std::move(savedFrames);
     scope = savedScope;

@@ -349,7 +349,10 @@ inline int uWidth(const slang::ast::Type& t0) {
         int w = 0;
         bool u = t.isUnpackedUnion();
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
-            int fw = uWidth(f.getType());
+            const Type& ft = f.getType().getCanonicalType();
+            // A queue, dynamic or associative array member: its container id (7.2)
+            bool cont = !u && (ft.isQueue() || ft.isAssociativeArray() || ft.kind == SymbolKind::DynamicArrayType);
+            int fw = cont ? 64 : uWidth(f.getType());
             if (fw <= 0) return -1;
             w = u ? std::max(w, fw) : w + fw;
         }
@@ -370,15 +373,22 @@ inline int bitsOf(const slang::ast::Type& t) {
     return t.getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType ? uWidth(t) : storeW(t);
 }
 // Offset and width of field f inside unpacked struct or union t.
+// The bits of a member of unpacked struct type: a container member holds
+// its container's id (7.2).
+inline int uMemberW(const slang::ast::Type& ft0) {
+    const auto& ft = ft0.getCanonicalType();
+    if (ft.isQueue() || ft.isAssociativeArray() || ft.kind == slang::ast::SymbolKind::DynamicArrayType) return 64;
+    return uWidth(ft);
+}
 inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::FieldSymbol& f) {
     using namespace slang::ast;
     const auto& t = t0.getCanonicalType();
-    int fw = uWidth(f.getType());
-    if (t.isUnpackedUnion()) return {0, fw};
+    if (t.isUnpackedUnion()) return {0, uWidth(f.getType())};
+    int fw = uMemberW(f.getType());
     int after = 0;
     bool seen = false;
     for (const auto& g : t.as<Scope>().membersOfType<FieldSymbol>()) {
-        if (seen) after += uWidth(g.getType());
+        if (seen) after += uMemberW(g.getType());
         if (&g == &f) seen = true;
     }
     return {after, fw};
@@ -567,6 +577,53 @@ inline DpiType dpiType(const slang::ast::Type& t0, int& w, bool& sgn) {
     }
     if (t.kind == SymbolKind::ScalarType) return t.isFourState() ? DT_LOGIC : DT_BIT;
     return t.isFourState() ? DT_LOGICVEC : DT_BITVEC;
+}
+// An unpacked struct argument of a DPI import (35.5.6, H.7.6): the scalars
+// of the C struct with natural alignment, members in declared order, arrays
+// leftmost element first. lo is the bit of the SV value (held packed, the
+// first member at the top) where the value of type t starts.
+inline size_t dpiCAlign(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    if (t.isUnpackedStruct()) {
+        size_t a = 1;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) a = std::max(a, dpiCAlign(f.getType()));
+        return a;
+    }
+    if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) return dpiCAlign(t.as<FixedSizeUnpackedArrayType>().elementType);
+    int w; bool sg;
+    DpiType d = dpiType(t, w, sg);
+    switch (d) {
+        case DT_BYTE: case DT_BIT: case DT_LOGIC: return 1;
+        case DT_SHORT: return 2;
+        case DT_INT: case DT_SHORTREAL: case DT_BITVEC: case DT_LOGICVEC: return 4;
+        default: return 8;
+    }
+}
+inline void dpiStructFields(const slang::ast::Type& t0, int lo, size_t& cur, std::vector<DpiField>& out) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    size_t al = dpiCAlign(t);
+    cur = (cur + al - 1) / al * al;
+    if (t.isUnpackedStruct()) {
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>())
+            dpiStructFields(f.getType(), lo + uField(t, f).first, cur, out);
+        cur = (cur + al - 1) / al * al;
+        return;
+    }
+    if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+        const auto& a = t.as<FixedSizeUnpackedArrayType>();
+        int n = (int)a.range.width(), ew = uWidth(a.elementType);
+        for (int k = 0; k < n; k++) dpiStructFields(a.elementType, lo + (n - 1 - k) * ew, cur, out);
+        return;
+    }
+    if (t.isUnpackedUnion()) throw std::runtime_error("lower: unsupported DPI struct member of type " + t0.toString());
+    DpiField f;
+    f.t = dpiType(t, f.w, f.sgn);
+    f.lo = lo;
+    f.off = cur;
+    out.push_back(f);
+    cur += f.t == DT_BITVEC ? 4 * (size_t)((f.w + 31) / 32) : f.t == DT_LOGICVEC ? 8 * (size_t)((f.w + 31) / 32) : al;
 }
 // ---------- classes (8) ----------
 // An object is a block of signals laid out like a frame: slot 0 holds its
@@ -1771,6 +1828,123 @@ struct Lowerer {
         return wantValue ? ref(res, sym.getReturnType().isSigned()) : nullptr;
     }
     const slang::ast::SubroutineSymbol* vifTarget = nullptr;
+    const slang::ast::SubroutineSymbol* externImpl = nullptr;   // the exporter one fork branch calls
+    // extern forkjoin task exported by several modules (25.7.4): the call
+    // runs every exporter's task at once, as fork ... join, and returns when
+    // all of them have.
+    E forkJoinCall(const slang::ast::CallExpression& call, const slang::ast::MethodPrototypeSymbol& pr, bool wantValue) {
+        if (wantValue || pr.subroutineKind != slang::ast::SubroutineKind::Task) unsupported("extern function with more than one export");
+        if (!store) unsupported("extern forkjoin task call here");
+        Instr f; f.k = IK::Fork; f.join = 0;
+        for (auto* im = pr.getFirstExternImpl(); im; im = im->getNextImpl()) {
+            Lowerer lw(sigmap);
+            lw.bind(subs, mkSig, tempSeq, store);
+            lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+            lw.current = current;
+            lw.scope = scope;
+            lw.sampleEv = sampleEv;
+            lw.curClass = curClass;
+            FrameLayout* bl = newLayout("forkjoin branch");
+            lw.frames = frames;
+            lw.frames.push_back(bl);
+            if (frames.empty()) lw.frames.clear();
+            f.blays.push_back(frames.empty() ? nullptr : bl);
+            lw.stmtDepth = stmtDepth;
+            lw.externImpl = im->impl;
+            lw.emitUserCall(call, false);
+            lw.finishImplicit();
+            store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+            f.branches.push_back(store->back().get());
+        }
+        prog.emit(f);
+        return nullptr;
+    }
+    E dynGetAt0(int d) {
+        auto g = node(Op::DynGet, {konst(make(0, 0, 32, 0, true))});
+        g->sig = d;
+        return g;
+    }
+    static bool mailboxArrayType(const slang::ast::Type& t) {
+        return t.getCanonicalType().isUnpackedArray();
+    }
+    // put / get / peek and their try_ forms on a mailbox of arrays or
+    // containers (15.4): the method waits and counts, then the message is
+    // copied into the mailbox's queue, or out of its front, here.
+    bool mailboxArrayCall(const slang::ast::CallExpression& call, const slang::ast::SubroutineSymbol& sym,
+                          const Subr& sub, bool wantValue, E& result) {
+        using namespace slang::ast;
+        auto n = sym.name;
+        bool isPut = n == "put" || n == "try_put", isGet = n == "get" || n == "try_get";
+        bool isPeek = n == "peek" || n == "try_peek";
+        if (!(isPut || isGet || isPeek) || !call.thisClass() || call.arguments().size() != 1) return false;
+        const ClassInfo* ci = classInfo(*call.thisClass()->type);
+        if (!ci || ci->builtin != 3 || sym.getArguments().empty() || !mailboxArrayType(sym.getArguments()[0]->getType()))
+            return false;
+        const DynObj* shape = nullptr;
+        for (auto& [off, o] : ci->lay->dyn) if (off == ci->bslot) shape = &o;
+        if (!shape) unsupported("mailbox of arrays: queue shape");
+        const Type& T = sym.getArguments()[0]->getType();
+        bool packed = !shape->elem;   // a fixed-size array: one packed element (uWidth)
+        if (packed && uWidth(T) <= 0) unsupported("mailbox of arrays of this element type");
+        int h = fresh(64);
+        { Instr i; i.k = IK::Assign; i.sig = h; i.e = exprH(*call.thisClass()); prog.emit(i); }
+        bool tries = n.starts_with("try_");
+        E r = emitAutoCall(sub, {}, tries, ref(h));
+        size_t skip = 0;
+        if (tries) {
+            Instr j; j.k = IK::JmpIfNot; j.e = r;
+            skip = prog.emit(j);
+        }
+        int q = indSlot(ref(h), ci->bslot);
+        indShape[q] = *shape;
+        const Expression& a = *call.arguments()[0];
+        if (isPut && packed) { Instr i = dynCmd(q, D_PUSH_BACK); i.e = packedValue(T, a); prog.emit(i); }
+        else if (isPut) pushContainer(q, D_PUSH_BACK, a);
+        else if (packed) {
+            const Expression& tgt = peel(outArg(a));
+            auto ts = tgt.kind == ExpressionKind::NamedValue ? arrFind(&tgt.as<ValueExpressionBase>().symbol) : nullptr;
+            if (!ts || ts->dynElem) unsupported("mailbox message into this target");
+            const Type* leaf = &T.getCanonicalType();
+            while (leaf->kind == SymbolKind::FixedSizeUnpackedArrayType)
+                leaf = &leaf->as<FixedSizeUnpackedArrayType>().elementType.getCanonicalType();
+            int lw = uWidth(*leaf);
+            if (lw <= 0 || uWidth(T) / lw != ts->count) unsupported("mailbox message into an array of another shape");
+            int v = fresh(uWidth(T));
+            { Instr i; i.k = IK::Assign; i.sig = v; i.e = dynGetAt0(q); prog.emit(i); }
+            for (int k = 0; k < ts->count; k++) {
+                auto sl = node(Op::Slice, {ref(v)});
+                sl->hi = uWidth(T) - k * lw - 1;
+                sl->lo = sl->hi - lw + 1;
+                Instr i; i.k = IK::Assign; i.sig = ts->base + k;
+                i.e = leaf->isIntegral() ? resize(sl, lw, false, leaf->isSigned()) : E(sl);
+                prog.emit(i);
+            }
+            if (isGet) { Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i); }
+        } else {
+            const Expression& tgt = peel(outArg(a));
+            auto first = node(Op::DynElemRef, {konst(mk(0, 32))});
+            first->sig = q;
+            int e = elemRef(q, first);
+            if (isDynType(*tgt.type)) {
+                int t = dynSig(tgt);
+                if (t < 0) unsupported("mailbox message into this target");
+                Instr i = dynCmd(t, D_COPY); i.dsrc = e; prog.emit(i);
+            } else {
+                auto ts = tgt.kind == ExpressionKind::NamedValue ? arrFind(&tgt.as<ValueExpressionBase>().symbol) : nullptr;
+                if (!ts) unsupported("mailbox message into this target");
+                for (int k = 0; k < ts->count; k++) {
+                    auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                    g->sig = e;
+                    Instr i; i.k = IK::Assign; i.sig = ts->base + k; i.e = g;
+                    prog.emit(i);
+                }
+            }
+            if (isGet) { Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i); }
+        }
+        if (tries) prog.code[skip].target = prog.here();
+        result = wantValue ? r : nullptr;
+        return true;
+    }
     E emitUserCall(const slang::ast::CallExpression& call, bool wantValue) {
         using namespace slang::ast;
         if (call.isSystemCall()) unsupported("system call");
@@ -1803,9 +1977,10 @@ struct Lowerer {
                 return nullptr;
             }
         }
-        if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
+        if (externImpl) { sym = externImpl; externImpl = nullptr; }
+        else if (sym->flags.has(MethodFlags::InterfaceExtern))   // extern task of an interface: the module that exports it (25.7)
             if (const auto* pr = sym->getPrototype(); pr && pr->getFirstExternImpl()) {
-                if (pr->getFirstExternImpl()->getNextImpl()) unsupported("extern forkjoin task with more than one export");
+                if (pr->getFirstExternImpl()->getNextImpl()) return forkJoinCall(call, *pr, wantValue);
                 sym = pr->getFirstExternImpl()->impl;
             }
         auto it = subs->find(sym);
@@ -1818,6 +1993,7 @@ struct Lowerer {
 
         auto args = call.arguments();
         if (args.size() != sub->args.size()) unsupported("subroutine argument count");
+        if (E r; isClassMethod(*sym) && mailboxArrayCall(call, *sym, *sub, wantValue, r)) return r;
         if (isClassMethod(*sym)) {   // 8.6, 8.10, 8.20
             bool isStatic = sym->flags.has(MethodFlags::Static);
             E self;
@@ -1847,7 +2023,7 @@ struct Lowerer {
             const Expression& a = *args[n];
             if (staged && !formal.arr && formal.dir == ArgumentDirection::In && a.kind != ExpressionKind::EmptyArgument) {
                 int tmp = fresh(formal.w);
-                Instr i; i.k = IK::Assign; i.sig = tmp; i.e = expr(a);
+                Instr i; i.k = IK::Assign; i.sig = tmp; i.e = cloneConts(*a.type, expr(a));
                 prog.emit(i);
                 stagedSet.push_back({formal.sig, tmp});
                 continue;
@@ -1868,14 +2044,15 @@ struct Lowerer {
                 Instr i;
                 i.k = IK::Assign;
                 i.sig = formal.sig;
-                i.e = expr(a);
+                i.e = cloneConts(*a.type, expr(a));
                 prog.emit(i);
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
                 Instr i;
                 i.k = IK::Assign;
                 i.sig = formal.sig;
-                i.e = expr(a.as<AssignmentExpression>().left());
+                const Expression& l = a.as<AssignmentExpression>().left();
+                i.e = cloneConts(*l.type, expr(l));
                 prog.emit(i);
             } else if (a.kind != ExpressionKind::Assignment &&
                        a.kind != ExpressionKind::EmptyArgument) {
@@ -1911,7 +2088,7 @@ struct Lowerer {
             OutSlot slot{formal.sig, formal.w, formal.sgn};
             const OutSlot* saved = outSlot;
             outSlot = &slot;
-            i.e = expr(as.right());
+            i.e = cloneConts(*as.left().type, expr(as.right()));
             outSlot = saved;
             prog.emit(i);
         }
@@ -1945,6 +2122,24 @@ struct Lowerer {
         for (size_t n = 0; n < args.size(); n++) {
             const DpiArg& formal = f->args[n];
             const Expression& a = *args[n];
+            if (formal.popen && formal.udims.empty()) {   // bit [] (35.5.6.1): the vector as a one-element array
+                const Expression* x = &a;
+                if (formal.dir != 0) {
+                    if (a.kind != ExpressionKind::Assignment) unsupported("DPI output argument");
+                    x = &a.as<AssignmentExpression>().left();
+                }
+                if (!x->type->isIntegral()) unsupported("DPI packed open array argument that is not a packed value");
+                int W = (int)x->type->getBitWidth();
+                auto A = std::make_shared<ArrShape>();
+                A->base = freshStatic(W);
+                A->count = 1;
+                A->elemW = W;
+                A->twoState = !x->type->isFourState();
+                if (formal.dir != 1) { Instr i; i.k = IK::Assign; i.sig = A->base; i.e = resize(expr(*x), W, false, false); prog.emit(i); }
+                c.dact[n].arr = A;
+                c.dact[n].pw = W;
+                continue;
+            }
             if (formal.uarr) {
                 const Expression* x = &a;
                 if (formal.dir != 0) {
@@ -1952,6 +2147,12 @@ struct Lowerer {
                     x = &a.as<AssignmentExpression>().left();
                 }
                 x = &peel(*x);
+                if (formal.popen) {   // logic [] v []: the elements' packed width
+                    const Type* et = x->type;
+                    while (et->getCanonicalType().isUnpackedArray()) et = et->getCanonicalType().getArrayElementType();
+                    if (!et->isIntegral()) unsupported("DPI packed open array argument that is not packed");
+                    c.dact[n].pw = (int)et->getBitWidth();
+                }
                 if (!ValueExpressionBase::isKind(x->kind)) unsupported("DPI array argument that is not a variable");
                 const Symbol* as = &x->as<ValueExpressionBase>().symbol;
                 if (auto it = arrMap().find(as); it != arrMap().end()) c.dact[n].arr = it->second;
@@ -1993,6 +2194,13 @@ struct Lowerer {
         prog.emit(c);
         for (size_t n = 0; n < args.size(); n++) {
             const DpiArg& formal = f->args[n];
+            if (formal.popen && formal.udims.empty() && formal.dir != 0) {   // bit []: the vector back
+                Instr i; i.k = IK::Assign;
+                lhs(args[n]->as<AssignmentExpression>().left(), i);
+                i.e = ref(c.dact[n].arr->base);
+                prog.emit(i);
+                continue;
+            }
             if (formal.dir == 0 || formal.uarr) continue;
             const Expression& a = *args[n];
             if (a.kind == ExpressionKind::EmptyArgument) continue;
@@ -2190,10 +2398,11 @@ struct Lowerer {
                     c.init.push_back({formal.sig, konst(mkstr(std::string(peel(a).as<StringLiteral>().getValue())))});
                     continue;
                 }
-                c.init.push_back({formal.sig, expr(a)});
+                c.init.push_back({formal.sig, cloneConts(*a.type, expr(a))});
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
-                c.init.push_back({formal.sig, expr(a.as<AssignmentExpression>().left())});
+                const Expression& l = a.as<AssignmentExpression>().left();
+                c.init.push_back({formal.sig, cloneConts(*l.type, expr(l))});
             } else if (a.kind != ExpressionKind::Assignment && a.kind != ExpressionKind::EmptyArgument) {
                 unsupported("output argument");
             }
@@ -2599,10 +2808,18 @@ struct Lowerer {
                     if (isDynType(f.getType()) || f.getType().isUnpackedArray()) unsupported("a mailbox of arrays");
                     return sigAt(&f);
                 };
-                auto push = [&]() { Instr i = dynCmd(q, D_PUSH_BACK); i.e = arg(0); prog.emit(i); bump(chg); };
+                // A mailbox of arrays or containers: the body only waits and
+                // counts; the call site moves the message (mailboxArrayCall).
+                bool arrMsg = !sub.sym->getArguments().empty() && mailboxArrayType(sub.sym->getArguments()[0]->getType());
+                auto push = [&]() {
+                    if (!arrMsg) { Instr i = dynCmd(q, D_PUSH_BACK); i.e = arg(0); prog.emit(i); }
+                    bump(chg);
+                };
                 auto pop = [&]() {
-                    set(msg(), front());
-                    Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i);
+                    if (!arrMsg) {
+                        set(msg(), front());
+                        Instr i = dynCmd(q, D_DELETE_AT); i.args = {konst(mk(0, 32))}; prog.emit(i);
+                    }
                     bump(chg);
                 };
                 if (n == "new") set(thisRel(bound), arg(0));
@@ -2611,8 +2828,8 @@ struct Lowerer {
                 else if (n == "try_put") tryDo(node(Op::LogNot, {full()}), push);
                 else if (n == "get") { waitWhile(empty, chg); pop(); }
                 else if (n == "try_get") tryDo(node(Op::LogNot, {empty()}), pop);
-                else if (n == "peek") { waitWhile(empty, chg); set(msg(), front()); }
-                else if (n == "try_peek") tryDo(node(Op::LogNot, {empty()}), [&]() { set(msg(), front()); });
+                else if (n == "peek") { waitWhile(empty, chg); if (!arrMsg) set(msg(), front()); }
+                else if (n == "try_peek") tryDo(node(Op::LogNot, {empty()}), [&]() { if (!arrMsg) set(msg(), front()); });
                 return;
             }
             case 4: {   // process
@@ -3550,6 +3767,10 @@ struct Lowerer {
         const Type& t = t0.getCanonicalType();
         if (t.kind != SymbolKind::FixedSizeUnpackedArrayType) {
             if (t.isUnpackedArray()) unsupported("a container inside a fixed-size array");
+            if ((t.isUnpackedStruct() || t.isUnpackedUnion()) && uWidth(t) > 0) {   // a struct element: its bits (7.2)
+                out.push_back(expr(x0));
+                return;
+            }
             if (!t.isIntegral() && !t.isFloating() && !t.isString()) unsupported("array of this element type");
             int w = (int)t.getBitWidth();
             const Expression& x = peel(x0);
@@ -3897,9 +4118,139 @@ struct Lowerer {
     // A container is a hidden 64-bit handle signal whose value counts its
     // changes; the elements live in dynStore()[handle].
     int dollarQ = -1;   // the queue whose `$` (last index) the selector being lowered uses
+    // The containers inside a value of type t (7.2), at bit offset base:
+    // members of unpacked structs, also inside nested structs and arrays.
+    static void structConts(const slang::ast::Type& t0, int base, std::vector<std::pair<int, DynObj>>& out) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        if (t.isUnpackedStruct()) {
+            for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+                const Type& ft = f.getType().getCanonicalType();
+                int off = base + uField(t, f).first;
+                if (isDynType(ft)) out.push_back({off, dynShapeOf(ft)});
+                else structConts(ft, off, out);
+            }
+        } else if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            const auto& a = t.as<FixedSizeUnpackedArrayType>();
+            std::vector<std::pair<int, DynObj>> one;
+            structConts(a.elementType, 0, one);
+            if (one.empty()) return;
+            int ew = uWidth(a.elementType), n = (int)a.range.width();
+            for (int k = 0; k < n; k++)
+                for (auto& [o, sh] : one) out.push_back({base + k * ew + o, sh});
+        }
+    }
+    static bool hasStructConts(const slang::ast::Type& t) {
+        std::vector<std::pair<int, DynObj>> v;
+        structConts(t, 0, v);
+        return !v.empty();
+    }
+    // A value of type t that is about to be stored: its containers copied,
+    // so the copy does not share them with where it came from (7.2).
+    E cloneConts(const slang::ast::Type& t, E v) {
+        auto c = std::make_shared<std::vector<std::pair<int, DynObj>>>();
+        structConts(t, 0, *c);
+        if (c->empty()) return v;
+        auto n = node(Op::StructClone, {std::move(v)});
+        n->conts = std::move(c);
+        return n;
+    }
+    // A container id slot that names no container yet: 0, or X in a
+    // variable that never got its struct default (an output formal).
+    E noCont(E id) {
+        return bin(Op::LogOr, bin(Op::CaseEq, id, konst(make(0, 0, 64))),
+                   bin(Op::CaseEq, node(Op::RedXor, {id}), konst(xfill(1))));
+    }
+    // The container a struct member's id names (made empty when it has none
+    // yet), as an indirect id, for reading only.
+    int contOfId(E id, const DynObj& shape) {
+        auto a = node(Op::DynAlloc);
+        a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, shape}});
+        int p1 = fresh(64);
+        Instr i; i.k = IK::Assign; i.sig = p1;
+        i.e = bin(Op::Add, node(Op::Mux, {noCont(id), a, id}), konst(make(1, 0, 64)));
+        prog.emit(i);
+        int d = indThrough(p1);
+        indShape[d] = shape;
+        return d;
+    }
+    // l == r for unpacked structs that hold containers (7.2, 11.4.5): every
+    // member pair equal, containers by their elements.
+    E structContsEq(const slang::ast::Type& t0, const slang::ast::Expression& l, const slang::ast::Expression& r, bool cs) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        int W = uWidth(t);
+        int tl = fresh(W), tr = fresh(W);
+        { Instr i; i.k = IK::Assign; i.sig = tl; i.e = expr(l); prog.emit(i); }
+        { Instr i; i.k = IK::Assign; i.sig = tr; i.e = expr(r); prog.emit(i); }
+        E acc;
+        auto add = [&](E m) { acc = acc ? bin(Op::LogAnd, acc, m) : m; };
+        std::function<void(const Type&, int)> walk = [&](const Type& t1, int base) {
+            const Type& u = t1.getCanonicalType();
+            if (isDynType(u)) {
+                DynObj sh = dynShapeOf(u);
+                int da = contOfId(slice(ref(tl), base + 63, base), sh), db = contOfId(slice(ref(tr), base + 63, base), sh);
+                auto n = node(Op::DynEq);
+                n->sig = da; n->hi = db; n->lo = cs;
+                add(n);
+                return;
+            }
+            if (hasStructConts(u)) {
+                if (u.isUnpackedStruct()) {
+                    for (const auto& f : u.as<Scope>().membersOfType<FieldSymbol>()) walk(f.getType(), base + uField(u, f).first);
+                    return;
+                }
+                const auto& a = u.as<FixedSizeUnpackedArrayType>();
+                int ew = uWidth(a.elementType), n = (int)a.range.width();
+                for (int k = 0; k < n; k++) walk(a.elementType, base + k * ew);
+                return;
+            }
+            int w = uWidth(u);
+            if (u.isFloating()) {
+                add(fcmp(4, slice(ref(tl), base + w - 1, base), slice(ref(tr), base + w - 1, base)));
+                return;
+            }
+            if (u.isString()) {
+                auto n = node(Op::StrCmp, {un(Op::AsStr, slice(ref(tl), base + 63, base)), un(Op::AsStr, slice(ref(tr), base + 63, base))});
+                n->hi = 4;
+                add(n);
+                return;
+            }
+            add(bin(cs ? Op::CaseEq : Op::Eq, slice(ref(tl), base + w - 1, base), slice(ref(tr), base + w - 1, base)));
+        };
+        walk(t, 0);
+        return acc ? acc : konst(mk(1, 1));
+    }
+    // s.q, a container member of an unpacked struct (7.2): the container its
+    // id names, made (and its id written into s) on first use.
+    int structMemberDyn(const slang::ast::MemberAccessExpression& m) {
+        using namespace slang::ast;
+        if (consDepth) unsupported("a container member of a struct in a constraint");
+        DynObj shape = dynShapeOf(*m.type);
+        int tmp = fresh(64);
+        { Instr r; r.k = IK::Assign; r.sig = tmp; r.e = readPSel(expr(m.value()), memberPSel(m)); prog.emit(r); }
+        Instr j; j.k = IK::JmpIfNot; j.e = noCont(ref(tmp));
+        size_t jf = prog.emit(j);
+        {
+            auto a = node(Op::DynAlloc);
+            a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, shape}});
+            Instr i; i.k = IK::Assign; i.sig = tmp; i.e = a; prog.emit(i);
+            Instr w; w.k = IK::Assign; lhs(m, w); w.e = ref(tmp); prog.emit(w);
+        }
+        prog.code[jf].target = prog.here();
+        int p1 = fresh(64);
+        { Instr i; i.k = IK::Assign; i.sig = p1; i.e = bin(Op::Add, ref(tmp), konst(make(1, 0, 64))); prog.emit(i); }
+        int d = indThrough(p1);
+        indShape[d] = std::move(shape);
+        return d;
+    }
     int dynSig(const slang::ast::Expression& e0) {
         using namespace slang::ast;
         const Expression& e = peel(e0);
+        if (e.kind == ExpressionKind::MemberAccess && isDynType(*e.type)) {
+            const auto& m = e.as<MemberAccessExpression>();
+            if (m.value().type->getCanonicalType().isUnpackedStruct()) return structMemberDyn(m);
+        }
         if (classMember(e)) {   // h.q (8.4): the container slot through the handle
             const auto& m = e.as<MemberAccessExpression>();
             const PropSlot* ps = memberSlot(m);
@@ -4137,7 +4488,7 @@ struct Lowerer {
             }
         }
         if (x.type->isUnpackedArray()) unsupported("container value");
-        Instr i = dynCmd(t, D_PUSH_BACK); i.e = expr(x); prog.emit(i);
+        Instr i = dynCmd(t, D_PUSH_BACK); i.e = cloneConts(*x.type, expr(x)); prog.emit(i);
     }
     // An array argument (7.7): the formal gets a copy of the actual.
     void copyArrayArg(const slang::ast::FormalArgumentSymbol& f, const slang::ast::Expression& a) {
@@ -4276,13 +4627,15 @@ struct Lowerer {
         assignInto(d, x);
         return d;
     }
-    int fixedAsQueue(const slang::ast::Expression& x) {
+    // anyRange: the method neither returns nor reads indices, so the
+    // declared range of the array does not matter.
+    int fixedAsQueue(const slang::ast::Expression& x, bool anyRange = false) {
         using namespace slang::ast;
         const Type& at = x.type->getCanonicalType();
         if (!isFixedArr(x)) unsupported("array method of this array");
         if (!stmtDepth) unsupported("array method of a fixed-size array outside a procedural statement");
         auto r = at.as<FixedSizeUnpackedArrayType>().range;
-        if (r.left != 0 || r.right < 0) unsupported("array method of an array not declared [N] or [0:N-1]");
+        if (!anyRange && (r.left != 0 || r.right < 0)) unsupported("array method of an array not declared [N] or [0:N-1]");
         int q = keyQueue(*at.getArrayElementType());
         dynAppend(q, x);
         lastFixedQueue = q;
@@ -4527,13 +4880,15 @@ struct Lowerer {
         using namespace slang::ast;
         std::string_view n = call.getSubroutineName();
         auto args = call.arguments();
-        int d = dynValue(*args[0]);
-        if (d < 0) d = fixedAsQueue(*args[0]);
-        const DynObj& o = dynShape(d);
         const Expression* withE = nullptr;
         const ValueSymbol* itSym = nullptr;
         if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
             std::tie(withE, itSym) = sci->getIteratorInfo();
+        int d = dynValue(*args[0]);
+        if (d < 0)
+            d = fixedAsQueue(*args[0], !withE && (n == "sort" || n == "rsort" || n == "reverse" || n == "shuffle" ||
+                                                  n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor"));
+        const DynObj& o = dynShape(d);
         if (withE && consDepth) {   // in a constraint: sum() with (...) and the like, folded at solve time (18.5.8.2)
             static const std::pair<const char*, int> red[] = {{"sum", 0}, {"product", 1}, {"and", 2}, {"or", 3}, {"xor", 4}};
             for (auto& [s, id] : red)
@@ -4646,8 +5001,8 @@ struct Lowerer {
             pushContainer(d, i.dcmd, i.dcmd == D_INSERT ? *args[2] : *args[1], i.dcmd == D_INSERT ? args[1] : nullptr);
             return nullptr;
         }
-        if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = expr(*args[1]);
-        if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = expr(*args[2]); }
+        if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = cloneConts(*args[1]->type, expr(*args[1]));
+        if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = cloneConts(*args[2]->type, expr(*args[2])); }
         prog.emit(i);
         return nullptr;
     }
@@ -5127,6 +5482,14 @@ struct Lowerer {
                     n->hi = db;
                     n->lo = b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality;
                     E acc = n;
+                    if (b.op == BinaryOperator::Inequality || b.op == BinaryOperator::CaseInequality) acc = un(Op::LogNot, acc);
+                    return sized(acc, 1, false, ctx);
+                }
+                if ((hasStructConts(*b.left().type) || hasStructConts(*b.right().type)) &&
+                    (b.op == BinaryOperator::Equality || b.op == BinaryOperator::Inequality ||
+                     b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality)) {
+                    bool cs = b.op == BinaryOperator::CaseEquality || b.op == BinaryOperator::CaseInequality;
+                    E acc = structContsEq(*b.left().type, b.left(), b.right(), cs);
                     if (b.op == BinaryOperator::Inequality || b.op == BinaryOperator::CaseInequality) acc = un(Op::LogNot, acc);
                     return sized(acc, 1, false, ctx);
                 }
@@ -6074,6 +6437,18 @@ struct Lowerer {
         const auto& t = t0.getCanonicalType();
         if (t.isFloating()) { auto b = node(Op::Resize, {realOf(x)}); b->hi = 64; return b; }
         if (t.isString()) return resize(strOf(x), 64, false, false);
+        if (isDynType(t)) {   // a container member (7.2): a new container holding x, by its id
+            if (!stmtDepth) unsupported("a struct pattern with a container member outside a procedural statement");
+            auto a = node(Op::DynAlloc);
+            a->conts = std::make_shared<std::vector<std::pair<int, DynObj>>>(std::vector<std::pair<int, DynObj>>{{0, dynShapeOf(t)}});
+            int id = fresh(64), p1 = fresh(64);
+            { Instr i; i.k = IK::Assign; i.sig = id; i.e = a; prog.emit(i); }
+            { Instr i; i.k = IK::Assign; i.sig = p1; i.e = bin(Op::Add, ref(id), konst(make(1, 0, 64))); prog.emit(i); }
+            int d = indThrough(p1);
+            indShape[d] = dynShapeOf(t);
+            assignContainer(d, x);
+            return ref(id);
+        }
         int w = bitsOf(t);
         if (t.isIntegral()) return resize(expr(x), w, x.type->isSigned(), false);
         return resize(expr(x), w, false, false);
@@ -6126,7 +6501,7 @@ struct Lowerer {
         std::vector<E> parts;
         for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
             const Type& ft = f.getType().getCanonicalType();
-            int w = uWidth(ft);
+            int w = t.isUnpackedUnion() ? uWidth(ft) : uMemberW(ft);
             if (ft.isUnpackedStruct() || ft.kind == SymbolKind::FixedSizeUnpackedArrayType) parts.push_back(structDefault(ft));
             else if (ft.isIntegral() && ft.isFourState()) parts.push_back(konst(xfill(w)));
             else if (ft.isString()) parts.push_back(konst(make(mkstr("").v, 0, 64, 0)));
@@ -6680,6 +7055,12 @@ struct Lowerer {
     void pfmtBits(const slang::ast::Type& t0, E part, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
         const Type& ft = t0.getCanonicalType();
+        if (isDynType(ft)) {   // a container member of a struct (7.2): the container its id names
+            const Type* et = ft.getArrayElementType();
+            while (isDynType(*et)) et = et->getCanonicalType().getArrayElementType();
+            pfmtCont(et->getCanonicalType(), node(Op::DynById, {std::move(part)}), fmt, out);
+            return;
+        }
         int w = uWidth(ft);
         if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {   // '{e0, e1, ...}, the left element first
             const auto& a = ft.as<FixedSizeUnpackedArrayType>();
@@ -7463,7 +7844,23 @@ struct Lowerer {
                     }
                     return;
                 }
-                if (classMember(x)) unsupported("ordering method of an array property");
+                if (classMember(x)) {   // h.a.sort() (8.4): each element back through the handle
+                    const auto& m = x.as<slang::ast::MemberAccessExpression>();
+                    const PropSlot* ps = memberSlot(m);
+                    if (!ps || ps->kind != 1 || ps->arr->dynElem || ps->arr->count != n)
+                        unsupported("ordering method of this array property");
+                    const ArrShape& P = *ps->arr;
+                    auto A = std::make_shared<ArrShape>(P);
+                    A->base = indSlot(exprH(m.value()), P.base);
+                    auto [lo, ro] = P.dims[0];
+                    for (int k = 0; k < n; k++) {
+                        Instr i; i.k = IK::Assign;
+                        i.sig = A->base; i.arr = A; i.e = resize(parts[(size_t)k], P.elemW, P.sgn, P.sgn);
+                        i.aidx.push_back(konst(make((uint64_t)(lo <= ro ? lo + k : lo - k), 0, 32, 0, true)));
+                        prog.emit(i);
+                    }
+                    return;
+                }
                 Instr i; i.k = IK::Assign;   // held packed (a struct member): all its bits at once
                 i.e = parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
                 lhs(x, i);
@@ -8619,6 +9016,7 @@ struct Lowerer {
             if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
             lvalue = saved;
+            if (!a.isCompound()) i.e = cloneConts(*a.left().type, i.e);   // a struct's containers are copied (7.2)
             if (const TimingControl* tc = a.timingControl; tc && tc->kind != TimingControlKind::Delay) {
                 // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
                 // written after the event (n events for repeat).
@@ -8894,7 +9292,9 @@ struct Lowerer {
                     labelSym = b.blockSymbol;   // label: assert ... names the assertion
                     labelOf = &b.body;
                     size_t s0 = prog.here();
+                    blockEventSample(b.blockSymbol, true);   // @@(begin blk) (19.3)
                     stmt(b.body);
+                    blockEventSample(b.blockSymbol, false);
                     if (blockIds().targets.count(b.blockSymbol))   // another process may disable it (9.6.2)
                     { prog.spans.push_back({blockIds().of(b.blockSymbol), s0, prog.here()}); anySpans() = true; }
                     patch(named[k].second, prog.here());   // disable blk: jump past it
@@ -9083,7 +9483,9 @@ struct Lowerer {
                 if (localMap().count(&vd.symbol)) {   // an automatic variable starts over at each entry (6.21)
                     if (vd.symbol.getType().isEvent()) break;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol);
-                    i.e = init ? expr(*init) : konst(initOf(vd.symbol.getType()));
+                    const Type& vt = vd.symbol.getType().getCanonicalType();
+                    i.e = init ? cloneConts(vt, expr(*init))
+                        : konst(vt.isUnpackedStruct() || vt.isUnpackedUnion() ? structDefaultVal(vt) : initOf(vt));
                     prog.emit(i);
                     break;
                 }
@@ -9105,6 +9507,10 @@ struct Lowerer {
                         !vt.isEvent() && (vt.isIntegral() || vt.isFloating() || vt.isString())) {
                         Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = konst(initOf(vt));
                         prog.emit(i);
+                    } else if (vd.symbol.lifetime == VariableLifetime::Automatic && current &&
+                               (vt.isUnpackedStruct() || vt.isUnpackedUnion()) && uWidth(vt) > 0) {
+                        Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = konst(structDefaultVal(vt));
+                        prog.emit(i);
                     }
                     break;
                 }
@@ -9116,7 +9522,7 @@ struct Lowerer {
                 bool once = vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
                 auto initVar = [&] {   // a fixed-size array takes its value element by element
                     if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
-                    Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = expr(*init);
+                    Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = cloneConts(vd.symbol.getType(), expr(*init));
                     prog.emit(i);
                 };
                 if (!once) {
@@ -9143,9 +9549,10 @@ struct Lowerer {
                     i.k = IK::Assign;
                     i.sig = retSig;
                     i.e = r.expr->type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType
-                        ? packedValue(*r.expr->type, *r.expr) : expr(*r.expr);
+                        ? packedValue(*r.expr->type, *r.expr) : cloneConts(*r.expr->type, expr(*r.expr));
                     prog.emit(i);
                 }
+                if (current && current->sym) blockEventSample(current->sym, false);   // @@(end f) (19.3)
                 Instr ret;
                 ret.k = IK::Ret;
                 prog.emit(ret);
@@ -9693,7 +10100,7 @@ inline Val structDefaultVal(const slang::ast::Type& t0) {
     int top = W;
     for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
         const Type& ft = f.getType().getCanonicalType();
-        int w = uWidth(ft);
+        int w = uMemberW(ft);
         top -= w;
         Val p;
         if (ft.isUnpackedStruct() || ft.isUnpackedUnion() || ft.kind == SymbolKind::FixedSizeUnpackedArrayType) p = structDefaultVal(ft);
@@ -12101,6 +12508,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     clockings().clear();
     Lowerer::clockingIdxMap().clear();
     cgDefs().clear();
+    cgBlockDefs().clear();
+    Lowerer::blockEventIds().clear();
     cgInsts().clear();
     Lowerer::cgIdxMap().clear();
     Lowerer::seqTrackers().clear();
@@ -12336,7 +12745,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             while (t->kind == SymbolKind::FixedSizeUnpackedArrayType || t->kind == SymbolKind::DPIOpenArrayType) {
                 if (t->kind == SymbolKind::DPIOpenArrayType) {
                     const auto& o = t->as<DPIOpenArrayType>();
-                    if (o.isPacked) Lowerer::unsupported("DPI packed open array argument (bit [])");
+                    if (o.isPacked) {   // bit [] / logic []: the element's width comes from the actual
+                        if (f.isExport) Lowerer::unsupported("open array argument of a DPI export");
+                        a.popen = true;
+                        a.open = true;
+                        a.uarr = true;
+                        a.t = o.elementType.isFourState() ? DT_LOGICVEC : DT_BITVEC;
+                        a.w = 0;
+                        break;
+                    }
                     a.open = true;
                     a.udims.push_back({0, 0});
                     a.uopen.push_back(true);
@@ -12349,13 +12766,30 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 }
                 a.uarr = true;
             }
-            if (t->isUnpackedStruct()) Lowerer::unsupported("DPI unpacked struct argument");
+            if (t->isUnpackedStruct()) {
+                if (f.isExport) Lowerer::unsupported("unpacked struct argument of a DPI export");
+                a.t = DT_STRUCT;
+                a.w = uWidth(*t);
+                if (a.w <= 0) Lowerer::unsupported("DPI unpacked struct argument with members of this kind");
+                size_t cur = 0;
+                dpiStructFields(*t, 0, cur, a.fields);
+                a.cSize = cur;
+                const Type* named = &formal->getType();   // an array of structs: the element's name
+                while (named->getCanonicalType().isUnpackedArray() || named->getCanonicalType().kind == SymbolKind::DPIOpenArrayType)
+                    named = named->getArrayElementType();
+                a.cName = named->name.empty() ? "void" : std::string(named->name);
+            } else if (!a.popen)
             a.t = dpiType(*t, a.w, a.sgn);
             if (!a.uarr) {
                 auto it = sigmap.find(formal);
                 if (it == sigmap.end()) Lowerer::unsupported("DPI argument");
                 a.sig = it->second;
-            } else if (f.isExport) Lowerer::unsupported("unpacked array argument of a DPI export");
+            } else if (f.isExport) {   // sized only (open arrays are for imports, 35.5.6.1)
+                if (a.open) Lowerer::unsupported("open array argument of a DPI export");
+                auto it = arrMap().find(formal);
+                if (it == arrMap().end() || !it->second || it->second->dynElem) Lowerer::unsupported("unpacked array argument of a DPI export");
+                a.sarr = it->second;
+            }
             f.args.push_back(std::move(a));
         }
     };
@@ -12498,6 +12932,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         g_nullSig = mkSig("$null", 64, false);
     }
 
+    Lowerer::scanBlockEvents(comp.getRoot());
     int tempSeq = 0;
     for (Subr* sub : order) {
         if (sub->sym && sub->sym->flags.has(slang::ast::MethodFlags::DPIImport)) continue;
@@ -12528,7 +12963,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (isClassMethod(*sub->sym)) lw.curClass = classInfo(sub->sym->getParentScope()->asSymbol().as<slang::ast::ClassType>());
         lw.current = sub;
         if (lw.curClass && lw.curClass->builtin) lw.builtinMethod(*lw.curClass, *sub);
-        else lw.stmt(sub->sym->getBody());
+        else {
+            lw.blockEventSample(sub->sym, true);   // @@(begin f) / @@(end f) (19.3)
+            lw.stmt(sub->sym->getBody());
+            lw.blockEventSample(sub->sym, false);
+        }
         if (blockIds().targets.count(sub->sym))   // a task some disable names (9.6.2)
         { lw.prog.spans.push_back({blockIds().of(sub->sym), 0, SIZE_MAX}); anySpans() = true; }
         *sub->prog = std::move(lw.prog);

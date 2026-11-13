@@ -184,7 +184,16 @@ enum DpiType : uint8_t {
     DT_BIT,      // svBit
     DT_LOGIC,    // svLogic
     DT_BITVEC,   // svBitVecVal[], 32 bits a word
-    DT_LOGICVEC  // svLogicVecVal[], aval/bval pairs
+    DT_LOGICVEC, // svLogicVecVal[], aval/bval pairs
+    DT_STRUCT    // an unpacked struct (35.5.6): a C struct, always by pointer
+};
+// One scalar of an unpacked struct argument: where it sits in the C struct
+// and in the SV value (the struct held packed, see uWidth).
+struct DpiField {
+    DpiType t = DT_INT;
+    int w = 32, lo = 0;   // bits, and the lowest bit in the SV value
+    bool sgn = false;
+    size_t off = 0;       // byte offset in the C struct
 };
 struct DpiArg {
     DpiType t = DT_INT;
@@ -197,6 +206,15 @@ struct DpiArg {
     bool uarr = false, open = false;
     std::vector<std::pair<int64_t, int64_t>> udims;
     std::vector<bool> uopen;   // per dimension: open
+    // The packed dimension is open too (`bit []`, 35.5.6.1): each element is
+    // as wide as the actual's packed part (DpiActual::pw), as C sees it.
+    bool popen = false;
+    // DT_STRUCT: its scalars, the C struct's size, and its type name
+    std::vector<DpiField> fields;
+    size_t cSize = 0;
+    std::string cName;
+    // An unpacked array formal of an export: the SV formal's elements.
+    std::shared_ptr<const ArrShape> sarr;
 
     std::string name;
 };
@@ -252,6 +270,7 @@ struct VpiSite {
 struct DpiActual {
     std::shared_ptr<const ArrShape> arr;
     int dyn = -1;
+    int pw = 0;   // a packed open formal (bit []): the actual's packed width
 };
 
 struct Instr {
