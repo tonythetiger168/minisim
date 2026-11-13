@@ -1,4 +1,4 @@
-// fpu.hpp - the F and D extensions: IEEE 754 single and double arithmetic
+// fpu.hpp - the F, D and Zfh extensions: IEEE 754 half, single and double arithmetic
 // with RISC-V's rounding modes, exception flags, NaN boxing and canonical
 // NaNs (RISC-V unprivileged ISA, chapters 20 and 21).
 //
@@ -232,6 +232,144 @@ inline uint64_t sToD(uint32_t u, uint32_t& fl) {
     if (snan32(u)) fl |= NV;
     float s = f32(u);
     return std::isnan(s) ? QNAN64 : b64((double)s);
+}
+
+// Zfh: IEEE 754 half precision. A half widens to a double exactly; an
+// operation runs in double rounded toward zero with the inexact bit kept in
+// the last place (round to odd, which has more than two bits to spare), and
+// that rounds to half once by the instruction's mode. Rounding to half is done
+// here, with RISC-V's tininess after rounding and every mode including RMM.
+constexpr uint16_t QNAN16 = 0x7e00;
+inline uint16_t unbox16(uint64_t r) { return (r >> 16) == 0xffffffffffffull ? (uint16_t)r : QNAN16; }
+inline uint64_t box16(uint16_t v) { return 0xffffffffffff0000ull | v; }
+inline bool snan16(uint16_t b) { return (b & 0x7c00) == 0x7c00 && (b & 0x3ff) && !(b & 0x200); }
+
+// Half to double, exact. A NaN keeps its quiet bit, so snan64 still sees a
+// signaling one.
+inline uint64_t h2d(uint16_t h) {
+    const uint64_t s = (uint64_t)(h >> 15) << 63;
+    const unsigned e = (h >> 10) & 31;
+    const uint64_t m = h & 0x3ff;
+    if (e == 31) return s | 0x7ff0000000000000ull | (m << 42);
+    if (e == 0) return m ? s | b64(std::ldexp((double)m, -24)) : s;
+    return s | ((uint64_t)(e - 15 + 1023) << 52) | (m << 42);
+}
+
+// m >> sh rounded by rm for a value of sign `neg`; nx if bits were lost.
+inline uint64_t shiftRound(uint64_t m, unsigned sh, unsigned rm, bool neg, bool& nx) {
+    if (sh == 0) { nx = false; return m; }
+    uint64_t q, rem, half;
+    if (sh >= 63) { q = 0; rem = m; half = ~0ull; }  // m < 2^54: below one half
+    else { q = m >> sh; rem = m & ((1ull << sh) - 1); half = 1ull << (sh - 1); }
+    nx = rem != 0;
+    bool up = false;
+    switch (rm) {
+        case RTZ: break;
+        case RDN: up = neg && rem; break;
+        case RUP: up = !neg && rem; break;
+        case RMM: up = rem >= half && rem; break;
+        default: up = rem > half || (rem == half && (q & 1)); break;
+    }
+    return q + up;
+}
+
+// Double to half, rounded by rm.
+inline uint16_t d2h(uint64_t u, unsigned rm, uint32_t& fl) {
+    const bool neg = u >> 63;
+    const uint16_t s = neg ? 0x8000 : 0;
+    const int e = (int)((u >> 52) & 0x7ff);
+    uint64_t m = u & ((1ull << 52) - 1);
+    if (e == 0x7ff) {
+        if (!m) return s | 0x7c00;
+        if (!(m >> 51)) fl |= NV;
+        return QNAN16;
+    }
+    if (e == 0 && m == 0) return s;
+    int E = e - 1023;                       // the exponent of the leading bit
+    if (e == 0) E = -1023; else m |= 1ull << 52;
+    bool nx;
+    if (E >= -14) {
+        uint64_t q = shiftRound(m, 42, rm, neg, nx);
+        if (q >> 11) { q >>= 1; E++; }
+        if (E > 15) {                       // overflow
+            fl |= OF | NX;
+            bool toInf = rm == RNE || rm == RMM || (rm == RDN && neg) || (rm == RUP && !neg);
+            return s | (toInf ? 0x7c00 : 0x7bff);
+        }
+        if (nx) fl |= NX;
+        return s | (uint16_t)((E + 15) << 10) | (uint16_t)(q & 0x3ff);
+    }
+    uint64_t q = shiftRound(m, (unsigned)(42 + (-14 - E)), rm, neg, nx);  // subnormal; 0x400 is the least normal
+    if (nx) {
+        bool t;
+        bool tiny = !(E == -15 && (shiftRound(m, 42, rm, neg, t) >> 11));  // tininess after rounding
+        fl |= NX | (tiny ? UF : 0);
+    }
+    return s | (uint16_t)q;
+}
+
+// A half result from `fn`, which computes in double: rounded to odd, then to half.
+template <class Fn> uint16_t halfOp(Fn fn, unsigned rm, uint32_t& fl) {
+    volatile double r;
+    uint32_t f;
+    {
+        Env env(RTZ);
+        r = fn();
+        f = Env::flags();
+    }
+    double v = r;
+    if (std::isnan(v)) { fl |= f & NV; return QNAN16; }
+    uint64_t b = b64(v);
+    if (v == 0 && !(f & NX)) {  // an exact zero takes its sign from the real mode
+        Env env(rm == RMM ? RNE : rm);
+        volatile double z = fn();
+        b = b64(z);
+    } else if ((f & NX) && !std::isinf(v)) b |= 1;
+    fl |= f & (NV | DZ);
+    return d2h(b, rm, fl);
+}
+
+inline uint16_t harith(Op op, uint16_t ha, uint16_t hb, uint16_t hc, unsigned rm, uint32_t& fl) {
+    volatile double a = f64(h2d(ha)), b = f64(h2d(hb)), c = f64(h2d(hc));
+    uint16_t r = halfOp([&]() -> double {
+        switch (op) {
+            case Op::Add: return a + b;
+            case Op::Sub: return a - b;
+            case Op::Mul: return a * b;
+            case Op::Div: return a / b;
+            case Op::Sqrt: return std::sqrt((double)a);
+            case Op::Madd: return std::fma((double)a, (double)b, (double)c);
+            case Op::Msub: return std::fma((double)a, (double)b, -(double)c);
+            case Op::Nmsub: return std::fma(-(double)a, (double)b, (double)c);
+            default: return std::fma(-(double)a, (double)b, -(double)c);
+        }
+    }, rm, fl);
+    if (op >= Op::Madd) {
+        double x = a, y = b;
+        if ((std::isinf(x) && y == 0) || (x == 0 && std::isinf(y))) fl |= NV;
+        if (snan16(ha) || snan16(hb) || snan16(hc)) fl |= NV;
+    }
+    return r;
+}
+
+inline uint16_t hminmax(uint16_t a, uint16_t b, bool max, uint32_t& fl) {
+    uint64_t da = h2d(a), r = minmax<double>(da, h2d(b), max, fl);
+    return std::isnan(f64(r)) ? QNAN16 : r == da ? a : b;  // a NaN only when both are
+}
+
+inline uint64_t hclassify(uint16_t h) {
+    const bool neg = h >> 15;
+    const unsigned e = (h >> 10) & 31, m = h & 0x3ff;
+    if (e == 31) return m ? (snan16(h) ? 1 << 8 : 1 << 9) : neg ? 1 << 0 : 1 << 7;
+    if (e == 0) return m ? (neg ? 1 << 2 : 1 << 5) : neg ? 1 << 3 : 1 << 4;
+    return neg ? 1 << 1 : 1 << 6;
+}
+
+inline uint16_t hFromInt(uint64_t x, bool sign, unsigned bits, unsigned rm, uint32_t& fl) {
+    return halfOp([&]() -> double {
+        uint32_t f = 0;
+        return f64(fromInt<double>(x, sign, bits, RTZ, f));
+    }, rm, fl);
 }
 
 }  // namespace vp::fpu
