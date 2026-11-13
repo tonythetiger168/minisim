@@ -632,8 +632,20 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
         // become bounds too, so each bin is a run of keys.
         for (size_t bi = 0; bi < c.bins.size(); bi++) {
             const CgBinDef& bd = c.bins[bi];
-            if (bd.with || (bd.array && bd.wildcard)) {   // each value its own bound
-                wideWith[bi] = wideValues(c, bd.items, bd.with ? &bd : nullptr, bd.wildcard);
+            if (bd.with || (bd.array && bd.wildcard) || bd.setIdx >= 0) {   // each value its own bound
+                std::vector<CgItem> items = bd.items;
+                if (bd.setIdx >= 0) {   // bins b = q; (19.5.1.2): the container's values now
+                    Val n = eval(bd.setSize, rd);
+                    for (uint64_t k = 0; !n.x && k < n.v; k++) {
+                        S.set(bd.setIdx, mk(k, 32));
+                        Val v = eval(bd.setItem.lo, rd);
+                        if (unknownAny(v)) continue;
+                        CgItem it;
+                        it.lo = konst(v_resize(v, c.w, bd.setItem.loSgn));
+                        items.push_back(std::move(it));
+                    }
+                }
+                wideWith[bi] = wideValues(c, items, bd.with ? &bd : nullptr, bd.wildcard);
                 for (auto& v : wideWith[bi]) ci.wb.push_back(v);
                 continue;
             }
