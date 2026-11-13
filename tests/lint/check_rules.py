@@ -48,7 +48,7 @@ for name in sorted(os.listdir(rules_dir)):
         continue
     path = os.path.join(rules_dir, name)
     text = open(path).read()
-    args = re.search(r"^//! args: (.*)$", text, re.M).group(1).split()
+    args = [x.replace("$DIR", here) for x in re.search(r"^//! args: (.*)$", text, re.M).group(1).split()]
     want = []
     for n, line in enumerate(text.splitlines(), 1):
         m = re.search(r"//~(v?) (.*)$", line)

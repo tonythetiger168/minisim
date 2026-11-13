@@ -96,13 +96,22 @@ keeps running in a powered-off domain (9.2.1). Errors print as
 With `-upf`, the processes power can gate (those in a power domain), those
 that run UPF code (isolation and level-shifter cells on port connections,
 calls of the UPF package) and those that write a signal the UPF runtime
-watches stay coroutines on the interpreter. The rest of the design (the
-testbench and always-on logic) is planned as without `-upf`: static
-combinational and clocked schedules, partitions and `-threads`. Results do
-not depend on the thread count. `MSIM_UPF_SERIAL=1` runs everything on the
-interpreter on one thread. `-compile` is not used with `-upf` yet, and the
-schedule rewrites that move code between processes (merged drivers, split
-or inlined blocks, unrolled loops) stay off.
+watches stay coroutines. The rest of the design (the testbench and
+always-on logic) is planned as without `-upf`: static combinational and
+clocked schedules, partitions and `-threads`. Results do not depend on the
+thread count. `MSIM_UPF_SERIAL=1` runs everything on the interpreter on one
+thread. The schedule rewrites that move code between processes (merged
+drivers, split or inlined blocks, unrolled loops) stay off.
+
+`-compile` works with `-upf`: msim binds the power intent to the design,
+writes what it bound to a snapshot next to `simv`, and `simv` reads the UPF
+file again with the design's answers and runs the same power-aware runtime.
+A process of a power domain sleeps while the domain is off and corrupts its
+writes as its simstate says, as in the interpreter; replayed initial blocks
+(`sim_replay_control`), HDL ports on supply nets, VCMs, retention and
+isolation models, and `-upf_cov` all run in `simv`. A design `-compile`
+cannot build for another reason (a concurrent assertion, say) still runs on
+the interpreter.
 
 ### Forward SAIF (Annex J)
 

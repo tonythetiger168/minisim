@@ -1157,6 +1157,15 @@ static void runAtomCall(const Prog* p) {
 }
 static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
+    if (!a.killAt.empty()) {   // vpi_control(vpiAssertionKill, h, start) (39.5.2): those attempts only
+        std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
+            if (!a.killAt.count(t.start)) return false;
+            if (!a.hidden) for (uint64_t n = 0; n < t.count; n++) assertEvent(c.id, AE_KILLED, t.start);
+            expectDone(t.wait, 2);
+            return true;
+        });
+        a.killAt.clear();
+    }
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
         std::erase_if(c.att, [&](const ConcAssert::Attempt& t) {
             if (t.killGen == a.killGen) return false;
@@ -1231,7 +1240,7 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
         const sva::Node* t = dv.d(at.t);
         ConcAssert::Envs envs;
         if (lenv) std::tie(t, envs) = lenv->finish(t);
-        if (a.step && assertHook() && !a.hidden) {   // VPI stepping (39.5.2): this attempt's step
+        if (!a.stepAt.empty() && a.stepAt.count(at.start) && assertHook() && !a.hidden) {   // VPI stepping (39.5.2): this attempt's step
             assertStep() = {at.t, t};
             for (uint64_t n = 0; n < at.count; n++) assertEvent(c.id, t->k == sva::PFALSE ? AE_STEP_FAIL : AE_STEP_OK, at.start);
         }
@@ -1410,11 +1419,12 @@ static bool relEvents(const Instr& i) {
 
 // A write by a process of a domain whose simstate corrupts on activity or
 // on change (IEEE 1801-2024 9.5.4 to 9.5.7) stores a corrupt value instead.
-static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) {
-    int m = g_pdMode[(size_t)e->pd];
+// msim -compile emits the same call for a process of a domain (codegen.hpp).
+inline Val upfWriteM(int pd, bool pstate, int sig, int hi, int lo, const Val& v) {
+    int m = g_pdMode[(size_t)pd];
     bool stateOnly = m == 1 || m == 2;    // CORRUPT_STATE_ON_CHANGE / _ON_ACTIVITY
     bool onChange = m == 1 || m == 3;     // ..._ON_CHANGE
-    if (stateOnly && !e->pstate) return v;
+    if (stateOnly && !pstate) return v;
     if (onChange) {
         Val cur = S.get(sig);
         if (hi >= 0) cur = v_slice(cur, hi, lo);
@@ -1422,6 +1432,7 @@ static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) {
     }
     return allx(v.w);
 }
+static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) { return upfWriteM(e->pd, e->pstate, sig, hi, lo, v); }
 
 inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     const Prog* p = entry;
@@ -1555,7 +1566,12 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 else writeMem(i);
                 pc++; break;
             }
-            case IK::Force: S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
+            case IK::Force:
+                S.holdSrc = {i.file, i.line};
+                S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey);
+                S.holdSrc = {};
+                pc++;
+                break;
             case IK::Release: S.holdOff(i.sig, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey); pc++; break;
             case IK::Dyn: dynExec(i); pc++; break;
             case IK::Udp: udpExec(i); pc++; break;

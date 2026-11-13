@@ -139,8 +139,9 @@ inline void loadWithDesign(Model& m, const std::string& path, slang::ast::Compil
                            const std::string& powerTop, bool powerTopSet) {
     m.dv = &dv;
     m.topFixed = powerTopSet;
-    m.resolveTop = [&comp](const std::string& t) { return powerTopPath(comp, t, false); };
+    m.resolveTop = [&comp, &m](const std::string& t) { return m.topSeen[t] = powerTopPath(comp, t, false); };
     std::string start = powerTopSet ? powerTopPath(comp, powerTop, true) : "";
+    m.loadStart = start;
     m.load(path, start);
     if (!powerTopSet) m.top = powerTopPath(comp, m.designTop, false);
     m.dv = nullptr;
