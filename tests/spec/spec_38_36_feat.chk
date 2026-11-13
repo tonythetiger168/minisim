@@ -1,8 +1,0 @@
-msim checkpoint
-save 1
-time 10
-state a15d70e742aadac0
-cwd /home/claude/minisim/tests/spec
-arg /home/claude/minisim/build/msim
-arg 38.36-vpi-feature-cbs.sv
-arg data/vpi/features.c
