@@ -90,6 +90,11 @@ public:
     std::map<std::string, SvModule> svModules;   // lower-case name -> module
     std::string timeUnit = "1ns", timePrec = "1fs";
     std::vector<std::string> warnings;
+    // For synthesis tools: a combinational process (a sensitivity list or an
+    // equivalent process of a concurrent assignment, no wait inside, no
+    // 'event history) becomes `always @*` instead of a loop that waits on its
+    // signals, which simulates the same but is not a synthesizable form.
+    bool synth = false;
 
     void add(const std::vector<UP>& units) {
         for (auto& u : units) {
@@ -3317,13 +3322,15 @@ endpackage
             std::string tg = target(s.target, sig);
             Val sel = ex(s.value, nullptr);
             r += I + caseKw(s, sel) + " (" + sel.s + ")\n";
-            for (auto& a : s.alts) {
+            std::vector<std::string> labels = caseLabels(s, sel);
+            for (size_t ai = 0; ai < s.alts.size(); ++ai) {
+                auto& a = s.alts[ai];
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
                     body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + "; ";
                 }
-                r += I + "  " + choiceList(a.choices, sel.t, s.matching) + ": begin " + body + "end\n";
+                r += I + "  " + labels[ai] + ": begin " + body + "end\n";
             }
             r += I + "endcase\n";
             break;
@@ -3343,8 +3350,10 @@ endpackage
         case SK::Case: {
             Val sel = ex(s.value, nullptr);
             r += I + caseKw(s, sel) + " (" + sel.s + ")\n";
-            for (auto& a : s.alts) {
-                r += I + "  " + choiceList(a.choices, sel.t, s.matching) + ": begin\n";
+            std::vector<std::string> labels = caseLabels(s, sel);
+            for (size_t ai = 0; ai < s.alts.size(); ++ai) {
+                auto& a = s.alts[ai];
+                r += I + "  " + labels[ai] + ": begin\n";
                 cx->indent += 2;
                 r += seqStmts(a.body);
                 cx->indent -= 2;
@@ -4012,6 +4021,22 @@ endpackage
     // ===================================================================
     // Concurrent statements
     // ===================================================================
+    // The labels of a case or selected assignment. VHDL requires the choices
+    // to cover every value, so for synthesis the last one becomes `default`
+    // when there is no `others`: the SystemVerilog type (an enum is an int)
+    // may have values the VHDL type does not, which would infer a latch.
+    template <class S>
+    std::vector<std::string> caseLabels(const S& s, const Val& sel) {
+        std::vector<std::string> l;
+        bool def = false;
+        for (auto& a : s.alts) {
+            l.push_back(choiceList(a.choices, sel.t, s.matching));
+            def = def || l.back().rfind("default", 0) == 0;
+        }
+        if (synth && !def && !l.empty()) l.back() = "default";
+        return l;
+    }
+
     std::string procName(const std::string& label) { return label.empty() ? "" : " : " + svId(label); }
 
     // an equivalent process: body once at time 0, then wait on the signals read
@@ -4024,6 +4049,8 @@ endpackage
                 prevUpd += prevName(p) + " = " + p + "; ";
             }
         replaceAll(bodyText, "@@PREV@@", prevUpd);
+        if (synth && prevDecl.empty() && !sigs.empty() && bodyText.find("@(") == std::string::npos && bodyText.find("wait") == std::string::npos)
+            return "  always @* begin" + procName(label) + "\n" + bodyText + "  end\n";
         std::string r = "  always begin" + procName(label) + "\n" + prevDecl + bodyText;
         if (sigs.empty()) r += "    " + prevUpd + "wait (0);\n";
         else r += "    " + prevUpd + "@(" + eventList(sigs) + ");\n";
@@ -4226,14 +4253,18 @@ endpackage
                     prevUpd += prevName(p) + " = " + p + "; ";
                 }
                 replaceAll(body, "@@PREV@@", prevUpd);
-                out = "  always begin" + procName(s.label) + "\n" + decls.str() + prevDecl + body;
-                if (s.hasSens) {
-                    if (sens.empty()) out += "    " + prevUpd + "wait (0);\n";
-                    else out += "    " + prevUpd + "@(" + eventList(sens) + ");\n";
-                } else if (!containsWait(s.body)) {
-                    out += "    wait (0);\n";   // a process without wait would loop forever
+                if (synth && s.hasSens && !sens.empty() && prevDecl.empty()) {
+                    out = "  always @* begin" + procName(s.label) + "\n" + decls.str() + body + "  end\n";
+                } else {
+                    out = "  always begin" + procName(s.label) + "\n" + decls.str() + prevDecl + body;
+                    if (s.hasSens) {
+                        if (sens.empty()) out += "    " + prevUpd + "wait (0);\n";
+                        else out += "    " + prevUpd + "@(" + eventList(sens) + ");\n";
+                    } else if (!containsWait(s.body)) {
+                        out += "    wait (0);\n";   // a process without wait would loop forever
+                    }
+                    out += "  end\n";
                 }
-                out += "  end\n";
             }
         } catch (...) {
             cx->proc = saved;
