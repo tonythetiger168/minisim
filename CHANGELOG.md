@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mlint -cdc-html`: the selected crossing is drawn as a schematic: source
+  flop, the nets and logic between it and the reader (a glitch source for
+  CDC003), the synchronizer stages, and the qualifier of an enable-qualified
+  bus.
 - `mlint -cdc-sva`: handshake checks are now an alternation check that
   holds on both sides (the side that starts a transfer and the side that
   answers), and an acknowledge read back through logic (an FSM) counts.
@@ -29,6 +33,10 @@ Spec references are IEEE 1800-2023 clauses.
   writes in the generated code. Without `-upf` the generated C++ is
   unchanged. `tests/msim_compile.cmake` runs four UPF designs and the
   low-power coverage report both ways.
+- `mlint -upf` rules `UPF008` to `UPF012`: isolation and retention controls
+  driven from a domain that can be off, isolation or retention powered by
+  the switched supply of the domain itself, a power switch controlled from
+  the domain it powers, and redundant level shifters.
 - `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability
