@@ -902,6 +902,17 @@ Spec references are IEEE 1800-2023 clauses.
   by default (`-threads N`) with the same report for every thread count. A
   35-rule SKY130 deck and `sky130_fd_sc_hd` cells are the tests. `src/gds.hpp`
   is the shared GDSII reader and writer. See `docs/MPV.md`.
+- UVM (IEEE 1800.2-2020): three tests cover the classes that compiled but
+  had no check of their own: `tests/uvm/base_extras.sv` (`uvm_time`,
+  `uvm_heartbeat`, `uvm_sequence_library`, report macros,
+  `uvm_callback_iter`, `uvm_run_test_callback`, `uvm_root`),
+  `reg_extras.sv` (`uvm_reg_file`, `uvm_reg_indirect_data`, `uvm_reg_fifo`,
+  `uvm_vreg`, `uvm_vreg_field`, `uvm_mem_mam`, block lookups) and
+  `reg_sequences.sv` (the built-in register and memory test sequences of
+  Annex E, each also run against a faulty DUT). Two faults they found are
+  fixed: `c ? i++ : i` and `c ? (x = 1) : 0` ran the assignment in the arm
+  not picked (11.4.11), and a `randc` property named in `randomize(v)` lost
+  its cycle (18.11).
 - `msim -uvm` (and `-uvmhome <dir>`, `-uvmnodpi`): compile the Accellera UVM
   library from `$UVM_HOME` with its C code, so regular expressions, the full
   command line (`+uvm_set_config_*`, `+UVM_VERBOSITY`, ...) and HDL backdoor
