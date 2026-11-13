@@ -1,0 +1,5 @@
+protected.vhd:128:5:@5ns:(report note): count=8 max=50
+protected.vhd:129:5:@5ns:(report note): mean_x10=180
+protected.vhd:130:5:@5ns:(report note): slv=000010010000
+protected.vhd:131:5:@5ns:(report note): global=11
+protected.vhd:134:5:@5ns:(report note): local=3 name_len=9
