@@ -15,6 +15,10 @@ Spec references are IEEE 1800-2023 clauses.
 - The UPF information model also holds abstract power sources, composite
   domains, power state groups, state transitions, repeater strategies, power
   models and attributes (IEEE 1801-2024 10.6.1, 10.6.3).
+- `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
+  acknowledge back gets an assertion that it changes only once the
+  acknowledge has caught up (two- and four-phase). The one-bit stability
+  check no longer counts the reset value as a change.
 - `mvplat`, a virtual platform engine in the manner of Virtualizer, Helium
   and Vista (`docs/VPLAT.md`). It runs RV32IMAC harts in machine and user mode
   with PMP, and all 77 rv32 riscv-tests pass (`tests/mvplat_isa.sh`). The
@@ -26,6 +30,8 @@ Spec references are IEEE 1800-2023 clauses.
   headers (`vp/*.hpp`) are installed with the core package, and `vp/ext.hpp`
   is the interface of the licensed extension library: gdb, checkpoints, the
   profile, model libraries and RTL co-simulation.
+- The `minisimCore` package installs `compat.hpp`, so a tool built against the
+  installed kernel can register its vendor command-line rules too.
 - `mlint` rule `CDC009` (with `-sdc`): a one-bit signal that can pulse for
   one cycle, crossing from a clock of shorter period into one of longer
   period through a plain synchronizer, can be missed. Periods come from
@@ -39,6 +45,12 @@ Spec references are IEEE 1800-2023 clauses.
   `vpiDistType` and `vpiWeight`, and the constraint blocks of a class
   object, whose `vpiIsConstraintEnabled` follows `constraint_mode`. A
   `vpiRefObj` has `vpiName` and `vpiFullName`.
+- VPI threads and frames (38.36.1): `vpi_handle(vpiThread / vpiFrame, NULL)`
+  in a calltf, thread objects (`vpiParent`, `vpiFrame`, child threads) and
+  frame objects (`vpiScope`, `vpiParent`, `vpiThread`, `vpiAutomatic`), both
+  with `vpiValid`, and the callbacks `cbStartOfThread`, `cbEndOfThread`,
+  `cbEnterThread`, `cbStartOfFrame` and `cbEndOfFrame`. The value of a
+  system task argument that is an automatic variable no longer crashes.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
@@ -48,6 +60,12 @@ Spec references are IEEE 1800-2023 clauses.
   `MW_fp_flt2i`, `MW_fp_mac` (fused multiply-add), `MW_fp_recip`,
   `MW_fp_flt2flt` (format conversion) and the shared `MW_fp_round`. `tests/dw_fp_test.py` checks
   them against an exact rational reference (docs/DATAPATH.md).
+- `mcov` reads and writes UCIS XML (Accellera UCIS 1.0, its XML interchange
+  format): a database named `.xml` is UCIS. Each instance becomes an
+  instanceCoverages scope with its statements, branches, conditions,
+  toggles, FSMs, assertions and covergroups. It also reads what other tools
+  write, such as blocks, case statements with more than two arms and
+  SystemVerilog literal state values.
 
 ### Fixed
 - The `SV_TIED_HI`, `SV_TIED_LO`, `VHDL_TIED_HI` and `VHDL_TIED_LO` value
