@@ -9,7 +9,7 @@ print tb.head tb.head.next tb.head.next.id tb.head.tag tb.b.flag tb.head.zz
 delete 2
 run
 print cnt
-step 2
+run -slot 2
 time
 force tb.en 0
 run 30

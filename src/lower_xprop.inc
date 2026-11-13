@@ -191,6 +191,13 @@ int xpTemp(int w) {
 }
 static int xpSigW(int s) { return (size_t)s < sigInfo().size() && sigInfo()[s].second > 0 ? sigInfo()[s].second : 1; }
 static E xpX(int w) { return konst(allx(w)); }
+// A blocking write to an element of an array this small chosen at run time
+// is a plain write: the region saves, puts back and merges every element
+// like a variable, so several branches writing one element, or reading back
+// what they wrote, merge exactly.
+static bool xpUnitArr(const ArrShape& a) {
+    return a.base >= 0 && !isRel(a.base) && a.count > 0 && a.count <= 64 && !a.dynElem && xpSigW(a.base) == a.elemW;
+}
 static E xpOnes(int w) { return konst(v_not(make(0, 0, w))); }
 static E xpZero(int w) { return konst(make(0, 0, w)); }
 static E xpIsX(E e) { return bin(Op::CaseEq, std::move(e), konst(allx(1))); }
@@ -560,6 +567,11 @@ void xpEmit(Instr i, const slang::ast::Expression& target) {
     // present value and the new one: right for one write, pessimistic when
     // several branches write the same element. A nonblocking write merges with
     // the present value only when no other one to that array can be pending.
+    if (arrOk && i.k == IK::Assign && xpUnitArr(*i.arr)) {   // a small array: its elements are units (xpScan)
+        xp.okArr.insert(prog.emit(i));
+        if (jidx != (size_t)-1) prog.code[jidx].target = prog.here();
+        return;
+    }
     if (arrOk) {
         size_t jf = emitJmpIfNot(ref(xp.xm));
         xp.okArr.insert(prog.emit(merged(i.aidx)));
@@ -829,7 +841,11 @@ bool xpScan(size_t a, size_t b, std::map<int, XpBits>& tg, std::string& why) {
             case IK::Assign: {
                 if (i.dyn >= 0) { why = "an assignment to a queue, dynamic or associative array element"; return false; }
                 if (i.arr) {
-                    if (xp.okArr.count(pc)) break;
+                    if (xp.okArr.count(pc)) {
+                        if (i.k == IK::Assign && xpUnitArr(*i.arr))
+                            for (int k = 0; k < i.arr->count; k++) tg[i.arr->base + k].all = true;
+                        break;
+                    }
                     why = "an assignment to an array element chosen at run time"; return false;
                 }
                 if (i.sig < 0 || isRel(i.sig)) { why = "an assignment to an automatic variable or class property"; return false; }
