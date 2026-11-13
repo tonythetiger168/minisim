@@ -28,9 +28,10 @@ add_executable(minisim src/minisim.cpp)
 target_include_directories(minisim PRIVATE src)
 
 # Unit tests: value library, scheduler (test_sched), system tasks (test_sys),
-# net initial value (test_net), and the demo VCD's time-0 $dumpvars sample (test_vcd).
+# net initial value (test_net), the demo VCD's time-0 $dumpvars sample (test_vcd),
+# and the Tcl interpreter of the tool line (test_tcl).
 enable_testing()
-foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf)
+foreach(t test_expr test_z test_sched test_net test_sys test_cpu test_upf test_tcl)
   add_executable(${t} tests/${t}.cpp)
   target_include_directories(${t} PRIVATE src)
   target_compile_options(${t} PRIVATE -UNDEBUG)   # asserts stay on in Release too
