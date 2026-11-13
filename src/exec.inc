@@ -1410,11 +1410,12 @@ static bool relEvents(const Instr& i) {
 
 // A write by a process of a domain whose simstate corrupts on activity or
 // on change (IEEE 1801-2024 9.5.4 to 9.5.7) stores a corrupt value instead.
-static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) {
-    int m = g_pdMode[(size_t)e->pd];
+// msim -compile emits the same call for a process of a domain (codegen.hpp).
+inline Val upfWriteM(int pd, bool pstate, int sig, int hi, int lo, const Val& v) {
+    int m = g_pdMode[(size_t)pd];
     bool stateOnly = m == 1 || m == 2;    // CORRUPT_STATE_ON_CHANGE / _ON_ACTIVITY
     bool onChange = m == 1 || m == 3;     // ..._ON_CHANGE
-    if (stateOnly && !e->pstate) return v;
+    if (stateOnly && !pstate) return v;
     if (onChange) {
         Val cur = S.get(sig);
         if (hi >= 0) cur = v_slice(cur, hi, lo);
@@ -1422,6 +1423,7 @@ static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) {
     }
     return allx(v.w);
 }
+static Val upfWrite(const Prog* e, int sig, int hi, int lo, const Val& v) { return upfWriteM(e->pd, e->pstate, sig, hi, lo, v); }
 
 inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
     const Prog* p = entry;

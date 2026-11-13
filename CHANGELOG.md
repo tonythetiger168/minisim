@@ -8,6 +8,12 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `msim -compile -upf`: power-aware simulation in compiled mode. msim binds
+  the power intent, then writes a snapshot that `simv` reads with the UPF
+  file; processes of a power domain sleep while it is off and corrupt their
+  writes in the generated code. Without `-upf` the generated C++ is
+  unchanged. `tests/msim_compile.cmake` runs four UPF designs and the
+  low-power coverage report both ways.
 - `mlint -cdc-sva`: handshakes. A request whose flop reads a synchronized
   acknowledge back gets an assertion that it changes only once the
   acknowledge has caught up (two- and four-phase). The one-bit stability

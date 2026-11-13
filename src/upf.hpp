@@ -918,6 +918,10 @@ struct Model {
     // -power_top fixed it (topFixed).
     std::function<std::string(const std::string&)> resolveTop;
     bool topFixed = false;
+    // What loadWithDesign asked of the design: msim -compile reads the file
+    // again in simv, which has no design, with these answers.
+    std::string loadStart;
+    std::map<std::string, std::string> topSeen;
     std::string result;   // the Tcl result of the UPF command just run
 
     // ---- names ----

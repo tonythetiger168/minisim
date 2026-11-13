@@ -502,6 +502,7 @@ install(PROGRAMS tools/mplan_serve.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME
 # The Python interface to mdebug -script (import mdebug_api).
 install(FILES tools/mdebug_api.py DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/python)
 install(FILES src/minisim.cpp src/prog.hpp src/expr.hpp src/exec.inc
+              src/upf_rt.inc src/upf.hpp src/upf_impl.inc src/upf_vct.hpp src/tcl.hpp   # msim -compile -upf
         DESTINATION ${CMAKE_INSTALL_DATADIR}/minisim/include)
 if(MINISIM_WITH_SLANG AND MINISIM_WITH_FST)
   # msim -compile with an FST waveform builds these into simv.
