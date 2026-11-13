@@ -896,6 +896,22 @@ struct Model {
         std::multimap<std::string, std::string> opts;
     };
     std::vector<ImplCmd> implCmds;
+    // map_retention_cell -lib_model_name (6.39): the model simulates the
+    // mapped registers in place of the strategy's retention semantics.
+    struct RetModel {
+        std::vector<std::string> strategies, elements;   // elements: rooted; empty = the strategies' own
+        std::string domain, scope, where, model;
+        std::vector<std::pair<std::string, std::string>> portMap;   // model port -> net_ref (a leading ~ inverts)
+    };
+    std::vector<RetModel> retModels;
+    // use_interface_cell -force_function (6.62): the first of -lib_cells is
+    // the functional model of the isolation strategy's cells.
+    struct IfcModel {
+        std::string strategy, ls, domain, scope, where, model, clamp;   // ls: the level shifter of -strategy; clamp: -applies_to_clamp
+        std::vector<std::string> elements, exclude;                 // rooted
+        std::vector<std::pair<std::string, std::string>> portMap;   // model port -> net_ref (a leading ~ inverts)
+    };
+    std::vector<IfcModel> ifcModels;
     std::map<std::string, std::string> nameFormat;                  // name_format affix -> pattern
     struct Variation { double lo = 1, hi = 1; std::string where; };
     std::map<std::string, Variation> variations;                    // set_variation: supply -> range
@@ -2275,7 +2291,11 @@ inline void Model::run(const std::vector<Cmd>& cmds, std::string& scope, Reader&
             if (o.has("-retention_condition")) rt->powerdownCond = expr(o.get("-retention_condition"), c);
             if (o.has("-no_retention")) rt->noRet = true;
             if (o.has("-use_retention_as_primary")) rt->useAsPrimary = true;
-            if (o.has("-applies_to")) rt->appliesTo = o.get("-applies_to");
+            if (o.has("-applies_to")) {
+                rt->appliesTo = o.get("-applies_to");
+                if (rt->appliesTo != "flop" && rt->appliesTo != "latch" && rt->appliesTo != "any")
+                    throw Error(c.where() + ": set_retention -applies_to " + rt->appliesTo + " is not flop, latch or any (6.54)");
+            }
             for (auto& p : o.list("-parameters")) {
                 if (p == "NO_RET_SUP_COR") rt->retSupCor = false;
                 if (p == "RET_SUP_COR") rt->retSupCor = true;

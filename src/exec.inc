@@ -4,6 +4,21 @@
 // and the return address is still on `rets` when the process resumes.
 static Val rd(int s) { return S.get(s); }
 
+// A case statement with a jump table (Instr::caseId at pc): evaluate the
+// selector once and go to the matching item, or the default. false: run the
+// item compares one by one instead (coverage counts each compare, and a
+// selector with x / z bits or wider than 64 bits needs the full compare).
+static bool caseJump(const std::vector<Instr>& code, size_t& pc) {
+    if (g_cov) return false;
+    const CaseTable* t = caseTable(code, pc);
+    if (!t->ok) return false;
+    Val s = eval(t->sel, rd);
+    if (s.x || s.z || !s.hi.empty() || s.real || s.str) return false;
+    auto it = std::lower_bound(t->to.begin(), t->to.end(), s.v, [](const auto& a, uint64_t v) { return a.first < v; });
+    pc = it != t->to.end() && it->first == s.v ? it->second : t->dflt;
+    return true;
+}
+
 struct RetFrame { const Prog* prog; size_t pc; FrameP fr; };
 
 // Resolve a run-time array index and bit index. false: no write happens.
@@ -1125,6 +1140,21 @@ static shared_ptr<ExpectWait> startExpect(const Instr& i, const shared_ptr<ProcC
     return w;
 }
 // `ticked`: the clocks that ticked (16.13); attempts start at the leading one.
+// A function called in an assertion's boolean: run to its end now.
+static void runAtomCall(const Prog* p) {
+    Frame* sf = g_fr;
+    Frame* sr = g_ret;
+    auto ctl = make_shared<ProcCtl>();
+    Task t = exec(p, ctl, newFrame(nullptr, nullptr, 0));
+    t.h.resume();
+    if (!t.h.done()) {
+        cerr << "error: a function called in an assertion waited (time " << S.now << ")\n";
+        exit(1);
+    }
+    t.h.destroy();
+    g_fr = sf;
+    g_ret = sr;
+}
 static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!c.att.empty() && c.att.front().killGen != a.killGen)   // $assertkill (20.11)
@@ -1179,6 +1209,7 @@ static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
             for (size_t k = 0; k < c.capSlot.size(); k++) c.capSlot[k]->k = (*caps)[k];
         valCaps = caps.get();
         have = true;
+        for (const Prog* p : c.pre) runAtomCall(p);
         for (size_t i = 0; i < c.atoms.size(); i++) val[i] = truth(eval(c.atoms[i], rd)) == 1;
     };
     sva::Deriv dv{sva::store(), val};
@@ -1634,6 +1665,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++; break;
             }
             case IK::JmpIfNot:
+                if (i.caseId && caseJump(p->code, pc)) break;
                 if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
                 break;
@@ -1886,6 +1918,7 @@ static void execSeq(const void* ctx, vector<Sim::NbaItem>& out) {
                 break;
             }
             case IK::JmpIfNot:
+                if (i.caseId && caseJump(p->code, pc)) break;
                 if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
                 else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
                 break;
@@ -1911,6 +1944,7 @@ static void execComb(const void* ctx) {
         }
         if (i.k == IK::JmpIfNot) {
             if (g_cov) covHit(i.hits);
+            else if (i.caseId && caseJump(p->code, pc)) continue;
             if (int tv = truth(eval(i.e, rd)); tv == 1) pc++;
             else { if (g_cov) covHit(i.taken); pc = tv == 2 && i.xt != Instr::NOX ? i.xt : i.target; }
             continue;
@@ -1943,6 +1977,14 @@ inline Task cbLater(int s, Val v, int hi, int lo, uint64_t d) {
     S.reNbaq.push_back({s, v, hi, lo});
     S.rare = true;
 }
+// An output with an edge skew: at the next such edge of the clock, then the
+// delay (14.3).
+inline Task cbAtEdge(int s, Val v, int hi, int lo, int clk, int edge, uint64_t d) {
+    co_await Wait{clk, (Edge)edge};
+    if (d) co_await Delay{d};
+    S.reNbaq.push_back({s, v, hi, lo});
+    S.rare = true;
+}
 static void cbSchedule(ClockingRT& c, int out, const Val& v, int hi, int lo) {
     const ClockingRT::Out& o = c.outs[out];
     if (hi < 0) { hi = o.w - 1; lo = 0; }
@@ -1953,7 +1995,8 @@ static void cbSchedule(ClockingRT& c, int out, const Val& v, int hi, int lo) {
             Val part = v_slice(v, b - lo, a - lo);
             int dhi = p.lo + (b - pl), dlo = p.lo + (a - pl);
             if (dlo == 0 && dhi == S.sigs[p.sig].w - 1) dhi = -1;
-            if (o.skew == 0) { S.reNbaq.push_back({p.sig, part, dhi, dlo}); S.rare = true; }
+            if (o.edgeSig >= 0) S.spawn(cbAtEdge(p.sig, part, dhi, dlo, o.edgeSig, o.edge, o.skew));
+            else if (o.skew == 0) { S.reNbaq.push_back({p.sig, part, dhi, dlo}); S.rare = true; }
             else S.spawn(cbLater(p.sig, part, dhi, dlo, o.skew));
         }
         pl += p.w;
@@ -2008,6 +2051,16 @@ inline Task cbHist(int k, int j, shared_ptr<vector<pair<int, Edge>>> ev) {
         else in.hist.push_back({S.now, v});
     }
 }
+// An input with an edge skew keeps its value at each such edge of the clock.
+inline Task cbEdgeSample(int k, int j) {
+    for (;;) {
+        auto& in0 = clockings()[k].ins[j];
+        co_await Wait{in0.edgeSig, (Edge)in0.edge};
+        auto& in = clockings()[k].ins[j];
+        in.last = eval(in.src, rd);
+        in.lastAt = S.now;
+    }
+}
 // A net output is driven from its hidden variable (14.16).
 inline Task cbNetDriver(int var, int net, int drv, int lo) {
     for (;;) {
@@ -2031,6 +2084,15 @@ inline Task cbProc(int k) {
             auto& in = c.ins[j];
             if (in.kind == 0) S.set(in.cv, eval(in.src, rd));
             else if (in.kind == 2) S.set(in.cv, S.now >= in.skew ? cbHistAt(in, S.now - in.skew) : in.hist.front().second);
+            else if (in.kind == 3) {   // the value at the last such edge; one at this very step is read now
+                // The clocking event is an edge of the same signal: is it the skew's edge too?
+                Val cv = S.get(in.edgeSig);
+                int cur = (cv.x & 1) ? 2 : (int)(cv.v & 1);
+                bool now = in.lastAt == S.now || in.edge == ANY || in.edge == c.ev[0].second ||
+                           (c.ev[0].second == ANY && ((in.edge == POS && cur == 1) || (in.edge == NEG && cur == 0)));
+                if (now) S.set(in.cv, eval(in.src, rd));
+                else if (in.lastAt != ~0ull) S.set(in.cv, in.last);
+            }
         }
         // Drives due at this clocking event.
         if (!c.drives.empty()) {
@@ -2059,6 +2121,7 @@ inline void startClockings() {
         S.set(c.evSig + 1, mk(0, 64));
         for (size_t j = 0; j < c.ins.size(); j++) {
             auto& in = c.ins[j];
+            if (in.kind == 3) { S.spawn(cbEdgeSample((int)k, (int)j)); continue; }
             if (in.kind != 2) continue;
             in.hist.push_back({0, eval(in.src, rd)});   // cbHist updates it once the initializers have run
             if (in.refs.empty()) continue;

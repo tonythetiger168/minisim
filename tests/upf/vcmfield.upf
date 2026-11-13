@@ -1,0 +1,25 @@
+# Power intent for vcmfield.sv: table VCMs on struct fields (6.30 -field).
+upf_version 4.0
+set_design_top dut
+create_power_domain PD_TOP -include_scope
+foreach s {VDD VSS} {
+    create_supply_port $s
+    create_supply_net $s
+    connect_supply_net $s -ports $s
+}
+create_supply_set SS_TOP -function {power VDD} -function {ground VSS}
+associate_supply_set SS_TOP -handle PD_TOP.primary
+
+create_vcm RV2U -hdl_type {sv pw_pkg::rail_t} -field v -conversion_direction hdl2upf \
+    -table {{{1.0 *} {FULL_ON *}} {{0.5 1.0} {PARTIAL_ON *}} {{* 0.5} {OFF}}}
+create_vcm U2RV -hdl_type {sv pw_pkg::rail_t} -field v -conversion_direction upf2hdl \
+    -table {{{FULL_ON} {*}} {{PARTIAL_ON} {*}} {{OFF} {0.0}} {{UNDETERMINED} {Xreal}}}
+create_vcm U2EN -hdl_type {sv pw_pkg::rail_t} -field en -conversion_direction upf2hdl \
+    -table {{{FULL_ON} {1}} {{PARTIAL_ON} {1}} {{OFF} {0}} {{UNDETERMINED} {0}}}
+create_vcm RAIL -vcms {RV2U U2RV U2EN}
+create_vcm M2U -hdl_type {sv pw_pkg::stat_t} -field mode -conversion_direction hdl2upf \
+    -table {{{3} {FULL_ON 1.0}} {{2} {FULL_ON 0.9}} {{1} {PARTIAL_ON 0.6}} {{0} {OFF}}}
+
+foreach n {VR VS} { create_supply_net $n }
+connect_supply_net VR -ports {u_reg/r u_load/ri} -vcm RAIL
+connect_supply_net VS -ports {u_sens/s} -vcm M2U

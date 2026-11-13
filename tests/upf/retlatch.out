@@ -1,0 +1,6 @@
+4 loaded 5: f=5 l1=5 l2=5 c=0
+6 off, flops saved: f=x l1=x l2=x c=x
+8 on, flops restored: f=5 l1=x l2=x c=0
+11 loaded 9: f=9 l1=9 l2=9 c=0
+13 off, latches saved: f=x l1=x l2=x c=x
+15 on, latches restored: f=x l1=9 l2=9 c=0
