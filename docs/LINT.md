@@ -45,23 +45,50 @@ else; `-enable`, `-disable` and `-severity` after it adjust it.
 A goal turns on the rules of its groups that are off by default, too.
 
 The STARC guide's topics, and the mlint rules that cover them (the guide's
-own wording and numbering are not reproduced here):
+own wording and numbering are not reproduced here). Every topic of the guide
+is either covered by rules or marked as not a lint check, with the reason:
+32 topics: 28 covered, 4 not lint checks.
 
 | STARC topic | mlint rules |
 |---|---|
-| Naming: modules, signals, parameters, clocks, resets, active-low, instances, ports, length, case clashes, keywords of other languages | `NAME001`..`NAME013`, `NAME018` |
-| One module per file, the file named after it | `STY001`, `STY002` |
+| Naming: modules, signals, parameters, clocks, resets, active-low, instances, ports, length, case clashes, keywords of other languages | `NAME001`..`NAME013`, `NAME018`, `NAME019` |
+| Files: one module per file, the file named after it, include guards | `STY001`, `STY002`, `STY004`, `STY005` |
+| Hierarchy: structure and logic on separate levels, no glue logic in a hierarchical module | `STY016` |
+| Hierarchy: no hierarchical references, no `defparam`, connections by name, no implicit nets | `SYN017`, `SYN015`, `CON003`, `CON004`, `VHD006` |
+| Ports: unused, undriven and unconnected ports, port widths | `UNU004`, `UNU005`, `CON001`, `CON002`, `W003` |
+| Parameters and macros: typed parameters inside `#()`, macro names | `STY007`, `STY014`, `NAME003`, `NAME014`, `NAME017` |
 | Combinational logic: complete sensitivity lists, no latches, no loops | `COMB001`, `COMB002`, `L001`, `LAT001`, `LAT002` |
-| Case statements: default or full coverage, no `casex`, no X/Z items, no duplicates, constant items, no `full_case`/`parallel_case` | `CASE001`..`CASE007` |
-| Blocking in combinational, non-blocking in sequential logic | `L002`, `L003`, `SEQ001`..`SEQ003` |
-| One driver per signal | `L004`, `L005` |
-| Widths and signs of assignments, comparisons, shifts and conditions | `W001`..`W010`, `EXP003`, `EXP005` |
-| Synthesizable constructs: no initial, delays, real, `===`, X, dynamic types, while loops, tasks, integer signals | `SYN001`..`SYN020`, `EXP006` |
-| Clocks: no clock as data, one edge, no derived clocks | `CLK001`..`CLK004` |
-| Resets: polarity, sync/async consistency, reset values, reset style | `RST001`..`RST007` |
-| State machines | `FSM001`..`FSM004` |
-| Unused and unconnected signals and ports | `UNU001`..`UNU005`, `CON001`..`CON004` |
-| Clock-domain crossings | `CDC`, `RDC` (docs/CDC.md) |
+| Latches by intent only | `LAT002`, `L001`, `LAT001` |
+| Flip-flops: blocking in combinational, non-blocking in sequential logic | `L002`, `L003`, `SEQ001`..`SEQ003` |
+| if statements: conditions of one bit, no constant conditions, no dead branches | `W006`, `EXP006`, `FML001` |
+| Case statements: default or full coverage, no `casex`, no X/Z items, no duplicates, constant items, no `full_case`/`parallel_case` | `CASE001`..`CASE007`, `FSM003` |
+| Loops: bounded, no timing inside, no while loops, indexes in range | `SYN008`, `SYN018`, `FML002` |
+| Functions and tasks: no side effects, automatic, no tasks in synthesized code | `FUNC001`, `STY006`, `SYN019` |
+| Operators: no division or power by a variable, logical operators on one bit, reductions, shifts | `SYN014`, `W007`, `EXP003`, `W010` |
+| Widths and signs of assignments, comparisons and conditions | `W001`..`W009`, `EXP005`, `TIDY004`, `TIDY006` |
+| One driver per signal | `L004`, `L005`, `TIDY005` |
+| Tri-state buffers only on bidirectional ports | `SYN016`, `L005` |
+| Synthesizable constructs: no initial, delays, real, force, fork, dynamic types, integer signals | `SYN001`..`SYN006`, `SYN012`, `SYN013`, `SYN020`, `VHD005`, `VHD008` |
+| Simulation and synthesis agree: no X compares, no `===`, no X assignments, no pragmas, no initial values | `SYN009`..`SYN011`, `CASE006`, `VHD004`, `VHD001`, `VHD002` |
+| Clocks: no clock as data, one edge, no mixed edges and levels, no derived or gated clocks | `CLK001`..`CLK004`, `SYN007`, `CDC007`, `CDC008` |
+| Resets: polarity, sync/async consistency, every flop reset, constant reset values, reset style | `RST001`..`RST007`, `TIDY001`..`TIDY003`, `FML003` |
+| Reset synchronizers and reset-domain crossings | `RDC001`..`RDC006` |
+| State machines: reachable states, a way out, a safe default, a reset state | `FSM001`..`FSM004` |
+| Clock-domain crossings: synchronizers, Gray codes, reconvergence, pulses | `CDC001`..`CDC010` (docs/CDC.md) |
+| Unused and undriven signals | `UNU001`..`UNU003`, `TIDY007` |
+| Design for test: no gated or derived clocks, no logic-driven resets, no latches, no loops, one clock edge | `CLK001`, `CLK002`, `CDC008`, `RDC006`, `LAT001`, `COMB002`; the scan checks of `mdft` |
+| Timing constraints match the design | `SDC001`..`SDC005`, `CDC006` (with `-sdc`) |
+| Low power: isolation, level shifters, retention, always-on controls | `UPF001`..`UPF012` (with `-upf`, docs/LOWPOWER.md) |
+| Layout of the source: line length, tabs, `begin`/`end`, one statement per line | `FMT001`..`FMT004`, `STY013` |
+
+Not lint checks, and why:
+
+| STARC topic | Why mlint does not check it |
+|---|---|
+| Comments and file headers (author, history, the meaning of each port) | A review item: what a comment must say cannot be judged from the text |
+| Testbenches and verification style | mlint leaves testbench code out on purpose (programs, modules with no ports, `tb.modules`); verification is msim's, mcov's and the UVM library's |
+| Design flow and documentation (specification, review, hand-off deliverables) | Process, not RTL |
+| Gate-level and library cells instantiated in RTL | Depends on the target library, which RTL lint does not read; synthesis and `mequiv` see it |
 
 ## What is checked
 
@@ -223,6 +250,7 @@ a module with no ports, or a module named in `tb.modules`.
 |---|---|---|---|
 | `STY001` | info | on | More than one module in a file |
 | `STY002` | info | off | A file's name is not its module's name |
+| `STY016` | info | off | A module with both submodule instances and logic of its own (glue logic); wiring is not logic |
 | `STY003` | info | off | A plain always where always_ff / always_comb / always_latch says more |
 | `FUNC001` | info | on | A function reads or writes a signal that is not one of its arguments |
 
@@ -427,6 +455,21 @@ it. One-hot registers tested bit by bit are followed too.
 
 How domains and synchronizers are recognized, and the options `-cdc-report`,
 `-clock-group` and `-static`, are in [CDC.md](CDC.md).
+
+### Timing constraints (`sdc`)
+
+With `-sdc FILE`, the constraints are checked against the design
+(`src/lintsdc.hpp`; the file is read with the same reader as the crossing
+checks). Names are the ones a timing tool shows: top ports, instance paths
+with `/`, pins as `instance/port`, nets, and a flop as its signal with `_reg`.
+
+| Rule | Severity | Default | What it finds |
+|---|---|---|---|
+| `SDC001` | warning | on | A top input with no `set_input_delay` (clocks, resets, `set_case_analysis` constants and `set_false_path -from` inputs are left out) |
+| `SDC002` | warning | on | A top output with no `set_output_delay` (or `set_false_path -to`) |
+| `SDC003` | warning | on | A clock defined on a port that clocks no flop and feeds no logic |
+| `SDC004` | warning | on | A clock defined on a port the design uses as a reset |
+| `SDC005` | warning | on | An SDC command names an object the design does not have, or is not SDC (reported at the SDC line) |
 
 The UPF rules (`UPF001`..`UPF007`, with `-upf`) are in `docs/LOWPOWER.md`.
 Design-for-test rules (gated clocks, logic-driven resets, divided clocks,

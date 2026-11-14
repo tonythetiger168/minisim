@@ -241,6 +241,8 @@ inline const std::vector<RuleInfo>& table() {
          "Verible rule instance-shadowing."},
         {"STY001", "style", Sev::Info, true, "more than one module in a file", ""},
         {"STY002", "style", Sev::Info, false, "a file's name is not its module's name", ""},
+        {"STY016", "style", Sev::Info, false, "a module with both submodule instances and logic of its own (glue logic)",
+         "STARC and the Reuse Methodology Manual keep structure and logic on separate levels: glue logic in a hierarchical module is hard to synthesize, constrain and test as a unit. Wiring (names, selects, concatenations, constants) is not logic. Off by default."},
         {"STY003", "style", Sev::Info, false, "a plain always where always_ff / always_comb / always_latch says more", ""},
         {"STY004", "style", Sev::Info, false, "`endif with no comment", "Verible rule endif-comment."},
         {"STY005", "style", Sev::Info, false, "a package in a file that is not named after it", "Verible rule package-filename."},
@@ -327,6 +329,19 @@ inline const std::vector<RuleInfo>& table() {
          "The block clocks registers on this input."},
         {"ABS004", "soc", Sev::Warning, true, "a block was signed off with errors or warnings not waived",
          "From the counts in its abstract (-abstract-out at block level)."},
+        // --------------------------------------------------------------------- sdc
+        // With -sdc FILE: the constraints against the design (lintsdc.hpp).
+        {"SDC001", "sdc", Sev::Warning, true, "with -sdc: a top input with no set_input_delay",
+         "No path from the input is timed. Clocks, resets, set_case_analysis constants and inputs with set_false_path -from are left out."},
+        {"SDC002", "sdc", Sev::Warning, true, "with -sdc: a top output with no set_output_delay",
+         "No path to the output is timed. Outputs with set_false_path -to are left out."},
+        {"SDC003", "sdc", Sev::Warning, true, "with -sdc: a clock defined on a port that clocks no flop and feeds no logic",
+         "A misnamed port, or a clock the design no longer has."},
+        {"SDC004", "sdc", Sev::Warning, true, "with -sdc: a clock defined on a port the design uses as a reset",
+         "Timing then treats the reset as a clock. Constrain it with set_input_delay, or a false path for an asynchronous reset."},
+        {"SDC005", "sdc", Sev::Warning, true, "with -sdc: an SDC command names an object the design does not have, or is not SDC",
+         "The constraint applies to nothing: a renamed port or instance, or a typo."},
+
         // -------------------------------------------------------------------- vhdl
         // On the VHDL text (lintvhdl.hpp); everything else in a VHDL design is
         // checked by the rules above, through the translation.
@@ -476,7 +491,7 @@ struct Goal {
 };
 inline const std::vector<Goal>& goals() {
     static const std::vector<Goal> g = {
-        {"lint_rtl", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,vhdl",
+        {"lint_rtl", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,vhdl,sdc",
          "RTL correctness before simulation and synthesis (SpyGlass lint_rtl)"},
         {"lint_synth", "latch,comb,case,driver,synth,SEQ001,SEQ002,W001,RST006,RST007",
          "what synthesis rejects or builds differently from simulation"},
@@ -491,7 +506,7 @@ inline const std::vector<Goal>& goals() {
          "the rules after Verible's lint rules (docs/LINT.md lists which)"},
         {"cdc", "cdc,rdc", "clock- and reset-domain crossings (docs/CDC.md)"},
         {"formal", "formal", "formal-assisted checks: dead branches, out-of-range indexes, stuck registers"},
-        {"signoff", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,formal,cdc,rdc,soc",
+        {"signoff", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,formal,cdc,rdc,soc,sdc",
          "everything that can break hardware, before handing a block off"},
     };
     return g;

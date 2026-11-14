@@ -1,0 +1,12 @@
+# Constraints for sdc.sv (tests/lint/rules): each SDC rule once.
+create_clock -name CLK -period 10 [get_ports clk]
+create_clock -name SPARE -period 20 [get_ports spare_clk]
+create_clock -name ARST -period 100 [get_ports arst]
+set_input_delay 2 -clock CLK [get_ports din]
+set_output_delay 3 -clock CLK [get_ports dout]
+set_case_analysis 0 [get_ports scan_mode]
+set_false_path -from [get_ports test_in]
+set_false_path -to [get_ports dbgg]
+set_multicycle_path 2 -to [get_cells u_subb/q_reg]
+set_false_path -to [get_ports dbg]
+set_max_fanout 10 [get_cells u_sub]

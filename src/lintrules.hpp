@@ -15,6 +15,7 @@
 //                connections.
 //   * the definitions (files and module names), and the unused-signal rules,
 //     which need every body's reads and writes merged.
+#include <functional>
 #include <regex>
 
 #include "lintcfg.hpp"
@@ -580,6 +581,52 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
         }
         visitDefault(body);
         finish();
+        glue();
+    }
+
+    // STY016: a module that instantiates others and also has logic of its own
+    // (glue logic in a hierarchical module: STARC and the RMM keep the two
+    // apart, so each level is either structure or logic). Wiring is not logic:
+    // an assign of a name, a select, a concatenation or a constant.
+    void glue() {
+        if (!on("STY016") || tb) return;
+        bool inst = false;
+        SourceLocation logic;
+        std::function<bool(const Expression&)> wiring = [&](const Expression& e) -> bool {
+            const Expression& x = strip(e);
+            switch (x.kind) {
+                case ExpressionKind::NamedValue:
+                case ExpressionKind::HierarchicalValue:
+                case ExpressionKind::IntegerLiteral:
+                case ExpressionKind::UnbasedUnsizedIntegerLiteral:
+                    return true;
+                case ExpressionKind::ElementSelect: return wiring(x.as<ElementSelectExpression>().value());
+                case ExpressionKind::RangeSelect: return wiring(x.as<RangeSelectExpression>().value());
+                case ExpressionKind::Concatenation:
+                    for (auto* o : x.as<ConcatenationExpression>().operands())
+                        if (!wiring(*o)) return false;
+                    return true;
+                case ExpressionKind::Replication: return wiring(x.as<ReplicationExpression>().concat());
+                default: return false;
+            }
+        };
+        for (const Symbol& m : body.members()) {
+            if (m.kind == SymbolKind::Instance && m.as<InstanceSymbol>().isModule()) inst = true;
+            if (logic) continue;
+            if (m.kind == SymbolKind::ProceduralBlock) {
+                auto k = m.as<ProceduralBlockSymbol>().procedureKind;
+                if (k != ProceduralBlockKind::Initial && k != ProceduralBlockKind::Final) logic = m.location;
+            } else if (m.kind == SymbolKind::ContinuousAssign) {
+                const Expression& e = m.as<ContinuousAssignSymbol>().getAssignment();
+                if (e.kind == ExpressionKind::Assignment && !wiring(e.as<AssignmentExpression>().right()))
+                    logic = m.location ? m.location : e.sourceRange.start();
+            }
+        }
+        if (inst && logic)
+            rep.add("STY016", logic,
+                    "logic in module '" + std::string(body.name) +
+                        "', which also instantiates submodules; move it into a submodule so each level is "
+                        "either structure or logic");
     }
 
     // ------------------------------------------------------------ reads, writes
