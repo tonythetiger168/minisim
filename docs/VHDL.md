@@ -104,7 +104,7 @@ and the std.env report and assert API (`GetVhdlAssertCount`,
 std.env's calendar time (`time_record`, `dayofweek`, `epoch`,
 `localtime`, `gmtime`, `to_string` of a time record, `+` and `-` on time
 records, `time_to_seconds`,
-`seconds_to_time`), `getenv`, directories (`dir_workingdir`,
+`seconds_to_time`), `getenv`, directories (`dir_open` and `dir_close` with the `directory` record, its items in name order, `dir_workingdir`,
 `dir_itemexists`, `dir_itemisdir`, `dir_itemisfile`, `dir_createdir`,
 `dir_deletedir`, `dir_deletefile` as functions and procedures,
 `dir_separator`) and the PSL queries (16.5.5 - 16.5.7, 16.5.10). msim
@@ -183,10 +183,8 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   integer subtype (`natural`, `integer range 0 to 15`); an out-of-range
   enumeration or real value, index, or actual in a port or parameter
   association is not checked.
-- VHDL-2019: an array mode view needs an array with static bounds; std.env's
-  `dir_open` / `dir_close` (the `directory` record with its item list)
-  and the call path functions
-  (`get_call_path`); `'image` of arrays whose elements are not integers,
+- VHDL-2019: an array mode view needs an array with static bounds; std.env's call path
+  functions (`get_call_path`); `'image` of arrays whose elements are not integers,
   characters or bits; the read severity is kept but textio reads do not
   report with it; `{i}` in an assert format is the module instance path
   (`:top:u1:`), without the process label; the reflection API (`'reflect`,
