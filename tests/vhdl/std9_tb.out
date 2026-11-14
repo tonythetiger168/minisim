@@ -1,0 +1,11 @@
+std9.vhd:53:5:@0ms:(report note): s='U' v=UUUU w=LH01 x='U'
+std9.vhd:55:5:@1ns:(report note): c=1010 p='L' and=0101 notU='U'
+std9.vhd:56:5:@1ns:(report note): UandO='0' UorO='U' UorH='1'
+std9.vhd:57:5:@1ns:(report note): sda='H' bus=LLLL
+std9.vhd:63:5:@2ns:(report note): s='H' v=UX-W s=H true s=1 false
+std9.vhd:64:5:@2ns:(report note): v=UX-W true v=XX-W false x01=XXXX
+std9.vhd:65:5:@2ns:(report note): sda='0' bus=L1L1 cnt=1
+std9.vhd:68:5:@2ns:(report note): x='W' r=UXXX ux01='U'
+std9.vhd:72:5:@3ns:(report note): sda='W' x01='X'
+std9.vhd:76:5:@4ns:(report note): sda='U' cnt=2
+std9.vhd:79:5:@5ns:(report note): sda='X' eqX true

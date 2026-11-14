@@ -53,7 +53,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | generic package, package instantiation (4.7, 4.9) | in a library, architecture, block, process or subprogram; one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals, and a package generic (6.5.6.4) names the actual instance |
 | an integer assigned to a subtype with a range (5.2.1) | a range check: out of range prints `file:line:@time:(bound check failure)` on stderr and stops the run with a non-zero exit, as GHDL does |
 | conditional analysis (24.2) | done on the source text before parsing. `TOOL_TYPE` is `"SIMULATION"`, `VHDL_VERSION` `"2019"`, `TOOL_VENDOR` `"minisim"`, `TOOL_NAME` `"msim"`; `+define+NAME=VALUE` (or `-D`) adds or overrides an identifier |
-| mode view port (6.5.2) | one SystemVerilog port per record element in the element's mode; inside the module the port is a record signal |
+| mode view port (6.5.2) | one SystemVerilog port per record element in the element's mode (`<port>__<element>`), recursively through element views and, for `view (v) of t`, through each array index (`<port>__<i>__<element>`); inside the module the port is a record signal |
 | `report`, `assert` | a message in GHDL's format (`file:line:col:@time:(report note): text`); severity failure stops the run with a non-zero exit |
 | `std.env.stop` / `finish` | `$stop` / `$finish` |
 | enumerations, records, arrays | enum, packed or unpacked struct, packed (bit-like elements) or unpacked arrays |
@@ -88,9 +88,28 @@ readline/writeline, files), `std.env`, `ieee.std_logic_1164`,
 matching relational operators and `??`, `justify`, and VHDL-2019's
 `std.env` tool and source queries (`tool_name`, `vhdl_version`,
 `file_name`, `file_path`, `file_line`). VHDL-2019 also brings mode views
-(`view`, `'converse` through an alias, 6.5.2), conditional analysis
+(`view`, `'converse`, a view as an element's mode, `view (v) of t` on
+arrays of records, 6.5.2), conditional analysis
 (`` `if ``, `` `elsif ``, `` `else ``, `` `end ``, `` `warning ``, `` `error ``,
-24.2), sequential block statements (10.15) and `return x when c else y`.
+24.2), sequential block statements (10.15), `return x when c else y`,
+conditional expressions in initial values, defaults and parentheses
+(`constant c : integer := 1 when n > 3 else 2;`, 9.1), empty records,
+`'image` of records and of string, bit-vector and integer array types (16.2.2), an
+interface list ending in `;`, generic type classes (`type t is (<>)`,
+`range <>`, `range <>.<>`, `array (i range <>) of type is private`, 6.5.3)
+and the std.env report and assert API (`GetVhdlAssertCount`,
+`IsVhdlAssertFailed`, `ClearVhdlAssert`, `SetVhdlAssertEnable`,
+`GetVhdlAssertEnable`, `SetVhdlAssertFormat` with `{s}` `{S}` `{r}` `{t}`
+`{i}`, `GetVhdlAssertFormat`, `Set/GetVhdlReadSeverity`; 16.5.9), and
+std.env's calendar time (`time_record`, `dayofweek`, `epoch`,
+`localtime`, `gmtime`, `to_string` of a time record, `+` and `-` on time
+records, `time_to_seconds`,
+`seconds_to_time`), `getenv`, directories (`dir_workingdir`,
+`dir_itemexists`, `dir_itemisdir`, `dir_itemisfile`, `dir_createdir`,
+`dir_deletedir`, `dir_deletefile` as functions and procedures,
+`dir_separator`) and the PSL queries (16.5.5 - 16.5.7, 16.5.10). msim
+exports small helpers for the time and directory calls, which the
+translation reaches through DPI-C.
 Attributes: `'event`, `'active`,
 `'last_value`, `'last_event`, `'last_active`, `'stable`, `'stable(T)`,
 `'quiet`, `'quiet(T)`, `'delayed`, `'delayed(T)`, `'transaction`, `'length`, `'range`, `'reverse_range`, `'left`,
@@ -99,6 +118,27 @@ Attributes: `'event`, `'active`,
 
 ## Checking against an independent simulator
 
+## Nine-value std_logic
+
+`std_logic` and `std_logic_vector` keep all nine values `U X 0 1 Z W L H -`
+(IEEE 1076-2019 16.7): a signal never assigned prints `'U'`, two `'H'`
+pull-ups resolve to `'H'`, `'L' and '1'` is `'0'`, `'U' or '0'` is `'U'`,
+and `to_x01`, `'image`, `to_string`, `=` and `textio` see every value.
+
+Each `std_logic` object is a four-state SystemVerilog variable (its
+four-value view: `L`/`H` read as `0`/`1`, `U`/`W` as `x`, `'-'` as `z`)
+plus a companion `<name>__9` that holds the weak/uninitialized bit. The
+four-value view is what SystemVerilog, UPF, waveforms and VPI see, so a
+mixed design needs no conversion at the boundary: an SV module driving a
+VHDL `in` port drives strong values, and a VHDL `out` port read by SV gives
+`0`/`1`/`x`/`z`. A resolved signal with weak drivers resolves with
+SystemVerilog drive strengths (`weak0`/`weak1`), as 16.7's resolution table.
+
+`msim -vhdl4` turns the companions off: std_logic then runs on the four
+values only (`'U'`, `'W'`, `'-'` are `'X'`, `'L'` is `'0'`, `'H'` is `'1'`).
+That is about twice as fast in the interpreter (NEORV32's processor test:
+55 s with `-vhdl4`, 103 s with nine values, for 300 µs).
+
 Every VHDL test in `tests/vhdl` has a golden output made with GHDL, an
 independent open-source VHDL simulator. `ctest -R vhdl` runs msim against the
 goldens; when `ghdl` is installed, the `vhdl_ghdl_*` tests also re-make each
@@ -106,13 +146,17 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
 
 ## Limits / Not yet
 
-- std_logic's nine values run on SystemVerilog's four: `'U'`, `'W'`, `'-'`
-  become `'X'`, `'L'` becomes `'0'`, `'H'` becomes `'1'`. `std_logic'image`
-  and `to_string` therefore print `X` where GHDL prints `U` for a signal
-  never assigned.
+- std_logic keeps all nine values (see "Nine-value std_logic" above) for
+  signals, variables, ports between VHDL units and literals. Record fields,
+  arrays of vectors, subprogram parameters and `inout` ports carry only the
+  four-value view: `'L'`/`'H'` read as `'0'`/`'1'` and `'U'`/`'W'` as `'X'`
+  there. A `case` selector compares the four-value view only.
 - A character of a `string(1 to n)` variable that was never assigned is a
   space, where VHDL has NUL (SystemVerilog strings hold no NUL).
-- A conversion on the formal of an `inout` port (out ports have it).
+- On an `inout` port, the conversions on the formal and the actual must be
+  type conversions between arrays of std_logic-based elements (such as
+  `std_logic_vector(io) => unsigned(bus)`); a conversion function there is
+  not supported. In and out ports take both kinds.
 - A package instance declared in an architecture, block, process or
   subprogram is a package of the same name, so two of them in the design
   need distinct names, and its generic actuals cannot name the enclosing
@@ -139,6 +183,11 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   integer subtype (`natural`, `integer range 0 to 15`); an out-of-range
   enumeration or real value, index, or actual in a port or parameter
   association is not checked.
-- VHDL-2019: a mode view as the mode of a record element, mode views of
-  arrays, `'converse` used directly in a port (use an alias); interfaces
-  and the other 2019 additions not listed under "Supported language".
+- VHDL-2019: an array mode view needs an array with static bounds; std.env's
+  `dir_open` / `dir_close` (the `directory` record with its item list)
+  and the call path functions
+  (`get_call_path`); `'image` of arrays whose elements are not integers,
+  characters or bits; the read severity is kept but textio reads do not
+  report with it; `{i}` in an assert format is the module instance path
+  (`:top:u1:`), without the process label; the reflection API (`'reflect`,
+  std.reflection).

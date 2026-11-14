@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <map>
 #include <set>
+#include <array>
 #include <unordered_map>
 #include <unordered_set>
 #include <sstream>
@@ -431,6 +432,7 @@ public:
             initText.clear();
         }
         std::vector<std::string> outFiles;   // split: design.hpp, then each part (main() goes to design.cpp)
+        std::unordered_map<std::string, std::string> rename;   // split with relocText: function -> its name after its text
         if (nf > 1) {
             // Process functions become external, declared in the header.
             std::string protos;
@@ -449,37 +451,141 @@ public:
                 }
                 c = std::move(out);
             }
+            // Signal numbers in the parts: link-time symbols (relocText).
+            std::vector<std::set<std::string>> csyms(chunks.size());
+            const bool reloc = relocOn() && !std::getenv("MSIM_FULLHDR");
+            std::vector<char> global(chunks.size(), 0);   // design.cpp: dispatch and tables, renumbered by any edit
+            std::string globalCode;
+            std::vector<std::string> kinds(chunks.size()), pkey(chunks.size());
+            if (reloc) {
+                buildSymOf();
+                // Each chunk's function, by name; the code of one process or one
+                // shared template stays in the parts, the rest (combAll, twoNow,
+                // the calls of a template with an instance's distances, ...)
+                // goes to design.cpp, which every edit rebuilds anyway.
+                auto fnName = [](const std::string& c) {
+                    size_t at = 0;
+                    while (at < c.size() && c.compare(at, 2, "//") == 0) at = c.find('\n', at) + 1;
+                    size_t nl = c.find('\n', at);
+                    std::string ln = c.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+                    std::string name;
+                    for (size_t i = 0; i < ln.size();) {
+                        if (std::isalpha((unsigned char)ln[i]) || ln[i] == '_') {
+                            size_t j = i;
+                            while (j < ln.size() && (std::isalnum((unsigned char)ln[j]) || ln[j] == '_')) j++;
+                            std::string id = ln.substr(i, j - i);
+                            if (j < ln.size() && ln[j] == '(' && id != "__attribute__" && id != "noinline" && id != "cold" && id != "used") { name = id; break; }
+                            i = j;
+                        } else i++;
+                    }
+                    return name;
+                };
+                auto localKind = [](const std::string& n) {
+                    size_t a = 0;
+                    while (a < n.size() && std::isalpha((unsigned char)n[a])) a++;
+                    std::string pre = n.substr(0, a);
+                    if (a == n.size() || !std::isdigit((unsigned char)n[a])) return std::string();
+                    static const char* ok[] = {"proc", "ds", "dsT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS"};
+                    for (const char* k : ok) if (pre == k) return pre + (n.size() > 2 && n.compare(n.size() - 2, 2, "_2") == 0 ? "2" : "");
+                    return std::string();
+                };
+                std::vector<std::string> names(chunks.size());
+                for (size_t i = 0; i < chunks.size(); i++) {
+                    names[i] = fnName(chunks[i]);
+                    std::string k = localKind(names[i]);
+                    kinds[i] = k;
+                    if (k.empty() || chunks[i].find("{ dsT") != std::string::npos) global[i] = 1;
+                }
+                // A process's or template's function and its part are named
+                // after a key that neither a logic edit nor renumbering
+                // changes: its kind and the first signal it writes (an NBA
+                // slot), else the first it names, by symbol (a hash of the
+                // signal's name), with an ordinal for the same key twice.
+                // So a logic edit changes only that function's text: its
+                // part is rebuilt and design.cpp (which calls it) is not.
+                // Only the parts' code goes by symbols; design.cpp keeps the
+                // numbers (it is rebuilt on any edit, and has no extern decls).
+                for (size_t i = 0; i < chunks.size(); i++)
+                    if (!global[i]) chunks[i] = localNames(relocText(chunks[i], csyms[i]));
+                auto mapIds = mapIdents;
+                std::unordered_map<std::string, int> taken;
+                for (size_t i = 0; i < chunks.size(); i++) {
+                    if (global[i] || names[i].empty()) continue;
+                    std::string k = kinds[i];   // a process's 2-state copy goes with it
+                    if (!k.empty() && k.back() == '2') k.pop_back();
+                    std::string m;
+                    bool sl = false;
+                    for (auto& y : csyms[i]) if (y.compare(0, 3, "SL_") == 0) { sl = true; break; }
+                    for (auto& y : csyms[i]) {
+                        if (sl && y.compare(0, 3, "SL_") != 0) continue;
+                        std::string b = y.size() > 3 ? y.substr(3) : y;
+                        if (m.empty() || b < m) m = b;
+                    }
+                    std::string key = k + ":" + m;
+                    key += "#" + std::to_string(taken[kinds[i] + ":" + m]++);
+                    pkey[i] = key;
+                    uint64_t h = 1469598103934665603ULL;
+                    for (char c : key) h = (h ^ (unsigned char)c) * 1099511628211ULL;
+                    char hx[24];
+                    std::snprintf(hx, sizeof hx, "%012llx", (unsigned long long)(h & 0xffffffffffffULL));
+                    rename[names[i]] = kinds[i] + "_" + hx;
+                }
+                auto ren = [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; };
+                for (auto& c : chunks) c = mapIds(c, ren);
+                protos = mapIds(protos, ren);
+                cycHdr = mapIds(cycHdr, ren);
+                std::string pre = mapIds(o.str(), ren);
+                o.str("");
+                o << pre;
+                for (size_t i = 0; i < chunks.size(); i++) if (global[i]) globalCode += chunks[i];
+            }
             // The header: what does not depend on the design's numbering
             // (declSplit); the rest goes to the parts that name it, and all of
             // it to design.cpp.
             std::string stable = o.str() + "\n" + protos + cycHdr;
+            if (reloc)
+                stable += "#define MSIM_RELOC 1   // parts and simv without PIE (msim.cpp runCompiled)\n"
+                          "#define SGS(o) (*(Sig*)((char*)S.sigs.data() + (o)))\n"
+                          "#define SNI(x) ((int)(intptr_t)(x))\n";
             std::vector<HdrItem> hitems;
             if (!std::getenv("MSIM_FULLHDR")) { std::string all = std::move(stable); declSplit(all, stable, hitems); }
             std::unordered_map<std::string, int> howner;
             for (size_t i = 0; i < hitems.size(); i++) for (auto& x : hitems[i].names) howner[x] = (int)i;
             outFiles.push_back(stable);
-            // Each chunk goes to the file its key picks: a hash of its text
-            // with the numbers left out. An edit changes only the chunks of
-            // what was edited, so only their files are rebuilt (a part is
-            // rebuilt when its text changes, msim.cpp runCompiled); the
-            // instances of one process (the same text but for signal numbers
-            // and constants) share a file, and renumbering moves nothing.
-            // Filling the smallest file first balanced the files better (a
-            // full build of 4 Ibex cores took 6% less) but moved chunks between
-            // them on any edit, so every file was rebuilt; so did a load cap.
+            // Each chunk goes to the file its key picks: the first line that
+            // is not a comment (the function's signature) with the numbers
+            // left out, and how many chunks before it had that same line. A
+            // logic edit changes only the text of the chunks of what was
+            // edited, and they stay in their files, so only those files are
+            // rebuilt (a part is rebuilt when its text changes, msim.cpp
+            // runCompiled); renumbering signals or processes moves nothing.
+            // Only a process added or removed moves the later ones of its
+            // kind. (A hash of the whole text moved an edited chunk to
+            // another file: two files rebuilt for it.) Filling the smallest
+            // file first balanced the files better (a full build of 4 Ibex
+            // cores took 6% less) but moved chunks on any edit; so did a load cap.
             std::vector<std::vector<size_t>> mine(nf);
             std::vector<size_t> load(nf, 0);
+            std::unordered_map<std::string, int> seen;
             for (size_t i = 0; i < chunks.size(); i++) {
-                uint64_t h = 1469598103934665603ULL;
+                if (global[i]) continue;
                 const std::string& c = chunks[i];
-                for (size_t k = 0; k < c.size(); k++) {
+                size_t at = 0;
+                while (at < c.size() && c.compare(at, 2, "//") == 0) { size_t nl = c.find('\n', at); at = nl == std::string::npos ? c.size() : nl + 1; }
+                size_t nl = c.find('\n', at);
+                std::string sig;
+                for (size_t k = at; k < (nl == std::string::npos ? c.size() : nl); k++) {
                     if (c[k] >= '0' && c[k] <= '9') {   // a number: 12, 0x1fULL
                         if (c[k] == '0' && k + 1 < c.size() && c[k + 1] == 'x') k++;
                         while (k + 1 < c.size() && std::isxdigit((unsigned char)c[k + 1])) k++;
                         continue;
                     }
-                    h = (h ^ (unsigned char)c[k]) * 1099511628211ULL;
+                    sig += c[k];
                 }
+                if (!pkey[i].empty()) sig = pkey[i];
+                else sig += "#" + std::to_string(seen[sig]++);
+                uint64_t h = 1469598103934665603ULL;
+                for (char ch : sig) h = (h ^ (unsigned char)ch) * 1099511628211ULL;
                 h ^= h >> 29;
                 int f = (int)(h % (uint64_t)nf);
                 load[f] += c.size();
@@ -490,15 +596,16 @@ public:
             for (int f = 0; f < nf; f++) {
                 std::sort(mine[f].begin(), mine[f].end());   // process order within a file
                 std::string body;
-                for (size_t i : mine[f]) body += chunks[i];
-                outFiles.push_back("#include \"design.hpp\"\n\n" + partDecls(body, hitems, howner) + "\n" + body);
+                std::set<std::string> syms;
+                for (size_t i : mine[f]) { body += chunks[i]; syms.insert(csyms[i].begin(), csyms[i].end()); }
+                outFiles.push_back("#include \"design.hpp\"\n\n" + relocDecls(syms) + partDecls(body, hitems, howner) + "\n" + body);
             }
             o.str("");
             o << (kernelObj ? "#include \"design.hpp\"\n\n" : "#include \"design.hpp\"\n\nSim S;\n\n");
             for (auto& h : hitems) o << h.decl;
             o << "\n";
             for (auto& h : hitems) o << h.def;
-            o << "\n";
+            o << "\n" << relocAsm() << "\n" << globalCode;
         } else
             for (auto& c : chunks) o << c;
         o << cyc;
@@ -601,9 +708,18 @@ public:
             std::sort(ins.begin(), ins.end());
             ins.erase(std::unique(ins.begin(), ins.end()), ins.end());
             if (!coneIns_.empty()) {   // the clock cone runs first, on the clocks alone
-                o << "    S.addComb(combCone, nullptr, {";
-                for (size_t j = 0; j < coneIns_.size(); j++) o << (j ? ", " : "") << coneIns_[j];
-                o << "});\n";
+                std::vector<int> rest;
+                for (int x : coneIns_) if (!coneK_ || !std::binary_search(coneClkIns_.begin(), coneClkIns_.end(), x)) rest.push_back(x);
+                if (coneK_) {
+                    o << "    S.addComb(combConeK, nullptr, {";
+                    for (size_t j = 0; j < coneClkIns_.size(); j++) o << (j ? ", " : "") << coneClkIns_[j];
+                    o << "});\n";
+                }
+                if (!rest.empty()) {
+                    o << "    S.addComb(combCone, nullptr, {";
+                    for (size_t j = 0; j < rest.size(); j++) o << (j ? ", " : "") << rest[j];
+                    o << "});\n";
+                }
                 std::erase_if(ins, [&](int x) {
                     return std::binary_search(coneIns_.begin(), coneIns_.end(), x) || std::binary_search(coneOuts_.begin(), coneOuts_.end(), x);
                 });
@@ -701,12 +817,13 @@ public:
                  "        return 1;\n"
                  "    }\n";
         if (cov) o << "    if (covOut && !writeCov(covOut)) { std::cerr << \"simv: cannot write \" << covOut << \"\\n\"; return 1; }\n";
-        o << "    return 0;\n"
+        o << "    return S.exitCode;\n"
              "}\n";
         if (outFiles.empty()) return o.str();
         // Files after one another, each after a marker line msim splits on.
         std::string all = std::string(kFileMark) + "design.hpp\n" + outFiles[0];
-        all += std::string(kFileMark) + "design.cpp\n" + o.str();
+        all += std::string(kFileMark) + "design.cpp\n" +
+               (rename.empty() ? o.str() : mapIdents(o.str(), [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; }));
         for (size_t f = 1; f < outFiles.size(); f++) all += std::string(kFileMark) + "part" + std::to_string(f - 1) + ".cpp\n" + outFiles[f];
         return all;
     }
@@ -1191,8 +1308,24 @@ private:
                 return true;
             }
             case Op::Slice: {
-                if (!kid(0, A, fa)) return false;
                 int w = e->hi - e->lo + 1;
+                const E& r = e->kids.empty() ? e : e->kids[0];
+                if (r && r->op == Op::Ref && r->sig >= 0 && r->sig < (int)sigW_.size() && sigW_[r->sig] > 64 && !isPriv(r->sig) &&
+                    e->lo >= 0 && w >= 1 && w <= 64 && e->hi < sigW_[r->sig]) {
+                    // Up to 64 bits of a wider signal in S.sigs: from its limbs
+                    // (one or two), known when those limbs are.
+                    int l0 = e->lo / 64, l1 = e->hi / 64, sh = e->lo % 64;
+                    std::string val = "S.sigs[" + std::to_string(r->sig) + "].val";
+                    auto lv = [&](int l) { return "limbV(" + val + ", " + std::to_string(l) + ")"; };
+                    auto lx = [&](int l) { return "limbX(" + val + ", " + std::to_string(l) + ")"; };
+                    std::string a = "(" + lv(l0) + " >> " + std::to_string(sh) + ")";
+                    if (l1 != l0) a = "(" + a + " | (" + lv(l1) + " << " + std::to_string(64 - sh) + "))";
+                    out = "(" + a + " & " + M(w) + ")";
+                    fxXg_.push_back(l1 != l0 ? lx(l0) + " | " + lx(l1) : lx(l0));
+                    fi = {w, false};
+                    return true;
+                }
+                if (!kid(0, A, fa)) return false;
                 if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64) return false;
                 out = "((" + A + " >> " + std::to_string(e->lo) + ") & " + M(w) + ")";
                 fi = {w, false};
@@ -1257,15 +1390,228 @@ private:
                 return false;
         }
     }
+    // ---- 4-state path in two words ----
+    // When some input holds X (PicoRV32 drives 'bx onto its datapath every
+    // cycle), the Val helpers cost a call and a by-value copy per operator.
+    // For the same operators as fx(), up to 64 bits, this computes the value
+    // word and the X word inline (as expr.hpp does: a value bit is 0 where
+    // its X bit is set). It applies while no input holds Z (zGuard); the
+    // result is then free of Z too. Each operator becomes one temporary in
+    // `pre` (names _v<n> / _x<n>), so shared operands are not repeated.
+    std::string zRef(int s) const { return isPriv(s) ? "P" + std::to_string(s) + ".z" : "S.sigs[" + std::to_string(s) + "].val.z"; }
+    bool fx4(const E& e, std::string& V, std::string& X, FastInfo& fi, std::vector<int>& refs, std::string& pre, int& tn) {
+        if (!e) return false;
+        auto kid = [&](int i, std::string& v, std::string& x, FastInfo& f) {
+            return i < (int)e->kids.size() && fx4(e->kids[i], v, x, f, refs, pre, tn);
+        };
+        auto tmp = [&](const std::string& v, const std::string& x) {
+            std::string n = std::to_string(tn++);
+            pre += "const uint64_t _v" + n + " = " + v + ", _x" + n + " = " + x + "; ";
+            V = "_v" + n;
+            X = "_x" + n;
+        };
+        std::string A, AX, B, BX, C, CX;
+        FastInfo fa{}, fb{}, fc{};
+        switch (e->op) {
+            case Op::Const:
+                if (e->k.w > 64 || e->k.w < 1 || e->k.real || e->k.str || !e->k.hi.empty() || e->k.z) return false;
+                V = hex(e->k.v & ~e->k.x & mask(e->k.w));
+                X = hex(e->k.x & mask(e->k.w));
+                fi = {e->k.w, e->k.sgn};
+                return true;
+            case Op::Ref:
+                if (e->sig < 0 || e->sig >= (int)sigW_.size() || sigW_[e->sig] > 64 || sigW_[e->sig] < 1) return false;
+                refs.push_back(e->sig);
+                tmp("(" + vRef(e->sig) + " & ~" + xRef(e->sig) + ")", xRef(e->sig));
+                fi = {sigW_[e->sig], e->sgn};
+                return true;
+            case Op::Not:
+                if (!kid(0, A, AX, fa)) return false;
+                tmp("(~" + A + " & ~" + AX + " & " + M(fa.w) + ")", AX);
+                fi = fa;
+                return true;
+            case Op::And: case Op::Or: case Op::Xor: {
+                if (!kid(0, A, AX, fa) || !kid(1, B, BX, fb)) return false;
+                int w = std::max(fa.w, fb.w);
+                if (e->op == Op::And)   // a known 0 on either side gives 0
+                    tmp("(" + A + " & " + B + ")", "((" + AX + " | " + BX + ") & ((" + A + " | " + AX + ") & (" + B + " | " + BX + ")))");
+                else if (e->op == Op::Or)   // a known 1 on either side gives 1
+                    tmp("(" + A + " | " + B + ")", "((" + AX + " | " + BX + ") & ~(" + A + " | " + B + "))");
+                else
+                    tmp("((" + A + " ^ " + B + ") & ~(" + AX + " | " + BX + "))", "(" + AX + " | " + BX + ")");
+                fi = {w, fa.sgn && fb.sgn};
+                return true;
+            }
+            case Op::Add: case Op::Sub: case Op::Mul: {   // any X: all X
+                if (!kid(0, A, AX, fa) || !kid(1, B, BX, fb)) return false;
+                int w = std::max(fa.w, fb.w);
+                bool sg = fa.sgn && fb.sgn;
+                const char* o = e->op == Op::Add ? " + " : e->op == Op::Sub ? " - " : " * ";
+                std::string q = "(" + AX + " | " + BX + ")";
+                tmp("(" + q + " ? 0ULL : ((" + ext(A, fa.w, w, sg) + o + ext(B, fb.w, w, sg) + ") & " + M(w) + "))",
+                    "(" + q + " ? " + M(w) + " : 0ULL)");
+                fi = {w, sg};
+                return true;
+            }
+            case Op::Eq: case Op::Ne: case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: {
+                if (!kid(0, A, AX, fa) || !kid(1, B, BX, fb)) return false;
+                int w = std::max(fa.w, fb.w);
+                bool sg = fa.sgn && fb.sgn;
+                std::string a = ext(A, fa.w, w, sg), b = ext(B, fb.w, w, sg), ax = ext(AX, fa.w, w, sg), bx = ext(BX, fb.w, w, sg);
+                std::string anyx = "((" + AX + " | " + BX + ") != 0)";
+                if (e->op == Op::Eq || e->op == Op::Ne) {   // a known bit that differs decides; else any X gives X
+                    std::string d = "(((" + a + " ^ " + b + ") & ~" + ax + " & ~" + bx + ") != 0)";
+                    std::string val = e->op == Op::Eq ? "!" + d : d;
+                    tmp("(uint64_t)(!(!" + d + " && " + anyx + ") && " + val + ")", "(uint64_t)(!" + d + " && " + anyx + ")");
+                } else {
+                    if (sg) { a = "(int64_t)" + sx(a, w); b = "(int64_t)" + sx(b, w); }
+                    const char* o = e->op == Op::Lt ? " < " : e->op == Op::Le ? " <= " : e->op == Op::Gt ? " > " : " >= ";
+                    tmp("(uint64_t)(!" + anyx + " && (" + a + o + b + "))", "(uint64_t)" + anyx);
+                }
+                fi = {1, false};
+                return true;
+            }
+            case Op::CaseEq: case Op::CaseZEq:   // no Z (zGuard): every bit, X included, compared as is
+                if (!kid(0, A, AX, fa) || !kid(1, B, BX, fb)) return false;
+                tmp("(uint64_t)(" + A + " == " + B + " && " + AX + " == " + BX + ")", "0ULL");
+                fi = {1, false};
+                return true;
+            case Op::CaseXEq:     // X bits on either side match anything
+                if (!kid(0, A, AX, fa) || !kid(1, B, BX, fb)) return false;
+                tmp("(uint64_t)(((" + A + " ^ " + B + ") & ~(" + AX + " | " + BX + ")) == 0)", "0ULL");
+                fi = {1, false};
+                return true;
+            case Op::Shl: case Op::Shr: {   // an unknown amount: all X
+                if (!kid(0, A, AX, fa) || !kid(1, B, BX, fb)) return false;
+                std::string u = "(" + BX + " != 0)", big = "(" + B + " >= 64)";
+                if (e->op == Op::Shl)
+                    tmp("(" + u + " || " + big + " ? 0ULL : ((" + A + " << " + B + ") & " + M(fa.w) + "))",
+                        "(" + u + " ? " + M(fa.w) + " : " + big + " ? 0ULL : ((" + AX + " << " + B + ") & " + M(fa.w) + "))");
+                else
+                    tmp("(" + u + " || " + big + " ? 0ULL : (" + A + " >> " + B + "))",
+                        "(" + u + " ? " + M(fa.w) + " : " + big + " ? 0ULL : (" + AX + " >> " + B + "))");
+                fi = fa;
+                return true;
+            }
+            case Op::SysFn:
+                if (e->hi != SF_TO_2STATE || !kid(0, A, AX, fi)) return false;
+                V = A;
+                X = "0ULL";
+                return true;
+            case Op::Resize: {
+                if (!kid(0, A, AX, fa)) return false;
+                int w = e->hi;
+                if (w < 1 || w > 64) return false;
+                bool fill = e->lo && w > fa.w;
+                tmp("(" + (fill ? sx(A, fa.w) : A) + " & " + M(w) + ")", "(" + (fill ? sx(AX, fa.w) : AX) + " & " + M(w) + ")");
+                fi = {w, e->sgn};
+                return true;
+            }
+            case Op::LogNot:
+                if (!kid(0, A, AX, fa)) return false;
+                tmp("(uint64_t)(" + A + " == 0 && " + AX + " == 0)", "(uint64_t)(" + A + " == 0 && " + AX + " != 0)");
+                fi = {1, false};
+                return true;
+            case Op::LogAnd: case Op::LogOr: {
+                if (!kid(0, A, AX, fa) || !kid(1, B, BX, fb)) return false;
+                std::string a1 = "(" + A + " != 0)", b1 = "(" + B + " != 0)";
+                std::string a0 = "(" + A + " == 0 && " + AX + " == 0)", b0 = "(" + B + " == 0 && " + BX + " == 0)";
+                if (e->op == Op::LogAnd)
+                    tmp("(uint64_t)(" + a1 + " && " + b1 + ")", "(uint64_t)(!(" + a0 + " || " + b0 + ") && !(" + a1 + " && " + b1 + "))");
+                else
+                    tmp("(uint64_t)(" + a1 + " || " + b1 + ")", "(uint64_t)(!(" + a1 + " || " + b1 + ") && !(" + a0 + " && " + b0 + "))");
+                fi = {1, false};
+                return true;
+            }
+            case Op::RedAnd: case Op::RedOr: case Op::RedXor: {
+                if (!kid(0, A, AX, fa)) return false;
+                if (e->op == Op::RedAnd) {
+                    std::string k0 = "((" + M(fa.w) + " & ~" + AX + " & ~" + A + ") != 0)";
+                    tmp("(uint64_t)(!" + k0 + " && " + AX + " == 0)", "(uint64_t)(!" + k0 + " && " + AX + " != 0)");
+                } else if (e->op == Op::RedOr)
+                    tmp("(uint64_t)(" + A + " != 0)", "(uint64_t)(" + A + " == 0 && " + AX + " != 0)");
+                else
+                    tmp("(uint64_t)(" + AX + " == 0 && __builtin_parityll(" + A + "))", "(uint64_t)(" + AX + " != 0)");
+                fi = {1, false};
+                return true;
+            }
+            case Op::Slice: {
+                if (!kid(0, A, AX, fa)) return false;
+                int w = e->hi - e->lo + 1;
+                if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64) return false;
+                std::string l = std::to_string(e->lo);
+                tmp("((" + A + " >> " + l + ") & " + M(w) + ")", "((" + AX + " >> " + l + ") & " + M(w) + ")");
+                fi = {w, false};
+                return true;
+            }
+            case Op::Concat: {
+                if (e->kids.empty()) return false;
+                std::string rv, rx;
+                int w = 0;
+                for (size_t i = 0; i < e->kids.size();) {
+                    std::string P, PX;
+                    FastInfo fp{};
+                    if (!fx4(e->kids[i], P, PX, fp, refs, pre, tn)) return false;
+                    size_t j = i + 1;
+                    if (fp.w == 1) while (j < e->kids.size() && pureEq(e->kids[i], e->kids[j])) j++;
+                    int pw = fp.w * (int)(j - i);
+                    if (j - i > 1) {
+                        P = "(((uint64_t)0 - " + P + ") & " + M(pw) + ")";
+                        PX = "(((uint64_t)0 - " + PX + ") & " + M(pw) + ")";
+                    }
+                    w += pw;
+                    if (w > 64) return false;
+                    std::string sh = std::to_string(pw);
+                    rv = i ? "((" + rv + " << " + sh + ") | " + P + ")" : P;
+                    rx = i ? "((" + rx + " << " + sh + ") | " + PX + ")" : PX;
+                    i = j;
+                }
+                tmp(rv, rx);
+                fi = {w, false};
+                return true;
+            }
+            case Op::Mux: {   // an unknown condition: the bits both arms agree on, X elsewhere
+                if (!kid(0, C, CX, fc) || !kid(1, A, AX, fa) || !kid(2, B, BX, fb)) return false;
+                if (fa.w != fb.w || fa.sgn != fb.sgn) return false;
+                std::string t1 = "(" + C + " != 0)", tx = "(" + CX + " != 0)";
+                std::string same = "(~" + AX + " & ~" + BX + " & ~(" + A + " ^ " + B + ") & " + M(fa.w) + ")";
+                tmp("(" + t1 + " ? " + A + " : " + tx + " ? (" + A + " & " + same + ") : " + B + ")",
+                    "(" + t1 + " ? " + AX + " : " + tx + " ? (" + M(fa.w) + " & ~" + same + ") : " + BX + ")");
+                fi = fa;
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+    // `slow` (the Val code of e) with the two-word path in front of it when
+    // no input holds Z. Used where some input holds X: the cold branches.
+    std::string slow4(const E& e, const std::string& slow) {
+        if (!twoState || std::getenv("MSIM_NOFX4")) return slow;
+        std::string V, X, pre;
+        FastInfo fi{};
+        std::vector<int> refs;
+        int tn = 0;
+        if (!fx4(e, V, X, fi, refs, pre, tn)) return slow;
+        std::sort(refs.begin(), refs.end());
+        refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
+        std::string zg;
+        for (int r : refs) zg += (zg.empty() ? "" : " | ") + zRef(r);
+        std::string val = "({ " + pre + "Val{" + V + ", " + X + ", " + std::to_string(fi.w) + ", 0, " + (fi.sgn ? "true" : "false") + "}; })";
+        if (zg.empty()) return val;
+        return "((" + zg + ") == 0 ? " + val + " : " + slow + ")";
+    }
     // The expression as a Val, with the 2-state fast path when it applies.
     // The 2-state path in parts: `guard` true (or empty: always) means `u64`
     // is the value, else `slow`. False when there is no 2-state path.
     bool split(const E& e, std::string& guard, std::string& u64, std::string& slow) {
         slow = ex(e);
         if (!twoState) return false;
+        slow = slow4(e, slow);
         FastInfo fi{};
         std::vector<int> refs;
         fxOor_.clear();
+        fxXg_.clear();
         if (!fx(e, u64, fi, refs)) return false;
         // A run-time select that may fall outside its vector (the result is
         // then X): only where the caller tests the guard (dynOk_).
@@ -1274,11 +1620,13 @@ private:
         refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
         std::string g;
         for (int r : refs) g += (g.empty() ? "" : " | ") + xRef(r);
+        for (auto& x : fxXg_) g += (g.empty() ? "" : " | ") + x;
         guard = g.empty() ? "" : "(" + g + ") == 0";
         for (auto& c : fxOor_) guard += (guard.empty() ? "" : " && ") + ("!(" + c + ")");
         return true;
     }
     std::vector<std::string> fxOor_;   // fx: conditions under which the 2-state value does not hold
+    std::vector<std::string> fxXg_;    // fx: X words to test besides those of the refs (limbs of wide signals)
     bool dynOk_ = false;
     std::string fast(const E& e) {
         std::string slow = ex(e);
@@ -1287,11 +1635,13 @@ private:
         FastInfo fi{};
         std::vector<int> refs;
         fxOor_.clear();
+        fxXg_.clear();
         if (!fx(e, f, fi, refs)) return slow;
         std::sort(refs.begin(), refs.end());
         refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
         std::string g;
         for (int r : refs) g += (g.empty() ? "" : " | ") + xRef(r);
+        for (auto& x : fxXg_) g += (g.empty() ? "" : " | ") + x;
         if (!g.empty()) g = "(" + g + ") == 0";
         for (auto& c : fxOor_) g += (g.empty() ? "" : " && ") + ("!(" + c + ")");
         std::string val = "Val{" + f + ", 0, " + std::to_string(fi.w) + ", 0, " + (fi.sgn ? "true" : "false") + "}";
@@ -1303,7 +1653,7 @@ private:
     std::string assign(const Instr& i, std::string val = "") {
         if (val.empty()) val = fast(i.e);
         std::ostringstream o;
-        if (i.tmp || i.xq) {   // a temporary of the process, or a quiet -xprop write: no change event
+        if ((i.tmp || i.xq) && !isPriv(i.sig)) {   // a temporary of the process, or a quiet -xprop write: no change event
             o << " S.poke(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
             return o.str();
         }
@@ -1355,6 +1705,223 @@ private:
     // when signals were added or removed elsewhere: it is not rebuilt
     // (msim.cpp runCompiled). Anything not understood stays in the header,
     // which only costs that (MSIM_FULLHDR=1 keeps the whole header).
+    // ---- link-time signal numbers (split builds) ----
+    // A part names signals by their place in the signal table (S.sigs[N],
+    // P<N>), so adding or removing a signal anywhere renumbered the rest and
+    // changed every part. relocText writes those numbers as symbols named
+    // after the signal (SO_<name>: its byte offset in S.sigs, SN_<name>: its
+    // number, PV_<name>: its private copy), defined once in design.cpp
+    // (relocAsm) and resolved by the linker. A part then compiles to the same
+    // object until its own signals change. The code is the same as with the
+    // numbers: an absolute displacement or immediate (the parts and simv are
+    // built without PIE for this; msim.cpp runCompiled, MSIM_RELOC).
+    // x86-64 Linux only; MSIM_NORELOC=1 keeps the numbers.
+    std::vector<std::string> symOf_;          // signal -> symbol stem ("" when not relocated)
+    std::vector<std::array<int, 3>> slotSig_;   // NBA slot -> its target (sig, hi, lo), for slot symbols
+    std::vector<std::string> slotSym_;          // NBA slot -> its symbol ("" when not relocated)
+    std::map<std::string, std::string> relocSyms_;   // symbol -> its .set expression
+    static bool relocOn() {
+#if defined(__linux__) && defined(__x86_64__)
+        return !std::getenv("MSIM_NORELOC");
+#else
+        return false;
+#endif
+    }
+    void buildSymOf() {
+        symOf_.assign(sigName_.size(), "");
+        std::unordered_map<std::string, int> used;
+        for (size_t s = 0; s < sigName_.size(); s++) {
+            const std::string& n = sigName_[s];
+            if (n.empty()) continue;
+            uint64_t h = 1469598103934665603ULL;
+            for (char c : n) h = (h ^ (unsigned char)c) * 1099511628211ULL;
+            std::string m;
+            for (size_t i = n.size() > 48 ? n.size() - 48 : 0; i < n.size(); i++)
+                m += std::isalnum((unsigned char)n[i]) ? n[i] : '_';
+            char hx[24];
+            std::snprintf(hx, sizeof hx, "%012llx", (unsigned long long)(h & 0xffffffffffffULL));
+            std::string stem = std::string(hx) + "_" + m;
+            int& k = used[stem];
+            if (k++) stem += "_" + std::to_string(k - 1);   // the same name twice: in table order
+            symOf_[s] = stem;
+        }
+        // An NBA slot: its target's name, bits and how many slots before it
+        // have that same target.
+        slotSym_.assign(slotSig_.size(), "");
+        std::map<std::array<int, 3>, int> nth;
+        for (size_t k = 0; k < slotSig_.size(); k++) {
+            auto [sg, hi, lo] = slotSig_[k];
+            if (sg < 0 || (size_t)sg >= symOf_.size() || symOf_[(size_t)sg].empty()) continue;
+            int i = nth[slotSig_[k]]++;
+            slotSym_[k] = "SL_" + symOf_[(size_t)sg] + (hi >= 0 ? "_" + std::to_string(hi) + "_" + std::to_string(lo) : std::string()) +
+                          (i ? "_" + std::to_string(i) : std::string());
+        }
+    }
+    std::string relocText(const std::string& t, std::set<std::string>& syms) {
+        std::string r;
+        r.reserve(t.size() + t.size() / 4);
+        size_t last = 0, skipTo = 0;
+        auto stem = [&](long long n) -> const std::string* {
+            if (n < 0 || (size_t)n >= symOf_.size() || symOf_[(size_t)n].empty()) return nullptr;
+            return &symOf_[(size_t)n];
+        };
+        auto use = [&](const std::string& sym, const std::string& def) { syms.insert(sym); relocSyms_.emplace(sym, def); };
+        refScan(t, [&](size_t start, size_t at, size_t e, long long n, int kind) {
+            if (start < skipTo) return;
+            if (kind == 1) {   // P<N>: the private copy
+                const std::string* m = stem(n);
+                if (!m || !priv_.size() || (size_t)n >= priv_.size() || !priv_[(size_t)n]) return;
+                r.append(t, last, start - last);
+                std::string sym = "PV_" + *m;
+                use(sym, "PA+" + std::to_string(n) + "*%c1");
+                r += sym;
+                last = e;
+                return;
+            }
+            if (kind != 0) return;
+            const std::string* m = stem(n);
+            if (!m) return;
+            if (t.compare(start, 7, "S.sigs[") == 0) {
+                size_t close = t.find(']', e);
+                if (close == std::string::npos) return;
+                std::string rest = t.substr(e, close - e);
+                if (rest.find_first_of("[(") != std::string::npos) return;
+                std::string sym = "SO_" + *m;
+                use(sym, std::to_string(n) + "*%c0");
+                r.append(t, last, start - last);
+                r += "SGS((intptr_t)" + sym + (rest.empty() ? "" : " + (0" + rest + ") * (intptr_t)sizeof(Sig)") + ")";
+                last = close + 1;
+                skipTo = last;
+                return;
+            }
+            std::string sym = "SN_" + *m;
+            use(sym, std::to_string(n));
+            r.append(t, last, at - last);
+            r += "SNI(" + sym + ")";
+            last = e;
+        });
+        r.append(t, last, std::string::npos);
+        // PA[N + D<c>] (shared comb code, refParam): the private copy of the
+        // first instance, moved by D.
+        std::string o;
+        o.reserve(r.size());
+        for (size_t i = 0; i < r.size();) {
+            if (r.compare(i, 3, "PA[") == 0 && (i == 0 || !(std::isalnum((unsigned char)r[i - 1]) || r[i - 1] == '_')) && i + 3 < r.size() &&
+                std::isdigit((unsigned char)r[i + 3])) {
+                size_t e = i + 3;
+                while (e < r.size() && std::isdigit((unsigned char)r[e])) e++;
+                long long n = std::strtoll(r.c_str() + i + 3, nullptr, 10);
+                const std::string* m = stem(n);
+                size_t close = r.find(']', e);
+                if (m && (size_t)n < priv_.size() && priv_[(size_t)n] && close != std::string::npos &&
+                    r.substr(e, close - e).find_first_of("[(") == std::string::npos) {
+                    std::string sym = "PV_" + *m;
+                    use(sym, "PA+" + std::to_string(n) + "*%c1");
+                    o += "(&" + sym + ")[0" + r.substr(e, close - e) + "]";
+                    i = close + 1;
+                    continue;
+                }
+            }
+            o += r[i++];
+        }
+        // NBA slots: VA[k], HA[k], FA[k], CLP(k), with k + D<c> in shared code.
+        r.clear();
+        for (size_t i = 0; i < o.size();) {
+            size_t n = 0;
+            for (const char* p : {"VA[", "HA[", "FA[", "CLP("}) {
+                size_t l = std::strlen(p);
+                if (o.compare(i, l, p) == 0 && (i == 0 || !(std::isalnum((unsigned char)o[i - 1]) || o[i - 1] == '_')) && i + l < o.size() &&
+                    std::isdigit((unsigned char)o[i + l])) { n = l; break; }
+            }
+            if (n) {
+                size_t e = i + n;
+                while (e < o.size() && std::isdigit((unsigned char)o[e])) e++;
+                long long k = std::strtoll(o.c_str() + i + n, nullptr, 10);
+                if (k >= 0 && (size_t)k < slotSym_.size() && !slotSym_[(size_t)k].empty()) {
+                    const std::string& sym = slotSym_[(size_t)k];
+                    use(sym, std::to_string(k));
+                    r.append(o, i, n);
+                    r += "(intptr_t)" + sym;
+                    i = e;
+                    continue;
+                }
+            }
+            r += o[i++];
+        }
+        return r;
+    }
+    // Text that names nothing by number: labels (p<proc>_<pc>, cb<proc>_<k>,
+    // cq<proc>_<k>) and cold counters numbered within the chunk, the process
+    // number left out of "// process N (...)" comments. Labels are local to
+    // a function, so numbering them in order keeps them distinct.
+    static std::string localNames(const std::string& t) {
+        std::string r;
+        r.reserve(t.size());
+        std::unordered_map<std::string, int> lab;
+        int cold = 0;
+        auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+        for (size_t i = 0; i < t.size();) {
+            if (t.compare(i, 11, "// process ") == 0 && (i == 0 || t[i - 1] == '\n')) {
+                size_t e = i + 11;
+                while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
+                r += "// process";
+                i = e;
+                continue;
+            }
+            if (t.compare(i, 5, "COLD(") == 0 && (i == 0 || !idc(t[i - 1]))) {
+                size_t e = i + 5;
+                while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
+                if (e > i + 5) { r += "COLD(" + std::to_string(cold++); i = e; continue; }
+            }
+            if ((t[i] == 'p' || t.compare(i, 2, "cb") == 0 || t.compare(i, 2, "cq") == 0) && (i == 0 || !idc(t[i - 1]))) {
+                size_t a = i + (t[i] == 'p' ? 1 : 2), e = a;
+                while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
+                if (e > a && e < t.size() && t[e] == '_') {
+                    size_t f = e + 1;
+                    while (f < t.size() && std::isdigit((unsigned char)t[f])) f++;
+                    if (f > e + 1 && (f >= t.size() || !idc(t[f]))) {
+                        std::string tok = t.substr(i, f - i);
+                        auto [it, fresh] = lab.emplace(tok, (int)lab.size());
+                        r += "L" + std::to_string(it->second) + "_";
+                        i = f;
+                        continue;
+                    }
+                }
+            }
+            r += t[i++];
+        }
+        return r;
+    }
+    // design.cpp: the symbols, in one asm block (sizes from the compiler).
+    std::string relocAsm() const {
+        if (relocSyms_.empty()) return "";
+        std::string a = "__attribute__((used)) static void msimRelocSyms() {\n    asm volatile(\n";
+        for (auto& [sym, def] : relocSyms_) a += "        \".globl " + sym + "\\n.set " + sym + ", " + def + "\\n\"\n";
+        a += "        :: \"i\"(sizeof(Sig)), \"i\"(sizeof(PSig)));\n}\n";
+        return a;
+    }
+    // Each identifier of t through f.
+    static std::string mapIdents(const std::string& t, const std::function<std::string(const std::string&)>& f) {
+        std::string r;
+        r.reserve(t.size());
+        for (size_t i = 0; i < t.size();) {
+            if ((std::isalpha((unsigned char)t[i]) || t[i] == '_') && (i == 0 || !(std::isalnum((unsigned char)t[i - 1]) || t[i - 1] == '_'))) {
+                size_t j = i;
+                while (j < t.size() && (std::isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
+                r += f(t.substr(i, j - i));
+                i = j;
+            } else r += t[i++];
+        }
+        return r;
+    }
+    static std::string relocDecls(const std::set<std::string>& syms) {
+        std::string d, so, pv;
+        for (auto& x : syms) (x[0] == 'P' ? pv : so) += (x[0] == 'P' ? (pv.empty() ? "" : ", ") : (so.empty() ? "" : ", ")) + x + (x[0] == 'P' ? "" : "[]");
+        if (!so.empty()) d += "extern \"C\" char " + so + ";\n";
+        if (!pv.empty()) d += "extern \"C\" PSig " + pv + ";\n";
+        return d;
+    }
+
     struct HdrItem {
         std::vector<std::string> names;   // what it declares
         std::string decl;                 // into each part that names one of them, and design.cpp
@@ -2353,6 +2920,7 @@ private:
         std::vector<int> arms;
         std::vector<int> whyL(ns, 0), whyP(ns, -1);   // MSIM_WHYPRIV: the line that kept each candidate in S.sigs
         std::vector<int> owner(ns, -1);   // the branching comb process that writes a candidate
+        std::vector<int> tmpOwner(ns, -1);   // the domain process whose temporary a candidate is
         std::vector<char> mine(procs.size(), 0);
         for (int i : dom) mine[i] = 1;
         for (size_t i = 0; i < procs.size(); i++) if (procs[i].combRank >= 0) mine[i] = 1;
@@ -2394,7 +2962,15 @@ private:
                 for (auto& in : procs[i].prog->code)
                     if (in.k == IK::Nba && in.sig >= 0 && (size_t)in.sig < ns) {
                         if (in.hi < 0 || sigs[in.sig].w > 64) cand[in.sig] = 1; else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
-                    } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) (bad[in.sig] = 1, whyL[in.sig] = __LINE__);   // a temporary: kept in S.sigs
+                    } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) {
+                        // A temporary of this process (a decoder's locals): private
+                        // when it is written whole, by this process only. Two
+                        // processes would race on it when the domain runs in parallel.
+                        bool whole = in.tmp && in.hi < 0 && in.drv < 0 && !in.arr && in.aidx.empty() && !in.bidx &&
+                                     sigs[in.sig].w <= 64 && !std::getenv("MSIM_NOPRIVTMP");
+                        if (whole && (tmpOwner[in.sig] < 0 || tmpOwner[in.sig] == (int)i)) { tmpOwner[in.sig] = (int)i; cand[in.sig] = 1; }
+                        else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
+                    }
                 continue;
             }
             if (armShape(procs[i], sigs)) { arms.push_back((int)i); continue; }   // its wait: armChk
@@ -2494,6 +3070,11 @@ private:
     std::vector<int> coneOuts_;
     std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
+    // Of those, the clocks themselves, and their own smaller cone (combConeK):
+    // a clock edge runs only that. The others (a debug request, an enable
+    // feeding a clock gate) run the whole cone, rarely.
+    std::vector<int> coneClkIns_;
+    bool coneK_ = false;
     std::string cold(const std::string& stmt) {
         return "[&]() __attribute__((noinline, cold)) { COLD(" + std::to_string(colds_++) + ") " + stmt + " }();";
     }
@@ -2952,8 +3533,17 @@ private:
                     else if (in.k != IK::Assign && in.k != IK::Jmp && in.k != IK::JmpIfNot) u.live = true;
                 }
             }
+            // A clocked process's clock edge is a copy's root (the domain
+            // waits on that): a port's private clk_i copy nobody else reads
+            // is dead (1125 of them in Ibex, two passes a cycle).
             for (int n : dom)
-                for (auto& in : procs[n].prog->code) touchAll(in, live);
+                for (auto& in : procs[n].prog->code) {
+                    if (in.k == IK::WaitEdge && !std::getenv("MSIM_NOCLKALIAS")) {
+                        exprs(in, [&](Expr& x) { if (ok(x.sig)) live[x.sig] = 1; });
+                        if (ok(in.sig)) live[alias[in.sig] >= 0 && !wakeSig(in.sig) ? root(in.sig) : in.sig] = 1;
+                        for (auto& [sg, ed] : in.events) if (ok(sg)) live[alias[sg] >= 0 && !wakeSig(sg) ? root(sg) : sg] = 1;
+                    } else touchAll(in, live);
+                }
             for (bool ch = true; ch;) {
                 ch = false;
                 for (auto& u : us) {
@@ -3060,7 +3650,12 @@ private:
                         if (!i.tmp) throw CodegenUnsupported("instruction in a clocked process");
                         for (auto& a : i.aidx) noteRefs(a);
                         if (i.bidx) { noteRefs(i.bidx); fns << dynTarget(i, fast(i.e), " S.poke(s, v, hi, lo);", true); }
-                        else fns << assign(i);
+                        else if (isPriv(i.sig) && i.hi < 0) {   // a private temporary (privateSigs): no write through the kernel
+                            std::string g, u, sl;
+                            if (!split(i.e, g, u, sl)) fns << " " << pw(i.sig, sl) << "\n";
+                            else if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
+                            else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(pw(i.sig, sl)) << "\n";
+                        } else fns << assign(i);
                         hasTmp = true;
                         break;
                     default: throw CodegenUnsupported("instruction in a clocked process");
@@ -3073,6 +3668,8 @@ private:
             dsTmp[n] = hasTmp;
         }
         emitDomainFns(fns, fns2, dom, procs, dsB4, dsB2, dsTmp);
+        slotSig_.clear();
+        for (auto& sl : slots) slotSig_.push_back({sl.sig, sl.hi, sl.lo});
         // Dense arrays: the hot V and H of neighbouring slots share cache
         // lines (a Val is 56 bytes; interleaved, each slot took its own line).
         o << "static Val FA[" << std::max<size_t>(slots.size(), 1) << "]; static uint64_t VA[" << std::max<size_t>(slots.size(), 1)
@@ -3277,10 +3874,22 @@ private:
         // took the compiler 12 GB and 80 s.
         o << "static bool twoNow() {\n";
         if (two) {
+            // The x words of the narrow signals by address (taken once: S.sigs
+            // does not move after startup), then the wide ones limb by limb:
+            // a loop over Val and its limbs cost about 14 instructions a
+            // signal, 30% of Ibex's run time once it was all 2-state.
             o << "    static const int T[] = {-1";
-            for (int e : ext) if (!scratch(e)) o << ", " << e;
-            o << "};\n    if (!pclean) return false;\n    uint64_t x = 0;\n"
-                 "    for (size_t k = 1; k < sizeof T / sizeof T[0]; k++) x |= S.sigs[T[k]].val.x;\n    return x == 0;\n";
+            for (int e : ext) if (!scratch(e) && sigW_[e] <= 64) o << ", " << e;
+            o << "};\n    static const int TW[] = {-1";
+            for (int e : ext) if (!scratch(e) && sigW_[e] > 64) o << ", " << e;
+            o << "};\n    constexpr size_t NT = sizeof T / sizeof T[0] - 1;\n"
+                 "    static const uint64_t* TX[NT ? NT : 1];\n"
+                 "    static bool init = false;\n"
+                 "    if (!init) { for (size_t k = 0; k < NT; k++) TX[k] = &S.sigs[T[k + 1]].val.x; init = true; }\n"
+                 "    if (!pclean) return false;\n    uint64_t x = 0;\n"
+                 "    for (size_t k = 0; k < NT; k++) x |= *TX[k];\n"
+                 "    for (size_t k = 1; k < sizeof TW / sizeof TW[0]; k++) { const Val& v = S.sigs[TW[k]].val; x |= v.x; for (auto& h : v.hi) x |= h.x; }\n"
+                 "    return x == 0;\n";   // every limb: fx reads up to 64 bits of a wider signal
         } else
             o << "    return false;\n";
         o << "}\n";
@@ -3419,7 +4028,11 @@ private:
                  "      S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }, use); S.domainTune[1].done(S.threads); }\n";
         else if (multi) {
             o << "    const int grp = (int)(intptr_t)ctx;\n";
-            if (two) o << "    if (twoNow()) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
+            // The groups of one runSeqs run back to back and write no signal
+            // in between (NBAs only): one twoNow() for all of them.
+            if (two) o << "    static uint64_t tAt = ~0ULL; static bool tNow = false;\n"
+                          "    if (S.seqRun != tAt) { tAt = S.seqRun; tNow = twoNow(); }\n"
+                          "    if (tNow) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
             o << "    for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS[DSO[k]]();\n"
                  "    if (dpend) return;\n    dpend = true;\n";
         } else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
@@ -3517,7 +4130,10 @@ private:
             std::vector<int> cands;
             cands.swap(coneIns_);
             std::fill(coneSig.begin(), coneSig.end(), 0);
-            size_t nCone = 0;
+            size_t nCone = 0, nClk = 0;
+            std::vector<char> inClk(procs.size(), 0);
+            coneClkIns_.clear();
+            coneK_ = false;
             for (int c : cands) {
                 std::vector<char> in1(procs.size(), 0), sg1(sigW_.size(), 0);
                 sg1[c] = 1;
@@ -3543,6 +4159,13 @@ private:
                 coneIns_.push_back(c);
                 for (int i : byRank)
                     if (in1[i] && !inCone[i]) { inCone[i] = 1; nCone++; }
+                bool clk = clock_[c];   // a clock, or the source its copies down the hierarchy come from
+                for (size_t x = 0; x < clock_.size() && !clk; x++) clk = clock_[x] && x < domRoot_.size() && domRoot_[x] == c;
+                if (clk) {
+                    coneClkIns_.push_back(c);
+                    for (int i : byRank)
+                        if (in1[i] && !inClk[i]) { inClk[i] = 1; nClk++; }
+                }
             }
             if (nCone == 0) coneIns_.clear();
             // What the cone writes, only the cone reads: those signals do not wake combAll either.
@@ -3565,6 +4188,25 @@ private:
                 for (auto& c : callsC) o << "    " << c << ";\n";
                 if (privW) o << "    scanP();\n";
                 o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
+                // The clocks' own cone: when it is smaller, a clock edge runs
+                // only it (Ibex: the clock gate and the clock copies, not the
+                // controller logic behind the gate's enable).
+                std::sort(coneClkIns_.begin(), coneClkIns_.end());
+                if (!coneClkIns_.empty() && nClk < nCone && !std::getenv("MSIM_NOCONEK")) {
+                    coneK_ = true;
+                    std::vector<size_t> kUnits;
+                    bool kPriv = false;
+                    for (size_t j : coneUnits)
+                        if (inClk[unitProc[j]]) {
+                            kUnits.push_back(j);
+                            for (auto* in : unitIns[j]) kPriv |= isPriv(in->sig);
+                        }
+                    std::vector<std::string> callsK = shareChunks(o, "combK", kUnits, combStmts, unitProc, unitIns, procs, kChunk);
+                    o << "static void combConeK(const void*) {\n" << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
+                    for (auto& c : callsK) o << "    " << c << ";\n";
+                    if (kPriv) o << "    scanP();\n";
+                    o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
+                } else coneClkIns_.clear();
             }
         }
         // armChk before the pass (a testbench write to a private input) and
@@ -3655,7 +4297,10 @@ private:
              "}\n";
         o << "static void fcommit() {" << (multi ? " dpend = false;" : "");
         o << " const bool obs = S.observed;"
-             " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) commitOne(CL[j], obs); }"
+             // The common slot inline: a private signal given a known value.
+             " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) { const uint32_t k = CL[j]; const uint8_t h = HA[k];"
+             " if (h == 1) { const CTRow& t = CTAB[k]; if (t.kind == 0) { HA[k] = 0; PSig& p = *t.p; p.v = VA[k] & t.m; p.x = 0; p.z = 0; continue; } }"
+             " if (h) commitOne(k, obs); } }"
              " else for (uint32_t k = 0; k < " << slots.size() << "; k++) commitOne(k, obs);"
              " CN = 0; CLOVF = false;" << (armIns_.empty() ? "" : " if (ARMLEFT) armChk();");
         // The comb pass is queued, not run here: other NBAs of this time
@@ -3794,10 +4439,10 @@ private:
                 bool dynW = (i.k == IK::Assign || i.k == IK::Nba) && (i.arr || i.bidx);
                 if (dynW && ((i.k != IK::Assign && i.k != IK::Nba) || i.drv >= 0))
                     throw CodegenUnsupported(std::string("array or variable-index ") + (i.drv >= 0 ? "continuous assign" : "write (instruction " + std::to_string((int)i.k) + ")"));
-                if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
+                if (i.nbaLater && i.k != IK::Nba) throw CodegenUnsupported("intra-assignment delay");
+                if (i.de && i.k != IK::Nba && i.k != IK::WaitDelay) throw CodegenUnsupported("delay expression");
                 if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
                 if (!p.roots.empty() || !p.spans.empty()) throw CodegenUnsupported("disable of a named block");
-                if (i.k == IK::Finish && i.hi > 0) throw CodegenUnsupported("$fatal exit status");
                 if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
                 if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
                 if (i.k == IK::ReadMem || i.k == IK::WriteMem) {   // $readmem / $writemem (21.4, 21.5)
@@ -3822,7 +4467,11 @@ private:
                 switch (i.k) {
                     case IK::Assign: o << (pd >= 0 ? assign(i, W(i, fast(i.e))) : assign(i)); break;
                     case IK::Nba:
-                        o << " S.nba(" << i.sig << ", " << W(i, fast(i.e)) << ", " << i.hi << ", " << i.lo << ");\n";
+                        if (i.nbaLater)   // x <= #d v: the update d ticks later (9.4.5)
+                            o << " S.nbaAt(S.now + " << (i.de ? "v_time(" + fast(i.de) + ")" : std::to_string(i.delay) + "ULL") << ", " << i.sig
+                              << ", " << W(i, fast(i.e)) << ", " << i.hi << ", " << i.lo << ");\n";
+                        else
+                            o << " S.nba(" << i.sig << ", " << W(i, fast(i.e)) << ", " << i.hi << ", " << i.lo << ");\n";
                         break;
                     case IK::JmpIfNot:
                         o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, tgt(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, tgt(i.xt)));
@@ -3843,7 +4492,9 @@ private:
                         o << gate;
                         break;
                     }
-                    case IK::WaitDelay: o << " co_await Delay{" << i.delay << "ULL};\n" << gate; break;
+                    case IK::WaitDelay:
+                        o << " co_await Delay{" << (i.de ? "v_time(" + fast(i.de) + ")" : std::to_string(i.delay) + "ULL") << "};\n" << gate;
+                        break;
                     case IK::Display:
                     case IK::Strobe:
                     case IK::Monitor: {
@@ -3866,7 +4517,10 @@ private:
                         o << "); if (S.finished) co_return;\n";
                         break;
                     }
-                    case IK::Finish: o << " S.finished = true; co_return;\n"; break;
+                    case IK::Finish:   // $fatal: its exit status (the interpreter: exec.inc)
+                        o << " S.finished = true;" << (i.hi > 0 ? " if (S.exitCode < " + std::to_string(i.hi) + ") S.exitCode = " + std::to_string(i.hi) + ";" : "")
+                          << " co_return;\n";
+                        break;
                     case IK::Assert: {   // an immediate assertion (16.3, 16.4), through the kernel's runAssert
                         if (i.join > 2) throw CodegenUnsupported("a procedural concurrent assertion or expect");
                         const AssertInfo& a = asserts().at(i.sig);

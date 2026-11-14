@@ -21,6 +21,31 @@ Conventions:
   same outputs; they differ in area and delay.
 - An illegal parameter stops elaboration with `$error`.
 
+## Families
+
+Every family of a commercial building-block library (Synopsys DesignWare
+Building Blocks, the Cadence ChipWare equivalents) and what `dw/` has for it.
+Members of a family that `dw/` does not have yet are named in the last column.
+
+| Family | `dw/` modules | Not in `dw/` |
+| --- | --- | --- |
+| Arithmetic: add, subtract, compare, sum | `MW_add` (5 architectures), `MW_sub`, `MW_addsub`, `MW_inc`, `MW_dec`, `MW_incdec`, `MW_addsat`, `MW_absval`, `MW_cmp`, `MW_minmax`, `MW_csa`, `MW_csa_tree`, `MW_sum`, `MW_sat` | |
+| Arithmetic: multiply, divide, square root | `MW_mult` (2 architectures), `MW_square`, `MW_mac`, `MW_prod_sum`, `MW_div`, `MW_sqrt` | |
+| Pipelined arithmetic (for retiming) | `MW_mult_pipe`, `MW_div_pipe`, `MW_sqrt_pipe` | a pipelined sum of products |
+| Sequential (multi-cycle) arithmetic | `MW_mult_seq`, `MW_div_seq` | a multi-cycle square root |
+| Transcendental and trigonometric | `MW_log2`, `MW_exp2`, `MW_sincos` | |
+| Floating point (IEEE 754) | `MW_fp_add`, `MW_fp_sub`, `MW_fp_addsub`, `MW_fp_mult`, `MW_fp_div`, `MW_fp_sqrt`, `MW_fp_mac`, `MW_fp_recip`, `MW_fp_flt2flt`, `MW_fp_cmp`, `MW_fp_i2flt`, `MW_fp_flt2i` | floating point log, exp, sin/cos |
+| Combinational logic: shift, count, encode, select | `MW_shifter`, `MW_rotate`, `MW_lzd`, `MW_lsd`, `MW_norm`, `MW_popcount`, `MW_pri_enc`, `MW_thermdec`, `MW_decode`, `MW_onehot2bin`, `MW_bin2gray`, `MW_gray2bin`, `MW_mux`, `MW_mux_onehot` | |
+| Sequential logic: counters, LFSR | `MW_counter`, `MW_gray_counter`, `MW_lfsr` | |
+| Data integrity: CRC, ECC, parity | `MW_crc`, `MW_ecc`, `MW_parity` | |
+| Line coding | `MW_8b10b_enc`, `MW_8b10b_dec` | |
+| Memory: FIFO, stack, RAM | `MW_fifo_sync`, `MW_fifo_async`, `MW_stack`, `MW_ram` | separate FIFO controllers for an external RAM |
+| Clock domain crossing | `MW_sync`, `MW_reset_sync`, `MW_pulse_sync`, `MW_data_sync`, `MW_fifo_async` | |
+| DSP | `MW_fir` | an IIR filter |
+| Test: JTAG | `MW_tap` | boundary scan cells |
+| Control: arbiters | `MW_arb_fp`, `MW_arb_rr` | |
+| Generic gates (GTECH) | not applicable: generic gates are internal to a synthesis tool; msynth maps to its own generic cells and then to a Liberty library (mini45 or sky130) | |
+
 ## Arithmetic
 
 | Module | Function |

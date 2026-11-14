@@ -184,6 +184,7 @@
 #include "upf_design.hpp"
 #include "upf_hdl.hpp"
 #include "dpi.inc"
+#include "vhdl_env.inc"
 #include "vpi.inc"
 #include "interactive.inc"
 #include "vendor_tasks.hpp"
@@ -436,6 +437,29 @@ static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
         auto c = std::make_shared<Expr>(*e);
         c->at = sub(c->at, var, v);
         for (auto& k : c->kids) k = sub(k, var, v);
+        // Fold what is constant now (rf[i - 1], irq[i] with i known): the
+        // generated code then indexes a fixed bit instead of computing one.
+        bool pure = !c->at && !c->arr && c->op >= Op::Not && c->op <= Op::Mux && !c->kids.empty();
+        for (auto& k : c->kids) pure &= k && k->op == Op::Const;
+        // a[i +: w] with i known and in range: a fixed part select.
+        if (c->op == Op::DynSlice && !c->at && c->kids.size() == 2 && c->kids[1]->op == Op::Const && !c->kids[1]->k.x && c->kids[0]) {
+            const E& a = c->kids[0];
+            int aw = a->op == Op::Slice ? a->hi - a->lo + 1 : a->op == Op::Ref && !a->at && !a->arr ? S.sigs[(size_t)a->sig].w : -1;
+            int64_t st = v_to_i64(c->kids[1]->k);
+            if (c->lo) st = st - c->hi + 1;
+            if (aw > 0 && st >= 0 && st + c->hi <= aw) {
+                auto sl = node(Op::Slice);
+                sl->kids = {a};
+                sl->hi = (int)st + c->hi - 1;
+                sl->lo = (int)st;
+                return sl;
+            }
+        }
+        if (pure) {
+            Val r;
+            Reader none = [](int s) -> Val { return S.sigs[(size_t)s].val; };
+            try { r = eval(c, none); return konst(r); } catch (...) {}
+        }
         return c;
     };
     std::set<int> used;
@@ -794,6 +818,34 @@ static void localizeSeqBlocking(LowerResult& lowered) {
 // caller shares; the expanded copy gets its own, when no value ever travels
 // between callers through them: here and in every other process each read
 // follows a whole write in the same activation.
+// A call of a task that does nothing (PicoRV32's `assert in a non-formal
+// build calls `task empty_statement; begin end endtask`) becomes a jump to
+// the next instruction: a call keeps a clocked block out of the static
+// schedule and the cycle domain, where one empty call per block made two
+// PicoRV32 blocks per core run as coroutines on every clock edge.
+// MSIM_NOEMPTYCALL=1 keeps the calls.
+static void dropEmptyCalls(LowerResult& lowered) {
+    size_t n = 0;
+    auto empty = [](const Prog* c) {
+        if (!c) return false;
+        for (auto& x : c->code) if (x.k != IK::Ret) return false;
+        return c->roots.empty() && c->spans.empty();
+    };
+    for (auto& pr : lowered.procs)
+        for (size_t pc = 0; pc < pr.prog.code.size(); pc++) {
+            Instr& i = pr.prog.code[pc];
+            if (i.k != IK::Call || !empty(i.callee) || i.lay || !i.init.empty()) continue;
+            Instr j;
+            j.k = IK::Jmp;
+            j.target = pc + 1;
+            j.line = i.line;
+            j.file = i.file;
+            i = std::move(j);
+            n++;
+        }
+    if (std::getenv("MSIM_WHYATSTAR")) std::cerr << "empty task calls dropped: " << n << "\n";
+}
+
 static void inlineCombCalls(LowerResult& lowered) {
     const bool dbg = std::getenv("MSIM_WHYINLINE") != nullptr;
     auto plainAssign = [](const Instr& i) {
@@ -1629,6 +1681,10 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     if (!files.empty()) {
         std::string cflags = " -std=c++20 " + opt + " -I" + shq(inc) + fstC;
+        // Signal numbers resolved at link time (codegen.hpp relocText): absolute
+        // symbols as displacements and immediates, so no PIE.
+        const bool reloc = files[0].second.find("#define MSIM_RELOC 1") != std::string::npos;
+        if (reloc) cflags += " -fno-pie";
         stamp = cflags + fstL + "\n" + stamp;
         bool sameFlags = slurp(dir + "/simv.stamp") == stamp;
         bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
@@ -1700,7 +1756,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         if (failed) return 1;
         if (!kernelReady()) return 1;   // a new kernel object relinks (simv.kobj)
         if (!jobs.empty() || !std::filesystem::exists(exe, ec) || slurp(dir + "/simv.kobj") != kobj) {
-            std::string link = shq(cc) + " " + opt;
+            std::string link = shq(cc) + " " + opt + (reloc ? " -no-pie" : "");
             for (auto& o : objs) link += " " + shq(o);
             if (!kobj.empty()) link += " " + shq(kobj);
             link += fstL + " -o " + shq(exe);
@@ -2576,6 +2632,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::string> vhdlFiles;
     std::string vhdlSv;
+    bool vhdl4 = false;   // -vhdl4: VHDL std_logic with four values (faster; see vhdl::Translator::nine)
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
     std::string uvmHome;    // -uvm / -uvmhome: a uvm-core checkout
@@ -2873,6 +2930,7 @@ int main(int argc, char** argv) {
         // VHDL sources (docs/VHDL.md): translated for the same engine after slang reads the SV files
         if (a.size() && a[0] != '-' && vhdl::isVhdlFile(a)) { vhdlFiles.push_back(a); continue; }
         if (a == "-vhdl-sv") { vhdlSv = next("a file name"); continue; }
+        if (a == "-vhdl4") { vhdl4 = true; continue; }
         if (a == "-v93" || a == "-v2008" || a == "-vhdl2008" || a == "-v200x" || a == "-vhdl93" || a == "-vhdl87") continue;
         fwd.push_back(a);
     }
@@ -2999,6 +3057,7 @@ int main(int argc, char** argv) {
     if (!driver.parseAllSources()) return 1;
     if (!vhdlFiles.empty()) {
         vhdl::Translator vtr;
+        vtr.nine = !vhdl4;
         if (!vhdl::addVhdl(driver, vhdlFiles, vhdlSv, "msim", vtr)) return 1;
     }
     if (parseOnly) return driver.reportParseDiags() ? 0 : 1;
@@ -3294,6 +3353,7 @@ int main(int argc, char** argv) {
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
+    if (!vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOEMPTYCALL")) dropEmptyCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL"))

@@ -965,6 +965,83 @@ inline bool exactEligible(const std::vector<int>& rank) {
     return !g_ctx->vars.empty();
 }
 
+// Close to uniform where sampleExact could not draw exactly (18.5.9). The
+// search picks the variables one at a time, so in a big problem the last
+// ones take what is left: a.sum() == 200 over 40 nibbles leaves the last
+// ones at 0. Starting from its solution, pairs of variables are drawn
+// again together, uniformly among the values of the pair that keep their
+// constraints true with the others fixed. Each such step keeps the uniform
+// distribution over all solutions as it is, so a few steps per variable
+// bring the solution close to a uniform draw. A pair with more than 64
+// value combinations is drawn by rejection (64 draws, else it stays), which
+// keeps that property too. The work is bounded: each check of a constraint
+// counts the variables it reads.
+inline void mixPairs() {
+    size_t n = g_ctx->vars.size();
+    if (n < 2) return;
+    std::vector<i128> sol(n);
+    for (size_t k = 0; k < n; k++) sol[k] = g_ctx->vars[k].val;
+    for (auto& v : g_ctx->vars) { v.set = false; v.lo = rMin(v.w, v.sgn); v.hi = rMax(v.w, v.sgn); }
+    long budget0 = g_ctx->budget;
+    g_ctx->budget = 20000 + 2000 * (long)n;
+    bool ok = propagate();
+    g_ctx->budget = budget0;
+    std::vector<std::pair<i128, i128>> box(n);
+    for (size_t k = 0; k < n; k++) box[k] = {g_ctx->vars[k].lo, g_ctx->vars[k].hi};
+    auto setv = [&](size_t k, i128 x) { auto& v = g_ctx->vars[k]; v.set = true; v.val = v.lo = v.hi = x; };
+    for (size_t k = 0; k < n; k++) setv(k, sol[k]);
+    if (!ok) return;
+    std::vector<int> its;
+    std::vector<char> mark(g_ctx->items.size(), 0);
+    std::vector<size_t> perm(n);
+    for (size_t k = 0; k < n; k++) perm[k] = k;
+    long work = 0;
+    const long maxWork = 100000;
+    for (size_t step = 0; step < 3 * n && work < maxWork; step++) {
+        if (step % n == 0)   // every variable is redrawn once per sweep
+            for (size_t k = n; k > 1; k--) std::swap(perm[k - 1], perm[(size_t)below((i128)k)]);
+        size_t i = perm[step % n], j = (size_t)below((i128)n - 1);
+        if (j >= i) j++;
+        its.clear();
+        long cost = 0;
+        for (size_t k : {i, j})
+            for (int x : g_ctx->vars[k].items)
+                if (!mark[(size_t)x] && g_ctx->items[(size_t)x].on) {
+                    mark[(size_t)x] = 1;
+                    its.push_back(x);
+                    cost += 1 + (long)g_ctx->items[(size_t)x].vars.size();
+                }
+        for (int x : its) mark[(size_t)x] = 0;
+        auto okNow = [&]() {
+            work += cost;
+            for (int x : its)
+                if (!itemOk(g_ctx->items[(size_t)x])) return false;
+            return true;
+        };
+        i128 ni = box[i].second - box[i].first + 1, nj = box[j].second - box[j].first + 1;
+        if (ni <= 16 && nj <= 16 && ni * nj <= 64) {
+            std::vector<std::pair<i128, i128>> c;
+            for (i128 a = box[i].first; a <= box[i].second; a++)
+                for (i128 b = box[j].first; b <= box[j].second; b++) {
+                    setv(i, a); setv(j, b);
+                    if (okNow()) c.push_back({a, b});
+                }
+            auto pk = c.empty() ? std::pair<i128, i128>{sol[i], sol[j]} : c[(size_t)below((i128)c.size())];
+            setv(i, pk.first); setv(j, pk.second);
+        } else {
+            bool moved = false;
+            for (int t = 0; t < 64 && !moved; t++) {
+                setv(i, box[i].first + below(ni));
+                setv(j, box[j].first + below(nj));
+                moved = okNow();
+            }
+            if (!moved) { setv(i, sol[i]); setv(j, sol[j]); }
+        }
+        sol[i] = g_ctx->vars[i].val;
+        sol[j] = g_ctx->vars[j].val;
+    }
+}
+
 }   // namespace rnd
 
 // pre_randomize / post_randomize (18.6.2): run a method to its end now.
@@ -992,7 +1069,7 @@ static void randObjects(int obj, std::vector<int>& out) {
     const ClassRt& cr = classRt()[(size_t)S.sigs[obj].val.v];
     if (!cr.rand) return;
     for (const RandVar& rv : cr.rand->vars) {
-        if (!rv.obj || (S.get(obj + rv.mode).v & 1) == 0) continue;
+        if (!rv.obj || (S.get(obj + rv.mode).v & 1) == 0) continue;   // (a static one is never a handle)
         if (rv.dyn) {   // a rand container of handles: each element's object, at every level
             std::vector<int> hs;
             std::function<void(int, int)> walk = [&](int cid, int depth) {
@@ -1282,7 +1359,7 @@ static int doRandomize(int obj, const RandCall* rc) {
             if (obj > 0 && !S.sigs[obj].val.x && S.sigs[obj].val.v < classRt().size())
                 if (const auto& sp = classRt()[(size_t)S.sigs[obj].val.v].rand)
                     for (const RandVar& rv : sp->vars)
-                        if (!rv.dyn && !rv.obj && addr >= obj + rv.off && addr < obj + rv.off + rv.count) cyc = rv.randc;
+                        if (!rv.dyn && !rv.obj && !rv.stat && addr >= obj + rv.off && addr < obj + rv.off + rv.count) cyc = rv.randc;
             scalars.push_back({addr, S.sigs[addr].w, a->sgn, cyc, obj});
         }
         for (const auto& ca : rc->contArgs) {   // randomize(q): its size and elements
@@ -1304,6 +1381,15 @@ static int doRandomize(int obj, const RandCall* rc) {
         Frame* fr = frameFor(o);
         if (!(rc && rc->argsGiven))
             for (const RandVar& rv : sp->vars) {
+                if (rv.stat) {   // shared by every object: its mode is on unless set to 0 (18.8)
+                    Val m = S.get(rv.mode);
+                    if (m.x || (m.v & 1)) {
+                        bool seen = false;
+                        for (auto& sc : scalars) seen |= sc.addr == rv.off;
+                        if (!seen) scalars.push_back({rv.off, rv.w, rv.sgn, rv.randc, o});
+                    }
+                    continue;
+                }
                 if (rv.obj || !(S.get(o + rv.mode).v & 1)) continue;
                 if (rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // int q[4][$]: each queue
                     RCont c;
@@ -1533,6 +1619,11 @@ static int doRandomize(int obj, const RandCall* rc) {
             for (size_t k = 0; k < ctx.vars.size(); k++)
                 if (rank[k] == r) order.push_back((int)k);
         g_fr = callerFr;
+        // Nothing asks for an order: pick the variables in a random one, so
+        // that no variable is always among the last, which take what the
+        // others leave (mixPairs evens out the rest).
+        if (exactEligible(rank))
+            for (size_t k = order.size(); k > 1; k--) std::swap(order[k - 1], order[(size_t)below((i128)k)]);
 
         bool ok = false;
         std::vector<int> softs;
@@ -1545,7 +1636,10 @@ static int doRandomize(int obj, const RandCall* rc) {
             for (int a = 0; a < 16; a++) {
                 ctx.budget = 20000 + 2000 * (long)ctx.vars.size();
                 auto saveRandc = randcLeft();
-                if (solveOnce(order)) return true;
+                if (solveOnce(order)) {
+                    if (exactEligible(rank)) mixPairs();
+                    return true;
+                }
                 randcLeft() = saveRandc;
             }
             return false;
@@ -1731,6 +1825,6 @@ static void randModeAll(int obj, bool blocks, bool on) {
     if (blocks) {
         for (const auto& b : sp->blocks) if (b->mode >= 0) S.set(b->staticMode ? b->mode : obj + b->mode, mk(on));
     } else {
-        for (const RandVar& rv : sp->vars) if (rv.mode >= 0) S.set(obj + rv.mode, mk(on));
+        for (const RandVar& rv : sp->vars) if (rv.mode >= 0) S.set(rv.stat ? rv.mode : obj + rv.mode, mk(on));
     }
 }

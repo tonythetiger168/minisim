@@ -35,6 +35,7 @@ enum class EK {
     External, // << signal .a.b : T >> (text = path, name = class)
     Box,      // <>  (unconstrained index)
     SubtypeRange,   // type mark with a range constraint: a = mark, b = Range
+    Cond,     // VHDL-2019 conditional expression (9.1): a when b else args[0].actual
 };
 
 struct Assoc {
@@ -158,6 +159,7 @@ struct Decl {
     EP init;
     std::string mode;          // port/param: in out inout buffer linkage
     std::string sigKind;       // guarded signal (6.4.2.3): "bus" or "register"
+    bool arrayView = false;    // mode view indication `view (V)` (6.5.2): of an array's elements
     std::string cls;           // param/generic class: signal variable constant file type function procedure package
     bool shared = false;
     std::shared_ptr<TypeDef> tdef;

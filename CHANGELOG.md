@@ -8,6 +8,17 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- msim: VHDL type conversions on an `inout` port's formal and actual
+  (`std_logic_vector(io) => unsigned(bus)`, IEEE 1076-2019 6.5.7.3).
+- msim: VHDL std_logic keeps all nine values (U X 0 1 Z W L H -) by default:
+  operators, comparisons, `'image`, `to_x01`, ports between VHDL units and
+  weak-driver resolution match GHDL. SystemVerilog, UPF and waveforms see the
+  four-value view; `-vhdl4` keeps the old four-value mode (faster).
+  Procedures without `wait` lower to void functions.
+- mvplat: vector cryptography: Zvkned (AES), Zvknha/Zvknhb (SHA-256 and
+  SHA-512), Zvkg (GHASH), Zvksed (SM4), Zvksh (SM3), Zvbc (carry-less
+  multiply) and Zvkt, on element groups; checked against FIPS-197, FIPS
+  180-4, GCM and GB/T 32907/32905 known answers.
 - mvplat: Zvbb (and Zvkb): vector and-not, rotates, bit and byte reverses,
   count leading/trailing zeros, population count and the widening shift
   `vwsll`, at SEW 8 to 64; `zvbb`/`zvkb` in the device tree.
@@ -24,6 +35,17 @@ Spec references are IEEE 1800-2023 clauses.
   Tested with riscv-tests' vector benchmarks (845 programs now), clang's
   vectorized loops against its scalar ones, single-instruction checks, and
   under Linux. EXT_ABI 8: the extension library needs a rebuild.
+- msim VHDL-2019: `+` and `-` on std.env time records (16.5.5), `'image` of
+  integer arrays, `{i}` (instance path) in assert formats.
+- msim VHDL-2019: std.env calendar time (`time_record`, `epoch`,
+  `localtime`, `gmtime`, ISO 8601 `to_string`), `getenv`, directory
+  functions and procedures, `time_to_seconds` / `seconds_to_time` and the
+  PSL queries (16.5.5 - 16.5.7, 16.5.10).
+- msim VHDL-2019: mode views as the mode of a record element, array mode
+  views (`view (v) of t`) and `'converse` used directly in a port (6.5.2).
+- msim VHDL-2019: conditional expressions (9.1), empty records, `'image` of
+  records, strings and bit vectors, interface lists ending in `;`, generic
+  type classes (6.5.3) and the std.env report and assert API (16.5.9).
 - msim VHDL: guarded signals (`bus`, `register`, 6.4.2.3) disconnect their
   drivers on a guarded assignment with GUARD false or `s <= null`, with
   disconnection specifications (7.4); package instantiation in blocks,

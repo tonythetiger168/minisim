@@ -1698,10 +1698,11 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 break;
             }
             case 0x57:                                                 // OP-V
+            case 0x77:                                                 // OP-VE (vector crypto)
             vector: {
                 uint32_t vc = 0;
                 uint64_t vtv = 0;
-                cls = op == 0x57 ? C_ALU : op == 0x07 ? C_LOAD : C_STORE;
+                cls = op == 0x57 || op == 0x77 ? C_ALU : op == 0x07 ? C_LOAD : C_STORE;
                 switch (vexec(h, insn, vc, vtv, wrd, wval)) {
                     case VOK: break;
                     case VILL: ILLEGAL();

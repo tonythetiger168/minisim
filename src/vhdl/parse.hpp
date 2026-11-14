@@ -268,7 +268,14 @@ private:
             auto [l, x] = ident();
             d->names.push_back(l);
             d->texts.push_back(x);
-            if (accept("is")) { /* VHDL-2019 type classes */ while (!isOp(";") && !isOp(")")) next(); }
+            if (accept("is")) {   // VHDL-2019 generic type classes (6.5.3): (<>), range <>, array (...) of type is private, ...
+                int depth = 0;
+                while (!at(Tok::End) && !(depth == 0 && (isOp(";") || isOp(")")))) {
+                    if (isOp("(")) ++depth;
+                    else if (isOp(")")) --depth;
+                    next();
+                }
+            }
             return d;
         } else if (isKw("function") || isKw("procedure") || isKw("pure") || isKw("impure")) {
             d->cls = "subprogram";
@@ -299,16 +306,17 @@ private:
         do { auto [l, x] = ident(); d->names.push_back(l); d->texts.push_back(x); } while (accept(","));
         expect(":");
         if (isKw("in") || isKw("out") || isKw("inout") || isKw("buffer") || isKw("linkage")) { d->mode = cur().low; next(); }
-        else if (isKw("view")) {   // mode view (6.5.2, VHDL-2019): view v [of T]
+        else if (isKw("view")) {   // mode view (6.5.2, VHDL-2019): view v [of T], view (v) of T
             next();
             d->mode = "view";
-            d->target = name();
+            if (accept("(")) { d->arrayView = true; d->target = name(); expect(")"); }
+            else d->target = name();
             if (accept("of")) d->type = subtypeIndication();
             return d;
         }
         d->type = subtypeIndication();
         if (accept("bus")) d->sigKind = "bus";
-        if (accept(":=")) d->init = expression();
+        if (accept(":=")) d->init = condExpression();
         if (d->mode.empty()) d->mode = "in";
         return d;
     }
@@ -433,7 +441,7 @@ private:
             expect(":");
             d->type = subtypeIndication();
             if (isKw("register") || isKw("bus")) { d->sigKind = cur().low; next(); }
-            if (accept(":=")) d->init = expression();
+            if (accept(":=")) d->init = condExpression();
             expect(";");
         } else if (isKw("file")) {
             next();
@@ -516,9 +524,14 @@ private:
                 f->line = cur().line;
                 do { auto [fl, fx] = ident(); f->names.push_back(fl); f->texts.push_back(fx); } while (accept(","));
                 expect(":");
-                if (isKw("view")) fail("a mode view as the mode of a record element is not supported yet");
-                f->mode = cur().low;
-                next();
+                if (accept("view")) {   // element_mode_view_indication: view v | view (v)
+                    f->mode = "view";
+                    if (accept("(")) { f->arrayView = true; f->target = name(); expect(")"); }
+                    else f->target = name();
+                } else {
+                    f->mode = cur().low;
+                    next();
+                }
                 expect(";");
                 d->tdef = d->tdef ? d->tdef : std::make_shared<TypeDef>();
                 d->tdef->fields.push_back(f);
@@ -1261,6 +1274,19 @@ private:
     }
 
 public:
+    // VHDL-2019 conditional_expression (9.1): expression { when condition else expression }
+    EP condExpression() {
+        EP e = expression();
+        if (!isKw("when")) return e;
+        int ln = cur().line;
+        next();
+        auto c = std::make_shared<Expr>(EK::Cond, ln);
+        c->a = e;
+        c->b = expression();
+        expect("else");
+        c->args.push_back(Assoc{nullptr, condExpression()});
+        return c;
+    }
     EP expression() {
         if (isOp("??")) { next(); return mk(EK::Un, "??", primary()); }
         EP l = relation();
@@ -1425,6 +1451,15 @@ private:
                     }
                     expect("=>");
                     el.value = expression();
+                } else if (isKw("when") && elems.empty()) {   // ( conditional_expression ), 9.1
+                    int cl = cur().line;
+                    next();
+                    auto c = std::make_shared<Expr>(EK::Cond, cl);
+                    c->a = first;
+                    c->b = expression();
+                    expect("else");
+                    c->args.push_back(Assoc{nullptr, condExpression()});
+                    el.value = c;
                 } else el.value = first;
                 elems.push_back(el);
             } while (accept(","));

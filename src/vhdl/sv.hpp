@@ -79,6 +79,12 @@ struct Val {
     bool isConst = false;
     std::optional<int64_t> iv;   // folded integer value
     std::string accObj;          // p.all of an access-to-array object: p (the elements are p.a)
+    // std_logic values: the companion plane that refines the four-value s into
+    // VHDL's nine (Translator::nine); "" when every element is a strong 0 1 X Z
+    std::string a;
+    // the 'U' marker of a logical operator's result: x where an operand is 'U', 0
+    // elsewhere (such a result is never weak); "" for other values
+    std::string u;
 };
 
 class Translator {
@@ -91,6 +97,7 @@ public:
     };
     std::map<std::string, SvModule> svModules;   // lower-case name -> module
     std::string timeUnit = "1ns", timePrec = "1fs";
+    bool useEnv = false;   // the design calls std.env's calendar, directory or environment functions
     std::vector<std::string> warnings;
     std::map<std::string, std::string> condIds;   // conditional analysis identifiers from the command line (upper case)
     // For synthesis tools: a combinational process (a sensitivity list or an
@@ -98,6 +105,14 @@ public:
     // 'event history) becomes `always @*` instead of a loop that waits on its
     // signals, which simulates the same but is not a synthesizable form.
     bool synth = false;
+    // std_logic with all nine values (IEEE 1164): every std_logic object keeps its
+    // four-value SystemVerilog variable (what SystemVerilog, UPF and waveforms
+    // see) plus a companion <name>__9 of the same shape. Per element, (companion,
+    // value) is 0:(0,0) 1:(0,1) X:(0,x) Z:(0,z) L:(1,0) H:(1,1) W:(1,x) -:(1,z)
+    // U:(x,x), so an object never assigned reads 'U'. A companion that is unknown
+    // while the value is known reads as strong (a write that did not update it).
+    // false (msim -vhdl4, mlint): std_logic is four-valued.
+    bool nine = false;
     bool firstRunWait = true;   // false for mlint: the #0 before a process's first run is a simulation detail
 
     void add(const std::vector<UP>& units) {
@@ -130,7 +145,7 @@ public:
     std::string run() {
         builtins();
         std::ostringstream o;
-        o << rtPackage();
+        std::string rt = rtPackage();
         // packages in dependency order
         std::set<std::string> done;
         std::function<void(const UP&)> emitPkg = [&](const UP& u) {
@@ -188,7 +203,7 @@ public:
         }
         emitVariants();
         o << lateModules.str();
-        return o.str();
+        return rt + (useEnv ? envPackage() : std::string()) + o.str();
     }
 
 private:
@@ -230,6 +245,7 @@ private:
         bool waits = false;   // a process with wait statements (no sensitivity list)
         std::string label;
         std::map<std::string, TP> drvTypes;
+        std::set<std::string> weakDrv;   // drivers that may hold L H W - (see `nine`)
     };
     struct Loop {
         std::string label;   // lower
@@ -258,6 +274,10 @@ private:
         // drivers can all disconnect (a resolved net plus a held value), driver initial values
         std::map<std::string, std::string> discDelay, guardInit;
         std::set<std::string> regNets;
+        // resolved std_logic signals with several drivers and a companion (see `nine`):
+        // each driver adds to the nets <sig>__u, __s, __w that resolve the companion
+        std::set<std::string> resAux, resWeak;   // resWeak: some driver may be weak
+        std::map<std::string, TP> resTypes;
         UP cfgUnit;                     // module: bindings from a configuration
         std::vector<UP> cfgSpecs;       // module: configuration specifications of the architecture
         std::ostringstream* helpers = nullptr;   // module: implicit-signal helpers, before the processes
@@ -371,6 +391,29 @@ private:
         fos->lits = {"open_ok", "status_error", "name_error", "mode_error"};
         fos->litSv = {"0", "1", "2", "3"};
         fos->sv = "int";
+        // std.env (VHDL-2019, 16.5): calendar time and directory status types
+        TP dow = mkType(Type::Enum, "dayofweek");
+        dow->lits = {"sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"};
+        for (int i = 0; i < 7; ++i) dow->litSv.push_back(std::to_string(i));
+        dow->sv = "int";
+        TP trec = mkType(Type::Record, "time_record");
+        trec->sv = "vhdl_env::time_record";
+        for (const char* f : {"microsecond", "second", "minute", "hour", "day", "month", "year", "weekday", "dayofyear"}) {
+            trec->fnames.push_back(f);
+            trec->ftext.push_back(f);
+            trec->ftypes.push_back(std::string(f) == "weekday" ? dow : integer);
+        }
+        auto statusType = [&](const std::string& n, std::vector<std::string> lits) {
+            TP t = mkType(Type::Enum, n);
+            t->lits = lits;
+            for (size_t i = 0; i < lits.size(); ++i) t->litSv.push_back(std::to_string(i));
+            t->sv = "int";
+            return t;
+        };
+        TP dos = statusType("dir_open_status", {"status_ok", "status_not_found", "status_no_directory", "status_access_denied", "status_error"});
+        TP dcs = statusType("dir_create_status", {"status_ok", "status_item_exists", "status_access_denied", "status_error"});
+        TP dds = statusType("dir_delete_status", {"status_ok", "status_no_directory", "status_not_empty", "status_access_denied", "status_error"});
+        TP fds = statusType("file_delete_status", {"status_ok", "status_no_file", "status_access_denied", "status_error"});
         TP side = mkType(Type::Enum, "side");
         side->lits = {"right", "left"};
         side->litSv = {"0", "1"};
@@ -427,6 +470,9 @@ private:
         for (size_t i = 0; i < fos->lits.size(); ++i) lit(fos->lits[i], fos, fos->litSv[i]);
         lit("right", side, "0");
         lit("left", side, "1");
+        for (size_t i = 0; i < dow->lits.size(); ++i) lit(dow->lits[i], dow, dow->litSv[i]);
+        for (auto& st : {dos, dcs, dds, fds})
+            for (size_t i = 0; i < st->lits.size(); ++i) lit(st->lits[i], st, st->litSv[i]);
         // the named (non-graphic) literals of CHARACTER (16.3)
         {
             static const char* ctl[] = {"nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel", "bs", "ht", "lf", "vt",
@@ -468,6 +514,7 @@ private:
         };
         obj("output", text, "32'h8000_0001", "file");
         obj("input", text, "32'h8000_0000", "file");
+        obj("dir_separator", str, "\"/\"");
         obj("math_pi", real, "3.14159265358979323846");
         obj("math_2_pi", real, "6.28318530717958647693");
         obj("math_pi_over_2", real, "1.57079632679489661923");
@@ -487,7 +534,12 @@ private:
                        "resolution_limit", "find_leftmost", "find_rightmost", "and_reduce", "or_reduce", "xor_reduce", "nand_reduce",
                        "nor_reduce", "xnor_reduce", "to_real", "justify", "abs", "std_logic_vector", "tee", "fwrite", "unsigned_num_bits", "signed_num_bits",
                        "vhdl_version", "tool_type", "tool_vendor", "tool_name", "tool_edition", "tool_version", "file_name", "file_path",
-                       "file_line"})
+                       "file_line", "getvhdlassertcount", "isvhdlassertfailed", "clearvhdlassert", "setvhdlassertenable",
+                       "getvhdlassertenable", "setvhdlassertformat", "getvhdlassertformat", "setvhdlreadseverity",
+                       "getvhdlreadseverity", "epoch", "localtime", "gmtime", "time_to_seconds", "seconds_to_time",
+                       "getenv", "dir_workingdir", "dir_itemexists", "dir_itemisdir", "dir_itemisfile", "dir_createdir",
+                       "dir_deletedir", "dir_deletefile", "pslassertfailed", "psliscovered", "pslisassertcovered",
+                       "getpslcoverassert", "setpslcoverassert", "clearpslstate"})
             addBuiltinFn(n);
     }
 
@@ -819,6 +871,14 @@ private:
     TP typeOfMark(const EP& m) {
         if (!m) return bt["integer"];
         if (m->k == EK::Attr) {
+            // T'element / T'base with a type prefix
+            if ((m->name == "element" || m->name == "base") && m->a && (m->a->k == EK::Name || m->a->k == EK::Sel)) {
+                const Sym* py = m->a->k == EK::Name ? lookup(m->a->name) : lookupSel(m->a);
+                if (py && py->k == Sym::TypeK && py->type) {
+                    if (m->name == "base") return baseOf(py->type);
+                    return py->type->elem ? py->type->elem : py->type;
+                }
+            }
             if (m->name == "subtype" || m->name == "base") {
                 Val v = ex(m->a, nullptr);
                 if (m->name == "base") return baseOf(v.t);
@@ -977,8 +1037,146 @@ private:
         case '0': case 'l': return "0";
         case '1': case 'h': return "1";
         case 'z': return "z";
+        case '-': return nine ? "z" : "x";
         default: return "x";
         }
+    }
+    // ---------------------------------------------- nine-value std_logic
+    // The image of a std_logic value or vector (with its companion when it has one).
+    static std::string slStr(const Val& x) {
+        return x.a.empty() ? "vhdl_rt::sl_str(" + x.s + ")" : "vhdl_rt::sl_str9(" + x.s + ", " + x.a + ")";
+    }
+    static std::string slvStr(const Val& x, const std::string& w) {
+        return x.a.empty() ? "vhdl_rt::slv_str(" + x.s + ", " + w + ")" : "vhdl_rt::slv_str9(" + x.s + ", " + x.a + ", " + w + ")";
+    }
+    // The companion of an aggregate of std_logic literals ((others => 'L'), ('H', '0')):
+    // the same aggregate of each element's companion bit; "" when all are strong
+    // or an element is not a literal.
+    std::string auxAggregate(const EP& e, const TP& want) {
+        auto mapLit = [](const EP& x) -> EP {
+            if (!x || (x->k != EK::Char && x->k != EK::Str)) return nullptr;
+            auto y = std::make_shared<Expr>(*x);
+            for (char& c : y->text) { char a = auxChar(c); c = a == '1' ? '1' : a == 'x' ? 'X' : '0'; }
+            return y;
+        };
+        bool any = false;
+        auto c = std::make_shared<Expr>(*e);
+        for (auto& el : c->agg) {
+            EP m = mapLit(el.value);
+            if (!m) return "";
+            for (char ch : el.value->text) any |= auxChar(ch) != '0';
+            el.value = m;
+        }
+        if (!any) return "";
+        return aggregate(c, want).s;
+    }
+    // The companions of the module's resolved std_logic signals (see `nine`): 'U' from
+    // the wired 'U' markers; L H W from the net's strength where a driver may be weak.
+    std::string resolvedAux() {
+        std::string r;
+        for (auto& [sig, t] : cx->resTypes) {
+            if (!cx->resWeak.count(sig)) { r += "  assign " + sig + "__9 = " + sig + "__u;\n"; continue; }
+            // __wk is 1 while some driver holds a weak value: then each bit's strength decides
+            r += "  event " + sig + "__e9;\n";
+            r += "  always @(" + sig + " or " + sig + "__u or " + sig + "__wk) if (" + sig + "__wk !== 1'b1) " + sig + "__9 = " + sig + "__u; else ->" + sig + "__e9;\n";
+            if (t->k == Type::Array) {
+                std::string g = sig + "__g9";
+                r += "  for (genvar " + g + " = $low(" + sig + "); " + g + " <= $high(" + sig + "); " + g + "++) always @(" + sig + "__e9) " +
+                     sig + "__9[" + g + "] = vhdl_rt::res9($sformatf(\"%v\", " + sig + "[" + g + "]), " + sig + "__u[" + g + "]);\n";
+            } else r += "  always @(" + sig + "__e9) " + sig + "__9 = vhdl_rt::res9($sformatf(\"%v\", " + sig + "), " + sig + "__u);\n";
+        }
+        return r;
+    }
+    // Does entity port p (of type t) have a companion (see `nine`)?
+    bool auxPort(const DP& p, const TP& t) {
+        return nine && (p->mode == "in" || p->mode == "out" || p->mode == "buffer") && slT(t) && p->sigKind.empty();
+    }
+    // The companion bit of a std_logic character (see `nine`).
+    static char auxChar(char c) {
+        switch (std::tolower((unsigned char)c)) {
+        case 'l': case 'h': case 'w': case '-': return '1';
+        case 'u': return 'x';
+        default: return '0';
+        }
+    }
+    // The companion of a std_logic string literal, "" when every element is strong.
+    std::string auxBits(const std::string& bits) {
+        if (!nine) return "";
+        std::string r;
+        bool any = false;
+        for (char c : bits) { r += auxChar(c); any |= auxChar(c) != '0'; }
+        return any ? std::to_string(bits.size()) + "'b" + r : "";
+    }
+    // std_logic or a one-dimensional packed array of it (std_logic_vector,
+    // unsigned, signed): the objects that get a companion
+    bool slT(const TP& t) {
+        if (!nine || !t) return false;
+        if (baseOf(t)->k == Type::Logic) return true;
+        return t->k == Type::Array && t->dims.size() == 1 && t->elem && isScalarBit(t->elem) && baseOf(t->elem)->k == Type::Logic;
+    }
+    // The companion of a logical operator's result `m` (IEEE 1164 tables): 'U'
+    // where the result is unknown and an operand is 'U', strong elsewhere.
+    static std::string uOf(const Val& x) {
+        if (!x.u.empty()) return x.u;
+        return x.a.empty() ? "" : "(" + x.a + " & ~" + x.a + ")";
+    }
+    // the U marker of the operands (set in v.u) and the companion of the result m
+    // in v.a; m is only evaluated again when an operand is 'U'
+    void auxOp(Val& v, std::initializer_list<const Val*> xs) {
+        std::string u;
+        for (const Val* x : xs) {
+            std::string ux = uOf(*x);
+            if (!ux.empty()) u += (u.empty() ? "" : " | ") + ux;
+        }
+        if (u.empty()) return;
+        v.u = "(" + u + ")";
+        v.a = "((" + v.u + " === '0) ? '0 : ((" + v.s + " ^ " + v.s + ") & " + v.u + "))";
+    }
+    // `x = lit`, `x /= lit`: the companion part of the comparison of a std_logic
+    // object (or one with a companion) with any value: equal classes per element
+    // the bits of a sized binary literal "N'b0101", or "" for any other text
+    static std::string litBits(const std::string& s) {
+        size_t q = s.find("'b");
+        if (q == std::string::npos || q == 0) return "";
+        for (size_t i = 0; i < q; ++i) if (!std::isdigit((unsigned char)s[i])) return "";
+        std::string b = s.substr(q + 2);
+        for (char c : b) if (c != '0' && c != '1' && c != 'x' && c != 'z') return "";
+        if ((size_t)std::stoi(s.substr(0, q)) != b.size()) return "";
+        return b;
+    }
+    // x compared with a literal: each element's companion class must match
+    std::string auxEqLit(const Val& x, const std::string& mb, const std::string& ab) {
+        std::string m1, m0, mx, mn, px;
+        for (size_t i = 0; i < mb.size(); ++i) {
+            char a = ab.empty() ? '0' : ab[i];
+            bool w = a == '1', u = a == 'x', xx = a == '0' && mb[i] == 'x';
+            m1 += w ? '1' : '0';
+            m0 += xx ? '1' : '0';
+            mx += u ? '1' : '0';
+            px += u ? 'x' : '0';
+            mn += (!w && !u && !xx) ? '1' : '0';
+        }
+        std::string n = std::to_string(mb.size()) + "'b", xa = x.a.empty() ? "'0" : x.a;
+        std::vector<std::string> c;
+        if (m1.find('1') != std::string::npos) c.push_back("((" + xa + " & " + n + m1 + ") === " + n + m1 + ")");
+        if (m0.find('1') != std::string::npos) c.push_back("((" + xa + " & " + n + m0 + ") === " + n + std::string(mb.size(), '0') + ")");
+        if (mx.find('1') != std::string::npos) c.push_back("((" + xa + " & " + n + mx + ") === " + n + px + ")");
+        if (mn.find('0') == std::string::npos && !x.a.empty()) c.push_back(mb.size() == 1 ? "(" + xa + " !== 1'b1)" : "((|" + xa + ") !== 1'b1)");
+        else if (mn.find('1') != std::string::npos && !x.a.empty()) c.push_back("((|(" + xa + " & " + n + mn + ")) !== 1'b1)");
+        std::string r;
+        for (auto& k : c) r += (r.empty() ? "" : " && ") + k;
+        return r.empty() ? "" : "(" + r + ")";
+    }
+    std::string auxEq(const Val& x, const Val& y) {
+        if (y.isConst && !litBits(y.s).empty() && (y.a.empty() || !litBits(y.a).empty()) && (!x.a.empty() || !y.a.empty())) return auxEqLit(x, litBits(y.s), litBits(y.a));
+        if (x.isConst && !litBits(x.s).empty() && (x.a.empty() || !litBits(x.a).empty()) && (!x.a.empty() || !y.a.empty())) return auxEqLit(y, litBits(x.s), litBits(x.a));
+        if (x.a.empty() && y.a.empty()) return "";
+        // a value with no companion is strong: no element of the other may be weak
+        if (y.a.empty()) return "((|" + x.a + ") !== 1'b1)";
+        if (x.a.empty()) return "((|" + y.a + ") !== 1'b1)";
+        if (y.isConst) return "(" + x.a + " === " + y.a + ")";
+        if (x.isConst) return "(" + y.a + " === " + x.a + ")";
+        return "(" + x.a + " === " + y.a + ")";
     }
     std::string bitsLit(const std::string& bits, bool fourState = true) {
         if (bits.empty()) return "0";
@@ -1006,6 +1204,7 @@ private:
         } else {
             v.s = "1'b" + logicChar(c);
             v.t = bt["std_ulogic"];
+            if (nine && auxChar(c) != '0') v.a = std::string("1'b") + auxChar(c);
         }
         v.isConst = true;
         return v;
@@ -1023,6 +1222,7 @@ private:
         if (w && w->k == Type::Array && isScalarBit(w->elem)) {
             bool four = w->elem->k == Type::Logic;
             v.s = bitsLit(text, four);
+            if (four) v.a = auxBits(text);
             v.t = vecOf(want, std::to_string(text.size()), wantDownto(want), wantLeft(want, text.size()));
             if (want && want->k == Type::Array) v.t->flavor = want->flavor;
             return v;
@@ -1092,6 +1292,7 @@ private:
             if (w && w->k == Type::String) return strLit(e->text, want, e->line);
             bool four = !(w && w->k == Type::Array && w->elem && w->elem->k == Type::Bit);
             v.s = bitsLit(e->text, four);
+            if (four) v.a = auxBits(e->text);
             v.t = vecOf(want && want->k == Type::Array ? want : bt["std_logic_vector"], std::to_string(e->text.size()), wantDownto(want), wantLeft(want, e->text.size()));
             if (want && want->k == Type::Array) v.t->flavor = want->flavor;
             v.isConst = true;
@@ -1100,7 +1301,11 @@ private:
         case EK::Null:
             if (want && want->k == Type::Access) { v.s = "null"; v.t = want; return v; }
             v.s = "\"\""; v.t = want ? want : bt["line"]; return v;
-        case EK::Agg: return aggregate(e, want);
+        case EK::Agg: {
+            Val r = aggregate(e, want);
+            if (slT(r.t) && r.a.empty()) r.a = auxAggregate(e, want);
+            return r;
+        }
         case EK::Qual: {
             TP t = typeOfMark(e->a);
             Val x = ex(e->b, t);
@@ -1110,6 +1315,16 @@ private:
         }
         case EK::Un: return unary(e, want);
         case EK::Bin: return binary(e, want);
+        case EK::Cond: {   // 9.1: the first value whose condition is true
+            Val c = boolOf(ex(e->b, bt["boolean"]));
+            Val x = ex(e->a, want);
+            Val y = ex(e->args[0].actual, want ? want : x.t);
+            if (!want && ambiguous(e->a) && y.t) x = ex(e->a, y.t);
+            v.s = "(" + c.s + " ? " + x.s + " : " + y.s + ")";
+            v.t = want ? want : x.t ? x.t : y.t;
+            if (!x.a.empty() || !y.a.empty()) v.a = "(" + c.s + " ? " + (x.a.empty() ? "'0" : x.a) + " : " + (y.a.empty() ? "'0" : y.a) + ")";
+            return v;
+        }
         case EK::Name: case EK::Sel: case EK::Call: case EK::Attr: return nameExpr(e, want);
         case EK::Others: fail(e->line, "'others' outside an aggregate");
         case EK::Open: v.s = ""; v.t = want; return v;
@@ -1415,7 +1630,7 @@ private:
         }
         if (e->op == "not") {
             if (t && t->k == Type::Bool) v.s = "(!" + x.s + ")";
-            else v.s = "(~" + x.s + ")";
+            else { v.s = "(~" + x.s + ")"; auxOp(v, {&x}); }
             return v;
         }
         // VHDL-2008 reduction operators
@@ -1424,13 +1639,47 @@ private:
         if (it != red.end()) {
             v.s = "(" + it->second + x.s + ")";
             v.t = x.t && x.t->elem ? x.t->elem : bt["std_ulogic"];
+            if (!x.a.empty()) {
+                v.u = "(|" + uOf(x) + ")";
+                v.a = "((" + v.u + " === 1'b0) ? 1'b0 : ((" + v.s + " ^ " + v.s + ") & " + v.u + "))";
+            }
             return v;
         }
         fail(e->line, "unsupported operator " + e->op);
     }
 
+    // an operand of std.env's TIME_RECORD type: an object of the type or a call of
+    // localtime / gmtime (for the "+" and "-" of 16.5.5)
+    bool isTimeRecord(const EP& x) {
+        if (!x || !bt.count("time_record")) return false;
+        EP n = x->k == EK::Call ? x->a : x;
+        if (!n || n->k != EK::Name) return false;
+        if (x->k == EK::Call && (n->name == "localtime" || n->name == "gmtime")) return true;
+        const Sym* y = lookup(n->name);
+        return y && y->k == Sym::Obj && y->type && baseOf(y->type) == bt["time_record"];
+    }
     Val binary(const EP& e, const TP& want) {
         const std::string& op = e->op;
+        if ((op == "+" || op == "-") && (isTimeRecord(e->a) || isTimeRecord(e->b))) {
+            // TIME_RECORD +/- seconds, seconds + TIME_RECORD, TIME_RECORD - TIME_RECORD (16.5.5);
+            // the calendar arithmetic is done in UTC, which keeps a local-time record local
+            useEnv = true;
+            TP tr = bt["time_record"];
+            Val v;
+            if (isTimeRecord(e->a) && isTimeRecord(e->b)) {
+                if (op != "-") fail(e->line, "TIME_RECORD + TIME_RECORD is not defined");
+                v.s = "(vhdl_env::epoch_of(" + ex(e->a, tr).s + ", 0) - vhdl_env::epoch_of(" + ex(e->b, tr).s + ", 0))";
+                v.t = bt["real"];
+                return v;
+            }
+            bool recLeft = isTimeRecord(e->a);
+            Val r = ex(recLeft ? e->a : e->b, tr), d = ex(recLeft ? e->b : e->a, bt["real"]);
+            std::string secs = "vhdl_env::epoch_of(" + r.s + ", 0)";
+            // DELTA - TREC (declared next to TREC - DELTA) is taken as TREC - DELTA
+            v.s = "vhdl_env::tm(" + secs + (op == "+" ? " + " : " - ") + d.s + ", 0)";
+            v.t = tr;
+            return v;
+        }
         // logical operators
         static const std::map<std::string, std::string> lg = {{"and", "&"}, {"or", "|"}, {"xor", "^"}, {"nand", "&"}, {"nor", "|"}, {"xnor", "^"}};
         if (lg.count(op)) {
@@ -1445,10 +1694,20 @@ private:
                 return v;
             }
             // std_logic scalar mixed with a vector (VHDL-2008): replicate
-            if (a.t && b.t && a.t->k == Type::Array && isScalarBit(b.t)) b.s = "{" + widthOf(a.t) + "{" + b.s + "}}";
-            if (a.t && b.t && b.t->k == Type::Array && isScalarBit(a.t)) { a.s = "{" + widthOf(b.t) + "{" + a.s + "}}"; v.t = b.t; }
+            if (a.t && b.t && a.t->k == Type::Array && isScalarBit(b.t)) {
+                b.s = "{" + widthOf(a.t) + "{" + b.s + "}}";
+                if (!b.a.empty()) b.a = "{" + widthOf(a.t) + "{" + b.a + "}}";
+                if (!b.u.empty()) b.u = "{" + widthOf(a.t) + "{" + b.u + "}}";
+            }
+            if (a.t && b.t && b.t->k == Type::Array && isScalarBit(a.t)) {
+                a.s = "{" + widthOf(b.t) + "{" + a.s + "}}";
+                if (!a.a.empty()) a.a = "{" + widthOf(b.t) + "{" + a.a + "}}";
+                if (!a.u.empty()) a.u = "{" + widthOf(b.t) + "{" + a.u + "}}";
+                v.t = b.t;
+            }
             v.s = "(" + a.s + " " + lg.at(op) + " " + b.s + ")";
             if (op == "nand" || op == "nor" || op == "xnor") v.s = "(~" + v.s + ")";
+            auxOp(v, {&a, &b});
             return v;
         }
         // relational
@@ -1461,7 +1720,12 @@ private:
             bool four = isFourState(a.t) || isFourState(b.t);
             if (op == "=" || op == "/=") {
                 bool strs = (ta && (ta->k == Type::String || ta->k == Type::Line)) || (tb && (tb->k == Type::String || tb->k == Type::Line));
-                if (four && !(isNumVec(a.t) || isNumVec(b.t))) v.s = "(" + a.s + (op == "=" ? " === " : " !== ") + b.s + ")";
+                if (four && !(isNumVec(a.t) || isNumVec(b.t))) {
+                    std::string ae = auxEq(a, b);
+                    if (ae.empty()) v.s = "(" + a.s + (op == "=" ? " === " : " !== ") + b.s + ")";
+                    else if (op == "=") v.s = "((" + a.s + " === " + b.s + ") && " + ae + ")";
+                    else v.s = "(!((" + a.s + " === " + b.s + ") && " + ae + "))";
+                }
                 else if (four) v.s = "bit'(" + numCmpOperand(a, b) + (op == "=" ? " == " : " != ") + numCmpOperand(b, a) + ")";
                 else if (strs) v.s = "(" + a.s + (op == "=" ? " == " : " != ") + b.s + ")";
                 else v.s = "(" + a.s + (op == "=" ? " == " : " != ") + b.s + ")";
@@ -1488,7 +1752,9 @@ private:
         if (op == "sll" || op == "srl" || op == "sla" || op == "sra" || op == "rol" || op == "ror") {
             Val a = ex(e->a, want);
             Val b = ex(e->b, bt["integer"]);
-            return shiftOp(op, a, b);
+            Val r = shiftOp(op, a, b);
+            if (!a.a.empty()) { Val aa = a; aa.s = a.a; r.a = shiftOp(op, aa, b).s; }
+            return r;
         }
         // arithmetic
         return arith(e, want);
@@ -1581,18 +1847,28 @@ private:
         std::string w = "0";
         std::string s = "{";
         bool packed = arrT ? isScalarBit(elemT) : true;
+        std::vector<std::string> auxParts;
+        bool anyAux = false;
         for (size_t i = 0; i < parts.size(); ++i) {
             Val x = vals[i].s.empty() ? ex(parts[i], parts[i]->k == EK::Char ? elemT : (arrT ? arrT : bt["std_logic_vector"])) : vals[i];
             if (parts[i]->k == EK::Agg && x.t && x.t->k == Type::Array && !x.t->dims.empty() && x.t->dims[0].box) {
                 // others in a concatenation: unknown width
                 fail(parts[i]->line, "aggregate with 'others' in a concatenation needs a qualified type");
             }
-            w = addText(w, x.t && x.t->k == Type::Array ? widthOf(x.t) : "1");
+            std::string wi = x.t && x.t->k == Type::Array ? widthOf(x.t) : "1";
+            w = addText(w, wi);
             s += (i ? ", " : "") + x.s;
+            auxParts.push_back(x.a.empty() ? "(" + wi + ")'(0)" : x.a);
+            anyAux |= !x.a.empty();
         }
         s += "}";
         if (!packed) s = "'" + s;   // unpacked arrays: assignment pattern of elements
         v.s = s;
+        if (packed && anyAux) {
+            v.a = "{";
+            for (size_t i = 0; i < auxParts.size(); ++i) v.a += (i ? ", " : "") + auxParts[i];
+            v.a += "}";
+        }
         TP base = arrT ? arrT : bt["std_logic_vector"];
         v.t = vecOf(base, w, wantDownto(want ? want : base));
         v.t->elem = elemT;
@@ -1763,7 +2039,11 @@ private:
         }
         // indexed or sliced object (or a function result)
         Val p = ex(pre, nullptr);
-        return indexOrSlice(p, e);
+        Val r = indexOrSlice(p, e);
+        // the companion of an element or slice: the same selection of p's companion
+        if (!p.a.empty() && p.accObj.empty() && r.s.size() > p.s.size() && r.s.compare(0, p.s.size(), p.s) == 0 && slT(r.t))
+            r.a = p.a + r.s.substr(p.s.size());
+        return r;
     }
 
     Val symVal(const Sym& y, const EP& e) {
@@ -1780,6 +2060,7 @@ private:
             if (cx->proc && cx->proc->active && y.cls == "signal") {
                 // reading a signal through a driver variable is not possible; read the signal
             }
+            if (y.aux) v.a = v.s + "__9";
             return v;
         case Sym::Lit: v.s = y.home == "*" ? y.sv : (y.home.empty() || y.home == cx->container ? y.sv : svId(y.home) + "::" + y.sv); v.t = y.type; v.isConst = true; return v;
         case Sym::Alias: v.s = y.aliasSv; v.t = y.type; return v;
@@ -1903,6 +2184,24 @@ private:
         return true;
     }
 
+    // a type conversion call T(x)
+    bool isTypeConvCall(const EP& e) {
+        if (!e || e->k != EK::Call || !e->a || e->a->k != EK::Name || e->args.size() != 1 || !e->args[0].actual || e->args[0].formal) return false;
+        const std::vector<Sym>* syms = lookupAll(e->a->name);
+        return syms && !syms->empty() && syms->front().k == Sym::TypeK;
+    }
+    // T(x) where T and x's type are one-dimensional arrays of std_ulogic-based
+    // elements: the SystemVerilog bits are the same before and after
+    bool bitsConv(const EP& e, TP argT = nullptr) {
+        if (!isTypeConvCall(e)) return false;
+        auto logicArr = [&](const TP& t0) {
+            TP t = t0 ? baseOf(t0) : nullptr;
+            return t && t->k == Type::Array && t->dims.size() == 1 && t->elem && baseOf(t->elem)->k == Type::Logic;
+        };
+        TP to = lookupAll(e->a->name)->front().type;
+        if (!argT) argT = ex(e->args[0].actual, nullptr).t;
+        return logicArr(to) && logicArr(argT);
+    }
     // ---------------------------------------------------------- conversion
     Val conversion(const TP& to, const EP& e, const TP& want) {
         (void)want;
@@ -1969,7 +2268,7 @@ private:
         }
         if (a == "image") {
             Val x = ex(e->b, pt);
-            return image(pt, x);
+            return attrImage(pt, x);
         }
         if (a == "value") {
             Val x = ex(e->b, bt["string"]);
@@ -2067,6 +2366,39 @@ private:
         fail(e->line, "unsupported attribute '" + e->text + "'");
     }
 
+    // T'IMAGE (16.2.2): VHDL-2019 also takes a composite type. A one-dimensional array of
+    // character literals is its string in double quotes; a record is the images of its
+    // elements, separated by commas, in parentheses.
+    Val attrImage(const TP& t, const Val& x) {
+        TP b = baseOf(t);
+        Val v;
+        v.t = bt["string"];
+        if (b && (b->k == Type::String || (b->k == Type::Array && b->elem && isScalarBit(b->elem)) ||
+                  (b->k == Type::Array && b->elem && baseOf(b->elem)->k == Type::Char))) {
+            std::string s;
+            if (b->k == Type::String || baseOf(b->elem)->k == Type::Char) s = "vhdl_rt::dquote(" + x.s + ")";
+            else if (baseOf(b->elem)->k == Type::Logic) s = "{\"\\\"\", " + slvStr(x, widthOf(x.t && !isUnconstrained(x.t) ? x.t : t)) + ", \"\\\"\"}";
+            else s = "$sformatf(\"\\\"%b\\\"\", " + x.s + ")";
+            v.s = s;
+            return v;
+        }
+        if (b && b->k == Type::Array && b->dims.size() == 1 && b->elem && baseOf(b->elem)->k == Type::Int) {
+            v.s = "vhdl_rt::p2img($sformatf(\"%p\", " + x.s + "))";   // (e1,e2,...)
+            return v;
+        }
+        if (b && b->k == Type::Record) {
+            std::string s = "{\"(\"";
+            for (size_t f = 0; f < b->fnames.size(); ++f) {
+                Val y;
+                y.s = x.s + "." + svId(b->ftext[f]);
+                y.t = b->ftypes[f];
+                s += std::string(f ? ", \",\"" : "") + ", " + attrImage(b->ftypes[f], y).s;
+            }
+            v.s = s + ", \")\"}";
+            return v;
+        }
+        return image(t, x);
+    }
     Val image(const TP& t, const Val& x) {
         Val v;
         v.t = bt["string"];
@@ -2077,7 +2409,7 @@ private:
         case Type::Time: v.s = "vhdl_rt::time_image(" + x.s + ")"; break;
         case Type::Bool: v.s = "((" + x.s + ") ? \"true\" : \"false\")"; break;
         case Type::Bit: v.s = "((" + x.s + ") ? \"'1'\" : \"'0'\")"; break;
-        case Type::Logic: v.s = "{\"'\", vhdl_rt::sl_str(" + x.s + "), \"'\"}"; break;
+        case Type::Logic: v.s = "{\"'\", " + slStr(x) + ", \"'\"}"; break;
         case Type::Char: v.s = "{\"'\", string'(" + x.s + "), \"'\"}"; break;
         case Type::Enum:
             if (b->sv == "int") {
@@ -2348,7 +2680,18 @@ private:
     Val callSub(const EP& nameE, const std::vector<Sym>& syms, const std::vector<Assoc>& args, const TP& want, const std::string& recv = "") {
         int line = nameE->line;
         const Sym* s = pickOverload(syms, args, want, line);
-        if (!s->builtin.empty() && !s->sub) return builtinCall(s->builtin, args, want, line);
+        if (!s->builtin.empty() && !s->sub) {
+            Val r = builtinCall(s->builtin, args, want, line);
+            if (nine && !r.a.empty()) {
+                // conversions between std_logic types keep the nine values; to_ux01 keeps 'U';
+                // the other IEEE functions give strong values
+                static const std::set<std::string> keep = {"to_stdulogicvector", "to_stdlogicvector", "to_slv", "to_sulv", "to_stdulogic",
+                                                           "std_logic_vector", "std_ulogic_vector"};
+                if (s->builtin == "to_ux01") r.a = "(" + r.a + " & ~" + r.a + ")";
+                else if (!keep.count(s->builtin)) r.a.clear();
+            }
+            return r;
+        }
         if (!s->sub) fail(line, "not a subprogram");
         return userCall(*s, args, want, line, recv);
     }
@@ -2509,7 +2852,12 @@ private:
         }
         if (id == "to_bit") { Val x = arg(0); v.s = "bit'(" + x.s + ")"; v.t = bt["bit"]; return v; }
         if (id == "to_stdulogic") { Val x = arg(0); v.s = "logic'(" + x.s + ")"; v.t = bt["std_ulogic"]; return v; }
-        if (id == "to_x01" || id == "to_x01z" || id == "to_ux01") { Val x = arg(0); v = x; return v; }
+        if (id == "to_x01" || id == "to_x01z" || id == "to_ux01") {
+            Val x = arg(0);
+            v = x;
+            if (id != "to_x01z") v.s = "(" + x.s + " | " + x.s + ")";   // 'Z' and '-' become 'X'
+            return v;
+        }
         if (id == "to_01") {
             Val x = arg(0);
             v.t = x.t;
@@ -2538,14 +2886,19 @@ private:
             Val x = arg(0);
             v.t = bt["string"];
             TP b = baseOf(x.t);
+            if (id == "to_string" && b && b == bt["time_record"]) {   // ISO 8601 (16.5.5)
+                useEnv = true;
+                v.s = "vhdl_env::tm_str(" + x.s + ", " + (args.size() > 1 ? arg(1, bt["integer"]).s : std::string("0")) + ")";
+                return v;
+            }
             if (id == "to_string" && x.t && x.t->k == Type::Array && isScalarBit(x.t->elem)) {
-                v.s = x.t->elem->k == Type::Logic ? "vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t) + ")" : "$sformatf(\"%b\", " + x.s + ")";
+                v.s = x.t->elem->k == Type::Logic ? slvStr(x, widthOf(x.t)) : "$sformatf(\"%b\", " + x.s + ")";
                 return v;
             }
             if (id == "to_hstring" || id == "to_hex_string") { v.s = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 4)"; return v; }
             if (id == "to_ostring" || id == "to_octal_string") { v.s = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 3)"; return v; }
-            if (id == "to_bstring") { v.s = "vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t) + ")"; return v; }
-            if (b && b->k == Type::Logic) { v.s = "vhdl_rt::sl_str(" + x.s + ")"; return v; }
+            if (id == "to_bstring") { v.s = slvStr(x, widthOf(x.t)); return v; }
+            if (b && b->k == Type::Logic) { v.s = slStr(x); return v; }
             if (b && b->k == Type::Char) { v.s = "string'(" + x.s + ")"; return v; }
             if (b && b->k == Type::Real && args.size() > 1) {
                 Val f = arg(1);
@@ -2649,11 +3002,124 @@ private:
         }
         if (id == "file_line") { v.s = "\"" + std::to_string(line) + "\""; v.t = bt["string"]; return v; }
         if (id == "resolution_limit") { v.s = "(1fs)"; v.t = bt["time"]; return v; }
+        // std.env report and assert API (VHDL-2019, 16.5.9)
+        if (id == "getvhdlassertcount" || id == "isvhdlassertfailed") {
+            EP l = named("level");
+            if (!l && !args.empty() && !args[0].formal) l = args[0].actual;
+            std::string c = "vhdl_rt::assert_count(" + (l ? ex(l, bt["severity_level"]).s : std::string("-1")) + ")";
+            if (id == "getvhdlassertcount") { v.s = c; v.t = bt["natural"]; }
+            else { v.s = "bit'(" + c + " > 0)"; v.t = bt["boolean"]; }
+            return v;
+        }
+        if (id == "getvhdlassertenable" || id == "getvhdlassertformat") {
+            EP l = named("level");
+            if (!l && !args.empty() && !args[0].formal) l = args[0].actual;
+            std::string lv = l ? ex(l, bt["severity_level"]).s : "0";
+            if (id == "getvhdlassertenable") { v.s = "vhdl_rt::aenable[" + lv + "]"; v.t = bt["boolean"]; }
+            else { v.s = "vhdl_rt::afmt[" + lv + "]"; v.t = bt["string"]; }
+            return v;
+        }
+        if (id == "getvhdlreadseverity") { v.s = "vhdl_rt::read_sev"; v.t = bt["severity_level"]; return v; }
+        // std.env PSL API (16.5.10): msim's VHDL front end has no PSL, so nothing fails or is covered
+        if (id == "pslassertfailed" || id == "psliscovered" || id == "pslisassertcovered") { v.s = id == "pslassertfailed" ? "1'b0" : "1'b1"; v.t = bt["boolean"]; return v; }
+        if (id == "getpslcoverassert") { v.s = "vhdl_rt::psl_cover_assert"; v.t = bt["boolean"]; return v; }
+        // std.env calendar time, environment and directories (VHDL-2019, 16.5.5 - 16.5.7)
+        if (id == "epoch" || id == "localtime" || id == "gmtime" || id == "getenv" || id == "dir_workingdir" || id == "dir_itemexists" ||
+            id == "dir_itemisdir" || id == "dir_itemisfile" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
+            useEnv = true;
+            TP trec = bt["time_record"];
+            if (id == "epoch" || id == "localtime" || id == "gmtime") {
+                std::string loc = id == "gmtime" ? "0" : "1";
+                if (args.empty()) {
+                    if (id == "epoch") { v.s = "vhdl_env::msim_vhdl_epoch()"; v.t = bt["real"]; }
+                    else { v.s = "vhdl_env::tm(vhdl_env::msim_vhdl_epoch(), " + loc + ")"; v.t = trec; }
+                    return v;
+                }
+                Val x = arg(0);
+                bool isRec = x.t && baseOf(x.t) == trec;
+                if (!isRec) x = arg(0, bt["real"]);
+                if (id == "epoch") { v.s = isRec ? "vhdl_env::epoch_of(" + x.s + ", 1)" : x.s; v.t = bt["real"]; return v; }
+                // EPOCH and GMTIME take a time record in local time, LOCALTIME one in UTC
+                std::string secs = isRec ? "vhdl_env::epoch_of(" + x.s + ", " + (id == "gmtime" ? "1" : "0") + ")" : x.s;
+                v.s = "vhdl_env::tm(" + secs + ", " + loc + ")";
+                v.t = trec;
+                return v;
+            }
+            if (id == "getenv") { v.s = "vhdl_env::msim_vhdl_getenv(" + arg(0, bt["string"]).s + ")"; v.t = bt["string"]; return v; }
+            if (id == "dir_workingdir") {
+                if (args.empty()) { v.s = "vhdl_env::msim_vhdl_cwd()"; v.t = bt["string"]; }
+                else { v.s = "vhdl_env::msim_vhdl_chdir(" + arg(0, bt["string"]).s + ")"; v.t = bt["dir_open_status"]; }
+                return v;
+            }
+            if (id == "dir_itemexists" || id == "dir_itemisdir" || id == "dir_itemisfile") {
+                v.s = "bit'(vhdl_env::msim_vhdl_stat(" + arg(0, bt["string"]).s + ", " + (id == "dir_itemexists" ? "0" : id == "dir_itemisdir" ? "1" : "2") + "))";
+                v.t = bt["boolean"];
+                return v;
+            }
+            EP flag = named(id == "dir_createdir" ? "parents" : "recursive");
+            if (!flag && args.size() > 1 && !args[1].formal) flag = args[1].actual;
+            std::string f = flag ? ex(flag, bt["boolean"]).s : "1'b0";
+            std::string p = arg(0, bt["string"]).s;
+            if (id == "dir_createdir") { v.s = "vhdl_env::msim_vhdl_mkdir(" + p + ", " + f + ")"; v.t = bt["dir_create_status"]; }
+            else if (id == "dir_deletedir") { v.s = "vhdl_env::msim_vhdl_rmdir(" + p + ", " + f + ")"; v.t = bt["dir_delete_status"]; }
+            else { v.s = "vhdl_env::msim_vhdl_unlink(" + p + ")"; v.t = bt["file_delete_status"]; }
+            return v;
+        }
+        if (id == "time_to_seconds") { v.s = "(real'(" + arg(0, bt["time"]).s + ") * " + unitSeconds() + ")"; v.t = bt["real"]; return v; }
+        if (id == "seconds_to_time") { v.s = "(" + arg(0, bt["real"]).s + " / " + unitSeconds() + ")"; v.t = bt["time"]; return v; }
         if (id == "abs") { Val x = arg(0); v.t = x.t; v.s = "((" + x.s + ") < 0 ? -(" + x.s + ") : (" + x.s + "))"; return v; }
         if (id == "unsigned_num_bits") { Val x = arg(0); v.s = "vhdl_rt::num_bits(" + x.s + ")"; v.t = bt["integer"]; return v; }
         (void)named;
         (void)want;
         fail(line, "'" + id + "' is not supported as a function yet");
+    }
+
+    // std.env's calendar time, environment and directory functions (VHDL-2019,
+    // 16.5.5 - 16.5.7): DPI-C calls of helpers that msim itself exports
+    // (src/vhdl_env.inc). Emitted only for a design that uses them.
+    std::string envPackage() const {
+        return R"SV(package vhdl_env;
+  import "DPI-C" function real msim_vhdl_epoch();
+  import "DPI-C" function int msim_vhdl_tm(real t, int loc, int f);
+  import "DPI-C" function real msim_vhdl_mktime(int us, int s, int mi, int h, int d, int mo, int y, int loc);
+  import "DPI-C" function string msim_vhdl_getenv(string name);
+  import "DPI-C" function string msim_vhdl_cwd();
+  import "DPI-C" function int msim_vhdl_chdir(string path);
+  import "DPI-C" function int msim_vhdl_stat(string path, int what);
+  import "DPI-C" function int msim_vhdl_mkdir(string path, int parents);
+  import "DPI-C" function int msim_vhdl_rmdir(string path, int recursive);
+  import "DPI-C" function int msim_vhdl_unlink(string path);
+  typedef struct { int microsecond, second, minute, hour, day, month, year, weekday, dayofyear; } time_record;
+  function automatic time_record tm(real t, int loc);
+    time_record r;
+    r.microsecond = msim_vhdl_tm(t, loc, 0); r.second = msim_vhdl_tm(t, loc, 1); r.minute = msim_vhdl_tm(t, loc, 2);
+    r.hour = msim_vhdl_tm(t, loc, 3); r.day = msim_vhdl_tm(t, loc, 4); r.month = msim_vhdl_tm(t, loc, 5);
+    r.year = msim_vhdl_tm(t, loc, 6); r.weekday = msim_vhdl_tm(t, loc, 7); r.dayofyear = msim_vhdl_tm(t, loc, 8);
+    return r;
+  endfunction
+  function automatic real epoch_of(time_record r, int loc);
+    return msim_vhdl_mktime(r.microsecond, r.second, r.minute, r.hour, r.day, r.month, r.year, loc);
+  endfunction
+  function automatic string pad0(int v, int w);   // zero-padded decimal
+    string s = $sformatf("%0d", v);
+    while (s.len() < w) s = {"0", s};
+    return s;
+  endfunction
+  function automatic string tm_str(time_record r, int frac);   // ISO 8601
+    string s = {pad0(r.year, 4), "-", pad0(r.month + 1, 2), "-", pad0(r.day, 2), "T", pad0(r.hour, 2), ":", pad0(r.minute, 2), ":", pad0(r.second, 2)};
+    if (frac > 0) s = {s, ".", pad0(r.microsecond, 6).substr(0, frac - 1)};
+    return s;
+  endfunction
+endpackage
+)SV";
+    }
+
+    // seconds per unit of `timeUnit`, the unit of a VHDL time value in SystemVerilog
+    std::string unitSeconds() const {
+        static const std::map<std::string, std::string> u = {{"1s", "1.0"}, {"1ms", "1.0e-3"}, {"1us", "1.0e-6"}, {"1ns", "1.0e-9"}, {"1ps", "1.0e-12"}, {"1fs", "1.0e-15"},
+                                                              {"10ns", "1.0e-8"}, {"100ns", "1.0e-7"}, {"10ps", "1.0e-11"}, {"100ps", "1.0e-10"}};
+        auto it = u.find(timeUnit);
+        return it == u.end() ? "1.0e-9" : it->second;
     }
 
     // Built-in procedures (textio, env, file I/O, uniform)
@@ -2662,6 +3128,52 @@ private:
             if (i >= args.size()) fail(line, id + ": missing argument");
             return ex(args[i].actual, w);
         };
+        // std.env report and assert API (VHDL-2019, 16.5.9); `by` finds an argument by name or position
+        auto by = [&](const char* name, size_t pos) -> EP {
+            for (auto& a : args) if (a.formal && a.formal->k == EK::Name && a.formal->name == name) return a.actual;
+            return pos < args.size() && !args[pos].formal ? args[pos].actual : nullptr;
+        };
+        if (id == "clearvhdlassert") return "vhdl_rt::assert_clear();";
+        if (id == "setpslcoverassert") { EP e = by("enable", 0); return "vhdl_rt::psl_cover_assert = " + (e ? ex(e, bt["boolean"]).s : std::string("1'b1")) + ";"; }
+        if (id == "clearpslstate") return ";";
+        // std.env directory procedures: the last argument is the status (16.5.6)
+        if (id == "dir_workingdir" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
+            useEnv = true;
+            EP p = by("path", 0), st = by("status", args.size() - 1), flag = by(id == "dir_createdir" ? "parents" : "recursive", 99);
+            if (!flag && args.size() == 3 && !args[1].formal) flag = args[1].actual;
+            if (!p || !st) fail(line, id + ": missing argument");
+            std::string ps = ex(p, bt["string"]).s, f = flag ? ex(flag, bt["boolean"]).s : "1'b0";
+            std::string c = id == "dir_workingdir" ? "vhdl_env::msim_vhdl_chdir(" + ps + ")" : id == "dir_createdir" ? "vhdl_env::msim_vhdl_mkdir(" + ps + ", " + f + ")"
+                          : id == "dir_deletedir" ? "vhdl_env::msim_vhdl_rmdir(" + ps + ", " + f + ")" : "vhdl_env::msim_vhdl_unlink(" + ps + ")";
+            return target(st, false) + " = " + c + ";";
+        }
+        if (id == "setvhdlassertenable") {   // (Enable) for every level, or (Level, Enable)
+            EP lv, en;
+            std::vector<EP> pos;
+            for (auto& a : args) {
+                if (!a.formal) pos.push_back(a.actual);
+                else if (a.formal->k == EK::Name && a.formal->name == "level") lv = a.actual;
+                else if (a.formal->k == EK::Name && a.formal->name == "enable") en = a.actual;
+            }
+            if (pos.size() == 2) { lv = pos[0]; en = pos[1]; }
+            else if (pos.size() == 1) {
+                Val x = ex(pos[0], nullptr);
+                if (x.t && baseOf(x.t) == bt["boolean"] && !lv) en = pos[0];
+                else lv = pos[0];
+            }
+            return "vhdl_rt::assert_enable(" + (lv ? ex(lv, bt["severity_level"]).s : std::string("-1")) + ", " + (en ? ex(en, bt["boolean"]).s : "1'b1") + ");";
+        }
+        if (id == "setvhdlassertformat") {
+            EP lv = by("level", 0), f = by("format", 1), ok = by("valid", 2);
+            if (!lv || !f) fail(line, "SetVhdlAssertFormat: missing argument");
+            std::string c = "vhdl_rt::assert_format(" + ex(lv, bt["severity_level"]).s + ", " + ex(f, bt["string"]).s + ", " + (ok ? "1" : "0") + ")";
+            if (ok) return target(ok, false) + " = " + c + ";";
+            return "void'(" + c + ");";
+        }
+        if (id == "setvhdlreadseverity") {
+            EP lv = by("level", 0);
+            return "vhdl_rt::read_sev = " + (lv ? ex(lv, bt["severity_level"]).s : std::string("3")) + ";";
+        }
         if (id == "stop" || id == "finish") {
             if (id == "stop") return "$stop;";
             return "$finish;";
@@ -2685,8 +3197,8 @@ private:
             TP b = baseOf(x.t);
             if (id == "hwrite") img = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 4)";
             else if (id == "owrite") img = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 3)";
-            else if (b && b->k == Type::Array && isScalarBit(b->elem)) img = b->elem->k == Type::Logic ? "vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t) + ")" : "$sformatf(\"%b\", " + x.s + ")";
-            else if (b && b->k == Type::Logic) img = "vhdl_rt::sl_str(" + x.s + ")";
+            else if (b && b->k == Type::Array && isScalarBit(b->elem)) img = b->elem->k == Type::Logic ? slvStr(x, widthOf(x.t)) : "$sformatf(\"%b\", " + x.s + ")";
+            else if (b && b->k == Type::Logic) img = slStr(x);
             else if (b && b->k == Type::Bit) img = "((" + x.s + ") ? \"1\" : \"0\")";
             else if (b && b->k == Type::Char) img = "string'(" + x.s + ")";
             else if (b && b->k == Type::Real && args.size() > 4) { Val d = arg(4, bt["integer"]); img = "vhdl_rt::real_digits(" + x.s + ", " + d.s + ")"; }
@@ -2719,10 +3231,10 @@ private:
             else fail(line, "read of this type is not supported yet");
             std::string tmp = "vhdl_rt::" + fn;
             if (fn == "read_slv" || fn == "read_hex") {
-                return "begin logic [" + widthOf(x.t) + "-1:0] t__; bit ok__; ok__ = vhdl_rt::" + fn + "(" + l.s + ", t__, " + widthOf(x.t) + extra + "); " + x.s + " = t__;" + (good.empty() ? "" : " " + good + " = ok__;") + " end";
+                return "begin logic [" + widthOf(x.t) + "-1:0] t__; bit ok__; ok__ = vhdl_rt::" + fn + "(" + l.s + ", t__, " + widthOf(x.t) + extra + "); " + x.s + " = t__;" + (x.a.empty() ? "" : " " + x.a + " = '0;") + (good.empty() ? "" : " " + good + " = ok__;") + " end";
             }
             if (fn == "read_str") return "begin bit ok__; ok__ = vhdl_rt::read_str(" + l.s + ", " + x.s + ", " + widthOf(x.t) + ");" + (good.empty() ? "" : " " + good + " = ok__;") + " end";
-            return "begin bit ok__; ok__ = " + tmp + "(" + l.s + ", " + x.s + ");" + (good.empty() ? "" : " " + good + " = ok__;") + " end";
+            return "begin bit ok__; ok__ = " + tmp + "(" + l.s + ", " + x.s + ");" + (x.a.empty() ? "" : " " + x.a + " = '0;") + (good.empty() ? "" : " " + good + " = ok__;") + " end";
         }
         if (id == "file_open") {
             // file_open([status,] f, name, mode)
@@ -2771,6 +3283,24 @@ package vhdl_rt;
   function automatic string lower(string s);
     return s.tolower();
   endfunction
+  // a VHDL instance path (16.2.5 style) from SystemVerilog's %m: top.u1.p -> :top:u1:p:
+  function automatic string inst_path(string m, string loc);
+    string r = ":";
+    if (m == "") return loc;
+    for (int i = 0; i < m.len(); i++) r = {r, m[i] == "." ? ":" : string'(m[i])};
+    return {r, ":"};
+  endfunction
+  function automatic string p2img(string p);   // %p's '{1, 2} as VHDL-2019 'image: (1,2)
+    string r = "(";
+    for (int i = 0; i < p.len(); i++)
+      if (!(p[i] inside {"'", "{", "}", " "})) r = {r, string'(p[i])};
+    return {r, ")"};
+  endfunction
+  function automatic string dquote(string s);   // a string's 'image: quoted, quotes doubled
+    string r = "\"";
+    for (int i = 0; i < s.len(); i++) r = {r, s[i] == "\"" ? "\"\"" : string'(s[i])};
+    return {r, "\""};
+  endfunction
   function automatic string justify(string s, int left, int field);
     string pad = "";
     for (int i = s.len(); i < field; i++) pad = {pad, " "};
@@ -2799,6 +3329,35 @@ package vhdl_rt;
       1'bz: return "Z";
       default: return "X";
     endcase
+  endfunction
+  // nine-value std_logic (Translator::nine): v is the value, a its companion
+  function automatic string sl_str9(logic v, logic a);
+    if (a === 1'b1) return v === 1'b0 ? "L" : v === 1'b1 ? "H" : v === 1'bz ? "-" : "W";
+    if (v === 1'b0) return "0";
+    if (v === 1'b1) return "1";
+    if (v === 1'bz) return "Z";
+    return a === 1'b0 ? "X" : "U";
+  endfunction
+  function automatic string slv_str9(logic [4095:0] v, logic [4095:0] a, int n);
+    string s = "";
+    for (int i = n - 1; i >= 0; i--) s = {s, sl_str9(v[i], a[i])};
+    return s;
+  endfunction
+  // a driver (v, a) of a resolved std_logic net that may be weak: k = 0 its strong
+  // part, 1 its weak part (L H W), z elsewhere
+  function automatic logic [4095:0] drv9(logic [4095:0] v, logic [4095:0] a, int k, int n);
+    logic [4095:0] r = 'z;
+    for (int i = 0; i < n; i++) begin
+      bit wk = a[i] === 1'b1;
+      if (k == 0) r[i] = wk ? (v[i] === 1'bz ? 1'bx : 1'bz) : v[i];   // '-' resolves as X
+      else r[i] = wk && v[i] !== 1'bz ? v[i] : 1'bz;
+    end
+    return r;
+  endfunction
+  // the companion bit of a resolved net's bit from its strength (%v) and 'U' marker
+  function automatic logic res9(string st, logic u);
+    if (u !== 1'b0) return 1'bx;
+    return st.len() >= 2 && ((st[0] == "W" && st[1] == "e") || (st[0] == "P" && st[1] == "u")) ? 1'b1 : 1'b0;
   endfunction
   function automatic int sl_pos(logic v);
     case (v) 1'b0: return 2; 1'b1: return 3; 1'bz: return 4; default: return 1; endcase
@@ -2884,10 +3443,102 @@ package vhdl_rt;
     end
     return int'(v);
   endfunction
-  function automatic void report(string msg, int sev, string loc, bit is_assert);
+  // std.env report and assert API (VHDL-2019, 16.5.9): counts, enables and formats per severity
+  int acount[4];
+  bit aenable[4] = '{1, 1, 1, 1};
+  string afmt[4];
+  int read_sev = 2;
+  bit psl_cover_assert = 1;
+  function automatic int assert_count(int lvl);
+    if (lvl < 0) return acount[1] + acount[2] + acount[3];
+    return acount[lvl];
+  endfunction
+  function automatic void assert_clear();
+    acount = '{0, 0, 0, 0};
+  endfunction
+  function automatic void assert_enable(int lvl, bit en);
+    if (lvl < 0) aenable = '{en, en, en, en};
+    else aenable[lvl] = en;
+  endfunction
+  function automatic string fmt_field(string s, byte fill, byte align, int width);
+    string l = "", r = "";
+    int pad = width - s.len();
+    for (int k = 0; k < pad; k++)
+      if (align == "<" || (align == "^" && k >= pad / 2)) r = {r, string'(fill)};
+      else l = {l, string'(fill)};
+    return {l, s, r};
+  endfunction
+  // Apply an assert format string (16.5.9); 0 when the string is not valid.
+  function automatic bit fmt_apply(string f, string sev, string msg, string loc, output string o);
+    o = "";
+    for (int i = 0; i < f.len(); i++) begin
+      if (f[i] != "{") begin o = {o, string'(f[i])}; continue; end
+      if (i + 1 < f.len() && f[i + 1] == "{") begin o = {o, "{"}; i++; continue; end
+      begin
+        int j = i + 1, k, width = 0;
+        byte var_, fill = " ", align = 0;
+        string spec, unit = "", val;
+        while (j < f.len() && f[j] != "}") j++;
+        if (j >= f.len() || j == i + 1) return 0;
+        var_ = f[i + 1];
+        if (!(var_ inside {"s", "S", "r", "t", "i"})) return 0;
+        if (j > i + 2) begin
+          if (f[i + 2] == ":") spec = f.substr(i + 3, j - 1);
+          else if (f[i + 2] == ".") spec = f.substr(i + 2, j - 1);   // {t.ns}, as in the 16.5.9 example
+          else return 0;
+          k = 0;
+          if (spec.len() >= 2 && spec[1] inside {"<", ">", "^"}) begin fill = spec[0]; align = spec[1]; k = 2; end
+          else if (spec.len() >= 1 && spec[0] inside {"<", ">", "^"}) begin align = spec[0]; k = 1; end
+          while (k < spec.len() && spec[k] >= "0" && spec[k] <= "9") begin width = width * 10 + (spec[k] - "0"); k++; end
+          if (k < spec.len()) begin
+            if (spec[k] != "." || var_ != "t") return 0;
+            unit = spec.substr(k + 1, spec.len() - 1);
+            if (!(unit inside {"fs", "ps", "ns", "us", "ms", "sec", "m", "min", "hr"})) return 0;
+          end
+        end
+        case (var_)
+          "s": val = sev;
+          "S": val = sev.toupper();
+          "r": val = msg;
+          "i": val = loc;
+          default: begin
+            longint fs = longint'($realtime * 1.0e6), u = 1;
+            case (unit)
+              "": u = 0;
+              "ps": u = 64'd1000; "ns": u = 64'd1000000; "us": u = 64'd1000000000; "ms": u = 64'd1000000000000;
+              "sec": u = 64'd1000000000000000; "m", "min": u = 64'd60000000000000000; "hr": u = 64'd3600000000000000000;
+              default: u = 1;
+            endcase
+            val = u == 0 ? at_time() : $sformatf("%0d %s", fs / u, unit == "m" ? "min" : unit);
+          end
+        endcase
+        if (align == 0) align = var_ == "t" ? ">" : "<";
+        o = {o, fmt_field(val, fill, align, width)};
+        i = j;
+      end
+    end
+    return 1;
+  endfunction
+  function automatic bit assert_format(int lvl, string f, bit quiet);
+    string o;
+    if (!fmt_apply(f, "note", "", "", o)) begin
+      if (!quiet) report({"SetVhdlAssertFormat: invalid format string \"", f, "\""}, 3, "std.env", 0);
+      return 0;
+    end
+    afmt[lvl] = f;
+    return 1;
+  endfunction
+  function automatic void report(string msg, int sev, string loc, bit is_assert, string path = "");
     string sv;
     case (sev) 0: sv = "note"; 1: sv = "warning"; 2: sv = "error"; default: sv = "failure"; endcase
-    $display("%s:@%s:(%s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
+    if (!aenable[sev]) return;
+    acount[sev]++;
+    if (afmt[sev] != "") begin
+      string o;
+      void'(fmt_apply(afmt[sev], sv, msg, inst_path(path, loc), o));
+      $display("%s", o);
+    end else
+      $display("%s:@%s:(%s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
     if (sev >= 2) errors++;
     if (sev >= 3) $fatal(0, "VHDL severity failure");
   endfunction
@@ -3442,6 +4093,7 @@ endpackage
                     fields += " " + svDecl(ft, svId(f->texts[k])) + ";";
                 }
             }
+            if (fields.empty()) fields = " bit empty__;";   // an empty record (5.3.3, VHDL-2019)
             out << pre << "typedef struct " << (packed ? "packed " : "") << "{" << fields << " } " << t->sv << ";\n";
             Sym y;
             y.k = Sym::TypeK;
@@ -3826,6 +4478,19 @@ endpackage
                 }
             }
             y.type = ot;
+            // a std_logic signal or variable gets a companion (see `nine`); a resolved
+            // signal with several drivers stays four-valued
+            std::string auxInit;
+            bool multi = d->k == DK::Signal && cx->drvNames.count(y.sv) && isPackable(ot) && isFourState(ot);
+            if ((d->k == DK::Signal || (d->k == DK::Variable && !d->shared)) && (where == "module" || where == "process") && slT(ot) &&
+                !(multi && (!d->sigKind.empty() || cx->regNets.count(y.sv)))) {
+                y.aux = true;
+                if (multi) cx->resAux.insert(y.sv);
+                if (d->init) {
+                    std::string a = ex(d->init, t).a;
+                    auxInit = a.empty() ? "'0" : a;
+                }
+            }
             if (d->k == DK::Constant && init.empty() && cx->isPackage) {
                 // deferred constant: the value is in the package body
                 y.deferred = true;
@@ -3867,11 +4532,18 @@ endpackage
             if (d->k == DK::Signal && cx->drvNames.count(dname)) {
                 // resolved signal with several drivers: a wire, each driver is a variable
                 o << ind() << svDeclNet(ot, dname) << ";\n";
+                if (cx->resAux.count(dname)) {
+                    // its companion: 'U' where a driver is 'U', else strong where a driver is
+                    // strong (not Z), else weak where a driver is weak (IEEE 1164 resolution)
+                    o << ind() << svDeclNet(ot, dname + "__u") << ";\n" << ind() << svDecl(ot, dname + "__9") << ";\n" << ind() << "wire " << dname << "__wk;\n";
+                    cx->resTypes[dname] = ot;
+                }
                 continue;
             }
             o << ind() << kw << svDecl(ot, dname);
             if (!init.empty()) o << " = " << init;
             o << ";\n";
+            if (y.aux) o << ind() << kw << svDecl(ot, dname + "__9") << (auxInit.empty() ? "" : " = " + auxInit) << ";\n";
         }
     }
     std::string svDeclNet(const TP& t, const std::string& name) {
@@ -3887,8 +4559,46 @@ endpackage
         DP decl;
         bool converse = false;
         TP rec;
-        std::map<std::string, std::string> modes;   // element (lower) -> in / out / inout / buffer
+        std::map<std::string, std::string> modes;   // element (lower) -> in / out / inout / buffer / view
+        std::map<std::string, DP> nested;           // element (lower) -> its field declaration, for a view mode
     };
+    // A mode-view port flattened to one port per scalar or plain element (6.5.2):
+    // `suffix` is appended to the port's SystemVerilog name, `access` to the
+    // record object's ("." element, "[i]" array index).
+    struct ViewLeaf { std::string suffix, access, mode; TP type; };
+    void viewLeaves(const ViewInfo& vi, const std::string& sfx, const std::string& acc, int line, std::vector<ViewLeaf>& out) {
+        const TP& t = vi.rec;
+        for (size_t f = 0; f < t->fnames.size(); ++f) {
+            const std::string& fn = t->fnames[f];
+            std::string fs = sfx + "__" + svId(t->ftext[f]), fa = acc + "." + svId(t->ftext[f]);
+            auto m = vi.modes.find(fn);
+            if (m == vi.modes.end()) fail(line, "mode view gives no mode for element '" + t->ftext[f] + "'");
+            if (m->second != "view") { out.push_back({fs, fa, m->second, t->ftypes[f]}); continue; }
+            const DP& fd = vi.nested.at(fn);
+            EP vn = fd->target;
+            if (vi.converse) { auto c = std::make_shared<Expr>(EK::Attr, line); c->name = "converse"; c->a = vn; vn = c; }
+            if (!fd->arrayView) { viewLeaves(resolveView(vn), fs, fa, line, out); continue; }
+            viewArrayLeaves(resolveView(vn), t->ftypes[f], fs, fa, line, out);
+        }
+    }
+    // `view (V)` of an array of records: the elements' views, index by index
+    void viewArrayLeaves(const ViewInfo& vi, const TP& at, const std::string& sfx, const std::string& acc, int line, std::vector<ViewLeaf>& out) {
+        if (!at || at->k != Type::Array || at->dims.size() != 1) fail(line, "an array mode view needs a one-dimensional array type");
+        const Rng& g = at->dims[0];
+        if (!g.lv || !g.rv) fail(line, "an array mode view needs an array with static bounds");
+        int64_t lo = std::min(*g.lv, *g.rv), hi = std::max(*g.lv, *g.rv);
+        for (int64_t i = lo; i <= hi; ++i)
+            viewLeaves(vi, sfx + "__" + (i < 0 ? "m" + std::to_string(-i) : std::to_string(i)), acc + "[" + std::to_string(i) + "]", line, out);
+    }
+    std::vector<ViewLeaf> portViewLeaves(const DP& p) {
+        std::vector<ViewLeaf> out;
+        ViewInfo vi = resolveView(p->target);
+        if (p->arrayView) {
+            if (!p->type.present()) fail(p->line, "an array mode view port needs `of` an array subtype");
+            viewArrayLeaves(vi, subtype(p->type), "", "", p->line, out);
+        } else viewLeaves(vi, "", "", p->line, out);
+        return out;
+    }
     ViewInfo resolveView(const EP& e) {
         ViewInfo vi;
         EP n = e;
@@ -3906,6 +4616,7 @@ endpackage
                     std::string m = f->mode;
                     if (vi.converse) m = m == "in" ? "out" : m == "out" || m == "buffer" ? "in" : m;
                     vi.modes[fn] = m;
+                    if (m == "view") vi.nested[fn] = f;
                 }
         return vi;
     }
@@ -3945,7 +4656,7 @@ endpackage
                 if (a->k == EK::Call && r.idx.empty()) { r.mark = a->a; for (auto& x : a->args) r.idx.push_back(x.actual); }
                 else r.mark = a;
             }
-        }
+        } else if (si.mark) r.mark = substE(si.mark, m);   // A'element, p.T
         for (auto& x : r.idx) x = substE(x, m);
         r.range = substE(r.range, m);
         return r;
@@ -4179,14 +4890,6 @@ endpackage
         return pre;
     }
     std::set<const Subprog*> voidFns;   // procedures emitted as void functions
-    static bool assignsSignal(const std::vector<SP>& b) {
-        for (auto& s : b) {
-            if (s->k == SK::SigAssign || s->k == SK::CondSigAssign || s->k == SK::SelSigAssign || s->k == SK::Force || s->k == SK::Release) return true;
-            for (auto& a : s->alts) if (assignsSignal(a.body)) return true;
-            if (assignsSignal(s->body)) return true;
-        }
-        return false;
-    }
     // every procedure the body calls is built in or already a void function
     bool callsOnlyFunctions(const std::vector<SP>& b) {
         for (auto& s : b) {
@@ -4206,7 +4909,9 @@ endpackage
     bool procIsFunction(const Subprog& sp) {
         for (auto& p : sp.params)
             if (p->cls == "signal") return false;
-        return !containsWait(sp.body) && !assignsSignal(sp.body) && callsOnlyFunctions(sp.body);
+        // a signal assignment is a nonblocking assignment, which a function may do: a void
+        // function is not a task, so msim -compile runs it (tasks need call frames)
+        return !containsWait(sp.body) && callsOnlyFunctions(sp.body);
     }
     static bool containsWait(const std::vector<SP>& b) {
         for (auto& s : b) {
@@ -4305,6 +5010,7 @@ endpackage
         switch (e->k) {
         case EK::Int: case EK::Real: case EK::Char: case EK::Str: case EK::BitStr: case EK::Phys: return true;
         case EK::Un: case EK::Bin: return isStatic(e->a) && isStatic(e->b);
+        case EK::Cond: return isStatic(e->a) && isStatic(e->b) && isStatic(e->args[0].actual);
         case EK::Name: {
             const Sym* y = lookup(e->name);
             return y && (y->k == Sym::Lit || (y->k == Sym::Obj && y->cls == "constant" && !y->decl) || (y->k == Sym::Obj && y->cls == "constant" && y->decl && y->decl->k == DK::Constant));
@@ -4357,6 +5063,42 @@ endpackage
         Val v = ex(val, tt);
         return rangeCheck(val, v, tt, fitTo(v, tt));
     }
+    // assignRhs with the value's companion in .a
+    Val assignRhsV(const EP& val, const TP& tt) {
+        Val v = ex(val, tt);
+        v.s = rangeCheck(val, v, tt, fitTo(v, tt));
+        // a logical operator's result: computed once into a module-level temporary,
+        // and its companion is only worked out when the result is unknown
+        if (!v.u.empty() && cx->proc && !cx->inFunc && cx->helpers && tt && slT(tt) && (baseOf(tt)->k == Type::Logic || parseInt(widthOf(tt)))) {
+            std::string tmp = "vhdl_t9__" + std::to_string(++uniq);
+            *cx->helpers << "  " << svDecl(baseOf(tt)->k == Type::Logic ? bt["std_ulogic"] : vecOf(bt["std_logic_vector"], widthOf(tt)), tmp) << ";\n";
+            v.s = "(" + tmp + " = " + v.s + ")";
+            v.a = "(((" + tmp + " ^ " + tmp + ") === '0) ? '0 : ((" + tmp + " ^ " + tmp + ") & " + v.u + "))";
+        }
+        return v;
+    }
+    // The companion's half of `target op value` (op " <= #(d) " or " = "): the
+    // value's companion, or strong when it has none; "" when the target has no companion.
+    std::string auxWrite(const EP& t, const std::string& op, const Val& rhs, bool isSignal = true) {
+        if (!nine) return "";
+        if (t->k == EK::Agg) {
+            std::string r;
+            for (auto& a : t->agg) r += auxWrite(a.value, op, Val{}, isSignal);
+            return r;
+        }
+        Val v = ex(t, nullptr);
+        if (v.a.empty()) return "";
+        std::string at = v.a;
+        if (isSignal && cx->proc)   // the process's driver of a resolved signal has its own companion
+            for (auto& [sig, drv] : cx->proc->drv)
+                if (v.s == sig || v.s.rfind(sig + "[", 0) == 0) {
+                    if (!cx->resAux.count(sig)) return "";
+                    at = drv + "__9" + v.s.substr(sig.size());
+                    if (!rhs.a.empty() && rhs.u.empty()) cx->proc->weakDrv.insert(drv);   // a name or a literal may be weak
+                    break;
+                }
+        return " " + at + op + (rhs.a.empty() ? "'0" : rhs.a) + ";";
+    }
     // An integer value assigned to a subtype with a range is checked (5.2.1,
     // 14.7.4): out of range stops the run like GHDL's bound check failure.
     int chkLine = 0;
@@ -4404,7 +5146,8 @@ endpackage
                 }
             }
             TP tt = targetType(s.target);
-            r = I + target(s.target, false) + " = " + assignRhs(s.value, tt) + ";\n";
+            Val rv = assignRhsV(s.value, tt);
+            r = I + target(s.target, false) + " = " + rv.s + ";" + auxWrite(s.target, " = ", rv, false) + "\n";
             break;
         }
         case SK::SigAssign: {
@@ -4418,7 +5161,8 @@ endpackage
                     continue;
                 }
                 std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                r += I + tg + " <= " + d + assignRhs(w.val, tt) + ";" + transactionOf(s.target) + "\n";
+                Val rv = assignRhsV(w.val, tt);
+                r += I + tg + " <= " + d + rv.s + ";" + auxWrite(s.target, " <= " + d, rv) + transactionOf(s.target) + "\n";
             }
             break;
         }
@@ -4431,7 +5175,8 @@ endpackage
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + ";" + (sig ? transactionOf(s.target) : "") + " ";
+                    Val rv = assignRhsV(w.val, tt);
+                    body += tg + (sig ? " <= " + d : " = ") + rv.s + ";" + auxWrite(s.target, sig ? " <= " + d : " = ", rv, sig) + (sig ? transactionOf(s.target) : "") + " ";
                 }
                 if (a.cond) r += I + (i ? "else if (" : "if (") + boolOf(ex(a.cond, bt["boolean"])).s + ") begin " + body + "end\n";
                 else r += I + "else begin " + body + "end\n";
@@ -4450,7 +5195,8 @@ endpackage
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + ";" + (sig ? transactionOf(s.target) : "") + " ";
+                    Val rv = assignRhsV(w.val, tt);
+                    body += tg + (sig ? " <= " + d : " = ") + rv.s + ";" + auxWrite(s.target, sig ? " <= " + d : " = ", rv, sig) + (sig ? transactionOf(s.target) : "") + " ";
                 }
                 r += I + "  " + labels[ai] + ": begin " + body + "end\n";
             }
@@ -4652,6 +5398,7 @@ endpackage
                 Val v = ex(e, nullptr);
                 if (v.t && (isPackable(v.t) || v.t->k == Type::Real || v.t->k == Type::Time)) addUnique(out, v.s);
                 else if (v.t) addEvent(out, v.s, v.t);
+                if (!v.a.empty()) addUnique(out, v.a);   // 0 -> L is an event too
             } else if (y && y->k == Sym::Alias) {
                 addUnique(out, y->aliasSv);
             }
@@ -4694,6 +5441,9 @@ endpackage
         case EK::Agg:
             for (auto& a : e->agg) { readSignals(a.value, out); for (auto& c : a.choices) readSignals(c, out); }
             return;
+        case EK::Cond:
+            readSignals(e->args[0].actual, out);
+            [[fallthrough]];
         case EK::Range: case EK::Bin: case EK::Un: case EK::Qual:
             readSignals(e->a, out);
             readSignals(e->b, out);
@@ -4776,6 +5526,7 @@ endpackage
         for (auto& n : s.on) {
             Val v = ex(n, nullptr);
             addEvent(sigs, v.s, v.t);
+            if (!v.a.empty()) addUnique(sigs, v.a);
         }
         if (s.on.empty() && s.cond) readSignals(s.cond, sigs);
         std::string tm = s.forTime ? ex(s.forTime, bt["time"]).s : "";
@@ -4839,7 +5590,7 @@ endpackage
         }
         std::string sv = sev ? ex(sev, bt["severity_level"]).s : defSev;
         std::string loc = "\"" + cx->file + ":" + std::to_string(line) + (col ? ":" + std::to_string(col) : std::string()) + "\"";
-        return "vhdl_rt::report(" + m + ", " + sv + ", " + loc + ", " + (isAssert ? "1" : "0") + ");";
+        return "vhdl_rt::report(" + m + ", " + sv + ", " + loc + ", " + (isAssert ? "1" : "0") + ", $sformatf(\"%m\"));";
     }
 
     std::string procCall(const EP& c, int line) {
@@ -5312,9 +6063,10 @@ endpackage
             std::vector<std::string> portList;
             std::vector<int> portLines;   // each port's VHDL line, for diagnostics about it
             std::vector<std::pair<std::string, TP>> portSigs;
+            std::vector<std::string> auxPorts;
             std::map<std::string, TP> unconPort;   // lower-case port -> its type with parameter bounds
             for (auto& p : ent->ports) {
-                TP t = p->mode == "view" ? resolveView(p->target).rec : subtype(p->type);
+                TP t = p->mode == "view" ? (p->arrayView ? subtype(p->type) : resolveView(p->target).rec) : subtype(p->type);
                 if (isUnconstrained(t)) {
                     // an unconstrained array port (6.5.6.3): the actual gives its range, through
                     // two parameters per port; the direction is the module's (see variant)
@@ -5349,6 +6101,7 @@ endpackage
                     y.type = t;
                     y.mode = p->mode;
                     if (!p->sigKind.empty()) y.decl = p;
+                    y.aux = auxPort(p, t);
                     declare(y);
                     portSigs.push_back({y.sv, t});
                 }
@@ -5357,20 +6110,19 @@ endpackage
             std::string viewBody;   // mode-view ports: the record signal and its element connections
             for (auto& p : ent->ports) {
                 if (p->mode == "view") {   // one port per record element, in its mode (6.5.2)
-                    ViewInfo vi = resolveView(p->target);
-                    TP t = vi.rec;
+                    TP t = p->arrayView ? subtype(p->type) : resolveView(p->target).rec;
+                    std::vector<ViewLeaf> leaves = portViewLeaves(p);
                     for (size_t k = 0; k < p->names.size(); ++k) {
                         std::string sv = svId(p->texts[k]);
                         viewBody += "  " + svDecl(t, sv) + ";\n";
-                        for (size_t f = 0; f < t->fnames.size(); ++f) {
-                            std::string m = vi.modes.count(t->fnames[f]) ? vi.modes[t->fnames[f]] : "";
-                            if (m.empty()) fail(p->line, "mode view gives no mode for element '" + t->ftext[f] + "'");
-                            std::string ps = sv + "__" + svId(t->ftext[f]);
+                        for (auto& lf : leaves) {
+                            const std::string& m = lf.mode;
+                            std::string ps = sv + lf.suffix;
                             std::string dir = m == "in" ? "input" : m == "inout" ? "inout" : "output";
-                            portList.push_back(dir + " " + (m == "inout" && isPackable(t->ftypes[f]) && isFourState(t->ftypes[f]) ? svDeclNet(t->ftypes[f], ps) : svDecl(t->ftypes[f], ps)));
+                            portList.push_back(dir + " " + (m == "inout" && isPackable(lf.type) && isFourState(lf.type) ? svDeclNet(lf.type, ps) : svDecl(lf.type, ps)));
                             portLines.push_back(p->line);
-                            if (m == "in") viewBody += "  assign " + sv + "." + svId(t->ftext[f]) + " = " + ps + ";\n";
-                            else viewBody += "  assign " + ps + " = " + sv + "." + svId(t->ftext[f]) + ";\n";
+                            if (m == "in") viewBody += "  assign " + sv + lf.access + " = " + ps + ";\n";
+                            else viewBody += "  assign " + ps + " = " + sv + lf.access + ";\n";
                         }
                     }
                     continue;
@@ -5388,8 +6140,21 @@ endpackage
                     portList.push_back(decl);
                     portLines.push_back(p->line);
                     if (net) c.drvNames[sv] = sv;
+                    if (auxPort(p, t)) {
+                        // the companion (see `nine`): an input port after every VHDL port, strong
+                        // when SystemVerilog leaves it unconnected; an output's companion is a
+                        // variable the instantiating VHDL reads by name
+                        if (p->mode == "in") auxPorts.push_back("input " + svDecl(t, sv + "__9") + " = " + (p->init ? (ex(p->init, t).a.empty() ? "'0" : ex(p->init, t).a) : "'0"));
+                        else if (!net) viewBody += "  " + svDecl(t, sv + "__9") + ";\n";
+                        else if (isPackable(t) && isFourState(t)) {   // several drivers: resolved like a signal's
+                            c.resAux.insert(sv);
+                            c.resTypes[sv] = t;
+                            viewBody += "  " + svDeclNet(t, sv + "__u") + ";\n  " + svDecl(t, sv + "__9") + ";\n  wire " + sv + "__wk;\n";
+                        } else viewBody += "  " + svDecl(t, sv + "__9") + " = '0;\n";
+                    }
                 }
             }
+            for (auto& ap : auxPorts) { portList.push_back(ap); portLines.push_back(0); }
             // module header
             std::string imports = "import vhdl_rt::*;";
             for (auto& pk : c.usePkgs) imports += " import " + svId(pk) + "::*;";
@@ -5431,7 +6196,7 @@ endpackage
             curDrivers = &di;
             for (auto& s : stmts) conc << concStmt(*s, "");
             curDrivers = nullptr;
-            o << body.str() << helpers.str() << conc.str() << extra.str() << "endmodule\n";
+            o << body.str() << helpers.str() << conc.str() << extra.str() << resolvedAux() << "endmodule\n";
         } catch (...) {
             cx = saved;
             throw;
@@ -5507,11 +6272,19 @@ endpackage
                         std::string mode = "in";
                         if (a.formal) {
                             std::string fn = baseName(a.formal);
-                            for (auto& p : ports) if (p.name == fn) mode = p.mode;
+                            bool found = false;
+                            for (auto& p : ports) if (p.name == fn) { mode = p.mode; found = true; }
+                            // conv(formal) => actual
+                            if (!found && a.formal->k == EK::Call && a.formal->args.size() == 1 && a.formal->args[0].actual) {
+                                fn = baseName(a.formal->args[0].actual);
+                                for (auto& p : ports) if (p.name == fn) mode = p.mode;
+                            }
                         } else if (pos < ports.size()) mode = ports[pos].mode;
                         ++pos;
                         if (mode == "out" || mode == "inout" || mode == "buffer" || mode == "?") {
-                            std::string n = baseName(a.actual);
+                            EP act = a.actual;
+                            if (mode == "inout" && isTypeConvCall(act)) act = act->args[0].actual;
+                            std::string n = baseName(act);
                             if (!n.empty()) di.instDrivers[n]++;
                         }
                     }
@@ -5631,9 +6404,12 @@ endpackage
                     p2.drv = pr.drv;
                     cx->proc = &p2;
                     std::string tg = target(s.target, true);
-                    std::string rhs = assignRhs(s.alts[0].waves[0].val, tt);
+                    Val rv = assignRhsV(s.alts[0].waves[0].val, tt);
+                    std::string rhs = rv.s;
+                    std::string aw = auxWrite(s.target, " <= ", rv);
                     cx->proc = sp;
-                    if (p2.prev.empty()) return r + decl + "  always @(" + e + ") " + tg + " <= " + rhs + ";\n";
+                    if (p2.prev.empty() && aw.empty()) return r + decl + "  always @(" + e + ") " + tg + " <= " + rhs + ";\n";
+                    if (p2.prev.empty()) return r + decl + "  always @(" + e + ") begin " + tg + " <= " + rhs + ";" + aw + " end\n";
                 }
             }
             // a plain `assign` would lose VHDL's delta; keep the process
@@ -5829,6 +6605,20 @@ endpackage
         for (auto& [sig, dv] : pr.drv) {
             TP t = pr.drvTypes.at(dv);
             std::string init = cx->guardInit.count(sig) ? cx->guardInit.at(sig) : "'z";
+            if (cx->resAux.count(sig)) {
+                // a strong and a weak part, so the net resolves L and H as IEEE 1164 does
+                r += "  " + svDecl(t, dv) + " = " + init + ";\n  " + svDecl(t, dv + "__9") + " = '0;\n";
+                r += "  assign " + sig + "__u = " + dv + "__9 & ~" + dv + "__9;\n";   // 'U' wins (x on the wire)
+                if (pr.weakDrv.count(dv)) {
+                    cx->resWeak.insert(sig);
+                    // split only while the driver holds a weak value
+                    std::string wk = "((|" + dv + "__9) === 1'b1)";
+                    r += "  assign " + sig + " = " + wk + " ? vhdl_rt::drv9(" + dv + ", " + dv + "__9, 0, " + widthOf(t) + ") : " + dv + ";\n";
+                    r += "  assign (weak0, weak1) " + sig + " = " + wk + " ? vhdl_rt::drv9(" + dv + ", " + dv + "__9, 1, " + widthOf(t) + ") : 'z;\n";
+                    r += "  assign " + sig + "__wk = " + wk + " ? 1'b1 : 1'bz;\n";
+                } else r += "  assign " + sig + " = " + dv + ";\n";   // never weak: the four-value net resolves it
+                continue;
+            }
             r += "  " + svDecl(t, dv) + " = " + init + ";\n  assign " + sig + (cx->regNets.count(sig) ? "__res" : "") + " = " + dv + ";\n";
         }
         return r;
@@ -5858,7 +6648,7 @@ endpackage
                 std::string body = seqStmts(s.body);
                 std::vector<std::string> sens;
                 if (s.sensAll) readSignalsStmts(s.body, sens);
-                else for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); }
+                else for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); if (!v.a.empty()) addUnique(sens, v.a); }
                 if (s.hasSens && containsWait(s.body)) fail(s.line, "a process with a sensitivity list cannot contain wait");
                 // previous values for 'event / rising_edge
                 std::string prevDecl, prevUpd;
@@ -5916,7 +6706,7 @@ endpackage
         if (!s.hasSens || s.sensAll || s.body.size() != 1 || s.body[0]->k != SK::If) return "";
         const Stmt& iff = *s.body[0];
         std::vector<std::string> sens;
-        for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); }
+        for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); if (!v.a.empty()) addUnique(sens, v.a); }
         auto edgeSig = [&](const EP& c) -> std::string {
             std::string e = edgeOf(c);
             return e;
@@ -5999,7 +6789,7 @@ endpackage
         if (comp && comp->k != Sym::Comp) comp = nullptr;
         // component without an entity: an SV module of the same name (case-insensitively)
         std::shared_ptr<GenBind> genBind;
-        std::map<std::string, std::vector<std::string>> viewFields;   // mode-view port -> its elements (SV names)
+        std::map<std::string, std::vector<ViewLeaf>> viewFields;   // mode-view port -> its flattened elements
         if (ent && hasTypeGenerics(ent)) genBind = genericBinding(ent, s.genericMap, s.line);
         if (ent) {
             modName = svId(ent->text);
@@ -6046,9 +6836,9 @@ endpackage
                 for (auto& p : ent->ports) {
                     TP t;
                     if (p->mode == "view") {
-                        t = resolveView(p->target).rec;
-                        for (auto& n : p->names)
-                            for (auto& ft : t->ftext) viewFields[n].push_back(svId(ft));
+                        t = p->arrayView ? subtype(p->type) : resolveView(p->target).rec;
+                        std::vector<ViewLeaf> leaves = portViewLeaves(p);
+                        for (auto& n : p->names) viewFields[n] = leaves;
                     } else
                     try { t = subtype(p->type); } catch (const Error&) { t = nullptr; }
                     for (size_t k = 0; k < p->names.size(); ++k) {
@@ -6092,6 +6882,7 @@ endpackage
         std::vector<std::string> unconGens;
         std::set<std::string> unconAsc;
         std::string convPre;   // signals and processes of conversions on formals
+        std::string auxPost;   // companions of out ports read from the instance (see `nine`)
         auto mapList = [&](const std::vector<Assoc>& m, const std::vector<std::string>& order, const std::vector<std::string>& lowerNames,
                            const std::vector<TP>& types, const std::vector<std::string>& compOrder, const std::vector<TP>& compTypes, bool isPort) {
             std::vector<std::string> items;
@@ -6116,7 +6907,25 @@ endpackage
                         std::string mode;
                         if (ent) for (auto& p : ent->ports) for (auto& n : p->names) if (n == f) mode = p->mode;
                         if (comp && comp->decl) for (auto& p : comp->decl->ports) for (auto& n : p->names) if (n == f) mode = p->mode;
-                        if (mode != "out" && mode != "buffer") fail(s.line, "a conversion on the formal is supported on out ports only");
+                        if (mode == "inout") {
+                            TP ftc;
+                            for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) ftc = types[i];
+                            if (!ftc) for (size_t i = 0; i < compOrder.size(); ++i) if (compOrder[i] == f && i < compTypes.size()) ftc = compTypes[i];
+                            // inout: a type conversion between closely related arrays of the
+                            // same logic element keeps the bits, so the port connects straight
+                            // to the actual (whose own type conversion is stripped the same way)
+                            EP act = a.actual;
+                            if (!ftc || !bitsConv(a.formal, ftc) || (isTypeConvCall(act) && !bitsConv(act)))
+                                fail(s.line, "a conversion on an inout port must be a type conversion between logic arrays");
+                            if (isTypeConvCall(act)) act = act->args[0].actual;
+                            std::string fsv;
+                            for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) fsv = order[i];
+                            if (fsv.empty()) fsv = svId(f);
+                            items.push_back("." + fsv + "(" + ex(act, nullptr).s + ")");
+                            ++pos;
+                            continue;
+                        }
+                        if (mode != "out" && mode != "buffer") fail(s.line, "a conversion on the formal is supported on out and inout ports only");
                         TP ftc;
                         for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) ftc = types[i];
                         if (!ftc) for (size_t i = 0; i < compOrder.size(); ++i) if (compOrder[i] == f && i < compTypes.size()) ftc = compTypes[i];
@@ -6158,11 +6967,12 @@ endpackage
                 std::string formalSv;
                 for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == fl) formalSv = order[i];
                 if (formalSv.empty()) formalSv = svId(fl);
-                std::string act;
+                std::string act, actA;
                 if (a.actual->k == EK::Open) act = "";
                 else {
                     Val x = ex(a.actual, ft);
                     act = x.s;
+                    actA = x.a;
                     if (isPort && ft && isUnconstrained(ft) && ft->k == Type::Array && ft->dims.size() == 1 && ent) {
                         // an unconstrained port takes the actual's range (6.5.6.3)
                         if (!x.t || x.t->dims.empty() || x.t->dims[0].box || x.t->dims[0].l.empty())
@@ -6174,10 +6984,20 @@ endpackage
                     }
                 }
                 if (auto vf = viewFields.find(fl); vf != viewFields.end()) {   // one connection per element
-                    for (auto& f : vf->second) items.push_back("." + formalSv + "__" + f + "(" + (act.empty() ? "" : act + "." + f) + ")");
+                    for (auto& lf : vf->second) items.push_back("." + formalSv + lf.suffix + "(" + (act.empty() ? "" : act + lf.access) + ")");
                     continue;
                 }
                 items.push_back("." + formalSv + "(" + act + ")");
+                // the companion of a VHDL entity's port (see `nine`)
+                if (isPort && ent && nine)
+                    for (auto& p : ent->ports)
+                        if (std::find(p->names.begin(), p->names.end(), fl) != p->names.end() && auxPort(p, ft ? ft : subtype(p->type))) {
+                            if (p->mode == "in") items.push_back("." + formalSv + "__9(" + (actA.empty() ? "'0" : actA) + ")");
+                            else if (!act.empty()) {
+                                Val tv = ex(a.actual, nullptr);
+                                if (!tv.a.empty()) auxPost += "  assign " + tv.a + " = " + svId(label) + "." + formalSv + "__9;\n";
+                            }
+                        }
             }
             for (auto& [fl, parts] : partial) {
                 // a(1) => x, a(0) => y: concatenate in the formal's index order
@@ -6265,7 +7085,7 @@ endpackage
         r += " " + svId(label) + " (";
         for (size_t i = 0; i < ports.size(); ++i) r += (i ? ",\n      " : "\n      ") + ports[i];
         r += ");\n";
-        return r;
+        return r + auxPost;
     }
     static bool lookupFormal(const std::string& n, const std::vector<std::string>& names) {
         return std::find(names.begin(), names.end(), n) != names.end();

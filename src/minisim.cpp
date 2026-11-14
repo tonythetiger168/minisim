@@ -376,6 +376,7 @@ struct Sim {
     uint64_t sampledAt = 0;
     struct Mon {
         bool on = false, queued = false;
+        bool off = false;   // $monitoroff (21.2.3)
         string fmt;
         vector<E> args;
         vector<int> watch;
@@ -759,7 +760,9 @@ struct Sim {
         if (seqOf.size() < sigs.size()) seqOf.resize(sigs.size());
         for (auto& [sg, e] : ev) seqOf[sg].push_back({id, e});
     }
+    uint64_t seqRun = 0;   // counts runSeqs: the compiled clock groups of one run share a twoNow() (codegen dseq)
     void runSeqs() {
+        seqRun++;
         if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
         // The compiled cycle domain's clock groups (one dseq each) share the
@@ -1486,6 +1489,8 @@ struct Sim {
     // %b/%o/%h/%d of a value that does not fit in one limb. Digit rules match
     // the single-word formatter: an all-x digit is x, a mixed digit is X.
     static string fmtWide(char c, Val v, int minW, bool zero) {
+        bool zfill = zero && minW > 0;   // %05d / %02h: a zero-filled field
+        if (zfill) zero = false;
         auto digits = [&](int bits) {
             int n = (v.w + bits - 1) / bits;
             string s(n, '0');
@@ -1549,11 +1554,19 @@ struct Sim {
                 break;
             }
         }
+        if (zfill) {   // the field filled with zeros, after any sign
+            size_t at = !body.empty() && body[0] == '-' ? 1 : 0;
+            if ((int)body.size() < minW && c != 'c' && c != 's') body.insert(at, string(minW - body.size(), '0'));
+            else if ((int)body.size() < minW) body = string(minW - body.size(), ' ') + body;
+            return body;
+        }
         int width = zero ? 0 : (minW > 0 ? minW : (pad ? natural : 0));
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
         return body;
     }
     static string fmtVal(char c, Val v, int minW, bool zero) {
+        bool zfill = zero && minW > 0;   // %05d / %02h: a zero-filled field
+        if (zfill) zero = false;
         if (v.str) {   // a string (6.16) prints its text with %s, and as bytes otherwise
             if (c == 's') {
                 string t = v_str(v);
@@ -1628,6 +1641,12 @@ struct Sim {
                 }
                 break;
             }
+        }
+        if (zfill) {   // the field filled with zeros, after any sign
+            size_t at = !body.empty() && body[0] == '-' ? 1 : 0;
+            if ((int)body.size() < minW && c != 'c' && c != 's') body.insert(at, string(minW - body.size(), '0'));
+            else if ((int)body.size() < minW) body = string(minW - body.size(), ' ') + body;
+            return body;
         }
         int width = zero ? 0 : (minW > 0 ? minW : (pad ? natural : 0));
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
@@ -1747,6 +1766,13 @@ struct Sim {
                 c = fmt[++i];
                 while (isdigit((unsigned char)c) && i + 1 < fmt.size()) { prec = prec * 10 + (c - '0'); c = fmt[++i]; }
             }
+            if (c == 'Y') {   // internal: a format string known only at run time ($sformat, 21.3.3)
+                if (ai >= args.size()) continue;
+                string f = v_str(eval(args[ai++], rd));
+                cout << sformat(f, vector<E>(args.begin() + (long)ai, args.end()), rd);
+                ai = args.size();
+                continue;
+            }
             if (c == 'R') {   // internal: a real argument with no specifier
                 if (ai >= args.size()) continue;
                 Val v = eval(args[ai++], rd);
@@ -1842,13 +1868,25 @@ struct Sim {
     void printSys(const string& fmt, const vector<E>& args, bool newline = true);   // kernel object (MSIM_KDEF below)
     void strobe(const string& fmt, const vector<E>& args) { postq.push_back({false, fmt, args}); }
     void queueMon() {
-        if (!mon.on || mon.queued) return;
+        if (!mon.on || mon.off || mon.queued) return;
         postq.push_back({true, mon.fmt, mon.args});
         mon.queued = true;
     }
     // A new $monitor cancels the previous one. The call itself schedules a
     // print, like $strobe; a later change in this slot does not schedule another.
     void armMon(const string& fmt, const vector<E>& args) {
+        if (fmt == kMonitorOff || fmt == kMonitorOn) {   // 21.2.3
+            mon.off = fmt == kMonitorOff;
+            if (mon.off) {
+                if (mon.queued)
+                    for (auto it = postq.begin(); it != postq.end(); ++it)
+                        if (it->mon) { postq.erase(it); break; }
+                mon.queued = false;
+            } else {
+                queueMon();   // $monitoron prints the monitored values at once
+            }
+            return;
+        }
         if (mon.queued) {
             for (auto it = postq.begin(); it != postq.end(); ++it)
                 if (it->mon) { postq.erase(it); break; }
@@ -2645,7 +2683,7 @@ struct Sim {
             g.p0 = (uint8_t)o; g.at = now;
             if (o == 2 || n == 2) xAt = now;
         }
-        dump(s);
+        if (observed) dump(s);   // a VCD or FST open sets observed (dumpvars)
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
         if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);

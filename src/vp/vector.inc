@@ -153,6 +153,8 @@ static uint64_t vfrsqrt7(uint64_t u, unsigned bits, uint32_t& fl) {
     return ((uint64_t)oe << mb) | ((uint64_t)vrsqrt7Table()[idx] << (mb - 7));
 }
 
+#include "vcrypto.inc"
+
 int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uint64_t& wval) {
     const unsigned op = insn & 0x7f, rd = (insn >> 7) & 31, f3 = (insn >> 12) & 7, rs1 = (insn >> 15) & 31,
                    rs2 = (insn >> 20) & 31, vm = (insn >> 25) & 1, f6 = insn >> 26;
@@ -292,8 +294,9 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
         return VOK;
     }
 
-    if (op != 0x57) return VILL;
+    if (op != 0x57 && op != 0x77) return VILL;
     if (h.vill) return VILL;
+    if (op == 0x77) return vcrypto(h, insn);
     const VType& t = h.vt;
     const unsigned sew = t.sew, sB = sew / 8;
     const uint64_t vl = h.vl;
@@ -858,6 +861,21 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
     }
 
     // f3 == 2 (OPMVV) or 6 (OPMVX)
+    // Zvbc: vclmul / vclmulh, the low or high 64 bits of a carry-less product (SEW 64).
+    if (f6 == 0x0c || f6 == 0x0d) {
+        if (sew != 64 || !aligned(rd, lregs) || !aligned(rs2, lregs) || (vv && !aligned(rs1, lregs))) return VILL;
+        if (!vm && rd == 0) return VILL;
+        const uint64_t xv = rv64 ? h.x[rs1] : (uint64_t)(int64_t)(int32_t)h.x[rs1];
+        for (uint64_t i = h.vstart; i < vl; i++) {
+            if (!active(i)) continue;
+            const uint64_t a = vget(h, rs2, i, 8), b = vv ? vget(h, rs1, i, 8) : xv;
+            uint64_t lo = 0, hi = 0;
+            for (unsigned k = 0; k < 64; k++)
+                if (b >> k & 1) { lo ^= a << k; if (k) hi ^= a >> (64 - k); }
+            vset(h, rd, i, 8, f6 == 0x0c ? lo : hi);
+        }
+        return done();
+    }
     if (f3 != 2 && f3 != 6) return VILL;
     // Reductions.
     if (f6 <= 0x07 && vv) {
