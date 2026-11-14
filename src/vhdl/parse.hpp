@@ -307,7 +307,7 @@ private:
             return d;
         }
         d->type = subtypeIndication();
-        if (accept("bus")) {}
+        if (accept("bus")) d->sigKind = "bus";
         if (accept(":=")) d->init = expression();
         if (d->mode.empty()) d->mode = "in";
         return d;
@@ -432,7 +432,7 @@ private:
             do { auto [l, x] = ident(); d->names.push_back(l); d->texts.push_back(x); } while (accept(","));
             expect(":");
             d->type = subtypeIndication();
-            if (isKw("register") || isKw("bus")) next();
+            if (isKw("register") || isKw("bus")) { d->sigKind = cur().low; next(); }
             if (accept(":=")) d->init = expression();
             expect(";");
         } else if (isKw("file")) {
@@ -581,9 +581,16 @@ private:
             for (auto& l : labels) { auto bb = b; bb.label = l; d->cfg->binds.push_back(bb); }
             if (isKw("end") && peekKw(1, "for")) { next(); next(); expect(";"); }
         } else if (isKw("disconnect")) {
-            one(DK::Disconnect);
-            while (!isOp(";")) next();
+            // disconnection specification (7.4): disconnect names|others|all : type_mark after time;
             next();
+            auto d = one(DK::Disconnect);
+            if (isKw("others") || isKw("all")) { d->names.push_back(cur().low); d->texts.push_back(cur().low); next(); }
+            else do { auto [l, x] = ident(); d->names.push_back(l); d->texts.push_back(x); } while (accept(","));
+            expect(":");
+            d->type = subtypeIndication();
+            expect("after");
+            d->init = expression();
+            expect(";");
         } else if (isKw("group")) {
             one(DK::Group);
             while (!isOp(";")) next();
