@@ -39,6 +39,7 @@ set(CASES
   "examples/privtmp.sv"
   "examples/wideslice.sv"
   "examples/nbadelay.sv"
+  "examples/conek.sv"
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
