@@ -8,6 +8,8 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- msim: VHDL type conversions on an `inout` port's formal and actual
+  (`std_logic_vector(io) => unsigned(bus)`, IEEE 1076-2019 6.5.7.3).
 - msim: VHDL std_logic keeps all nine values (U X 0 1 Z W L H -) by default:
   operators, comparisons, `'image`, `to_x01`, ports between VHDL units and
   weak-driver resolution match GHDL. SystemVerilog, UPF and waveforms see the

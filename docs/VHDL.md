@@ -153,7 +153,10 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   there. A `case` selector compares the four-value view only.
 - A character of a `string(1 to n)` variable that was never assigned is a
   space, where VHDL has NUL (SystemVerilog strings hold no NUL).
-- A conversion on the formal of an `inout` port (out ports have it).
+- On an `inout` port, the conversions on the formal and the actual must be
+  type conversions between arrays of std_logic-based elements (such as
+  `std_logic_vector(io) => unsigned(bus)`); a conversion function there is
+  not supported. In and out ports take both kinds.
 - A package instance declared in an architecture, block, process or
   subprogram is a package of the same name, so two of them in the design
   need distinct names, and its generic actuals cannot name the enclosing

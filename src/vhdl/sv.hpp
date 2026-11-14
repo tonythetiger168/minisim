@@ -2184,6 +2184,24 @@ private:
         return true;
     }
 
+    // a type conversion call T(x)
+    bool isTypeConvCall(const EP& e) {
+        if (!e || e->k != EK::Call || !e->a || e->a->k != EK::Name || e->args.size() != 1 || !e->args[0].actual || e->args[0].formal) return false;
+        const std::vector<Sym>* syms = lookupAll(e->a->name);
+        return syms && !syms->empty() && syms->front().k == Sym::TypeK;
+    }
+    // T(x) where T and x's type are one-dimensional arrays of std_ulogic-based
+    // elements: the SystemVerilog bits are the same before and after
+    bool bitsConv(const EP& e, TP argT = nullptr) {
+        if (!isTypeConvCall(e)) return false;
+        auto logicArr = [&](const TP& t0) {
+            TP t = t0 ? baseOf(t0) : nullptr;
+            return t && t->k == Type::Array && t->dims.size() == 1 && t->elem && baseOf(t->elem)->k == Type::Logic;
+        };
+        TP to = lookupAll(e->a->name)->front().type;
+        if (!argT) argT = ex(e->args[0].actual, nullptr).t;
+        return logicArr(to) && logicArr(argT);
+    }
     // ---------------------------------------------------------- conversion
     Val conversion(const TP& to, const EP& e, const TP& want) {
         (void)want;
@@ -6254,11 +6272,19 @@ endpackage
                         std::string mode = "in";
                         if (a.formal) {
                             std::string fn = baseName(a.formal);
-                            for (auto& p : ports) if (p.name == fn) mode = p.mode;
+                            bool found = false;
+                            for (auto& p : ports) if (p.name == fn) { mode = p.mode; found = true; }
+                            // conv(formal) => actual
+                            if (!found && a.formal->k == EK::Call && a.formal->args.size() == 1 && a.formal->args[0].actual) {
+                                fn = baseName(a.formal->args[0].actual);
+                                for (auto& p : ports) if (p.name == fn) mode = p.mode;
+                            }
                         } else if (pos < ports.size()) mode = ports[pos].mode;
                         ++pos;
                         if (mode == "out" || mode == "inout" || mode == "buffer" || mode == "?") {
-                            std::string n = baseName(a.actual);
+                            EP act = a.actual;
+                            if (mode == "inout" && isTypeConvCall(act)) act = act->args[0].actual;
+                            std::string n = baseName(act);
                             if (!n.empty()) di.instDrivers[n]++;
                         }
                     }
@@ -6881,7 +6907,25 @@ endpackage
                         std::string mode;
                         if (ent) for (auto& p : ent->ports) for (auto& n : p->names) if (n == f) mode = p->mode;
                         if (comp && comp->decl) for (auto& p : comp->decl->ports) for (auto& n : p->names) if (n == f) mode = p->mode;
-                        if (mode != "out" && mode != "buffer") fail(s.line, "a conversion on the formal is supported on out ports only");
+                        if (mode == "inout") {
+                            TP ftc;
+                            for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) ftc = types[i];
+                            if (!ftc) for (size_t i = 0; i < compOrder.size(); ++i) if (compOrder[i] == f && i < compTypes.size()) ftc = compTypes[i];
+                            // inout: a type conversion between closely related arrays of the
+                            // same logic element keeps the bits, so the port connects straight
+                            // to the actual (whose own type conversion is stripped the same way)
+                            EP act = a.actual;
+                            if (!ftc || !bitsConv(a.formal, ftc) || (isTypeConvCall(act) && !bitsConv(act)))
+                                fail(s.line, "a conversion on an inout port must be a type conversion between logic arrays");
+                            if (isTypeConvCall(act)) act = act->args[0].actual;
+                            std::string fsv;
+                            for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) fsv = order[i];
+                            if (fsv.empty()) fsv = svId(f);
+                            items.push_back("." + fsv + "(" + ex(act, nullptr).s + ")");
+                            ++pos;
+                            continue;
+                        }
+                        if (mode != "out" && mode != "buffer") fail(s.line, "a conversion on the formal is supported on out and inout ports only");
                         TP ftc;
                         for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == f) ftc = types[i];
                         if (!ftc) for (size_t i = 0; i < compOrder.size(); ++i) if (compOrder[i] == f && i < compTypes.size()) ftc = compTypes[i];
