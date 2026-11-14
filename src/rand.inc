@@ -906,7 +906,9 @@ inline bool sampleExact(int tries) {
         }
     };
     reset();
-    if (tries == 0) return false;
+    // Listing pays off only for a few variables; more of them (arrays,
+    // uniqueness) have many solutions, found by the search below.
+    if (tries == 0 || g_ctx->vars.size() > 4) return false;
     // Few solutions in a big box, too thin to be hit: list them, depth
     // first, each value of a variable narrowing the ones after it
     // (propagate), and take one of them. More than 4096 values left for a
