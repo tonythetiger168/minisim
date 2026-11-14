@@ -28,6 +28,12 @@ Spec references are IEEE 1800-2023 clauses.
   Tested with riscv-tests' vector benchmarks (845 programs now), clang's
   vectorized loops against its scalar ones, single-instruction checks, and
   under Linux. EXT_ABI 8: the extension library needs a rebuild.
+- msim VHDL-2019: std.env calendar time (`time_record`, `epoch`,
+  `localtime`, `gmtime`, ISO 8601 `to_string`), `getenv`, directory
+  functions and procedures, `time_to_seconds` / `seconds_to_time` and the
+  PSL queries (16.5.5 - 16.5.7, 16.5.10).
+- msim VHDL-2019: mode views as the mode of a record element, array mode
+  views (`view (v) of t`) and `'converse` used directly in a port (6.5.2).
 - msim VHDL-2019: conditional expressions (9.1), empty records, `'image` of
   records, strings and bit vectors, interface lists ending in `;`, generic
   type classes (6.5.3) and the std.env report and assert API (16.5.9).

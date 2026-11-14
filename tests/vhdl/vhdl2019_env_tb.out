@@ -1,0 +1,11 @@
+vhdl2019_env.vhd:14:5:@0ms:(report note): gm=2001-09-09T01:46:40 frac=2001-09-09T01:46:40.250 wd=sunday yday=251
+vhdl2019_env.vhd:16:5:@0ms:(report note): round=1.0e9
+vhdl2019_env.vhd:17:5:@0ms:(report note): now>2020=true year>2020=true
+vhdl2019_env.vhd:18:5:@0ms:(report note): t2s=1.5 s2t=2000000000000 fs
+vhdl2019_env.vhd:19:5:@0ms:(report note): unset=[] path=true sep=/
+vhdl2019_env.vhd:20:5:@0ms:(report note): mk=status_ok again=status_item_exists
+vhdl2019_env.vhd:21:5:@0ms:(report note): isdir=true isfile=false
+vhdl2019_env.vhd:23:5:@0ms:(report note): del1=status_not_empty
+vhdl2019_env.vhd:24:5:@0ms:(report note): del2=status_ok exists=false
+vhdl2019_env.vhd:25:5:@0ms:(report note): nofile=status_no_file
+vhdl2019_env.vhd:26:5:@0ms:(report note): cwd ok=true psl=false

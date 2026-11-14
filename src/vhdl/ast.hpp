@@ -159,6 +159,7 @@ struct Decl {
     EP init;
     std::string mode;          // port/param: in out inout buffer linkage
     std::string sigKind;       // guarded signal (6.4.2.3): "bus" or "register"
+    bool arrayView = false;    // mode view indication `view (V)` (6.5.2): of an array's elements
     std::string cls;           // param/generic class: signal variable constant file type function procedure package
     bool shared = false;
     std::shared_ptr<TypeDef> tdef;
