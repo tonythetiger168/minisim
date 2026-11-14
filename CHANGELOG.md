@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: vector cryptography: Zvkned (AES), Zvknha/Zvknhb (SHA-256 and
+  SHA-512), Zvkg (GHASH), Zvksed (SM4), Zvksh (SM3), Zvbc (carry-less
+  multiply) and Zvkt, on element groups; checked against FIPS-197, FIPS
+  180-4, GCM and GB/T 32907/32905 known answers.
 - mvplat: Zvbb (and Zvkb): vector and-not, rotates, bit and byte reverses,
   count leading/trailing zeros, population count and the widening shift
   `vwsll`, at SEW 8 to 64; `zvbb`/`zvkb` in the device tree.
