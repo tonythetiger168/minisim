@@ -198,6 +198,7 @@ Spec references are IEEE 1800-2023 clauses.
   More findings now carry their signal (`UNU001`..`UNU005`, `L004`, `L005`,
   `LAT001`, `SEQ001`, `EXP001`, `CLK001`, `CLK004`), which `-json` and
   `mdebug -lint` use too.
+- mlint: VHDL-only rules VHD001..VHD009 on the VHDL text (vendor arithmetic packages, 'event clock edges, buffer ports, initial values, shared variables, positional port maps, unlabeled processes, integers with no range, bit ports). A process starting with `wait until rising_edge(clk)` is a flop, not an implicit state machine, and `COMB001` on VHDL suggests `process (all)`.
 
 ### Changed
 - `msim -compile` builds the kernel once into a cached object

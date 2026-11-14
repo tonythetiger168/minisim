@@ -451,6 +451,20 @@ small design then builds in about 8 s (it was 21 s when every design
 compiled the kernel again; OpenTitan Ibex 68 -> 50 s). `MSIM_NOKOBJ=1`
 compiles the kernel into the design as before.
 
+The design itself is built as several C++ files (`-cfiles <n>`, default one
+per core, at most 16) kept in the build directory, and a file whose text did
+not change is not rebuilt. Each process goes to the file chosen by a hash of
+its generated code with the numbers left out. All instances of one process
+share a file, and an edit moves nothing else, so an edit to one module
+rebuilds only the files holding that module's code. 16 PicoRV32 cores, 4
+files: an edit to the CPU, its wrapper or the testbench rebuilt all 4 files
+before and rebuilds 1 now (about 32 s -> 24 to 34 s on 4 cores; the CPU time
+drops from about 120 s to 30 s). More files make an edit cheaper and a full
+build dearer: `-cfiles 16`, 15 s per edit, 70 s for a full build (51 s with
+4). An edit that adds or removes signals renumbers them, and the shared
+header changes, so every file is still rebuilt then. `MSIM_WHYPARTS=1`
+prints each file's share.
+
 ### Static combinational schedule
 
 Continuous assigns, gates, and straight-line `always_comb` / `always @*`

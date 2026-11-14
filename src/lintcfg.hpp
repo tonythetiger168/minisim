@@ -327,6 +327,28 @@ inline const std::vector<RuleInfo>& table() {
          "The block clocks registers on this input."},
         {"ABS004", "soc", Sev::Warning, true, "a block was signed off with errors or warnings not waived",
          "From the counts in its abstract (-abstract-out at block level)."},
+        // -------------------------------------------------------------------- vhdl
+        // On the VHDL text (lintvhdl.hpp); everything else in a VHDL design is
+        // checked by the rules above, through the translation.
+        {"VHD001", "vhdl", Sev::Warning, true, "a vendor arithmetic package (ieee.std_logic_arith / _unsigned / _signed)",
+         "Not IEEE packages: Synopsys wrote them and tools ship different versions. ieee.numeric_std (and numeric_std_unsigned in VHDL-2008) are the standard."},
+        {"VHD002", "vhdl", Sev::Info, true, "a clock edge written with 'event",
+         "clk'event and clk = '1' is also true for X to 1, L to 1 and others; rising_edge() and falling_edge() are true only for a real edge, so simulation matches the flop."},
+        {"VHD003", "vhdl", Sev::Warning, true, "a buffer port",
+         "A buffer port forces buffer ports up the hierarchy in older tools. Drive the port from an internal signal and read that (VHDL-2008 also lets out ports be read)."},
+        {"VHD004", "vhdl", Sev::Info, false, "a signal with an initial value",
+         "FPGA tools load initial values at configuration; ASIC synthesis ignores them, so silicon starts differently from simulation. Off by default (FPGA designs rely on them); use a reset."},
+        {"VHD005", "vhdl", Sev::Warning, true, "a shared variable",
+         "Not synthesizable, and processes that share it race. Use a signal."},
+        {"VHD006", "vhdl", Sev::Warning, true, "a port map or generic map by position",
+         "A port added to the entity later shifts every connection after it. Connect by name (port => actual). The SystemVerilog rule is CON003."},
+        {"VHD007", "vhdl", Sev::Info, false, "a process with no label",
+         "A label names the process in waveforms, coverage and messages (STARC). Off by default."},
+        {"VHD008", "vhdl", Sev::Warning, true, "an integer signal or port with no range",
+         "integer, natural and positive with no range constraint are 32 bits in synthesis. Give a range: integer range 0 to 15 is 4 bits."},
+        {"VHD009", "vhdl", Sev::Info, false, "a port of type bit or bit_vector",
+         "bit cannot hold X or Z, so an undriven or contended input is invisible, and every connection to std_logic needs a conversion. Off by default."},
+
         // --------------------------------------------------------------------- fsm
         {"FSM001", "fsm", Sev::Warning, true, "a state that no transition and no reset leads to",
          "The state is named or tested, but the machine can never be in it: dead logic, or a transition that was forgotten."},
@@ -454,14 +476,14 @@ struct Goal {
 };
 inline const std::vector<Goal>& goals() {
     static const std::vector<Goal> g = {
-        {"lint_rtl", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth",
+        {"lint_rtl", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,vhdl",
          "RTL correctness before simulation and synthesis (SpyGlass lint_rtl)"},
         {"lint_synth", "latch,comb,case,driver,synth,SEQ001,SEQ002,W001,RST006,RST007",
          "what synthesis rejects or builds differently from simulation"},
         {"lint_style", "naming,style,format,suspicious", "naming, layout and coding style"},
-        {"starc", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,naming,style",
+        {"starc", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,naming,style,vhdl",
          "rules in the spirit of the STARC RTL design style guide (docs/LINT.md has the mapping)"},
-        {"openmore", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,synth,naming,style,format",
+        {"openmore", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,synth,naming,style,format,vhdl",
          "rules in the spirit of the OpenMORE / Reuse Methodology Manual checklist"},
         {"verible", "FMT001,FMT002,FMT003,FMT004,STY004,STY005,STY006,STY007,STY008,STY009,STY010,STY011,STY012,"
                     "STY013,STY014,STY015,SUS001,SUS002,SUS003,SUS004,NAME014,NAME015,NAME016,NAME017,NAME018,"
