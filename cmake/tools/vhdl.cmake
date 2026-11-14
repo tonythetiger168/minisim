@@ -35,6 +35,8 @@ if(TARGET msim)
     "pkggen_types_tb|pkggen_types.vhd|"
     "vhdl2019_tb|vhdl2019.vhd|"
     "vhdl2019b_tb|vhdl2019b.vhd|"
+    "vhdl2019c_tb|vhdl2019c.vhd|"
+    "vhdl2019_assert_tb|vhdl2019_assert.vhd|"
     "mixed_sv_top|counter.vhd,mixed_sv_top.sv|"
     "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|"
     "mixed_uncon|uncon_ports.vhd,mixed_uncon.sv|")
