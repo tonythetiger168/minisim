@@ -11,6 +11,13 @@ Spec references are IEEE 1800-2023 clauses.
 - dw: `MW_reset_sync`, `MW_pulse_sync`, `MW_data_sync` (clock domain
   crossing), `MW_8b10b_enc`/`MW_8b10b_dec`, `MW_sincos` (CORDIC), `MW_fir`
   and `MW_tap` (IEEE 1149.1), checked by `tests/dw/xing.sv`.
+- mvplat: the V extension 1.0 on RV32 and RV64 (VLEN 128 to 1024 with
+  `-vlen` or the platform's `"vlen"`, ELEN 64): every load and store form,
+  integer, fixed point, mask, reduction, permutation and SEW 32/64 floating
+  point, `vstart` on traps, `mstatus.VS`; `v` in `misa` and the device tree.
+  Tested with riscv-tests' vector benchmarks (845 programs now), clang's
+  vectorized loops against its scalar ones, single-instruction checks, and
+  under Linux. EXT_ABI 8: the extension library needs a rebuild.
 - msim VHDL: unconstrained array ports (6.5.6.3). Each port's index range
   comes from the actual, ascending or descending, also through another
   unconstrained port; a SystemVerilog parent sets `<port>__L`/`<port>__R`.

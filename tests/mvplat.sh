@@ -59,6 +59,22 @@ done
 cmp -s smp64_1.log smp64_4.log && ok "RV64: the same run on 1 and 4 threads" || bad "RV64: the run depends on the thread count"
 head -1 smp64_1.log | grep -q "^core   0: 3 0x0000000080000000 (0x" && ok "RV64: 64-bit commit log" || { bad "RV64 -trace"; head -3 smp64_1.log; }
 
+# The V extension: clang's vectorized loops agree with its scalar ones
+# (RV32 and RV64, at the smallest and largest VLEN), and single
+# instructions agree with scalar models of the specification.
+for x in 32 64; do
+  for v in 128 1024; do
+    "$MVPLAT" "$E/vec$x.elf" -vlen $v -q > vec${x}_$v.out 2>&1; rc=$?
+    expect "V, RV$x, VLEN $v: vectorized loops agree with scalar ones" 0 vec${x}_$v.out "17 of 17 kernels agree"
+    "$MVPLAT" "$E/vec${x}m8.elf" -vlen $v -q > vec${x}m8_$v.out 2>&1; rc=$?
+    expect "V, RV$x, VLEN $v: the same with LMUL 8 groups" 0 vec${x}m8_$v.out "17 of 17 kernels agree"
+  done
+  for v in 128 512; do
+    "$MVPLAT" "$E/vops$x.elf" -vlen $v -q > vops${x}_$v.out 2>&1; rc=$?
+    expect "V, RV$x, VLEN $v: single instructions, traps, vstart" 0 vops${x}_$v.out "vops: all checks passed"
+  done
+done
+
 "$MVPLAT" "$E/irq.elf" -input abc -q -max-cycles 20000 > part1.out 2>&1; rc=$?
 expect "-max-cycles stops with exit code 4" 4 part1.out "stopped at cycle 20000"
 
@@ -202,7 +218,8 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
   # An rv64gc user space (floating point included): BusyBox's shell runs
   # what is typed on the console once the kernel's driver is up.
   if [ -n "${MVPLAT_BUSYBOX:-}" ] && command -v python3 > /dev/null 2>&1; then
-    python3 "$T/mkcpio.py" bb.cpio d:dev c:dev/console:5:1 d:bin d:mnt "f:bin/busybox:$MVPLAT_BUSYBOX" "f:init:$T/busybox_init.sh"
+    python3 "$T/mkcpio.py" bb.cpio d:dev c:dev/console:5:1 c:dev/null:1:3 d:bin d:mnt "f:bin/busybox:$MVPLAT_BUSYBOX" \
+      "f:init:$T/busybox_init.sh" "f:bin/vec:$E/vec_linux64"
     "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio \
       -append "console=ttyS0 rdinit=/init quiet" -harts 2 -q \
       -input "echo typed \$((6*7)); busybox printf '%.3f\n' 3.14159; poweroff -f
@@ -238,6 +255,14 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
       -append "console=ttyS0 rdinit=/init quiet" -mmu sv48 -input "grep -m1 mmu /proc/cpuinfo; poweroff -f
 " > sv48.out 2>&1; rc=$?
     expect "Linux runs with Sv48 paging (-mmu sv48)" 0 sv48.out "^mmu.*: sv48"
+    # Vector code in three processes at once on one hart: Linux turns the
+    # vector unit on for each and switches their vector registers.
+    "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio -q \
+      -append "console=ttyS0 rdinit=/init quiet" -input "grep -m1 isa /proc/cpuinfo; /bin/vec & /bin/vec & /bin/vec; wait; poweroff -f
+" > vlinux.out 2>&1; rc=$?
+    expect "Linux runs vector code in three processes" 0 vlinux.out "^isa.*: rv64imafdcv_"
+    [ "$(grep -c '51 of 51 kernel runs agree under Linux' vlinux.out)" = 3 ] &&
+      ok "each process's vector results agree with its scalar ones" || { bad "vector code under Linux"; sed 's/^/      /' vlinux.out; }
     # A network: Linux's virtio-net driver brings eth0 up and pings the
     # built-in gateway.
     "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio -q \

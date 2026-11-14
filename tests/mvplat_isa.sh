@@ -3,12 +3,12 @@
 # github.com/riscv-software-src/riscv-tests) on mvplat: every ui, um, ua, uc,
 # uf, ud, uzba, uzbb, uzbc, uzbs, uzicond, uzbkb, uzbkx, uzabha, uzacas,
 # uzabha_zacas, uzfh, si and mi test, for RV32 and RV64 (and RV64's mzicbo and
-# ssvnapot),
-# in its "p" environment (physical memory), and the user-level ones again in
+# ssvnapot), in its "p" environment (physical memory), and the user-level ones again in
 # the "v" environment, which runs them in user mode under Sv32 or Sv39 paging
 # (and RV64's ui, um, ua and uc again under Sv48) with a small supervisor
 # that maps pages on demand. A test ends through HTIF tohost with the number
-# of the first failing case.
+# of the first failing case. The vector benchmarks (benchmarks/vec-*) run
+# too, at VLEN 128 and 512.
 #
 # The tests are fetched at a pinned commit and built with clang; nothing from
 # them is shipped. Without git access or a clang that targets riscv32 (and
@@ -16,6 +16,7 @@
 #   tests/mvplat_isa.sh MVPLAT OUT
 set -u
 MVPLAT=$1 OUT=$2
+SRC_VPLAT=$(cd "$(dirname "$0")" && pwd)/vplat
 REV=3df703cd52d5f0d8224e3c50bf03c6cb70efff98
 ENV_REV=6de71edb142be36319e380ce782c3d1830c65d68
 mkdir -p "$OUT"; cd "$OUT"
@@ -163,6 +164,42 @@ for X in 32 64; do
       done
     done
   fi
+done
+# The vector benchmarks (vec-daxpy, vec-memcpy, vec-sgemm, vec-strcmp),
+# which check their own results. Their common/syscalls.c uses GCC's nested
+# functions, which clang lacks: tests/vplat/bench_rt.c stands in for it.
+# clang wants _Atomic objects in stdatomic.h's calls and the linker script's
+# flags as a number; vec-sgemm's vsetvli leaves LMUL out, and the routine
+# uses s3 without saving it, which a clang-compiled caller notices.
+mkdir -p binc/sys
+: > binc/sys/signal.h
+cp libc/*.h binc/
+cat > binc/stdatomic.h <<'EOH'
+#pragma once
+typedef enum { memory_order_relaxed = __ATOMIC_RELAXED, memory_order_acquire = __ATOMIC_ACQUIRE,
+               memory_order_release = __ATOMIC_RELEASE, memory_order_acq_rel = __ATOMIC_ACQ_REL,
+               memory_order_seq_cst = __ATOMIC_SEQ_CST } memory_order;
+#define atomic_fetch_add_explicit(p, v, o) __atomic_fetch_add((p), (v), (o))
+#define atomic_store_explicit(p, v, o) __atomic_store_n((p), (v), (o))
+#define atomic_load_explicit(p, o) __atomic_load_n((p), (o))
+EOH
+BM=$RT/benchmarks
+sed 's/FLAGS(SHF_ALLOC | SHF_EXECINSTR)/FLAGS(7)/' "$BM/common/test.ld" > bench.ld
+perl -0pe 's/e32, ta, ma/e32, m1, ta, ma/; s/(    REG_S s2, 16\(sp\)\n)/$1    REG_S s3, 24(sp)\n/; s/(    REG_L s2, 16\(sp\)\n)/$1    REG_L s3, 24(sp)\n/' \
+  "$BM/vec-sgemm/vec-sgemm.S" > vec-sgemm.S
+for b in vec-daxpy vec-memcpy vec-sgemm vec-strcmp; do
+  s=$BM/$b/$b.S
+  [ $b = vec-sgemm ] && s=vec-sgemm.S
+  if ! $CLANG --target=riscv64-unknown-elf -march=rv64gcv -mabi=lp64d -mcmodel=medany -static -O2 -std=gnu99 \
+       -ffast-math -fno-common -fno-builtin -nostdlib -fuse-ld=lld -DPREALLOCATE=1 -Ibinc -I"$RT/env" \
+       -I"$BM/common" -I"$BM/$b" -T bench.ld "$BM/$b"/*.c "$s" "$SRC_VPLAT/bench_rt.c" "$BM/common/crt.S" -o $b 2> $b.err; then
+    failed="$failed $b(build)"; continue
+  fi
+  for v in 128 512; do
+    timeout 60 "$MVPLAT" $b -q -vlen $v -max-cycles 50000000 > $b-$v.out 2>&1
+    rc=$?
+    if [ $rc = 0 ]; then pass=$((pass + 1)); else failed="$failed $b-vlen$v(exit $rc)"; fi
+  done
 done
 echo "riscv-tests: $pass passed"
 if [ -n "$failed" ]; then echo "failed:$failed"; exit 1; fi
