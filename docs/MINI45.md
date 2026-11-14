@@ -13,7 +13,8 @@ from another library, and it must not be used for a real chip.
 | `mini45_ff.lib` | fast corner: 1.25 V, -40 C |
 | `mini45.v` | Verilog models: functional, with specify paths and timing checks for SDF |
 | `mini45_tech.lef` | technology LEF: site, six metal layers, vias |
-| `mini45.lef` | cell LEF: one macro per cell with pin shapes |
+| `mini45.lef` | cell LEF: one macro per cell with pin and obstruction shapes |
+| `mini45_abstract.json` | each cell's width, pins and obstructions, taken from its layout; `gen_mini45.py` reads it |
 | `mini45_tb.sv` | self-checking bench of the Verilog models |
 | `mini45.sp` | transistor netlists: one `.subckt` per cell |
 | `mini45_models_tt.sp`, `_ss`, `_ff` | level-1 MOSFET models per corner |
@@ -100,12 +101,20 @@ templates that tell `mchar` what to measure.
 The site is 0.19 um by 1.40 um (ten metal1 tracks). Metal1, 3 and 5 run
 horizontally and metal2, 4 and 6 vertically, with sheet resistance and area
 and edge capacitance per layer and a default via per cut layer. Every cell
-is a whole number of sites wide and its Liberty `area` is its LEF size. Each
-signal pin is a metal1 shape centred where a metal2 track crosses a metal1
-track, one metal2 track per pin, so a router can drop a via on any pin.
-Each pin is 0.07 um by 0.21 um, the metal1 minimum area, so a pin no net
-connects is still legal. `VDD` and `VSS` are metal1 rails on the top and
-bottom edges. Metal1 to metal2 has two default vias: `via1_0` with a
+is a whole number of sites wide and its Liberty `area` is its LEF size.
+Every cell has a full transistor-level layout (diffusion, poly, contacts,
+metal1 and metal2 inside the cell, well and substrate taps under the rails),
+DRC clean and LVS clean against its transistor netlist, drawn by a layout
+generator; the widths, pins and obstructions of those layouts are
+`mini45_abstract.json`, and the LEF is made from it. Cells whose transistors
+need fingers in the 1.4 um row are wider than a hand estimate would make
+them: an inverter is still 2 sites, a two-input NOR 5, a flip-flop 21, a full adder 54 (728
+sites planned for the 88 cells, 1190 laid out).
+Each signal pin is a vertical metal1 bar, 0.07 um by 0.21 um (the metal1
+minimum area), centred on a metal2 track, one track per pin, and no other
+net's metal2 is over it or beside it, so a router can always drop a via on
+a pin. The cell's own metal1 and metal2 are LEF obstructions. `VDD` and
+`VSS` are metal1 rails on the top and bottom edges. Metal1 to metal2 has two default vias: `via1_0` with a
 horizontal metal1 pad for wires, and `via1_1` with a vertical pad the shape
 of a pin, so vias on the pins of neighbouring metal2 tracks keep their
 spacing.

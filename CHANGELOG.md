@@ -221,6 +221,10 @@ Spec references are IEEE 1800-2023 clauses.
 - mlint: with `-sdc`, rules SDC001..SDC005 check the constraints against the design (inputs and outputs with no I/O delay, a clock on a port that clocks nothing or on a reset, objects the design does not have). STY016 (off by default) reports glue logic in a module that also instantiates submodules. The STARC table in docs/LINT.md now lists every topic of the guide as covered or not a lint check.
 
 ### Changed
+- mini45: cell widths, pin shapes and obstructions now come from the cells'
+  generated layouts (`lib/mini45/mini45_abstract.json`). 67 of the 88 cells
+  are wider (728 sites in all before, 1190 now), so their Liberty `area` and
+  LEF `SIZE` change; the LEF has OBS for the cells' own metal1 and metal2.
 - `msim -compile` builds the kernel once into a cached object
   (`$MSIM_KCACHE`, default `~/.cache/msim`) that every `simv` links, instead
   of compiling it into each design: a small design's C++ build goes from

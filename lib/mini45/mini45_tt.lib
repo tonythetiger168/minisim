@@ -521,7 +521,7 @@ library (mini45_tt) {
     }
   }
   cell (BUF_X1) {
-    area : 0.798;
+    area : 1.064;
     cell_footprint : BUF;
     cell_leakage_power : 3.2;
     leakage_power () {
@@ -949,7 +949,7 @@ library (mini45_tt) {
     }
   }
   cell (CLKBUF_X1) {
-    area : 0.798;
+    area : 1.064;
     cell_footprint : CLKBUF;
     cell_leakage_power : 3.4;
     leakage_power () {
@@ -1785,7 +1785,7 @@ library (mini45_tt) {
     }
   }
   cell (NAND2_X2) {
-    area : 1.064;
+    area : 1.33;
     cell_footprint : NAND2;
     cell_leakage_power : 3.36;
     leakage_power () {
@@ -1979,7 +1979,7 @@ library (mini45_tt) {
     }
   }
   cell (NAND2_X4) {
-    area : 1.596;
+    area : 2.394;
     cell_footprint : NAND2;
     cell_leakage_power : 5.28;
     leakage_power () {
@@ -2561,7 +2561,7 @@ library (mini45_tt) {
     }
   }
   cell (AND2_X4) {
-    area : 1.862;
+    area : 2.128;
     cell_footprint : AND2;
     cell_leakage_power : 8.8;
     leakage_power () {
@@ -2755,7 +2755,7 @@ library (mini45_tt) {
     }
   }
   cell (NOR2_X1) {
-    area : 0.798;
+    area : 1.33;
     cell_footprint : NOR2;
     cell_leakage_power : 2.8;
     leakage_power () {
@@ -2949,7 +2949,7 @@ library (mini45_tt) {
     }
   }
   cell (NOR2_X2) {
-    area : 1.064;
+    area : 1.862;
     cell_footprint : NOR2;
     cell_leakage_power : 3.92;
     leakage_power () {
@@ -3143,7 +3143,7 @@ library (mini45_tt) {
     }
   }
   cell (NOR2_X4) {
-    area : 1.596;
+    area : 3.458;
     cell_footprint : NOR2;
     cell_leakage_power : 6.16;
     leakage_power () {
@@ -3337,7 +3337,7 @@ library (mini45_tt) {
     }
   }
   cell (OR2_X1) {
-    area : 1.064;
+    area : 1.862;
     cell_footprint : OR2;
     cell_leakage_power : 4.4;
     leakage_power () {
@@ -3531,7 +3531,7 @@ library (mini45_tt) {
     }
   }
   cell (OR2_X2) {
-    area : 1.33;
+    area : 1.862;
     cell_footprint : OR2;
     cell_leakage_power : 6.16;
     leakage_power () {
@@ -3725,7 +3725,7 @@ library (mini45_tt) {
     }
   }
   cell (OR2_X4) {
-    area : 1.862;
+    area : 2.128;
     cell_footprint : OR2;
     cell_leakage_power : 9.68;
     leakage_power () {
@@ -3919,7 +3919,7 @@ library (mini45_tt) {
     }
   }
   cell (NAND3_X1) {
-    area : 1.064;
+    area : 1.862;
     cell_footprint : NAND3;
     cell_leakage_power : 3.1;
     leakage_power () {
@@ -4208,7 +4208,7 @@ library (mini45_tt) {
     }
   }
   cell (NAND3_X2) {
-    area : 1.33;
+    area : 2.66;
     cell_footprint : NAND3;
     cell_leakage_power : 4.34;
     leakage_power () {
@@ -4497,7 +4497,7 @@ library (mini45_tt) {
     }
   }
   cell (AND3_X1) {
-    area : 1.33;
+    area : 2.128;
     cell_footprint : AND3;
     cell_leakage_power : 4.7;
     leakage_power () {
@@ -4786,7 +4786,7 @@ library (mini45_tt) {
     }
   }
   cell (AND3_X2) {
-    area : 1.596;
+    area : 2.394;
     cell_footprint : AND3;
     cell_leakage_power : 6.58;
     leakage_power () {
@@ -5075,7 +5075,7 @@ library (mini45_tt) {
     }
   }
   cell (NOR3_X1) {
-    area : 1.064;
+    area : 1.862;
     cell_footprint : NOR3;
     cell_leakage_power : 3.6;
     leakage_power () {
@@ -5364,7 +5364,7 @@ library (mini45_tt) {
     }
   }
   cell (NOR3_X2) {
-    area : 1.33;
+    area : 3.458;
     cell_footprint : NOR3;
     cell_leakage_power : 5.04;
     leakage_power () {
@@ -5653,7 +5653,7 @@ library (mini45_tt) {
     }
   }
   cell (OR3_X1) {
-    area : 1.33;
+    area : 2.394;
     cell_footprint : OR3;
     cell_leakage_power : 5.2;
     leakage_power () {
@@ -5942,7 +5942,7 @@ library (mini45_tt) {
     }
   }
   cell (OR3_X2) {
-    area : 1.596;
+    area : 3.192;
     cell_footprint : OR3;
     cell_leakage_power : 7.28;
     leakage_power () {
@@ -6231,7 +6231,7 @@ library (mini45_tt) {
     }
   }
   cell (NAND4_X1) {
-    area : 1.33;
+    area : 2.926;
     cell_footprint : NAND4;
     cell_leakage_power : 3.8;
     pg_pin (VDD) {
@@ -6567,7 +6567,7 @@ library (mini45_tt) {
     }
   }
   cell (NAND4_X2) {
-    area : 1.596;
+    area : 4.522;
     cell_footprint : NAND4;
     cell_leakage_power : 5.32;
     pg_pin (VDD) {
@@ -6903,7 +6903,7 @@ library (mini45_tt) {
     }
   }
   cell (AND4_X1) {
-    area : 1.596;
+    area : 2.926;
     cell_footprint : AND4;
     cell_leakage_power : 5.4;
     pg_pin (VDD) {
@@ -7239,7 +7239,7 @@ library (mini45_tt) {
     }
   }
   cell (AND4_X2) {
-    area : 1.862;
+    area : 2.926;
     cell_footprint : AND4;
     cell_leakage_power : 7.56;
     pg_pin (VDD) {
@@ -7575,7 +7575,7 @@ library (mini45_tt) {
     }
   }
   cell (NOR4_X1) {
-    area : 1.33;
+    area : 3.458;
     cell_footprint : NOR4;
     cell_leakage_power : 4.4;
     pg_pin (VDD) {
@@ -7911,7 +7911,7 @@ library (mini45_tt) {
     }
   }
   cell (NOR4_X2) {
-    area : 1.596;
+    area : 6.65;
     cell_footprint : NOR4;
     cell_leakage_power : 6.16;
     pg_pin (VDD) {
@@ -8247,7 +8247,7 @@ library (mini45_tt) {
     }
   }
   cell (OR4_X1) {
-    area : 1.596;
+    area : 3.724;
     cell_footprint : OR4;
     cell_leakage_power : 6;
     pg_pin (VDD) {
@@ -8583,7 +8583,7 @@ library (mini45_tt) {
     }
   }
   cell (OR4_X2) {
-    area : 1.862;
+    area : 3.99;
     cell_footprint : OR4;
     cell_leakage_power : 8.4;
     pg_pin (VDD) {
@@ -8919,7 +8919,7 @@ library (mini45_tt) {
     }
   }
   cell (XOR2_X1) {
-    area : 1.596;
+    area : 3.458;
     cell_footprint : XOR2;
     cell_leakage_power : 5.2;
     leakage_power () {
@@ -9113,7 +9113,7 @@ library (mini45_tt) {
     }
   }
   cell (XOR2_X2) {
-    area : 1.862;
+    area : 3.458;
     cell_footprint : XOR2;
     cell_leakage_power : 7.28;
     leakage_power () {
@@ -9307,7 +9307,7 @@ library (mini45_tt) {
     }
   }
   cell (XNOR2_X1) {
-    area : 1.596;
+    area : 3.458;
     cell_footprint : XNOR2;
     cell_leakage_power : 5.2;
     leakage_power () {
@@ -9501,7 +9501,7 @@ library (mini45_tt) {
     }
   }
   cell (XNOR2_X2) {
-    area : 1.862;
+    area : 3.458;
     cell_footprint : XNOR2;
     cell_leakage_power : 7.28;
     leakage_power () {
@@ -9695,7 +9695,7 @@ library (mini45_tt) {
     }
   }
   cell (AOI21_X1) {
-    area : 1.064;
+    area : 1.862;
     cell_footprint : AOI21;
     cell_leakage_power : 3.4;
     leakage_power () {
@@ -9984,7 +9984,7 @@ library (mini45_tt) {
     }
   }
   cell (AOI21_X2) {
-    area : 1.33;
+    area : 2.66;
     cell_footprint : AOI21;
     cell_leakage_power : 4.76;
     leakage_power () {
@@ -10273,7 +10273,7 @@ library (mini45_tt) {
     }
   }
   cell (AOI22_X1) {
-    area : 1.33;
+    area : 2.394;
     cell_footprint : AOI22;
     cell_leakage_power : 4.2;
     pg_pin (VDD) {
@@ -10609,7 +10609,7 @@ library (mini45_tt) {
     }
   }
   cell (AOI22_X2) {
-    area : 1.596;
+    area : 3.458;
     cell_footprint : AOI22;
     cell_leakage_power : 5.88;
     pg_pin (VDD) {
@@ -10945,7 +10945,7 @@ library (mini45_tt) {
     }
   }
   cell (AOI211_X1) {
-    area : 1.33;
+    area : 2.394;
     cell_footprint : AOI211;
     cell_leakage_power : 4.4;
     pg_pin (VDD) {
@@ -11281,7 +11281,7 @@ library (mini45_tt) {
     }
   }
   cell (OAI21_X1) {
-    area : 1.064;
+    area : 1.596;
     cell_footprint : OAI21;
     cell_leakage_power : 3.2;
     leakage_power () {
@@ -11570,7 +11570,7 @@ library (mini45_tt) {
     }
   }
   cell (OAI21_X2) {
-    area : 1.33;
+    area : 2.394;
     cell_footprint : OAI21;
     cell_leakage_power : 4.48;
     leakage_power () {
@@ -11859,7 +11859,7 @@ library (mini45_tt) {
     }
   }
   cell (OAI22_X1) {
-    area : 1.33;
+    area : 2.394;
     cell_footprint : OAI22;
     cell_leakage_power : 4;
     pg_pin (VDD) {
@@ -12195,7 +12195,7 @@ library (mini45_tt) {
     }
   }
   cell (OAI22_X2) {
-    area : 1.596;
+    area : 3.458;
     cell_footprint : OAI22;
     cell_leakage_power : 5.6;
     pg_pin (VDD) {
@@ -12531,7 +12531,7 @@ library (mini45_tt) {
     }
   }
   cell (OAI211_X1) {
-    area : 1.33;
+    area : 2.394;
     cell_footprint : OAI211;
     cell_leakage_power : 4.2;
     pg_pin (VDD) {
@@ -12867,7 +12867,7 @@ library (mini45_tt) {
     }
   }
   cell (MUX2_X1) {
-    area : 1.862;
+    area : 2.926;
     cell_footprint : MUX2;
     cell_leakage_power : 6;
     leakage_power () {
@@ -13156,7 +13156,7 @@ library (mini45_tt) {
     }
   }
   cell (MUX2_X2) {
-    area : 2.128;
+    area : 3.192;
     cell_footprint : MUX2;
     cell_leakage_power : 8.4;
     leakage_power () {
@@ -13445,7 +13445,7 @@ library (mini45_tt) {
     }
   }
   cell (MUX4_X1) {
-    area : 3.458;
+    area : 8.246;
     cell_footprint : MUX4;
     cell_leakage_power : 12;
     pg_pin (VDD) {
@@ -13939,7 +13939,7 @@ library (mini45_tt) {
     }
   }
   cell (HA_X1) {
-    area : 2.394;
+    area : 4.256;
     cell_footprint : HA;
     cell_leakage_power : 8;
     leakage_power () {
@@ -14286,7 +14286,7 @@ library (mini45_tt) {
     }
   }
   cell (FA_X1) {
-    area : 3.724;
+    area : 14.364;
     cell_footprint : FA;
     cell_leakage_power : 13;
     leakage_power () {
@@ -14801,7 +14801,7 @@ library (mini45_tt) {
     }
   }
   cell (TBUF_X1) {
-    area : 1.33;
+    area : 2.66;
     cell_footprint : TBUF;
     cell_leakage_power : 4;
     leakage_power () {
@@ -15021,7 +15021,7 @@ library (mini45_tt) {
     }
   }
   cell (TBUF_X2) {
-    area : 1.596;
+    area : 2.926;
     cell_footprint : TBUF;
     cell_leakage_power : 5.6;
     leakage_power () {
@@ -15241,7 +15241,7 @@ library (mini45_tt) {
     }
   }
   cell (DFF_X1) {
-    area : 4.522;
+    area : 5.586;
     cell_footprint : DFF;
     cell_leakage_power : 14;
     pg_pin (VDD) {
@@ -15484,7 +15484,7 @@ library (mini45_tt) {
     }
   }
   cell (DFF_X2) {
-    area : 5.054;
+    area : 6.118;
     cell_footprint : DFF;
     cell_leakage_power : 19.6;
     pg_pin (VDD) {
@@ -15727,7 +15727,7 @@ library (mini45_tt) {
     }
   }
   cell (DFFR_X1) {
-    area : 5.054;
+    area : 8.246;
     cell_footprint : DFFR;
     cell_leakage_power : 15.6;
     pg_pin (VDD) {
@@ -16060,7 +16060,7 @@ library (mini45_tt) {
     }
   }
   cell (DFFR_X2) {
-    area : 5.586;
+    area : 8.246;
     cell_footprint : DFFR;
     cell_leakage_power : 21.84;
     pg_pin (VDD) {
@@ -16393,7 +16393,7 @@ library (mini45_tt) {
     }
   }
   cell (DFFS_X1) {
-    area : 5.054;
+    area : 7.714;
     cell_footprint : DFFS;
     cell_leakage_power : 15.6;
     pg_pin (VDD) {
@@ -16726,7 +16726,7 @@ library (mini45_tt) {
     }
   }
   cell (DFFS_X2) {
-    area : 5.586;
+    area : 7.98;
     cell_footprint : DFFS;
     cell_leakage_power : 21.84;
     pg_pin (VDD) {
@@ -17059,7 +17059,7 @@ library (mini45_tt) {
     }
   }
   cell (DFFRS_X1) {
-    area : 5.586;
+    area : 11.172;
     cell_footprint : DFFRS;
     cell_leakage_power : 17.2;
     pg_pin (VDD) {
@@ -17484,7 +17484,7 @@ library (mini45_tt) {
     }
   }
   cell (DFFE_X1) {
-    area : 5.586;
+    area : 7.98;
     cell_footprint : DFFE;
     cell_leakage_power : 17.6;
     pg_pin (VDD) {
@@ -17772,7 +17772,7 @@ library (mini45_tt) {
     }
   }
   cell (SDFF_X1) {
-    area : 5.852;
+    area : 8.512;
     cell_footprint : SDFF;
     cell_leakage_power : 18.4;
     pg_pin (VDD) {
@@ -18135,7 +18135,7 @@ library (mini45_tt) {
     }
   }
   cell (SDFF_X2) {
-    area : 6.384;
+    area : 9.31;
     cell_footprint : SDFF;
     cell_leakage_power : 25.76;
     pg_pin (VDD) {
@@ -18498,7 +18498,7 @@ library (mini45_tt) {
     }
   }
   cell (SDFFR_X1) {
-    area : 6.384;
+    area : 10.906;
     cell_footprint : SDFFR;
     cell_leakage_power : 20;
     pg_pin (VDD) {
@@ -18955,7 +18955,7 @@ library (mini45_tt) {
     }
   }
   cell (SDFFR_X2) {
-    area : 6.916;
+    area : 10.906;
     cell_footprint : SDFFR;
     cell_leakage_power : 28;
     pg_pin (VDD) {
@@ -19412,7 +19412,7 @@ library (mini45_tt) {
     }
   }
   cell (SDFFS_X1) {
-    area : 6.384;
+    area : 11.704;
     cell_footprint : SDFFS;
     cell_leakage_power : 20;
     pg_pin (VDD) {
@@ -19869,7 +19869,7 @@ library (mini45_tt) {
     }
   }
   cell (DLH_X1) {
-    area : 2.66;
+    area : 3.99;
     cell_footprint : DLH;
     cell_leakage_power : 9;
     pg_pin (VDD) {
@@ -20076,7 +20076,7 @@ library (mini45_tt) {
     }
   }
   cell (DLH_X2) {
-    area : 3.192;
+    area : 3.99;
     cell_footprint : DLH;
     cell_leakage_power : 12.6;
     pg_pin (VDD) {
@@ -20283,7 +20283,7 @@ library (mini45_tt) {
     }
   }
   cell (DLL_X1) {
-    area : 2.66;
+    area : 3.192;
     cell_footprint : DLL;
     cell_leakage_power : 9;
     pg_pin (VDD) {
@@ -20490,7 +20490,7 @@ library (mini45_tt) {
     }
   }
   cell (CLKGATE_X1) {
-    area : 3.724;
+    area : 5.852;
     cell_footprint : CLKGATE;
     cell_leakage_power : 11;
     clock_gating_integrated_cell : latch_posedge_precontrol;
@@ -20697,7 +20697,7 @@ library (mini45_tt) {
     }
   }
   cell (CLKGATE_X2) {
-    area : 4.256;
+    area : 5.852;
     cell_footprint : CLKGATE;
     cell_leakage_power : 15.4;
     clock_gating_integrated_cell : latch_posedge_precontrol;
@@ -20904,7 +20904,7 @@ library (mini45_tt) {
     }
   }
   cell (CLKGATE_X4) {
-    area : 5.32;
+    area : 6.384;
     cell_footprint : CLKGATE;
     cell_leakage_power : 24.2;
     clock_gating_integrated_cell : latch_posedge_precontrol;
