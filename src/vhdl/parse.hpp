@@ -205,22 +205,12 @@ private:
             auto [comp, compText] = ident();
             Unit::Bind b;
             b.comp = comp;
-            if (accept("use")) {
-                if (accept("entity")) {
-                    EP en = name();
-                    if (en->k == EK::Call) {   // e(arch)
-                        if (!en->args.empty() && en->args[0].actual) b.arch = lastName(en->args[0].actual);
-                        en = en->a;
-                    }
-                    b.entity = lastName(en);
-                } else if (accept("configuration")) {
-                    b.entity = lastName(name());
-                } else if (accept("open")) {
-                }
-                while (isKw("generic") || isKw("port")) { next(); expect("map"); assocList(); }
-                expect(";");
+            if (accept("use")) bindingIndication(b);
+            if (isKw("for")) {   // the bound architecture's own configuration
+                b.sub = std::make_shared<Unit>();
+                b.sub->k = Unit::Config;
+                configBlock(*b.sub, true);
             }
-            if (isKw("for")) configBlock(u, false);
             for (auto& l : labels) { auto bb = b; bb.label = l; u.binds.push_back(bb); }
             expect("end");
             expect("for");
@@ -228,6 +218,23 @@ private:
         }
         expect("end");
         expect("for");
+        expect(";");
+    }
+    // entity lib.e(a) | configuration lib.c | open, then optional maps and ';'
+    void bindingIndication(Unit::Bind& b) {
+        if (accept("entity")) {
+            EP en = name();
+            if (en->k == EK::Call) {   // e(arch)
+                if (!en->args.empty() && en->args[0].actual) b.arch = lastName(en->args[0].actual);
+                en = en->a;
+            }
+            b.entity = lastName(en);
+        } else if (accept("configuration")) {
+            b.entity = lastName(name());
+            b.isConfig = true;
+        } else if (accept("open")) {
+        }
+        while (isKw("generic") || isKw("port")) { next(); expect("map"); assocList(); }
         expect(";");
     }
     void skipParens() {
@@ -472,11 +479,12 @@ private:
             d->names.push_back(d->sub->name);
             d->texts.push_back(d->sub->text);
             if (accept("is")) {
-                if (accept("new")) {   // subprogram instantiation: skip
-                    name();
-                    if (accept("generic")) { expect("map"); assocList(); }
+                if (accept("new")) {   // subprogram instantiation (4.4)
+                    d->target = name();
+                    if (isOp("[")) { while (!isOp("]")) next(); next(); }   // signature
+                    if (accept("generic")) { expect("map"); d->genericMap = assocList(); }
                     expect(";");
-                    d->k = DK::Ignored;
+                    d->k = DK::SubInst;
                     return out;
                 }
                 d->sub->hasBody = true;
@@ -528,8 +536,18 @@ private:
             out.push_back(libraryClause());
         } else if (isKw("for")) {   // configuration specification: for u : c use entity ...;
             auto d = one(DK::Config);
-            while (!isOp(";")) next();
             next();
+            std::vector<std::string> labels;
+            do { labels.push_back(cur().low); next(); } while (accept(","));
+            expect(":");
+            auto [comp, compText] = ident();
+            Unit::Bind b;
+            b.comp = comp;
+            if (accept("use")) bindingIndication(b);
+            else expect(";");
+            d->cfg = std::make_shared<Unit>();
+            d->cfg->k = Unit::Config;
+            for (auto& l : labels) { auto bb = b; bb.label = l; d->cfg->binds.push_back(bb); }
             if (isKw("end") && peekKw(1, "for")) { next(); next(); expect(";"); }
         } else if (isKw("disconnect")) {
             one(DK::Disconnect);
@@ -549,7 +567,14 @@ private:
             expect("is");
             if (accept("new")) {
                 d->target = name();
-                if (accept("generic")) { expect("map"); assocList(); }
+                d->cfg = std::make_shared<Unit>();
+                d->cfg->k = Unit::PackageInst;
+                d->cfg->name = l;
+                d->cfg->text = x;
+                d->cfg->of = lastName(d->target);
+                d->cfg->ofText = d->cfg->of;
+                d->cfg->line = d->line;
+                if (accept("generic")) { expect("map"); d->cfg->genericMap = assocList(); }
                 expect(";");
             } else {
                 declarations();
@@ -578,7 +603,7 @@ private:
         for (auto& pd : s->params) {
             if (pd->cls.empty()) pd->cls = (s->isFunc || pd->mode == "in") ? "constant" : "variable";
         }
-        if (s->isFunc) {
+        if (s->isFunc && !(isKw("is") && peekKw(1, "new"))) {   // function f is new g: no return type
             expect("return");
             if (isIdent() && peekKw(1, "of")) { ident(); next(); }   // return identifier of (2019)
             s->ret = subtypeIndication();

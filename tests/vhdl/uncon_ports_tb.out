@@ -1,0 +1,12 @@
+uncon_ports.vhd:11:5:@0ms:(report note): par: d'left=7 d'right=0 asc=false len=8 d=10100101
+uncon_ports.vhd:11:5:@0ms:(report note): par: d'left=0 d'right=2 asc=true len=3 d=110
+uncon_ports.vhd:11:5:@0ms:(report note): par: d'left=7 d'right=4 asc=false len=4 d=1100
+uncon_ports.vhd:23:5:@0ms:(report note): inv: a'high=11 a'low=4 y'left=11 a=00111100
+uncon_ports.vhd:23:5:@0ms:(report note): inv: a'high=4 a'low=1 y'left=1 a=1000
+uncon_ports.vhd:11:5:@0ms:(report note): par: d'left=1 d'right=4 asc=true len=4 d=1000
+uncon_ports.vhd:58:5:@1ns:(report note): pa='0' na=8 pb='0' nb=3 pc='0' nc=4
+uncon_ports.vhd:60:5:@1ns:(report note): ca=11000011 eo=0111 pe='1'
+uncon_ports.vhd:11:5:@1ns:(report note): par: d'left=7 d'right=0 asc=false len=8 d=10100100
+uncon_ports.vhd:62:5:@2ns:(report note): pa='1'
+uncon_ports.vhd:11:5:@2ns:(report note): par: d'left=1 d'right=4 asc=true len=4 d=0110
+uncon_ports.vhd:64:5:@3ns:(report note): eo=1001 pe='0'

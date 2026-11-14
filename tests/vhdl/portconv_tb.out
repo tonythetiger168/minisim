@@ -1,0 +1,4 @@
+portconv.vhd:38:7:@2ns:(report note): n=3 u=00000101
+portconv.vhd:38:7:@4ns:(report note): n=6 u=00001010
+portconv.vhd:38:7:@6ns:(report note): n=9 u=00001111
+portconv.vhd:38:7:@8ns:(report note): n=12 u=00010100
