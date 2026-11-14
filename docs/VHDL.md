@@ -100,7 +100,15 @@ interface list ending in `;`, generic type classes (`type t is (<>)`,
 and the std.env report and assert API (`GetVhdlAssertCount`,
 `IsVhdlAssertFailed`, `ClearVhdlAssert`, `SetVhdlAssertEnable`,
 `GetVhdlAssertEnable`, `SetVhdlAssertFormat` with `{s}` `{S}` `{r}` `{t}`
-`{i}`, `GetVhdlAssertFormat`, `Set/GetVhdlReadSeverity`; 16.5.9).
+`{i}`, `GetVhdlAssertFormat`, `Set/GetVhdlReadSeverity`; 16.5.9), and
+std.env's calendar time (`time_record`, `dayofweek`, `epoch`,
+`localtime`, `gmtime`, `to_string` of a time record, `time_to_seconds`,
+`seconds_to_time`), `getenv`, directories (`dir_workingdir`,
+`dir_itemexists`, `dir_itemisdir`, `dir_itemisfile`, `dir_createdir`,
+`dir_deletedir`, `dir_deletefile` as functions and procedures,
+`dir_separator`) and the PSL queries (16.5.5 - 16.5.7, 16.5.10). msim
+exports small helpers for the time and directory calls, which the
+translation reaches through DPI-C.
 Attributes: `'event`, `'active`,
 `'last_value`, `'last_event`, `'last_active`, `'stable`, `'stable(T)`,
 `'quiet`, `'quiet(T)`, `'delayed`, `'delayed(T)`, `'transaction`, `'length`, `'range`, `'reverse_range`, `'left`,
@@ -150,9 +158,9 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   enumeration or real value, index, or actual in a port or parameter
   association is not checked.
 - VHDL-2019: an array mode view needs an array with static bounds; std.env's
-  time (`epoch`, `localtime`, `gmtime`, `time_record`), directory
-  (`dir_open`, `dir_createdir`, ...), `getenv` and call path functions;
-  `'image` of arrays of other element types; the read severity is kept
-  but textio reads do not report with it; `{i}` in an assert format is the
-  source position, not the instance path; the reflection API
-  (`'reflect`, std.reflection).
+  `dir_open` / `dir_close` (the `directory` record with its item list),
+  the `+` and `-` operators on time records, and the call path functions
+  (`get_call_path`); `'image` of arrays of other element types; the read
+  severity is kept but textio reads do not report with it; `{i}` in an
+  assert format is the source position, not the instance path; the
+  reflection API (`'reflect`, std.reflection).
