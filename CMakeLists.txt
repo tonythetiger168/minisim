@@ -284,6 +284,10 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_seqtmp
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_seqtmp.cmake)
+  # msim -compile: an edit to one module changes only that module's generated files.
+  add_test(NAME msim_parts
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/msim_parts
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_parts.cmake)
   # 2-state fast path vs 4-state on random expressions.
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)

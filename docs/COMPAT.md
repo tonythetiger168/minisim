@@ -78,9 +78,11 @@ mode (`-compile`), directly and through the xrun front end:
 
 msim chooses its own parts: the generated C++ files of the design. The build
 directory keeps them, a file that did not change is not rebuilt, and a design
-that did not change reuses the `simv` already there. There is no per-module
-partition yet (an edit to one module does not yet rebuild only that module's
-part), and partition configuration files are not read. msim prints one note
+that did not change reuses the `simv` already there. The code of each module
+stays in the same files from build to build, so an edit to one module's logic
+rebuilds only the files with that module's code (`tests/msim_parts.cmake`).
+An edit that adds or removes signals still rebuilds every file, and partition
+configuration files are not read. msim prints one note
 saying so (`tests/msim_partcomp.cmake`).
 
 ## msim: the Siemens and Synopsys multi-step flows
