@@ -1,6 +1,7 @@
-vhdl2019c.vhd:49:5:@0ms:(report note): c1=10 c2=2 paren=6
-vhdl2019c.vhd:51:5:@0ms:(report note): v=8 inc=3
-vhdl2019c.vhd:52:5:@0ms:(report note): pt=(3,-4,'q',"01XZ")
-vhdl2019c.vhd:53:5:@0ms:(report note): empty=()
-vhdl2019c.vhd:54:5:@0ms:(report note): str="a""b" slv="10100101"
-vhdl2019c.vhd:55:5:@0ms:(report note): nxt=red,green first=7 max=9
+vhdl2019c.vhd:50:5:@0ms:(report note): c1=10 c2=2 paren=6
+vhdl2019c.vhd:52:5:@0ms:(report note): v=8 inc=3
+vhdl2019c.vhd:53:5:@0ms:(report note): pt=(3,-4,'q',"01XZ")
+vhdl2019c.vhd:54:5:@0ms:(report note): empty=()
+vhdl2019c.vhd:55:5:@0ms:(report note): str="a""b" slv="10100101"
+vhdl2019c.vhd:56:5:@0ms:(report note): iv=(7,-8,9)
+vhdl2019c.vhd:57:5:@0ms:(report note): nxt=red,green first=7 max=9

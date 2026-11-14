@@ -94,7 +94,7 @@ arrays of records, 6.5.2), conditional analysis
 24.2), sequential block statements (10.15), `return x when c else y`,
 conditional expressions in initial values, defaults and parentheses
 (`constant c : integer := 1 when n > 3 else 2;`, 9.1), empty records,
-`'image` of records and of string and bit-vector types (16.2.2), an
+`'image` of records and of string, bit-vector and integer array types (16.2.2), an
 interface list ending in `;`, generic type classes (`type t is (<>)`,
 `range <>`, `range <>.<>`, `array (i range <>) of type is private`, 6.5.3)
 and the std.env report and assert API (`GetVhdlAssertCount`,
@@ -102,7 +102,8 @@ and the std.env report and assert API (`GetVhdlAssertCount`,
 `GetVhdlAssertEnable`, `SetVhdlAssertFormat` with `{s}` `{S}` `{r}` `{t}`
 `{i}`, `GetVhdlAssertFormat`, `Set/GetVhdlReadSeverity`; 16.5.9), and
 std.env's calendar time (`time_record`, `dayofweek`, `epoch`,
-`localtime`, `gmtime`, `to_string` of a time record, `time_to_seconds`,
+`localtime`, `gmtime`, `to_string` of a time record, `+` and `-` on time
+records, `time_to_seconds`,
 `seconds_to_time`), `getenv`, directories (`dir_workingdir`,
 `dir_itemexists`, `dir_itemisdir`, `dir_itemisfile`, `dir_createdir`,
 `dir_deletedir`, `dir_deletefile` as functions and procedures,
@@ -158,9 +159,10 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   enumeration or real value, index, or actual in a port or parameter
   association is not checked.
 - VHDL-2019: an array mode view needs an array with static bounds; std.env's
-  `dir_open` / `dir_close` (the `directory` record with its item list),
-  the `+` and `-` operators on time records, and the call path functions
-  (`get_call_path`); `'image` of arrays of other element types; the read
-  severity is kept but textio reads do not report with it; `{i}` in an
-  assert format is the source position, not the instance path; the
-  reflection API (`'reflect`, std.reflection).
+  `dir_open` / `dir_close` (the `directory` record with its item list)
+  and the call path functions
+  (`get_call_path`); `'image` of arrays whose elements are not integers,
+  characters or bits; the read severity is kept but textio reads do not
+  report with it; `{i}` in an assert format is the module instance path
+  (`:top:u1:`), without the process label; the reflection API (`'reflect`,
+  std.reflection).

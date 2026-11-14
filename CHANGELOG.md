@@ -28,6 +28,8 @@ Spec references are IEEE 1800-2023 clauses.
   Tested with riscv-tests' vector benchmarks (845 programs now), clang's
   vectorized loops against its scalar ones, single-instruction checks, and
   under Linux. EXT_ABI 8: the extension library needs a rebuild.
+- msim VHDL-2019: `+` and `-` on std.env time records (16.5.5), `'image` of
+  integer arrays, `{i}` (instance path) in assert formats.
 - msim VHDL-2019: std.env calendar time (`time_record`, `epoch`,
   `localtime`, `gmtime`, ISO 8601 `to_string`), `getenv`, directory
   functions and procedures, `time_to_seconds` / `seconds_to_time` and the

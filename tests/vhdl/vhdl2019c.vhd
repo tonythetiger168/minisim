@@ -45,6 +45,7 @@ begin
     variable p : pt := (3, -4, 'q', "01XZ");
     variable er : empty_r;
     variable v : integer;
+    variable ivv : iv(1 to 3) := (7, -8, 9);
   begin
     report "c1=" & integer'image(c1) & " c2=" & integer'image(c2) & " paren=" & integer'image((5 when c1 = 10 else 6) + 1);
     v := 7 when c2 = 1 else 8;
@@ -52,6 +53,7 @@ begin
     report "pt=" & pt'image(p);
     report "empty=" & empty_r'image(er);
     report "str=" & string'image("a""b") & " slv=" & std_logic_vector'image(s);
+    report "iv=" & iv'image(ivv);
     report "nxt=" & color'image(nc(blue)) & "," & color'image(nc(red)) & " first=" & integer'image(fi((7, 8, 9))) & " max=" & integer'image(maxi(3, 9));
     wait;
   end process;
