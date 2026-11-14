@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- dw: `MW_reset_sync`, `MW_pulse_sync`, `MW_data_sync` (clock domain
+  crossing), `MW_8b10b_enc`/`MW_8b10b_dec`, `MW_sincos` (CORDIC), `MW_fir`
+  and `MW_tap` (IEEE 1149.1), checked by `tests/dw/xing.sv`.
 - mvplat: the V extension 1.0 on RV32 and RV64 (VLEN 128 to 1024 with
   `-vlen` or the platform's `"vlen"`, ELEN 64): every load and store form,
   integer, fixed point, mask, reduction, permutation and SEW 32/64 floating
