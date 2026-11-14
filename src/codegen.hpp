@@ -28,6 +28,8 @@
 #include <cstdio>
 #include <map>
 #include <set>
+#include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -389,7 +391,7 @@ public:
             o << SV << "PSig PA[" << std::max<size_t>(np, 1) << "];\n";
             for (size_t x = 0; x < priv_.size(); x++)
                 if (priv_[x]) o << SV << "PSig& P" << x << " = PA[" << x << "];\n";
-            o << "static const struct { uint32_t s; uint64_t m; bool net; } PINIT[] = {";
+            o << "struct PInitRow { uint32_t s; uint64_t m; bool net; };\nstatic const PInitRow PINIT[] = {";
             size_t c = 0;
             for (size_t x = 0; x < priv_.size(); x++)
                 if (priv_[x]) o << (c++ ? ", " : "") << "{" << x << ", " << M(sigW_[x]) << ", " << (sigNet_[x] ? "true" : "false") << "}";
@@ -447,7 +449,15 @@ public:
                 }
                 c = std::move(out);
             }
-            outFiles.push_back(o.str() + "\n" + protos + cycHdr);
+            // The header: what does not depend on the design's numbering
+            // (declSplit); the rest goes to the parts that name it, and all of
+            // it to design.cpp.
+            std::string stable = o.str() + "\n" + protos + cycHdr;
+            std::vector<HdrItem> hitems;
+            if (!std::getenv("MSIM_FULLHDR")) { std::string all = std::move(stable); declSplit(all, stable, hitems); }
+            std::unordered_map<std::string, int> howner;
+            for (size_t i = 0; i < hitems.size(); i++) for (auto& x : hitems[i].names) howner[x] = (int)i;
+            outFiles.push_back(stable);
             // Each chunk goes to the file its key picks: a hash of its text
             // with the numbers left out. An edit changes only the chunks of
             // what was edited, so only their files are rebuilt (a part is
@@ -479,12 +489,16 @@ public:
                 for (int f = 0; f < nf; f++) std::fprintf(stderr, "part%d: %zu chunks, %zu bytes\n", f, mine[f].size(), load[f]);
             for (int f = 0; f < nf; f++) {
                 std::sort(mine[f].begin(), mine[f].end());   // process order within a file
-                std::string t = "#include \"design.hpp\"\n\n";
-                for (size_t i : mine[f]) t += chunks[i];
-                outFiles.push_back(t);
+                std::string body;
+                for (size_t i : mine[f]) body += chunks[i];
+                outFiles.push_back("#include \"design.hpp\"\n\n" + partDecls(body, hitems, howner) + "\n" + body);
             }
             o.str("");
             o << (kernelObj ? "#include \"design.hpp\"\n\n" : "#include \"design.hpp\"\n\nSim S;\n\n");
+            for (auto& h : hitems) o << h.decl;
+            o << "\n";
+            for (auto& h : hitems) o << h.def;
+            o << "\n";
         } else
             for (auto& c : chunks) o << c;
         o << cyc;
@@ -1332,6 +1346,310 @@ private:
     // (to `fns`, one each, still "static") and the rest (to `hdr`, with each
     // "static" variable made "inline" so that every file shares it). Forward
     // declarations of functions are dropped: the split writes prototypes.
+    // Split builds (several C++ files): the header keeps only what does not
+    // depend on the design's numbering (the kernel, helper functions, types).
+    // Every variable becomes an extern declaration, its definition goes to
+    // design.cpp, a reference to an array element (P<s>, F<k>, AI<k>) becomes
+    // a macro, and each part gets just the declarations it names. A part
+    // whose own text did not change then compiles to the same object even
+    // when signals were added or removed elsewhere: it is not rebuilt
+    // (msim.cpp runCompiled). Anything not understood stays in the header,
+    // which only costs that (MSIM_FULLHDR=1 keeps the whole header).
+    struct HdrItem {
+        std::vector<std::string> names;   // what it declares
+        std::string decl;                 // into each part that names one of them, and design.cpp
+        std::string def;                  // design.cpp only
+        std::vector<int> deps;            // other items its declaration names
+    };
+    static void identsOf(const std::string& t, const std::function<void(const std::string&)>& f) {
+        for (size_t i = 0; i < t.size();) {
+            unsigned char c = (unsigned char)t[i];
+            if (std::isalpha(c) || c == '_') {
+                size_t j = i + 1;
+                while (j < t.size() && (std::isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
+                f(t.substr(i, j - i));
+                i = j;
+            } else if (std::isdigit(c)) {
+                while (i < t.size() && (std::isalnum((unsigned char)t[i]) || t[i] == '_')) i++;
+            } else i++;
+        }
+    }
+    // The top-level items of generated C++: preprocessor lines, declarations
+    // and definitions, each with the comment lines before it.
+    static std::vector<std::string> topItems(const std::string& t) {
+        std::vector<std::string> out;
+        size_t start = 0, i = 0, n = t.size();
+        int depth = 0;
+        bool eq = false;
+        while (i < n) {
+            char c = t[i];
+            if (c == '/' && i + 1 < n && t[i + 1] == '/') { size_t nl = t.find('\n', i); i = nl == std::string::npos ? n : nl; continue; }
+            if (c == '#' && depth == 0 && (i == 0 || t[i - 1] == '\n') && t.compare(i, 3, "#if") == 0) {
+                // A conditional block stays one piece (of the header).
+                int lv = 0;
+                size_t q = i;
+                while (q < n) {
+                    size_t nl = t.find('\n', q);
+                    std::string ln = t.substr(q, (nl == std::string::npos ? n : nl) - q);
+                    if (ln.compare(0, 3, "#if") == 0) lv++;
+                    else if (ln.compare(0, 6, "#endif") == 0 && --lv == 0) { q = nl == std::string::npos ? n : nl + 1; break; }
+                    q = nl == std::string::npos ? n : nl + 1;
+                }
+                i = q;
+                out.push_back(t.substr(start, i - start));
+                start = i;
+                continue;
+            }
+            if (c == '#' && depth == 0 && (i == 0 || t[i - 1] == '\n')) {
+                size_t nl = i;
+                for (;;) {   // a line continued with a backslash
+                    nl = t.find('\n', nl);
+                    if (nl == std::string::npos || nl == 0 || t[nl - 1] != '\\') break;
+                    nl++;
+                }
+                i = nl == std::string::npos ? n : nl + 1;
+                out.push_back(t.substr(start, i - start));
+                start = i;
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                for (i++; i < n && t[i] != c; i++) if (t[i] == '\\') i++;
+                i++;
+                continue;
+            }
+            if (c == '{') depth++;
+            else if (c == '}') depth--;
+            else if (c == '=' && depth == 0) eq = true;
+            i++;
+            if (depth == 0 && (c == ';' || (c == '}' && !eq))) {
+                while (i < n && (t[i] == ' ' || t[i] == '\t')) i++;
+                if (i < n && t[i] == ';') i++;
+                while (i < n && t[i] != '\n' && (t[i] == ' ' || t[i] == '\t' || t[i] == '/')) {   // a trailing comment
+                    if (t[i] == '/') { size_t nl = t.find('\n', i); i = nl == std::string::npos ? n : nl; break; }
+                    i++;
+                }
+                if (i < n && t[i] == '\n') i++;
+                out.push_back(t.substr(start, i - start));
+                start = i;
+                eq = false;
+            }
+        }
+        if (start < n) out.push_back(t.substr(start));
+        return out;
+    }
+    // A variable definition "inline|static <head> [= init | {init}];": its
+    // declared name and the head without the initializer. False when it is
+    // not one (or not one this understands).
+    static bool varParts(const std::string& body, std::string& head, std::string& init, std::string& name) {
+        std::string b = body;
+        if (b.compare(0, 7, "inline ") == 0) b = b.substr(7);
+        else if (b.compare(0, 7, "static ") == 0) b = b.substr(7);
+        else return false;
+        if (b.compare(0, 7, "inline ") == 0) b = b.substr(7);
+        if (b.compare(0, 9, "template ") == 0 || b.compare(0, 7, "struct ") == 0 || b.compare(0, 6, "using ") == 0) return false;
+        int par = 0, br = 0, ang = 0;
+        size_t cut = std::string::npos;
+        for (size_t i = 0; i < b.size(); i++) {
+            char c = b[i];
+            if (c == '(') par++;
+            else if (c == ')') par--;
+            else if (c == '[') br++;
+            else if (c == ']') br--;
+            else if (c == '<') ang++;
+            else if (c == '>') ang--;
+            else if (par == 0 && br == 0 && ang == 0) {
+                if (c == ',') return false;   // several declarators
+                if (c == '=' || c == '{' || c == ';') { cut = i; break; }
+            }
+        }
+        if (cut == std::string::npos) return false;
+        head = b.substr(0, cut);
+        init = b.substr(cut);
+        while (!head.empty() && head.back() == ' ') head.pop_back();
+        if (head.find("struct {") != std::string::npos || head.find('(') != std::string::npos && head.find("(*") == std::string::npos) return false;
+        if (b[cut] == '{') {   // a function body, not a brace initializer?
+            if (!head.empty() && head.back() == ')') return false;
+        }
+        // The name: the first identifier followed by '[', else the first
+        // followed by ')' (a function pointer), else the last one.
+        name.clear();
+        std::string br1, pa1, last;
+        for (size_t i = 0; i < head.size();) {
+            if (std::isalpha((unsigned char)head[i]) || head[i] == '_') {
+                size_t j = i + 1;
+                while (j < head.size() && (std::isalnum((unsigned char)head[j]) || head[j] == '_')) j++;
+                size_t k = j;
+                while (k < head.size() && head[k] == ' ') k++;
+                std::string id = head.substr(i, j - i);
+                if (k < head.size() && head[k] == '[' && br1.empty()) br1 = id;
+                if (k < head.size() && head[k] == ')' && pa1.empty()) pa1 = id;
+                if (k == head.size()) last = id;
+                i = j;
+            } else i++;
+        }
+        name = !br1.empty() ? br1 : !pa1.empty() ? pa1 : last;
+        return !name.empty() && name != "const";
+    }
+    static void declSplit(const std::string& hdr, std::string& stable, std::vector<HdrItem>& items) {
+        std::vector<std::string> raw = topItems(hdr);
+        // Per raw item: an item (variable, function declaration), a candidate
+        // (a macro, function or type: an item only if it names an item), or
+        // stable text.
+        std::vector<HdrItem> it(raw.size());
+        std::vector<int> kind(raw.size(), 0);   // 0 stable, 1 item, 2 candidate
+        for (size_t r = 0; r < raw.size(); r++) {
+            const std::string& t = raw[r];
+            size_t at = t.find_first_not_of(" \t\n");
+            while (at != std::string::npos && t.compare(at, 2, "//") == 0) {
+                size_t nl = t.find('\n', at);
+                at = nl == std::string::npos ? std::string::npos : t.find_first_not_of(" \t\n", nl + 1);
+            }
+            if (at == std::string::npos) continue;
+            std::string body = t.substr(at);
+            while (!body.empty() && (body.back() == '\n' || body.back() == ' ')) body.pop_back();
+            {   // a comment after the last ';'
+                size_t sc = body.rfind(';');
+                if (sc != std::string::npos && body.find('\n', sc) == std::string::npos && body.find("//", sc) != std::string::npos) body.erase(sc + 1);
+            }
+            HdrItem& h = it[r];
+            std::string head, init, name;
+            if (body[0] != '#' && body.find('{') == std::string::npos && body.back() == ';' && body.find('=') == std::string::npos &&
+                body.compare(0, 7, "inline ") != 0 && body.compare(0, 7, "static ") != 0 && body.compare(0, 6, "using ") != 0 &&
+                body.compare(0, 7, "struct ") != 0 && body.compare(0, 9, "template ") != 0 && body.find('(') != std::string::npos) {
+                // A function declaration: "Task proc12();", "void ds3(const long D0, ...);"
+                std::string nm, sig = body;
+                for (size_t q; (q = sig.find("__attribute__((")) != std::string::npos;) {
+                    size_t e = sig.find("))", q);
+                    if (e == std::string::npos) break;
+                    sig.erase(q, e + 2 - q);
+                }
+                identsOf(sig.substr(0, sig.find('(')), [&](const std::string& x) { nm = x; });
+                if (nm.empty()) continue;
+                h.names = {nm};
+                h.decl = body + "\n";
+                kind[r] = 1;
+            } else if (body[0] != '#' && varParts(body, head, init, name)) {
+                std::string ext = head;
+                size_t nb = std::string::npos;
+                for (size_t p = ext.find(name); p != std::string::npos; p = ext.find(name, p + 1)) {
+                    auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+                    if ((p == 0 || !idc(ext[p - 1])) && (p + name.size() == ext.size() || !idc(ext[p + name.size()]))) nb = p;
+                }
+                if (nb == std::string::npos) continue;
+                size_t af = nb + name.size();
+                if (af + 1 < ext.size() && ext[af] == '[' && ext[af + 1] != ']') {
+                    // A stated bound grows with the design (PA, FA): the parts
+                    // do not need it, so they do not change with it.
+                    size_t e = ext.find(']', af);
+                    if (e == std::string::npos) continue;
+                    if (ext.find('[', e) == std::string::npos) ext.erase(af + 1, e - af - 1);
+                } else if (af + 1 < ext.size() && ext[af] == '[' && ext[af + 1] == ']') {
+                    // The bound from the initializer: a declaration with it keeps
+                    // sizeof and range for working in the parts.
+                    size_t ob = init.find('{');
+                    if (ob == std::string::npos) continue;
+                    int dep = 0;
+                    size_t cnt = 0;
+                    bool any = false;
+                    for (size_t q = ob; q < init.size(); q++) {
+                        char c = init[q];
+                        if (c == '"' || c == '\'') { char e = c; for (q++; q < init.size() && init[q] != e; q++) if (init[q] == '\\') q++; any = true; continue; }
+                        if (c == '{' || c == '(' || c == '[') { if (dep == 1) any = true; dep++; }
+                        else if (c == '}' || c == ')' || c == ']') { dep--; if (dep == 0) break; }
+                        else if (c == ',' && dep == 1) { cnt++; any = false; }
+                        else if (dep == 1 && c != ' ' && c != '\n') any = true;
+                    }
+                    if (any) cnt++;
+                    ext.insert(af + 1, std::to_string(std::max<size_t>(cnt, 1)));
+                }
+                h.names = {name};
+                kind[r] = 1;
+                // A reference to an array element (P<s> = PA[s]): a macro.
+                if (head.find('&') != std::string::npos && init.compare(0, 2, "= ") == 0) {
+                    std::string ix = init.substr(2);
+                    while (!ix.empty() && (ix.back() == ';' || ix.back() == ' ')) ix.pop_back();
+                    if (!ix.empty() && ix.back() == ']' && ix.find('[') != std::string::npos && ix.find_first_of("(=,") == std::string::npos) {
+                        h.decl = "#define " + name + " " + ix + "\n";
+                        continue;
+                    }
+                }
+                h.decl = "extern " + ext + ";\n";
+                h.def = head + init;
+                if (h.def.back() != ';') h.def += ";";
+                h.def += "\n";
+            } else if (body.compare(0, 8, "#define ") == 0) {
+                size_t e = 8;
+                while (e < body.size() && (std::isalnum((unsigned char)body[e]) || body[e] == '_')) e++;
+                h.names = {body.substr(8, e - 8)};
+                h.decl = t;
+                kind[r] = 2;
+            } else if (body[0] != '#' && body.compare(0, 6, "using ") != 0) {
+                // a function, type or template: named by its identifier before '(' or after struct
+                std::string nm;
+                size_t p = body.find('('), sb = body.find("struct ");
+                if (sb != std::string::npos && (p == std::string::npos || sb < p))
+                    identsOf(body.substr(sb + 7, 80), [&](const std::string& x) { if (nm.empty()) nm = x; });
+                else if (p != std::string::npos) {
+                    std::string sig = body;
+                    for (size_t q; (q = sig.find("__attribute__((")) != std::string::npos;) {
+                        size_t e = sig.find("))", q);
+                        if (e == std::string::npos) break;
+                        sig.erase(q, e + 2 - q);
+                    }
+                    identsOf(sig.substr(0, sig.find('(')), [&](const std::string& x) { nm = x; });
+                }
+                h.names = {nm.empty() ? "@" + std::to_string(r) : nm};
+                h.decl = t;
+                kind[r] = 2;
+            }
+        }
+        // A candidate that names an item is an item (the assertion helpers
+        // reading XSL, CLP reading CL); repeat until nothing changes.
+        std::unordered_set<std::string> named;
+        for (size_t r = 0; r < raw.size(); r++) if (kind[r] == 1) named.insert(it[r].names[0]);
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (size_t r = 0; r < raw.size(); r++) {
+                if (kind[r] != 2) continue;
+                bool hit = false;
+                identsOf(it[r].decl, [&](const std::string& x) { if (x != it[r].names[0] && named.count(x)) hit = true; });
+                if (!hit) continue;
+                kind[r] = 1;
+                named.insert(it[r].names[0]);
+                grew = true;
+            }
+        }
+        stable.clear();
+        items.clear();
+        for (size_t r = 0; r < raw.size(); r++) {
+            if (kind[r] == 1) items.push_back(std::move(it[r]));
+            else stable += raw[r];
+        }
+        std::unordered_map<std::string, int> owner;
+        for (size_t i = 0; i < items.size(); i++) for (auto& x : items[i].names) owner[x] = (int)i;
+        for (size_t i = 0; i < items.size(); i++) {
+            std::set<int> d;
+            identsOf(items[i].decl, [&](const std::string& x) {
+                auto f = owner.find(x);
+                if (f != owner.end() && f->second != (int)i) d.insert(f->second);
+            });
+            items[i].deps.assign(d.begin(), d.end());
+        }
+    }
+    // The declarations a part needs: the items it names, and theirs.
+    static std::string partDecls(const std::string& text, const std::vector<HdrItem>& items, const std::unordered_map<std::string, int>& owner) {
+        std::vector<char> need(items.size(), 0);
+        std::vector<int> work;
+        identsOf(text, [&](const std::string& x) { auto f = owner.find(x); if (f != owner.end() && !need[f->second]) { need[f->second] = 1; work.push_back(f->second); } });
+        while (!work.empty()) {
+            int i = work.back();
+            work.pop_back();
+            for (int d : items[i].deps) if (!need[d]) { need[d] = 1; work.push_back(d); }
+        }
+        std::string out;
+        for (size_t i = 0; i < items.size(); i++) if (need[i]) out += items[i].decl;
+        return out;
+    }
     static void splitTop(const std::string& t, std::vector<std::string>& fns, std::string& hdr) {
         size_t start = 0, i = 0, n = t.size();
         int depth = 0;
@@ -2765,14 +3083,15 @@ private:
         // The slots written in this time step, in order: the commit visits
         // only those (a large design has tens of thousands of slots, most
         // idle in any one cycle). CLON is off for the parallel path.
-        o << "static uint32_t CL[" << std::max<size_t>(slots.size(), 1) << "]; static uint32_t CN; static bool CLOVF, CLON = true;\n"
-             "#define CLP(k) do { if (CLON) { if (CN < sizeof CL / sizeof CL[0]) CL[CN++] = (k); else CLOVF = true; } } while (0)\n";
+        o << "static uint32_t CL[" << std::max<size_t>(slots.size(), 1) << "]; static const uint32_t CLCAP = " << std::max<size_t>(slots.size(), 1)
+          << "; static uint32_t CN; static bool CLOVF; static bool CLON = true;\n"
+             "#define CLP(k) do { if (CLON) { if (CN < CLCAP) CL[CN++] = (k); else CLOVF = true; } } while (0)\n";
         std::vector<int> privs;
         for (size_t s = 0; s < priv_.size(); s++) if (priv_[s]) privs.push_back((int)s);
         // Only when something watches every change (a VCD opened at run time).
         // One table and a loop: unrolled, the copies were 450 KB of code
         // and the slowest function to compile on Ibex.
-        o << "static const struct { PSig* p; int s, w; } SYN[] = {";
+        o << "struct SynRow { PSig* p; int s, w; };\nstatic const SynRow SYN[] = {";
         size_t nsyn = 0;
         for (int s : privs)
             if (origOf(s) == s) o << (nsyn++ ? ", " : "") << "{&P" << s << ", " << s << ", " << sigW_[s] << "}";
