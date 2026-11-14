@@ -28,6 +28,9 @@ Spec references are IEEE 1800-2023 clauses.
   Tested with riscv-tests' vector benchmarks (845 programs now), clang's
   vectorized loops against its scalar ones, single-instruction checks, and
   under Linux. EXT_ABI 8: the extension library needs a rebuild.
+- msim VHDL-2019: conditional expressions (9.1), empty records, `'image` of
+  records, strings and bit vectors, interface lists ending in `;`, generic
+  type classes (6.5.3) and the std.env report and assert API (16.5.9).
 - msim VHDL: guarded signals (`bus`, `register`, 6.4.2.3) disconnect their
   drivers on a guarded assignment with GUARD false or `s <= null`, with
   disconnection specifications (7.4); package instantiation in blocks,

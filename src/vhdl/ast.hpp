@@ -35,6 +35,7 @@ enum class EK {
     External, // << signal .a.b : T >> (text = path, name = class)
     Box,      // <>  (unconstrained index)
     SubtypeRange,   // type mark with a range constraint: a = mark, b = Range
+    Cond,     // VHDL-2019 conditional expression (9.1): a when b else args[0].actual
 };
 
 struct Assoc {
