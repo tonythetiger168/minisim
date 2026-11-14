@@ -1,0 +1,7 @@
+callpath2019.vhd:29:5:@0ms:(report note): process: callpath2019.vhd:28:main
+callpath2019.vhd:15:5:@0ms:(report note): direct: callpath2019.vhd:14:inner | callpath2019.vhd:30:main
+callpath2019.vhd:16:5:@0ms:(report note): inner: left=0 name0=inner line0=14 root=main
+callpath2019.vhd:15:5:@0ms:(report note): via outer: callpath2019.vhd:14:inner | callpath2019.vhd:22:outer | callpath2019.vhd:31:main
+callpath2019.vhd:16:5:@0ms:(report note): inner: left=0 name0=inner line0=14 root=main
+callpath2019.vhd:32:5:@0ms:(report note): depth in f: 2
+callpath2019.vhd:33:5:@0ms:(report note): element: callpath2019.vhd:28:main
