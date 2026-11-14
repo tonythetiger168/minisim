@@ -9,7 +9,7 @@ set(D ${SRC}/tests/mstep)
 set(VHD ${SRC}/tests/vhdl/counter.vhd)
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT}/bin ${OUT}/q ${OUT}/s ${OUT}/one)
-foreach(t vlib vmap vlog vcom vsim vlogan vhdlan vcs)
+foreach(t vlib vmap vlog vcom vopt vsim vlogan vhdlan vcs)
   file(CREATE_LINK ${MSIM} ${OUT}/bin/${t} SYMBOLIC)
 endforeach()
 set(B ${OUT}/bin)
@@ -67,6 +67,36 @@ run(${Q} 0 ${B}/vsim -c -L pkgs -sv_seed 5 -do "puts start\nrun -all\nquit -f" t
 expect("${out}" "start\n.*hi W=8 count=3\n")
 # A package library left out: the design does not elaborate.
 run(${Q} 1 ${B}/vsim -c -do "run -all" tb)
+
+# vopt as its own step: vsim runs the optimized unit by its name.
+run(${Q} 0 ${B}/vopt -L pkgs +acc work.tb -o tbopt)
+if(NOT EXISTS ${Q}/work/_msim/opt/tbopt.args)
+  message(FATAL_ERROR "vopt recorded nothing")
+endif()
+run(${Q} 0 ${B}/vsim -c -do "run -all\nquit -f" tbopt +more)
+expect("${out}" "hi W=8 count=3\nmore\n")
+run(${Q} 2 ${B}/vopt work.tb -o bad_opt)   # the package library left out
+if(EXISTS ${Q}/work/_msim/opt/bad_opt.args)
+  message(FATAL_ERROR "vopt recorded a design with errors")
+endif()
+
+# Each vlog is its own compilation unit: its +define+s reach its files only.
+set(U ${OUT}/units)
+file(MAKE_DIRECTORY ${U})
+run(${U} 0 ${B}/vlib work)
+run(${U} 0 ${B}/vlog +define+ONLY_A=7 ${D}/def_a.sv)
+run(${U} 0 ${B}/vlog ${D}/def_b.sv ${D}/def_top.sv)
+run(${U} 0 ${B}/vsim -c -do "run -all" def_top)
+expect("${out}" "ma sees ONLY_A=7\n")
+expect("${out}" "mb has no ONLY_A\n")
+
+# Questa's precompiled UVM: vlog finds it by itself, vsim -L uvm is accepted.
+if(UVM_HOME)
+  set(ENV{UVM_HOME} ${UVM_HOME})
+  run(${U} 0 ${B}/vlog ${D}/uvm_tb.sv)
+  run(${U} 0 ${B}/vsim -c -L uvm -do "run -all" uvm_tb)
+  expect("${out}" "hello from uvm")
+endif()
 
 # ---- Synopsys: vlogan, vhdlan, vcs, simv ----
 set(S ${OUT}/s)

@@ -1,0 +1,20 @@
+sigattr.vhd:26:5:@0ms:(report note): s='0' d1='0' d0='0'
+sigattr.vhd:26:5:@2ns:(report note): s='1' d1='0' d0='0'
+sigattr.vhd:17:24:@2ns:(report note): st=false qt=false s'last_value='0' v'last_value=0000
+sigattr.vhd:26:5:@2ns:(report note): s='1' d1='0' d0='1'
+sigattr.vhd:32:5:@3ns:(report note): last_event s=1000000 fs v=1000000 fs n=1000000 fs
+sigattr.vhd:33:5:@3ns:(report note): stable(2ns)=false stable(0.5ns)=true stable=true
+sigattr.vhd:34:5:@3ns:(report note): quiet(2ns)=false quiet(0.5ns)=true
+sigattr.vhd:17:24:@3500ps:(report note): st=false qt=true s'last_value='0' v'last_value=0000
+sigattr.vhd:17:24:@4ns:(report note): st=true qt=true s'last_value='0' v'last_value=0000
+sigattr.vhd:36:5:@5ns:(report note): last_event s=3000000 fs stable(2ns)=true
+sigattr.vhd:26:5:@5ns:(report note): s='1' d1='1' d0='1'
+sigattr.vhd:17:24:@5ns:(report note): st=true qt=false s'last_value='0' v'last_value=0101
+sigattr.vhd:39:5:@7ns:(report note): tcount=4
+sigattr.vhd:26:5:@7ns:(report note): s='0' d1='1' d0='1'
+sigattr.vhd:41:5:@7ns:(report note): same delta: last_event=0 fs stable=false
+sigattr.vhd:17:24:@7ns:(report note): st=false qt=false s'last_value='1' v'last_value=0101
+sigattr.vhd:26:5:@7ns:(report note): s='0' d1='1' d0='0'
+sigattr.vhd:17:24:@7500ps:(report note): st=false qt=true s'last_value='1' v'last_value=0101
+sigattr.vhd:17:24:@9ns:(report note): st=true qt=true s'last_value='1' v'last_value=0101
+sigattr.vhd:26:5:@10ns:(report note): s='0' d1='0' d0='0'

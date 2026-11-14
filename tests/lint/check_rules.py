@@ -68,6 +68,23 @@ for name in sorted(os.listdir(rules_dir)):
     if out4 != out or rc4 != rc:
         fail(f"{name}: -threads 4 differs from -threads 1")
 
+# Goals: each one names only known rules, and -goal runs just its set.
+rc, out, _ = run(["-list-goals"])
+goal_names = [l.split()[0] for l in out.splitlines() if l.strip()]
+if "starc" not in goal_names or "lint_rtl" not in goal_names:
+    fail(f"-list-goals: {out}")
+for g in goal_names:
+    rc, out, err = run(["-goal", g, "-list"])
+    if rc != 0 or "error" in err or "unknown" in err:
+        fail(f"-goal {g}: {rc} {err}")
+rc, out, _ = run(["-goal", "lint_style", "-list"])
+on = [l.split()[0] for l in out.splitlines() if len(l.split()) > 2 and l.split()[2] == "on"]
+if any(r.startswith(("L00", "W0", "SYN")) for r in on) or "NAME001" not in on:
+    fail(f"-goal lint_style turns on {on}")
+rc, _, err = run(["-goal", "nope", "-list"])
+if rc != 2 or "unknown goal" not in err:
+    fail(f"-goal nope: {rc} {err}")
+
 # Every rule in the table is exercised by some file (CDC has its own test).
 rc, out, _ = run(["-list"])
 listed = [l.split()[0] for l in out.splitlines() if l.strip()]

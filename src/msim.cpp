@@ -38,7 +38,7 @@
 //   -restore <file> [+args]  go back to a $save checkpoint and go on (docs/CHECKPOINT.md)
 //   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
 //   -parse           stop after parsing: syntax errors only (vlog / vlogan, mstep.inc)
-//   -vlog, -vcom, -vsim, -vlib, -vmap, -vlogan, -vhdlan, -vcs
+//   -vlog, -vcom, -vopt, -vsim, -vlib, -vmap, -vlogan, -vhdlan, -vcs
 //                    the rest is that Siemens / Synopsys step (also when msim
 //                    runs under that name): docs/COMPAT.md
 //   -xrun, -irun     take the rest of the command line as xrun / irun options

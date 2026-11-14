@@ -94,6 +94,7 @@ private:
 struct BootArgs {
     std::string bootargs;
     uint64_t initrdStart = 0, initrdEnd = 0;  // both 0: no initrd
+    std::string mmu = "sv39";                 // RV64: the largest paging mode offered
 };
 
 inline std::string hexName(const std::string& node, uint64_t a) {
@@ -148,11 +149,15 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
         f.propU32("reg", {h});
         f.propStr("status", {"okay"});
         f.propStr("compatible", {"riscv"});
-        f.propStr("riscv,isa", {xl + "imafdc_zicntr_zicond_zicsr_zifencei_zba_zbb_zbc_zbs"});
+        f.propStr("riscv,isa", {xl + "imafdc_zicboz_zicntr_zicond_zicsr_zifencei_zabha_zacas_zfh_zfhmin_zba_zbb_zbc_zbkb_zbkx_zbs" +
+                                (rv64 ? "_svnapot" : "")});
         f.propStr("riscv,isa-base", {xl + "i"});
-        f.propStr("riscv,isa-extensions", {"i", "m", "a", "f", "d", "c", "b", "zicntr", "zicond", "zicsr", "zifencei",
-                                            "zba", "zbb", "zbc", "zbs"});
-        f.propStr("mmu-type", {rv64 ? "riscv,sv39" : "riscv,sv32"});
+        std::vector<std::string> exts = {"i", "m", "a", "f", "d", "c", "b", "zicboz", "zicntr", "zicond", "zicsr", "zifencei",
+                                         "zabha", "zacas", "zfh", "zfhmin", "zba", "zbb", "zbc", "zbkb", "zbkx", "zbs"};
+        if (rv64) exts.push_back("svnapot");
+        f.propStr("riscv,isa-extensions", exts);
+        f.propU32("riscv,cboz-block-size", {64});
+        f.propStr("mmu-type", {rv64 ? "riscv," + boot.mmu : "riscv,sv32"});
         f.propU32("clock-frequency", {(uint32_t)cpuHz});
         f.begin("interrupt-controller");
         f.propU32("#interrupt-cells", {1});

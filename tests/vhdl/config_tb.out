@@ -1,0 +1,4 @@
+config.vhd:51:7:@1ns:(report note): a='0' b='0' xor='0' or='0' and='0' nand='1' cfg='0''0' dflt='0''0'
+config.vhd:51:7:@2ns:(report note): a='0' b='1' xor='1' or='1' and='0' nand='1' cfg='1''0' dflt='1''1'
+config.vhd:51:7:@3ns:(report note): a='1' b='0' xor='1' or='1' and='0' nand='1' cfg='1''0' dflt='1''1'
+config.vhd:51:7:@4ns:(report note): a='1' b='1' xor='0' or='1' and='1' nand='0' cfg='1''1' dflt='0''0'

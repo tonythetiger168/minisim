@@ -89,7 +89,7 @@ saying so (`tests/msim_partcomp.cmake`).
 
 The three-step flows run on msim's one engine (`src/mstep.inc`). msim takes
 them when it runs under the tool's name (a link you create; minisim ships
-none) or with `-vlog`, `-vcom`, `-vsim`, `-vlib`, `-vmap`, `-vlogan`,
+none) or with `-vlog`, `-vcom`, `-vopt`, `-vsim`, `-vlib`, `-vmap`, `-vlogan`,
 `-vhdlan` or `-vcs` as its first option.
 
 ```
@@ -141,11 +141,20 @@ vcs -sverilog +incdir+inc pkg.sv ctr.vhd tb.sv -R +more   # one step
   `<library>/_msim/<top>` (one-step vcs: `simv.daidir/msim.d`), so the
   generated parts are reused from the library. The kernel cache stays
   user-wide (`$MSIM_KCACHE`).
-- **Not here:** precompiled vendor libraries (`-L uvm` of Questa's own
-  install: analyse the UVM sources, or use `-ntb_opts uvm` / msim `-uvm`),
-  `vopt` as a separate step, per-file compilation units for macros (all
-  sources of one simulation share one set of `+define+`s), and `.db`
-  snapshot files.
+- **vopt** checks the design (`msim -elab`) and records it in the library
+  under its `-o` name (`_msim/opt/<name>.args`); `vsim <name>` runs it.
+- **Compilation units.** Each analysis step is its own compilation unit, as
+  vlog is without `-mfcu`: a `+define+` given to one step reaches only its
+  files. When the files do not all share one set of `+define+`s, each one
+  with its own is given to msim through a small generated file in the
+  library (`_msim/units`) that defines them and includes it.
+- **UVM.** `vlog` of a file that imports `uvm_pkg` or includes
+  `uvm_macros.svh` uses msim's UVM (`-uvm`, `$UVM_HOME`), as Questa finds
+  its precompiled one; `-L uvm` / `-L mtiUvm` are accepted for it. Analysing
+  the UVM sources yourself into a library works too.
+- **Not here:** `vlog -mfcu` (one unit over several files: macros defined
+  in one file reaching the next), `.db` snapshot files, other vendors'
+  precompiled libraries.
 
 ## Limits / Not yet
 

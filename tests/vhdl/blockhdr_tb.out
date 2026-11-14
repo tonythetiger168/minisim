@@ -1,0 +1,6 @@
+blockhdr.vhd:31:7:@3ns:(report note): d=0011 sum=0110 q=0000 q2=0000
+blockhdr.vhd:31:7:@6ns:(report note): d=0110 sum=1100 q=0110 q2=1111
+blockhdr.vhd:31:7:@9ns:(report note): d=1001 sum=0011 q=0110 q2=1111
+blockhdr.vhd:31:7:@12ns:(report note): d=1100 sum=1001 q=1100 q2=1111
+blockhdr.vhd:31:7:@15ns:(report note): d=1111 sum=1111 q=1100 q2=1111
+blockhdr.vhd:31:7:@18ns:(report note): d=0010 sum=0100 q=0010 q2=1111

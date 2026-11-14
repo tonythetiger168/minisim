@@ -36,7 +36,8 @@ struct Found {
 };
 
 inline const std::vector<const char*>& textRules() {
-    static const std::vector<const char*> r = {"FMT001", "FMT002", "FMT003", "FMT004", "STY004", "NAME014", "STY011"};
+    static const std::vector<const char*> r = {"FMT001", "FMT002", "FMT003", "FMT004", "STY004", "NAME014", "STY011",
+                                               "CASE006"};
     return r;
 }
 inline const std::vector<const char*>& syntaxRules() {
@@ -117,6 +118,28 @@ inline void checkText(BufferID buf, std::string_view text, const Rules& rules, c
         if (nl == std::string_view::npos) break;
         pos = nl + 1;
     }
+    // full_case / parallel_case: synthesis believes them, simulation does not.
+    if (rules.enabled("CASE006"))
+        for (std::string_view prag : {"full_case", "parallel_case"}) {
+            size_t f = 0;
+            while ((f = text.find(prag, f)) != std::string_view::npos) {
+                size_t ls = text.rfind('\n', f);
+                ls = ls == std::string_view::npos ? 0 : ls + 1;
+                std::string_view before = text.substr(ls, f - ls);
+                bool pragma = before.find("synopsys") != std::string_view::npos ||
+                              before.find("synthesis") != std::string_view::npos ||
+                              before.find("pragma") != std::string_view::npos || before.find("(*") != std::string_view::npos;
+                bool word = (f == 0 || !(std::isalnum((unsigned char)text[f - 1]) || text[f - 1] == '_')) &&
+                            (f + prag.size() >= text.size() ||
+                             !(std::isalnum((unsigned char)text[f + prag.size()]) || text[f + prag.size()] == '_'));
+                if (pragma && word)
+                    out.push_back({"CASE006", at(f),
+                                   std::string(prag) +
+                                       ": synthesis takes it on trust and simulation ignores it, so the two can differ; "
+                                       "use unique / priority case or a default"});
+                f += prag.size();
+            }
+        }
     if (rules.enabled("FMT004") && text.back() != '\n')
         out.push_back({"FMT004", at(text.size() - 1), "the file does not end with a newline"});
 }

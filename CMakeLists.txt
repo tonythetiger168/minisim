@@ -58,7 +58,8 @@ if(OPENSSL_FOUND)
   # Interop: envelopes msim did not make, built with the openssl command line
   # tool alone in the shapes other IEEE 1735 encryptors emit.
   find_program(MINISIM_OPENSSL_CLI openssl)
-  if(MINISIM_OPENSSL_CLI AND UNIX)
+  # msim exists only with the slang front end (MINISIM_WITH_SLANG, below).
+  if(MINISIM_OPENSSL_CLI AND UNIX AND MINISIM_WITH_SLANG)
     add_test(NAME protect_interop
              COMMAND sh ${CMAKE_SOURCE_DIR}/tests/protect_interop.sh $<TARGET_FILE:msim>
                      ${MINISIM_OPENSSL_CLI} ${CMAKE_SOURCE_DIR}
@@ -267,7 +268,7 @@ if(MINISIM_WITH_SLANG)
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_partcomp.cmake)
   # Siemens vlib/vlog/vcom/vsim and Synopsys vlogan/vhdlan/vcs/simv flows.
   add_test(NAME msim_mstep
-           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR} "-DUVM_HOME=${UVM_HOME}"
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mstep
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_mstep.cmake)
   # Simulation profile (msim -profile): processes, instances, kinds.

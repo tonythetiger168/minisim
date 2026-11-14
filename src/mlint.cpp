@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <iomanip>
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/diagnostics/AnalysisDiags.h"
@@ -74,7 +75,8 @@ void checkDrivers(const std::map<const Symbol*, std::vector<SourceLocation>>& dr
         rep.add("L004", locs[1],
                 "'" + path(*sym) + "' is assigned by " + std::to_string(locs.size()) +
                     " processes; in simulation the last write wins and in synthesis this is a "
-                    "multiple-driver error");
+                    "multiple-driver error",
+                path(*sym));
     }
 }
 
@@ -126,6 +128,7 @@ void usage() {
                  "  -enable X        turn on a rule, a group (naming, width, synth, ...) or all (repeatable)\n"
                  "  -disable X       turn off a rule or a group (repeatable)\n"
                  "  -only X[,Y]      run these rules or groups and nothing else\n"
+                 "  -goal NAME       run one methodology goal (lint_rtl, starc, ...); -list-goals\n"
                  "  -severity R=L    report rule or group R as error, warning or info\n"
                  "  -set NAME=VALUE  a setting, such as name.module='^[a-z][a-z0-9_]*$'\n"
                  "  -config FILE     directives, one per line: enable, disable, only, severity, set, waive\n"
@@ -252,10 +255,116 @@ void printText(std::ostream& os, const std::vector<Final>& fs, const lintcfg::Co
         if (!w.hits) os << "mlint: " << w.origin << ": this waiver matched nothing; remove it\n";
 }
 
+// The report's schematic: for each signal a finding names, the processes and
+// assigns that drive it (with what they read) and those that read it (with what
+// they drive). JSON: {"path": {"d": [node...], "r": [node...]}}, a node being
+// {"k": "flop"|"logic"|"assign", "at": "file:line", "clk": name, "io": [[name, path]...]}.
+std::string schematicJson(const Design& d, const SourceManager& sm, const std::set<std::string>& sigs) {
+    using lintcfg::jsonStr;
+    if (sigs.empty()) return "{}";
+    std::unordered_map<const Symbol*, std::string> pathOf;
+    auto P = [&](const Symbol* s) -> const std::string& {
+        auto it = pathOf.find(s);
+        if (it != pathOf.end()) return it->second;
+        return pathOf[s] = path(*s);
+    };
+    struct Node {
+        const char* k;
+        SourceLocation loc;
+        const Symbol* clk;
+        const std::set<const Symbol*>* outs;
+        const std::set<const Symbol*>* ins;
+        std::set<const Symbol*> own;   // targets of a block, for blocks
+    };
+    std::vector<Node> nodes;
+    nodes.reserve(d.blocks.size() + d.assigns.size());   // outs points into own
+    for (const Block& b : d.blocks) {
+        Node n{b.seq ? "flop" : "logic", b.sym->location, b.clk, nullptr, &b.reads, {}};
+        for (const Symbol* t : b.nba) if (!b.locals.count(t)) n.own.insert(t);
+        for (const Symbol* t : b.blocking) if (!b.locals.count(t)) n.own.insert(t);
+        nodes.push_back(std::move(n));
+    }
+    for (Node& n : nodes) n.outs = &n.own;
+    for (const Assign& a : d.assigns) nodes.push_back({"assign", a.loc, nullptr, &a.targets, &a.reads, {}});
+    std::map<std::string, std::pair<std::vector<size_t>, std::vector<size_t>>> by;   // path -> drivers, readers
+    // Two rounds: the signals the findings name, then their neighbours, so a
+    // click in the schematic can walk one step further.
+    std::set<std::string> want = sigs;
+    for (int round = 0; round < 2; round++) {
+    by.clear();
+    for (size_t i = 0; i < nodes.size(); i++) {
+        for (const Symbol* t : *nodes[i].outs)
+            if (want.count(P(t))) {
+                auto& v = by[P(t)].first;
+                if (v.size() < 6) v.push_back(i);
+            }
+        for (const Symbol* r : *nodes[i].ins)
+            if (want.count(P(r)) && !nodes[i].outs->count(r)) {
+                auto& v = by[P(r)].second;
+                if (v.size() < 8) v.push_back(i);
+            }
+        // a flop reads its clock too
+        if (const Symbol* c = nodes[i].clk; c && want.count(P(c)) && !nodes[i].ins->count(c)) {
+            auto& v = by[P(c)].second;
+            if (v.size() < 8) v.push_back(i);
+        }
+    }
+    if (round == 1) break;
+    for (auto& [pth, dr] : by)
+        for (auto* list : {&dr.first, &dr.second})
+            for (size_t i : *list)
+                for (const auto* set : {nodes[i].outs, nodes[i].ins})
+                    for (const Symbol* x : *set)
+                        if (want.size() < sigs.size() + 4000 && lintrules::isSignal(*x)) want.insert(P(x));
+    }
+    auto names = [&](const std::set<const Symbol*>& set, const Symbol* skip, size_t max) {
+        std::vector<std::pair<std::string, std::string>> v;
+        for (const Symbol* x : set)
+            if (x != skip && lintrules::isSignal(*x)) v.push_back({std::string(x->name), P(x)});
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        std::string o = "[";
+        for (size_t i = 0; i < v.size() && i < max; i++)
+            o += (i ? "," : "") + std::string("[") + jsonStr(v[i].first) + "," + jsonStr(v[i].second) + "]";
+        if (v.size() > max) o += ",[" + jsonStr("+" + std::to_string(v.size() - max) + " more") + ",\"\"]";
+        return o + "]";
+    };
+    auto node = [&](const Node& n, bool driver, const Symbol* self) {
+        SourceLocation full = sm.getFullyOriginalLoc(n.loc);
+        std::string at = std::string(sm.getFileName(full)) + ":" + std::to_string(sm.getLineNumber(full));
+        return "{\"k\":" + jsonStr(n.k) + ",\"at\":" + jsonStr(at) +
+               ",\"clk\":" + (n.clk ? jsonStr(std::string(n.clk->name)) : std::string("null")) +
+               ",\"io\":" + names(driver ? *n.ins : *n.outs, self, driver ? 8 : 4) + "}";
+    };
+    std::string o = "{";
+    bool first = true;
+    for (auto& [pth, dr] : by) {
+        // the symbol itself, to leave it out of its own lists
+        const Symbol* self = nullptr;
+        for (auto& [sym, p] : pathOf)
+            if (p == pth) { self = sym; break; }
+        std::string port;
+        if (self)
+            if (const Scope* sc = self->getParentScope(); sc && sc->asSymbol().kind == SymbolKind::InstanceBody)
+                for (const Symbol* ps : sc->asSymbol().as<InstanceBodySymbol>().getPortList())
+                    if (ps && ps->kind == SymbolKind::Port && ps->as<PortSymbol>().internalSymbol == self)
+                        port = ps->as<PortSymbol>().direction == ArgumentDirection::In    ? "in"
+                               : ps->as<PortSymbol>().direction == ArgumentDirection::Out ? "out"
+                                                                                          : "inout";
+        o += (first ? "" : ",") + jsonStr(pth) + ":{\"port\":" + jsonStr(port) + ",\"d\":[";
+        first = false;
+        for (size_t i = 0; i < dr.first.size(); i++) o += (i ? "," : "") + node(nodes[dr.first[i]], true, self);
+        o += "],\"r\":[";
+        for (size_t i = 0; i < dr.second.size(); i++) o += (i ? "," : "") + node(nodes[dr.second[i]], false, self);
+        o += "]}";
+    }
+    return o + "}";
+}
+
 // -html: one self-contained page (no server, no network): counts by severity
 // and rule, every finding with the source lines around it, a filter box, and
 // clicks on a rule or a severity to show only those.
-bool writeHtml(const std::string& path, const std::vector<Final>& fs) {
+bool writeHtml(const std::string& path, const std::vector<Final>& fs, const std::string& net) {
     std::ofstream os(path);
     if (!os) return false;
     using lintcfg::jsonStr;
@@ -302,6 +411,10 @@ pre .hl{background:#fff3b0;display:block}
 #q{padding:6px 10px;width:320px;border:1px solid #ccc;border-radius:6px}
 .msg{flex-basis:100%}
 .reason{color:#666;font-style:italic}
+.sch{border-top:1px solid #eee;padding:8px 10px;overflow:auto}
+.sch svg text{font:12px ui-monospace,monospace}
+.sch a{cursor:pointer;fill:#3366cc}
+.btn{font-size:12px;color:#3366cc;cursor:pointer;border:1px solid #ccd;border-radius:4px;padding:0 6px}
 </style></head><body>
 <header><h1>mlint report</h1><div class="tiles" id="tiles"></div>
 <p><input id="q" placeholder="filter: text, file, rule"> <label><input type="checkbox" id="sw"> show waived</label></p></header>
@@ -319,9 +432,14 @@ const F=[)HTML";
         os << (i ? ",\n" : "\n") << "{f:" << js(x.f.file) << ",l:" << x.f.line << ",c:" << x.f.col
            << ",r:" << js(x.f.rule) << ",g:" << js(lintcfg::groupOf(x.f.rule)) << ",s:" << js(lintcfg::sevName(x.sev))
            << ",t:" << js(x.f.text) << ",w:" << (x.waived ? "1" : "0") << ",why:" << js(x.reason) << ",src:" << js(src)
-           << "}";
+           << ",sig:" << js(x.f.signal) << "}";
     }
-    os << R"HTML(];
+    std::string netSafe;
+    for (size_t i = 0; i < net.size(); i++) {
+        if (net[i] == '<' && i + 1 < net.size() && net[i + 1] == '/') netSafe += "<\\";
+        else netSafe += net[i];
+    }
+    os << "];\nconst N=" << netSafe << R"HTML(;
 let sev=null,rule=null;
 const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function draw(){
@@ -337,8 +455,44 @@ function draw(){
   document.getElementById('list').innerHTML=(vis.length?'':'<p>No findings.</p>')+vis.map(x=>{
     const src=x.src?'<pre>'+x.src.split('\n').filter(l=>l).map(l=>{const hl=/^\d+\*/.test(l);
       return hl?'<span class="hl">'+esc(l.replace('*',' '))+'</span>':esc(l)+'\n'}).join('')+'</pre>':'';
+    const sb=x.sig&&N[x.sig]?`<span class="btn" onclick="sch(this,'${x.sig.replace(/['\\]/g,'\\$&')}')">schematic</span>`:'';
     return `<div class="f"><div class="h"><span class="sev ${x.w?'waived':x.s}">${x.w?'waived':x.s}</span><b>${x.r}</b>
-      <span class="loc">${esc(x.f)}:${x.l}:${x.c}</span><span class="msg">${esc(x.t)}</span>${x.w?'<span class="reason">'+esc(x.why)+'</span>':''}</div>${src}</div>`}).join('');
+      <span class="loc">${esc(x.f)}:${x.l}:${x.c}</span>${sb}<span class="msg">${esc(x.t)}</span>${x.w?'<span class="reason">'+esc(x.why)+'</span>':''}</div>${src}</div>`}).join('');
+}
+// The schematic of one signal: what drives it (and from what) on the left, what
+// reads it (and what that drives) on the right. Clicking a name that has its
+// own schematic moves to it.
+function sch(btn,sig){
+  const card=btn.closest('.f');let box=card.querySelector('.sch');
+  if(!box){box=document.createElement('div');box.className='sch';card.append(box)}
+  const n=N[sig];if(!n){box.textContent='no drivers or readers found for '+sig;return}
+  const NS='http://www.w3.org/2000/svg',W=200,BH=18,GAP=14,X1=190,XS=X1+W+50,X2=XS+190,XE=X2+W+210;
+  const hOf=nd=>Math.max(1,nd.io.length)*BH+30;
+  const col=(arr)=>{let y=10;return arr.map(nd=>{const h=hOf(nd),r={nd,y,h};y+=h+GAP;return r})};
+  const D=col(n.d),R=col(n.r);
+  const H=Math.max(80,...D.map(r=>r.y+r.h),...R.map(r=>r.y+r.h))+10,mid=H/2;
+  const s=document.createElementNS(NS,'svg');s.setAttribute('width',XE);s.setAttribute('height',H);
+  const add=(t,a,txt)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);if(txt!=null)e.textContent=txt;s.append(e);return e};
+  const short=t=>t.length>28?'…'+t.slice(-27):t;
+  const label=(x,y,pair,end)=>{const [nm,p]=pair;const e=add('text',end?{x,y,'text-anchor':'end'}:{x,y},short(nm));
+    if(p&&N[p]){e.setAttribute('class','');e.style.fill='#3366cc';e.style.cursor='pointer';e.onclick=()=>sch(btn,p)}};
+  const block=(r,x,driver)=>{const nd=r.nd;
+    add('rect',{x,y:r.y,width:W,height:r.h,rx:nd.k=='flop'?2:nd.k=='assign'?0:12,fill:'#fff',stroke:nd.k=='flop'?'#8a5300':'#555','stroke-width':nd.k=='flop'?2:1});
+    add('text',{x:x+8,y:r.y+15,'font-weight':'bold'},(nd.k=='flop'?'flop'+(nd.clk?' @ '+nd.clk:''):nd.k));
+    add('text',{x:x+W-8,y:r.y+15,'text-anchor':'end','fill-opacity':.6},short(nd.at.split('/').pop()));
+    nd.io.forEach((p,i)=>{const ty=r.y+32+i*BH;
+      if(driver){add('line',{x1:x-34,y1:ty-4,x2:x,y2:ty-4,stroke:'#999'});label(x-38,ty,p,true)}
+      else{add('line',{x1:x+W,y1:ty-4,x2:x+W+34,y2:ty-4,stroke:'#999'});label(x+W+38,ty,p)}});
+    if(driver&&!nd.io.length)add('text',{x:x+8,y:r.y+32,'fill-opacity':.6},'(constant)');};
+  D.forEach(r=>{block(r,X1,true);add('path',{d:`M${X1+W} ${r.y+r.h/2} C ${XS-20} ${r.y+r.h/2}, ${XS-20} ${mid}, ${XS} ${mid}`,fill:'none',stroke:'#333'})});
+  R.forEach(r=>{block(r,X2,false);add('path',{d:`M${XS+140} ${mid} C ${X2-20} ${mid}, ${X2-20} ${r.y+r.h/2}, ${X2} ${r.y+r.h/2}`,fill:'none',stroke:'#333'})});
+  add('rect',{x:XS,y:mid-14,width:140,height:28,rx:14,fill:'#fff3b0',stroke:'#333'});
+  add('text',{x:XS+70,y:mid+4,'text-anchor':'middle','font-weight':'bold'},short(sig.split('.').pop()));
+  if(!D.length)add('text',{x:X1,y:mid+4,fill:'#a4161a'},n.port=='in'?'input port':'no driver');
+  if(!R.length)add('text',{x:X2,y:mid+4,fill:n.port=='out'?'#555':'#a4161a'},n.port=='out'?'output port':'no reader');
+  if(D.length&&n.port=='in')add('text',{x:X1,y:10,fill:'#555'},'(also an input port)');
+  const head=document.createElement('div');head.className='loc';head.textContent=sig;
+  box.replaceChildren(head,s);
 }
 document.getElementById('q').oninput=draw;document.getElementById('sw').onchange=draw;draw();
 </script></body></html>
@@ -403,6 +557,11 @@ int main(int argc, char** argv) {
         const std::string origin = "command line";
         if (a == "-h" || a == "--help" || a == "-help") { usage(); return 0; }
         if (a == "-list" || a == "--list") { list = true; continue; }
+        if (a == "-goal") { cfg.directive({"goal", next("a goal name")}, origin); continue; }
+        if (a == "-list-goals") {
+            for (auto& g : lintcfg::goals()) std::cout << std::left << std::setw(12) << g.name << g.what << "\n";
+            return 0;
+        }
         if (a == "-explain") { explainRule = next("a rule name"); continue; }
         if (a == "-version" || a == "--version" || a == "-v") {
             std::cout << "mlint " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
@@ -526,6 +685,7 @@ int main(int argc, char** argv) {
         fwd.push_back(vhdlStub);
         fe.afterParse = [&](driver::Driver& drv) {
             vhdl::Translator tr;
+            tr.firstRunWait = false;
             return vhdl::addVhdl(drv, vhdlFiles, "", "mlint", tr);
         };
     }
@@ -600,6 +760,11 @@ int main(int argc, char** argv) {
         if (i == 0) {
             for (const Block& b : d.blocks) checkBlock(b, r);
             checkDrivers(d.drivers, d.wholeDriven, r);
+            for (auto& [sig, n] : d.contention)
+                r.add("L005", sig->location,
+                      "'" + path(*sig) + "' is a resolved signal driven by " + std::to_string(n) +
+                          " processes, and not every one releases it with 'Z': the values fight (X in simulation, contention in hardware)",
+                      path(*sig));
         } else if (i == 1) {
             global.analyze(r);
         } else if (i == 2) {
@@ -689,7 +854,14 @@ int main(int argc, char** argv) {
     if (hidden)
         std::cout << "mlint: " << hidden << (hidden == 1 ? " finding" : " findings")
                   << " in protected code (details hidden)\n";
-    if (!htmlPath.empty() && !writeHtml(htmlPath, fs)) {
+    std::string net = "{}";
+    if (!htmlPath.empty()) {
+        std::set<std::string> sigs;
+        for (const Final& x : fs)
+            if (!x.f.signal.empty()) sigs.insert(x.f.signal);
+        net = schematicJson(d, *fe.comp->getSourceManager(), sigs);
+    }
+    if (!htmlPath.empty() && !writeHtml(htmlPath, fs, net)) {
         std::cerr << "mlint: cannot write '" << htmlPath << "'\n";
         return 2;
     }
