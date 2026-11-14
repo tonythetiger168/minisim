@@ -104,7 +104,7 @@ inline bool sameBase(const TP& a, const TP& b) {
 }
 
 struct Sym {
-    enum K { Obj, TypeK, Lit, Sub, Comp, Entity, Pkg, Unit, Alias, Lib, Label } k = Obj;
+    enum K { Obj, TypeK, Lit, Sub, Comp, Entity, Pkg, Unit, Alias, Lib, Label, View } k = Obj;
     std::string cls;    // Obj: signal variable constant generic port file loop
     std::string name, text, sv;
     TP type;

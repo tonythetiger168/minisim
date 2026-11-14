@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "cond.hpp"
 #include "sv.hpp"
 
 namespace vhdl {
@@ -23,6 +24,11 @@ inline void readFiles(Translator& tr, const std::vector<std::string>& files) {
         std::stringstream ss;
         ss << in.rdbuf();
         std::string src = ss.str();
+        if (src.find('`') != std::string::npos) {   // conditional analysis (24.2)
+            CondAnalysis ca(condAnalysisIds(tr.condIds), f);
+            src = ca.run(src);
+            tr.warnings.insert(tr.warnings.end(), ca.warnings.begin(), ca.warnings.end());
+        }
         Lexer lx(src, f);
         Parser p(lx.run(), f);
         tr.add(p.designFile());

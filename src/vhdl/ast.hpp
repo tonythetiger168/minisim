@@ -146,6 +146,7 @@ enum class DK {
     Signal, Variable, Constant, File, Type, Subtype, Component, Subprog, Alias, Attribute, AttrSpec,
     Use, Library, Generic, Port, Field, Param, Config, Group, Disconnect, Context, PackageInst, Ignored,
     SubInst,   // function f is new g generic map (...): target = g
+    View,      // mode view: type = the record, tdef->fields = element names with their modes
 };
 
 struct Decl {

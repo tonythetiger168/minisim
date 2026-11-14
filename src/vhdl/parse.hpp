@@ -299,7 +299,13 @@ private:
         do { auto [l, x] = ident(); d->names.push_back(l); d->texts.push_back(x); } while (accept(","));
         expect(":");
         if (isKw("in") || isKw("out") || isKw("inout") || isKw("buffer") || isKw("linkage")) { d->mode = cur().low; next(); }
-        else if (isKw("view")) { next(); name(); return d; }
+        else if (isKw("view")) {   // mode view (6.5.2, VHDL-2019): view v [of T]
+            next();
+            d->mode = "view";
+            d->target = name();
+            if (accept("of")) d->type = subtypeIndication();
+            return d;
+        }
         d->type = subtypeIndication();
         if (accept("bus")) {}
         if (accept(":=")) d->init = expression();
@@ -495,6 +501,31 @@ private:
                 if (isKw("function") || isKw("procedure")) next();
                 if (isIdent() || at(Tok::Str)) next();
             }
+            expect(";");
+        } else if (isKw("view")) {   // mode view declaration (6.5.2, VHDL-2019)
+            next();
+            auto d = one(DK::View);
+            auto [l, x] = ident();
+            d->names.push_back(l);
+            d->texts.push_back(x);
+            expect("of");
+            d->type = subtypeIndication();
+            expect("is");
+            while (!isKw("end")) {
+                auto f = std::make_shared<Decl>(DK::Field);
+                f->line = cur().line;
+                do { auto [fl, fx] = ident(); f->names.push_back(fl); f->texts.push_back(fx); } while (accept(","));
+                expect(":");
+                if (isKw("view")) fail("a mode view as the mode of a record element is not supported yet");
+                f->mode = cur().low;
+                next();
+                expect(";");
+                d->tdef = d->tdef ? d->tdef : std::make_shared<TypeDef>();
+                d->tdef->fields.push_back(f);
+            }
+            expect("end");
+            expect("view");
+            if (isIdent()) next();
             expect(";");
         } else if (isKw("alias")) {
             next();
@@ -980,6 +1011,19 @@ private:
     }
     SP seqStmtBody(int ln) {
         SP s;
+        if (accept("block")) {   // sequential block statement (10.15, VHDL-2019)
+            s = std::make_shared<Stmt>(SK::Block, ln);
+            accept("is");
+            s->decls = declarations();
+            expect("begin");
+            s->body = sequentialStmts();
+            expect("end");
+            expect("block");
+            if (isIdent()) next();
+            expect(";");
+            s->hasSens = true;   // marks a sequential block
+            return s;
+        }
         if (accept("if")) {
             s = std::make_shared<Stmt>(SK::If, ln);
             Alt a;
@@ -1047,6 +1091,29 @@ private:
         } else if (accept("return")) {
             s = std::make_shared<Stmt>(SK::Return, ln);
             if (!isOp(";")) s->value = expression();
+            if (isKw("when")) {   // return x when c else y (10.13, VHDL-2019): an if statement
+                auto ifs = std::make_shared<Stmt>(SK::If, ln);
+                EP v = s->value;
+                for (;;) {
+                    if (!accept("when")) {   // the final else value
+                        Alt a;
+                        auto r = std::make_shared<Stmt>(SK::Return, ln);
+                        r->value = v;
+                        a.body.push_back(r);
+                        ifs->alts.push_back(a);
+                        break;
+                    }
+                    Alt a;
+                    a.cond = expression();
+                    auto r = std::make_shared<Stmt>(SK::Return, ln);
+                    r->value = v;
+                    a.body.push_back(r);
+                    ifs->alts.push_back(a);
+                    if (!accept("else")) break;
+                    v = expression();
+                }
+                s = ifs;
+            }
             expect(";");
         } else if (accept("null")) {
             s = std::make_shared<Stmt>(SK::Null, ln);

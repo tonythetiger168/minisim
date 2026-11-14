@@ -92,6 +92,7 @@ public:
     std::map<std::string, SvModule> svModules;   // lower-case name -> module
     std::string timeUnit = "1ns", timePrec = "1fs";
     std::vector<std::string> warnings;
+    std::map<std::string, std::string> condIds;   // conditional analysis identifiers from the command line (upper case)
     // For synthesis tools: a combinational process (a sensitivity list or an
     // equivalent process of a concurrent assignment, no wait inside, no
     // 'event history) becomes `always @*` instead of a loop that waits on its
@@ -149,8 +150,12 @@ public:
                     }
             };
             deps(u);
-            if (u->k == Unit::PackageInst)
+            if (u->k == Unit::PackageInst) {
                 if (auto it = packages.find(u->of); it != packages.end()) deps(it->second);
+                for (auto& a : u->genericMap)   // package generics: the actual instance first
+                    if (a.actual && (a.actual->k == EK::Name || a.actual->k == EK::Sel))
+                        if (auto it = packages.find(a.actual->name); it != packages.end() && it->second->k == Unit::PackageInst) emitPkg(it->second);
+            }
             o << emitPackage(u);
         };
         for (auto& u : order)
@@ -812,8 +817,14 @@ private:
         std::string pkg;
         if (pre->k == EK::Name) pkg = pre->name;
         else if (pre->k == EK::Sel) pkg = pre->name;
+        if (auto al = pkgAlias.find(pkg); al != pkgAlias.end()) pkg = al->second;
         if (packages.count(pkg) || pkgScope.count(pkg) || isBuiltinPkg(pkg)) return lookupIn(pkg, m->name);
         return nullptr;
+    }
+    std::map<std::string, std::string> pkgAlias;   // a package generic's name -> the actual instance (6.5.6.4)
+    std::string pkgOf(const std::string& n) const {
+        auto it = pkgAlias.find(n);
+        return it == pkgAlias.end() ? n : it->second;
     }
 
     Rng rangeOf(const EP& r, TP* idxType = nullptr) {
@@ -1661,7 +1672,7 @@ private:
         if (e->k == EK::Sel) {
             // package-qualified name?
             if (const Sym* y = lookupSel(e)) {
-                std::string pkg = e->a->name;
+                std::string pkg = pkgOf(e->a->name);
                 auto it = pkgScope.find(pkg);
                 if (y->k == Sym::Sub) {
                     if (it != pkgScope.end() && it->second.count(e->name)) return callSub(e, it->second[e->name], {}, want);
@@ -1707,7 +1718,7 @@ private:
         if (pre->k == EK::Name) syms = lookupAll(pre->name);
         else if (pre->k == EK::Sel) {
             if (const Sym* y = lookupSel(pre)) {
-                auto it = pkgScope.find(pre->a->name);
+                auto it = pkgScope.find(pkgOf(pre->a->name));
                 if (it != pkgScope.end() && it->second.count(pre->name)) syms = &it->second[pre->name];
                 else if (builtinScope.count(pre->name)) syms = &builtinScope[pre->name];
                 (void)y;
@@ -3137,6 +3148,17 @@ endpackage
             return;
         }
         case DK::Alias: {
+            if (d->target && d->target->k == EK::Attr && d->target->name == "converse") {   // alias v is m'converse
+                ViewInfo vi = resolveView(d->target);
+                Sym y;
+                y.k = Sym::View;
+                y.name = d->names[0];
+                y.text = d->texts[0];
+                y.decl = vi.decl;
+                y.mode = vi.converse ? "converse" : "";
+                declare(y);
+                return;
+            }
             Sym y;
             y.k = Sym::Alias;
             y.name = d->names[0];
@@ -3175,6 +3197,16 @@ endpackage
             }
             return emitSubprogDecl(o, d, where);
         case DK::SubInst: return emitSubInst(o, d, where);
+        case DK::View: {   // mode view (6.5.2)
+            Sym y;
+            y.k = Sym::View;
+            y.name = d->names[0];
+            y.text = d->texts[0];
+            y.decl = d;
+            y.home = cx->isPackage ? cx->container : "";
+            declare(y);
+            return;
+        }
         default: return;
         }
     }
@@ -3191,6 +3223,7 @@ endpackage
         if (parts.size() >= 3) { pkg = parts[1]; item = parts[2]; }
         else if (parts[0] == "work" || packages.count(parts[1])) { pkg = parts[1]; item = "all"; }
         else { pkg = parts[0]; item = parts[1]; }
+        if (auto al = pkgAlias.find(pkg); al != pkgAlias.end()) pkg = al->second;
         if (isBuiltinPkg(pkg)) return;
         if (!packages.count(pkg) && !pkgScope.count(pkg)) {
             if (parts.size() == 2 && !packages.count(pkg)) return;   // use lib.entity: nothing to import
@@ -3795,6 +3828,34 @@ endpackage
     }
 
     // ------------------------------------------------------------ subprograms
+    // A mode view (6.5.2): the record type and each element's mode, flipped by 'converse.
+    struct ViewInfo {
+        DP decl;
+        bool converse = false;
+        TP rec;
+        std::map<std::string, std::string> modes;   // element (lower) -> in / out / inout / buffer
+    };
+    ViewInfo resolveView(const EP& e) {
+        ViewInfo vi;
+        EP n = e;
+        bool flip = false;
+        while (n && n->k == EK::Attr && n->name == "converse") { flip = !flip; n = n->a; }
+        const Sym* y = n && n->k == EK::Name ? lookup(n->name) : n && n->k == EK::Sel ? lookupSel(n) : nullptr;
+        if (!y || y->k != Sym::View || !y->decl) fail(e ? e->line : 0, "not a mode view");
+        vi.decl = y->decl;
+        vi.converse = flip != (y->mode == "converse");
+        vi.rec = subtype(y->decl->type);
+        if (!vi.rec || vi.rec->k != Type::Record) fail(e->line, "a mode view needs a record type");
+        if (vi.decl->tdef)
+            for (auto& f : vi.decl->tdef->fields)
+                for (auto& fn : f->names) {
+                    std::string m = f->mode;
+                    if (vi.converse) m = m == "in" ? "out" : m == "out" || m == "buffer" ? "in" : m;
+                    vi.modes[fn] = m;
+                }
+        return vi;
+    }
+
     // Subprogram instantiation (4.4): a copy of the uninstantiated subprogram
     // in which each generic's name is replaced by its actual.
     std::map<std::string, DP> genericSubs;
@@ -4389,6 +4450,26 @@ endpackage
             break;
         }
         case SK::Null: r = I + ";\n"; break;
+        case SK::Block: {   // sequential block (10.15): its declarations are elaborated on each execution
+            r = I + "begin" + procName(s.label) + "\n";
+            cx->scopes.push_back(Scope());
+            cx->indent++;
+            std::ostringstream d;
+            emitDecls(d, s.decls, "process");
+            r += d.str();
+            for (auto& dd : s.decls)
+                if (dd->k == DK::Variable && dd->init)
+                    for (auto& n : dd->names)
+                        if (const Sym* y = lookup(n)) {
+                            Val v = ex(dd->init, y->type);
+                            r += ind() + y->sv + " = " + fitTo(v, y->type) + ";\n";
+                        }
+            r += seqStmts(s.body);
+            cx->indent--;
+            cx->scopes.pop_back();
+            r += I + "end\n";
+            break;
+        }
         case SK::Wait: r = waitStmt(s); break;
         case SK::Assert: {
             Val c = boolOf(ex(s.cond, bt["boolean"]));
@@ -4710,7 +4791,7 @@ endpackage
         if (n->k == EK::Name) syms = lookupAll(n->name);
         else if (n->k == EK::Sel) {
             if (lookupSel(n)) {
-                auto it = pkgScope.find(n->a->name);
+                auto it = pkgScope.find(pkgOf(n->a->name));
                 if (it != pkgScope.end() && it->second.count(n->name)) syms = &it->second[n->name];
                 else if (builtinScope.count(n->name)) syms = &builtinScope[n->name];
             }
@@ -4812,7 +4893,12 @@ endpackage
                     }
                     continue;
                 }
-                if (g->cls == "package") fail(inst->line, "package generics are not supported yet");
+                if (g->cls == "package") {   // the formal names the actual instance (6.5.6.4)
+                    std::string an = act ? (act->k == EK::Sel || act->k == EK::Name ? act->name : "") : "";
+                    if (an.empty() || !packages.count(an)) fail(inst->line, "the actual of package generic '" + g->texts[k] + "' must be a package instance");
+                    pkgAlias[n] = an;
+                    continue;
+                }
                 // constant
                 TP t = subtype(g->type);
                 EP val = act ? act : g->init;
@@ -4833,6 +4919,15 @@ endpackage
     }
 
     std::string emitPackage(const UP& u) {
+        auto saved = pkgAlias;
+        pkgAlias.clear();
+        try {
+            std::string r = emitPackage0(u);
+            pkgAlias = saved;
+            return r;
+        } catch (...) { pkgAlias = saved; throw; }
+    }
+    std::string emitPackage0(const UP& u) {
         UP src = u, body, inst;
         if (u->k == Unit::PackageInst) {
             auto it = packages.find(u->of);
@@ -5161,7 +5256,7 @@ endpackage
             std::vector<std::pair<std::string, TP>> portSigs;
             std::map<std::string, TP> unconPort;   // lower-case port -> its type with parameter bounds
             for (auto& p : ent->ports) {
-                TP t = subtype(p->type);
+                TP t = p->mode == "view" ? resolveView(p->target).rec : subtype(p->type);
                 if (isUnconstrained(t)) {
                     // an unconstrained array port (6.5.6.3): the actual gives its range, through
                     // two parameters per port; the direction is the module's (see variant)
@@ -5200,7 +5295,27 @@ endpackage
                 }
             }
             DriverInfo di = drivers(stmts);
+            std::string viewBody;   // mode-view ports: the record signal and its element connections
             for (auto& p : ent->ports) {
+                if (p->mode == "view") {   // one port per record element, in its mode (6.5.2)
+                    ViewInfo vi = resolveView(p->target);
+                    TP t = vi.rec;
+                    for (size_t k = 0; k < p->names.size(); ++k) {
+                        std::string sv = svId(p->texts[k]);
+                        viewBody += "  " + svDecl(t, sv) + ";\n";
+                        for (size_t f = 0; f < t->fnames.size(); ++f) {
+                            std::string m = vi.modes.count(t->fnames[f]) ? vi.modes[t->fnames[f]] : "";
+                            if (m.empty()) fail(p->line, "mode view gives no mode for element '" + t->ftext[f] + "'");
+                            std::string ps = sv + "__" + svId(t->ftext[f]);
+                            std::string dir = m == "in" ? "input" : m == "inout" ? "inout" : "output";
+                            portList.push_back(dir + " " + (m == "inout" && isPackable(t->ftypes[f]) && isFourState(t->ftypes[f]) ? svDeclNet(t->ftypes[f], ps) : svDecl(t->ftypes[f], ps)));
+                            portLines.push_back(p->line);
+                            if (m == "in") viewBody += "  assign " + sv + "." + svId(t->ftext[f]) + " = " + ps + ";\n";
+                            else viewBody += "  assign " + ps + " = " + sv + "." + svId(t->ftext[f]) + ";\n";
+                        }
+                    }
+                    continue;
+                }
                 TP t = subtype(p->type);
                 for (size_t k = 0; k < p->names.size(); ++k) {
                     if (unconPort.count(p->names[k])) t = unconPort[p->names[k]];
@@ -5238,6 +5353,7 @@ endpackage
                         for (auto& n : d->names)
                             if (di.needsNet(n)) c.drvNames[svId(d->texts[std::find(d->names.begin(), d->names.end(), n) - d->names.begin()])] = n;
             }
+            body << viewBody;
             emitDecls(body, ent->decls, "module");
             if (arch) {
                 c.file = arch->file;
@@ -5804,6 +5920,7 @@ endpackage
         if (comp && comp->k != Sym::Comp) comp = nullptr;
         // component without an entity: an SV module of the same name (case-insensitively)
         std::shared_ptr<GenBind> genBind;
+        std::map<std::string, std::vector<std::string>> viewFields;   // mode-view port -> its elements (SV names)
         if (ent && hasTypeGenerics(ent)) genBind = genericBinding(ent, s.genericMap, s.line);
         if (ent) {
             modName = svId(ent->text);
@@ -5849,6 +5966,11 @@ endpackage
                 }
                 for (auto& p : ent->ports) {
                     TP t;
+                    if (p->mode == "view") {
+                        t = resolveView(p->target).rec;
+                        for (auto& n : p->names)
+                            for (auto& ft : t->ftext) viewFields[n].push_back(svId(ft));
+                    } else
                     try { t = subtype(p->type); } catch (const Error&) { t = nullptr; }
                     for (size_t k = 0; k < p->names.size(); ++k) {
                         lowerPorts.push_back(p->names[k]);
@@ -5971,6 +6093,10 @@ endpackage
                         unconGens.push_back("." + formalSv + "__R(" + g.r + ")");
                         if (!g.downto) unconAsc.insert(fl);
                     }
+                }
+                if (auto vf = viewFields.find(fl); vf != viewFields.end()) {   // one connection per element
+                    for (auto& f : vf->second) items.push_back("." + formalSv + "__" + f + "(" + (act.empty() ? "" : act + "." + f) + ")");
+                    continue;
                 }
                 items.push_back("." + formalSv + "(" + act + ")");
             }

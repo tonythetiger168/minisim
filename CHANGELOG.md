@@ -18,6 +18,12 @@ Spec references are IEEE 1800-2023 clauses.
   Tested with riscv-tests' vector benchmarks (845 programs now), clang's
   vectorized loops against its scalar ones, single-instruction checks, and
   under Linux. EXT_ABI 8: the extension library needs a rebuild.
+- msim VHDL-2019: mode views and `'converse` (6.5.2), conditional analysis
+  directives (24.2, identifiers from `+define+`), sequential block
+  statements (10.15) and conditional `return`.
+- msim VHDL: package generics (6.5.6.4), a generic package taking an
+  instance of another; `use n.all` on one reaches its generic types and
+  subprograms.
 - msim VHDL: unconstrained array ports (6.5.6.3). Each port's index range
   comes from the actual, ascending or descending, also through another
   unconstrained port; a SystemVerilog parent sets `<port>__L`/`<port>__R`.

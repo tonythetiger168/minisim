@@ -29,6 +29,10 @@ if(TARGET msim)
     "blockhdr_tb|blockhdr.vhd|ghdl"
     "localpkg_tb|localpkg.vhd|ghdl"
     "subgen_tb|subgen.vhd|"
+    "pkggen_tb|pkggen.vhd|ghdl"
+    "pkggen_types_tb|pkggen_types.vhd|"
+    "vhdl2019_tb|vhdl2019.vhd|"
+    "vhdl2019b_tb|vhdl2019b.vhd|"
     "mixed_sv_top|counter.vhd,mixed_sv_top.sv|"
     "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|"
     "mixed_uncon|uncon_ports.vhd,mixed_uncon.sv|")
@@ -57,4 +61,9 @@ if(TARGET msim)
                        "-DDATA=${data}" -DOUT=${CMAKE_CURRENT_BINARY_DIR}/vhdl_ghdl_${top} -P ${VT}/ghdl_check.cmake)
     endif()
   endforeach()
+  # +define+ names a VHDL conditional analysis identifier (1076-2019 24.2)
+  add_test(NAME vhdl_cond_define
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${VT} -DTOP=vhdl2019b_tb "-DFILES=vhdl2019b.vhd"
+                   -DEXTRA=+define+MY_MODE=fast -DGOLDEN=vhdl2019b_define.out
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/vhdl_cond_define -P ${VT}/run_vhdl.cmake)
 endif()
