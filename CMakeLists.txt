@@ -606,3 +606,5 @@ set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "g++ (>= 11)")
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 include(CPack)
+
+include(cmake/gates.cmake)
