@@ -1,0 +1,8 @@
+vhdl2019_assert.vhd:9:5:@0ms:(report note): n0=0 f=false
+vhdl2019_assert.vhd:10:5:@0ms:(assertion error): e1
+vhdl2019_assert.vhd:11:5:@0ms:(report warning): w1
+vhdl2019_assert.vhd:12:5:@0ms:(report note): n1=2 err=1 fe=true ff=false
+vhdl2019_assert.vhd:15:5:@0ms:(report note): en w=false e=true n2=2
+vhdl2019_assert.vhd:18:5:@0ms:(report note): n3=0 f=false
+** NOTE: hello***| at 3000 ps [  note   ] {x}
+** NOTE: fmt=** {S}: {r:*<8}| at {t.ps} [{s:^9}] {{x} valid=false| at 3000 ps [  note   ] {x}

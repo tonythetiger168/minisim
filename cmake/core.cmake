@@ -123,6 +123,7 @@ set(MINISIM_CORE_VP_HEADERS
     machine.hpp
     rv32.hpp
     vector.inc
+    vcrypto.inc
     virtio.hpp)
 list(TRANSFORM MINISIM_CORE_VP_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vp/
      OUTPUT_VARIABLE MINISIM_CORE_VP_HEADER_PATHS)
