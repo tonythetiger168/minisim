@@ -30,6 +30,8 @@ for x in 32 64; do
   $V -march=rv${x}gcv -fuse-ld=lld -Wl,-T,link.ld -Wl,--build-id=none -static crt0.S vec.c "$out/vk_s.o" "$out/vk_v.o" -o "$out/vec${x}m8.elf"
   $V -march=rv${x}gcv -fno-vectorize -fno-slp-vectorize -fuse-ld=lld -Wl,-T,link.ld -Wl,--build-id=none -static \
     crt0.S vops.c -o "$out/vops$x.elf"
+  $V -march=rv${x}gcv_zvbb -fno-vectorize -fno-slp-vectorize -fuse-ld=lld -Wl,-T,link.ld -Wl,--build-id=none -static \
+    crt0.S zvbb.c -o "$out/zvbb$x.elf"
 done
 # ... and as a Linux program, for the BusyBox test.
 V="${CLANG:-clang} --target=riscv64-unknown-linux-gnu -mabi=lp64d $VF -fno-stack-protector"

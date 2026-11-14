@@ -707,6 +707,22 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             }
             return done();
         }
+        // vwsll (Zvbb): 2*SEW = zero-extended vs2 << (op & (2*SEW-1)).
+        if (f6 == 0x35) {
+            if (sew > 32 || t.lmul >= 3) return VILL;
+            const unsigned wregs = lregs * (t.lmul >= 0 ? 2 : 1), w = 2 * sew;
+            if (!aligned(rd, t.lmul >= 0 ? 2 * lregs : 1) || !aligned(rs2, lregs) || (vv && !aligned(rs1, lregs)))
+                return VILL;
+            if (rs2 < rd + wregs && rd < rs2 + lregs) return VILL;
+            if (vv && rs1 < rd + wregs && rd < rs1 + lregs) return VILL;
+            if (!vm && rd == 0) return VILL;
+            for (uint64_t i = h.vstart; i < vl; i++) {
+                if (!active(i)) continue;
+                const uint64_t a = vget(h, rs2, i, sB), s = (f3 == 3 ? uimm : op1(i)) & (w - 1);
+                vset(h, rd, i, 2 * sB, (a << s) & vmaskw(w));
+            }
+            return done();
+        }
         // Single-width element-wise.
         if (!aligned(rd, lregs) || !aligned(rs2, lregs) || (vv && !aligned(rs1, lregs))) return VILL;
         if (!vm && rd == 0) return VILL;
@@ -723,6 +739,15 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                 case 0x05: if (f3 == 3) return VILL; r = sx(a) < sx(b) ? a : b; break;
                 case 0x06: if (f3 == 3) return VILL; r = a > b ? a : b; break;
                 case 0x07: if (f3 == 3) return VILL; r = sx(a) > sx(b) ? a : b; break;
+                case 0x01: if (f3 == 3) return VILL; r = a & ~b; break;           // vandn (Zvbb)
+                case 0x14: case 0x15: {                                         // vror, vrol (Zvbb)
+                    // vror.vi has a 6-bit immediate, its top bit in funct6[0].
+                    const bool rol = f6 == 0x15 && f3 != 3;
+                    unsigned s = f3 == 3 ? (unsigned)(uimm | (f6 & 1) << 5) & (sew - 1) : sh;
+                    if (rol) s = (sew - s) & (sew - 1);
+                    r = s ? (a >> s | a << (sew - s)) : a;
+                    break;
+                }
                 case 0x09: r = a & b; break;
                 case 0x0a: r = a | b; break;
                 case 0x0b: r = a ^ b; break;
@@ -842,6 +867,29 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
     }
     if (f6 == 0x12 && vv) {                                            // vzext, vsext
         const unsigned k = rs1;
+        if (k >= 8 && k <= 14 && k != 11) {                           // Zvbb: vbrev8 vrev8 vbrev vclz vctz vcpop.v
+            if (!aligned(rd, lregs) || !aligned(rs2, lregs)) return VILL;
+            if (!vm && rd == 0) return VILL;
+            for (uint64_t i = h.vstart; i < vl; i++) {
+                if (!active(i)) continue;
+                const uint64_t a = vget(h, rs2, i, sB);
+                uint64_t r = 0;
+                switch (k) {
+                    case 8: case 10:                                   // vbrev8, vbrev
+                        for (unsigned b = 0; b < sew; b++)
+                            if (a >> b & 1) r |= 1ull << (k == 10 ? sew - 1 - b : (b & ~7u) | (7 - (b & 7)));
+                        break;
+                    case 9:                                            // vrev8
+                        for (unsigned b = 0; b < sB; b++) r |= (a >> 8 * b & 0xff) << 8 * (sB - 1 - b);
+                        break;
+                    case 12: r = a ? (unsigned)__builtin_clzll(a) - (64 - sew) : sew; break;   // vclz
+                    case 13: r = a ? (unsigned)__builtin_ctzll(a) : sew; break;               // vctz
+                    case 14: r = (unsigned)__builtin_popcountll(a); break;                    // vcpop.v
+                }
+                vset(h, rd, i, sB, r & smask);
+            }
+            return done();
+        }
         if (k < 2 || k > 7) return VILL;
         const unsigned frac = k <= 3 ? 8 : k <= 5 ? 4 : 2;
         const bool sgn = k & 1;

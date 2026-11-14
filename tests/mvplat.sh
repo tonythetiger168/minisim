@@ -72,6 +72,8 @@ for x in 32 64; do
   for v in 128 512; do
     "$MVPLAT" "$E/vops$x.elf" -vlen $v -q > vops${x}_$v.out 2>&1; rc=$?
     expect "V, RV$x, VLEN $v: single instructions, traps, vstart" 0 vops${x}_$v.out "vops: all checks passed"
+    "$MVPLAT" "$E/zvbb$x.elf" -vlen $v -q > zvbb${x}_$v.out 2>&1; rc=$?
+    expect "Zvbb, RV$x, VLEN $v: every instruction at SEW 8 to 64" 0 zvbb${x}_$v.out "checks passed, all"
   done
 done
 
