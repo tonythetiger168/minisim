@@ -31,6 +31,7 @@ if(TARGET msim)
     "subgen_tb|subgen.vhd|"
     "guarded_tb|guarded.vhd|ghdl"
     "std9_tb|std9.vhd|ghdl"
+    "ioconv_tb|ioconv.vhd|ghdl"
     "localpkg2_tb|localpkg2.vhd|"
     "pkggen_tb|pkggen.vhd|ghdl"
     "pkggen_types_tb|pkggen_types.vhd|"

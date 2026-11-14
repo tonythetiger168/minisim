@@ -1,0 +1,2 @@
+ioconv.vhd:24:5:@1ns:(report note): en=0 bus=1100 q=1100
+ioconv.vhd:26:5:@2ns:(report note): en=1 bus=0101 q=0101
