@@ -424,6 +424,16 @@ private:
         line->target = str;
         TP text = mkType(Type::File, "text");
         text->target = str;
+        // std.textio's LINE_VECTOR and std.env's DIRECTORY (VHDL-2019, 16.4, 16.5.5)
+        TP lvec = mkArray("line_vector", line, natural, "");
+        TP ditems = mkType(Type::Access, "directory_items");
+        ditems->target = lvec;
+        ditems->sv = "vhdl_env::directory_items";
+        TP dir = mkType(Type::Record, "directory");
+        dir->sv = "vhdl_env::directory";
+        dir->fnames = {"name", "items"};
+        dir->ftext = {"name", "items"};
+        dir->ftypes = {line, ditems};
         TP bv = mkArray("bit_vector", bit, natural, "bv");
         TP bov = mkArray("boolean_vector", boolean, natural, "");
         TP iv = mkArray("integer_vector", integer, natural, "");
@@ -538,7 +548,7 @@ private:
                        "getvhdlassertenable", "setvhdlassertformat", "getvhdlassertformat", "setvhdlreadseverity",
                        "getvhdlreadseverity", "epoch", "localtime", "gmtime", "time_to_seconds", "seconds_to_time",
                        "getenv", "dir_workingdir", "dir_itemexists", "dir_itemisdir", "dir_itemisfile", "dir_createdir",
-                       "dir_deletedir", "dir_deletefile", "pslassertfailed", "psliscovered", "pslisassertcovered",
+                       "dir_deletedir", "dir_deletefile", "dir_open", "dir_close", "pslassertfailed", "psliscovered", "pslisassertcovered",
                        "getpslcoverassert", "setpslcoverassert", "clearpslstate"})
             addBuiltinFn(n);
     }
@@ -976,6 +986,7 @@ private:
 
     TP subtype(const SubInd& si, const EP& initForWidth = nullptr) {
         TP t = typeOfMark(si.mark);
+        if (t && (t == bt["directory"] || t == bt["directory_items"])) useEnv = true;
         if (si.range) {
             TP n = std::make_shared<Type>(*t);
             n->base = t->base ? t->base : t;
@@ -3025,8 +3036,15 @@ private:
         if (id == "getpslcoverassert") { v.s = "vhdl_rt::psl_cover_assert"; v.t = bt["boolean"]; return v; }
         // std.env calendar time, environment and directories (VHDL-2019, 16.5.5 - 16.5.7)
         if (id == "epoch" || id == "localtime" || id == "gmtime" || id == "getenv" || id == "dir_workingdir" || id == "dir_itemexists" ||
-            id == "dir_itemisdir" || id == "dir_itemisfile" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
+            id == "dir_itemisdir" || id == "dir_itemisfile" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile" ||
+            id == "dir_open") {
             useEnv = true;
+            if (id == "dir_open") {   // DIR_OPEN(Dir, Path) return DIR_OPEN_STATUS (16.5.5)
+                if (args.size() != 2) fail(line, "DIR_OPEN: needs Dir and Path");
+                v.s = "vhdl_env::dir_open(" + target(args[0].actual, false) + ", " + arg(1, bt["string"]).s + ")";
+                v.t = bt["dir_open_status"];
+                return v;
+            }
             TP trec = bt["time_record"];
             if (id == "epoch" || id == "localtime" || id == "gmtime") {
                 std::string loc = id == "gmtime" ? "0" : "1";
@@ -3089,6 +3107,50 @@ private:
   import "DPI-C" function int msim_vhdl_mkdir(string path, int parents);
   import "DPI-C" function int msim_vhdl_rmdir(string path, int recursive);
   import "DPI-C" function int msim_vhdl_unlink(string path);
+  import "DPI-C" function int msim_vhdl_diropen(string path);
+  import "DPI-C" function string msim_vhdl_dirname();
+  import "DPI-C" function int msim_vhdl_dircount();
+  import "DPI-C" function string msim_vhdl_diritem(int i);
+  // DIRECTORY_ITEMS: an access to LINE_VECTOR, laid out like every access-to-array class
+  class directory_items;
+    typedef string arr_t[];
+    arr_t a;
+    int l; bit dn;
+    static function directory_items alloc(int l, int r, bit dn);
+      directory_items p = new(); p.l = l; p.dn = dn;
+      p.a = new[(dn ? l - r : r - l) >= 0 ? (dn ? l - r : r - l) + 1 : 0];
+      return p;
+    endfunction
+    static function directory_items from(int l, bit dn, string x[]);
+      directory_items p = new(); p.l = l; p.dn = dn; p.a = x; return p;
+    endfunction
+    function int right(); return dn ? l - a.size() + 1 : l + a.size() - 1; endfunction
+    function int idx(int i); return dn ? l - i : i - l; endfunction
+    function arr_t slice(int i, int j);
+      arr_t r = new[j >= i ? j - i + 1 : 0];
+      foreach (r[k]) r[k] = a[i + k];
+      return r;
+    endfunction
+    function void set_slice(int i, arr_t x);
+      foreach (x[k]) a[i + k] = x[k];
+    endfunction
+  endclass
+  typedef struct { string name; directory_items items; } directory;
+  // DIR_OPEN: the canonical path and the items' simple names, sorted; null values on failure
+  function automatic int dir_open(output directory d, input string path);
+    int st = msim_vhdl_diropen(path);
+    d.name = "";
+    d.items = null;
+    if (st != 0) return st;
+    d.name = msim_vhdl_dirname();
+    d.items = directory_items::alloc(0, msim_vhdl_dircount() - 1, 1'b0);
+    foreach (d.items.a[i]) d.items.a[i] = msim_vhdl_diritem(i);
+    return 0;
+  endfunction
+  function automatic void dir_close(inout directory d);
+    d.name = "";
+    d.items = null;
+  endfunction
   typedef struct { int microsecond, second, minute, hour, day, month, year, weekday, dayofyear; } time_record;
   function automatic time_record tm(real t, int loc);
     time_record r;
@@ -3137,6 +3199,15 @@ endpackage
         if (id == "setpslcoverassert") { EP e = by("enable", 0); return "vhdl_rt::psl_cover_assert = " + (e ? ex(e, bt["boolean"]).s : std::string("1'b1")) + ";"; }
         if (id == "clearpslstate") return ";";
         // std.env directory procedures: the last argument is the status (16.5.6)
+        if (id == "dir_open" || id == "dir_close") {   // (16.5.5)
+            useEnv = true;
+            EP d = by("dir", 0), p = by("path", 1), st = by("status", 2);
+            if (!d) fail(line, id + ": missing argument");
+            if (id == "dir_close") return "vhdl_env::dir_close(" + target(d, false) + ");";
+            if (!p) fail(line, "DIR_OPEN: missing Path");
+            std::string c = "vhdl_env::dir_open(" + target(d, false) + ", " + ex(p, bt["string"]).s + ")";
+            return st ? target(st, false) + " = " + c + ";" : "void'(" + c + ");";
+        }
         if (id == "dir_workingdir" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
             useEnv = true;
             EP p = by("path", 0), st = by("status", args.size() - 1), flag = by(id == "dir_createdir" ? "parents" : "recursive", 99);
