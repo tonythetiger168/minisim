@@ -3342,6 +3342,44 @@ struct Lowerer {
     void unpin(const std::vector<const slang::ast::Expression*>& sels) {
         for (auto* x : sels) exprOverride.erase(x);
     }
+    // Does the low part of x depend on its high bits? Only >>, / and % (in
+    // the context-determined part of x) bring high bits down; +, -, * and
+    // the bitwise operators can be worked out at a narrower target width.
+    static bool carriesDown(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        switch (x.kind) {
+            case ExpressionKind::BinaryOp: {
+                const auto& b = x.as<BinaryExpression>();
+                switch (b.op) {
+                    case BinaryOperator::LogicalShiftRight: case BinaryOperator::ArithmeticShiftRight:
+                    case BinaryOperator::Divide: case BinaryOperator::Mod:
+                        return true;
+                    case BinaryOperator::Add: case BinaryOperator::Subtract: case BinaryOperator::Multiply:
+                    case BinaryOperator::BinaryAnd: case BinaryOperator::BinaryOr: case BinaryOperator::BinaryXor:
+                    case BinaryOperator::BinaryXnor:
+                        return carriesDown(b.left()) || carriesDown(b.right());
+                    case BinaryOperator::LogicalShiftLeft: case BinaryOperator::ArithmeticShiftLeft:
+                    case BinaryOperator::Power:
+                        return carriesDown(b.left());
+                    default: return false;
+                }
+            }
+            case ExpressionKind::UnaryOp: {
+                const auto& u = x.as<UnaryExpression>();
+                if (u.op == UnaryOperator::BitwiseNot || u.op == UnaryOperator::Minus || u.op == UnaryOperator::Plus)
+                    return carriesDown(u.operand());
+                return false;
+            }
+            case ExpressionKind::ConditionalOp: {
+                const auto& c = x.as<ConditionalExpression>();
+                return carriesDown(c.left()) || carriesDown(c.right());
+            }
+            case ExpressionKind::Conversion:
+                return x.as<ConversionExpression>().conversionKind != ConversionKind::Explicit &&
+                       carriesDown(x.as<ConversionExpression>().operand());
+            default: return false;
+        }
+    }
     // The value of e as a new temporary, by its type.
     E asType(const slang::ast::Type& t, int sig, bool sgn) {
         if (t.isFloating()) return un(Op::AsReal, ref(sig));
@@ -5455,7 +5493,7 @@ struct Lowerer {
                     // that a shift or divide brings down is kept, then cut.
                     int ow = (int)c.operand().type->getBitWidth();
                     int to = ctx.live && ctx.w > 0 ? ctx.w : dst;
-                    if (ow > to && to > 0) {
+                    if (ow > to && to > 0 && carriesDown(c.operand())) {
                         bool os = c.operand().type->isSigned();
                         needWidth(ow);
                         bool tg = ctx.live && ctx.w > 0 ? ctx.tag : c.type->isSigned();
