@@ -82,8 +82,11 @@ L.append("  initial begin")
 L.append("    clk = 0;")
 for step in range(24):
     for n, w, s in ops:
-        if R.random() < 0.15:
-            digits = "".join(R.choice("01xz") if R.random() < 0.3 else R.choice("01") for _ in range(w))
+        if R.random() < 0.3:
+            # Half of these have x but no z: codegen.hpp's two-word path
+            # (fx4) takes them; with a z the Val code does.
+            pool = "01xz" if R.random() < 0.5 else "01x"
+            digits = "".join(R.choice(pool) if R.random() < 0.3 else R.choice("01") for _ in range(w))
             L.append(f"    {n} = {w}'b{digits};")
         else:
             L.append(f"    {n} = {w}'d{R.getrandbits(w)};")
