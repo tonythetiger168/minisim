@@ -16,7 +16,7 @@ begin
     SetVhdlAssertEnable(true);
     ClearVhdlAssert;
     report "n3=" & integer'image(GetVhdlAssertCount) & " f=" & boolean'image(IsVhdlAssertFailed);
-    SetVhdlAssertFormat(note, "** {S}: {r:*<8}| at {t.ps} [{s:^9}] {{x}");
+    SetVhdlAssertFormat(note, "** {S}: {r:*<8}| at {t.ps} [{s:^9}] {i} {{x}");
     wait for 3 ns;
     report "hello";
     SetVhdlAssertFormat(note, "{q}", ok);

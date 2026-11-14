@@ -1479,8 +1479,38 @@ private:
         fail(e->line, "unsupported operator " + e->op);
     }
 
+    // an operand of std.env's TIME_RECORD type: an object of the type or a call of
+    // localtime / gmtime (for the "+" and "-" of 16.5.5)
+    bool isTimeRecord(const EP& x) {
+        if (!x || !bt.count("time_record")) return false;
+        EP n = x->k == EK::Call ? x->a : x;
+        if (!n || n->k != EK::Name) return false;
+        if (x->k == EK::Call && (n->name == "localtime" || n->name == "gmtime")) return true;
+        const Sym* y = lookup(n->name);
+        return y && y->k == Sym::Obj && y->type && baseOf(y->type) == bt["time_record"];
+    }
     Val binary(const EP& e, const TP& want) {
         const std::string& op = e->op;
+        if ((op == "+" || op == "-") && (isTimeRecord(e->a) || isTimeRecord(e->b))) {
+            // TIME_RECORD +/- seconds, seconds + TIME_RECORD, TIME_RECORD - TIME_RECORD (16.5.5);
+            // the calendar arithmetic is done in UTC, which keeps a local-time record local
+            useEnv = true;
+            TP tr = bt["time_record"];
+            Val v;
+            if (isTimeRecord(e->a) && isTimeRecord(e->b)) {
+                if (op != "-") fail(e->line, "TIME_RECORD + TIME_RECORD is not defined");
+                v.s = "(vhdl_env::epoch_of(" + ex(e->a, tr).s + ", 0) - vhdl_env::epoch_of(" + ex(e->b, tr).s + ", 0))";
+                v.t = bt["real"];
+                return v;
+            }
+            bool recLeft = isTimeRecord(e->a);
+            Val r = ex(recLeft ? e->a : e->b, tr), d = ex(recLeft ? e->b : e->a, bt["real"]);
+            std::string secs = "vhdl_env::epoch_of(" + r.s + ", 0)";
+            // DELTA - TREC (declared next to TREC - DELTA) is taken as TREC - DELTA
+            v.s = "vhdl_env::tm(" + secs + (op == "+" ? " + " : " - ") + d.s + ", 0)";
+            v.t = tr;
+            return v;
+        }
         // logical operators
         static const std::map<std::string, std::string> lg = {{"and", "&"}, {"or", "|"}, {"xor", "^"}, {"nand", "&"}, {"nor", "|"}, {"xnor", "^"}};
         if (lg.count(op)) {
@@ -2131,6 +2161,10 @@ private:
             else if (baseOf(b->elem)->k == Type::Logic) s = "{\"\\\"\", vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t && !isUnconstrained(x.t) ? x.t : t) + "), \"\\\"\"}";
             else s = "$sformatf(\"\\\"%b\\\"\", " + x.s + ")";
             v.s = s;
+            return v;
+        }
+        if (b && b->k == Type::Array && b->dims.size() == 1 && b->elem && baseOf(b->elem)->k == Type::Int) {
+            v.s = "vhdl_rt::p2img($sformatf(\"%p\", " + x.s + "))";   // (e1,e2,...)
             return v;
         }
         if (b && b->k == Type::Record) {
@@ -3014,6 +3048,19 @@ package vhdl_rt;
   function automatic string lower(string s);
     return s.tolower();
   endfunction
+  // a VHDL instance path (16.2.5 style) from SystemVerilog's %m: top.u1.p -> :top:u1:p:
+  function automatic string inst_path(string m, string loc);
+    string r = ":";
+    if (m == "") return loc;
+    for (int i = 0; i < m.len(); i++) r = {r, m[i] == "." ? ":" : string'(m[i])};
+    return {r, ":"};
+  endfunction
+  function automatic string p2img(string p);   // %p's '{1, 2} as VHDL-2019 'image: (1,2)
+    string r = "(";
+    for (int i = 0; i < p.len(); i++)
+      if (!(p[i] inside {"'", "{", "}", " "})) r = {r, string'(p[i])};
+    return {r, ")"};
+  endfunction
   function automatic string dquote(string s);   // a string's 'image: quoted, quotes doubled
     string r = "\"";
     for (int i = 0; i < s.len(); i++) r = {r, s[i] == "\"" ? "\"\"" : string'(s[i])};
@@ -3217,14 +3264,14 @@ package vhdl_rt;
     afmt[lvl] = f;
     return 1;
   endfunction
-  function automatic void report(string msg, int sev, string loc, bit is_assert);
+  function automatic void report(string msg, int sev, string loc, bit is_assert, string path = "");
     string sv;
     case (sev) 0: sv = "note"; 1: sv = "warning"; 2: sv = "error"; default: sv = "failure"; endcase
     if (!aenable[sev]) return;
     acount[sev]++;
     if (afmt[sev] != "") begin
       string o;
-      void'(fmt_apply(afmt[sev], sv, msg, loc, o));
+      void'(fmt_apply(afmt[sev], sv, msg, inst_path(path, loc), o));
       $display("%s", o);
     end else
       $display("%s:@%s:(%s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
@@ -5223,7 +5270,7 @@ endpackage
         }
         std::string sv = sev ? ex(sev, bt["severity_level"]).s : defSev;
         std::string loc = "\"" + cx->file + ":" + std::to_string(line) + (col ? ":" + std::to_string(col) : std::string()) + "\"";
-        return "vhdl_rt::report(" + m + ", " + sv + ", " + loc + ", " + (isAssert ? "1" : "0") + ");";
+        return "vhdl_rt::report(" + m + ", " + sv + ", " + loc + ", " + (isAssert ? "1" : "0") + ", $sformatf(\"%m\"));";
     }
 
     std::string procCall(const EP& c, int line) {
