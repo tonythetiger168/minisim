@@ -139,6 +139,14 @@ struct CgBin {
     std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>> wwild;
     const sva::Node* trans = nullptr;   // a transition bin
     E iff;
+    // A with bin over more values than can be listed (every value of a
+    // coverpoint wider than 64 bits, a wildcard of one, or more than 2^24
+    // values): a value is in it when it is in the ranges and the with
+    // expression is true for it, checked when the value is sampled.
+    E pred;
+    int predItem = -1;
+    int predW = 0;
+    bool predSgn = false;
     bool empty = false;              // no value left: not counted (19.11.1)
     uint64_t hits = 0;
     // transition attempts in flight: (term, count)
