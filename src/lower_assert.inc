@@ -412,6 +412,8 @@ SampleClock& gclkSampler() {
 // tick late: each sampled value is replaced by its copy from the tick before
 // (a $past stage one further back), and a future value by the value now.
 bool futureProc = false;   // shifting a procedural assertion (16.14.6)
+// The signals of sequence end points matched one global clock tick late.
+static std::set<int>& futureEnds() { static std::set<int> s; return s; }
 E futureShift(const E& e) {
     if (!e || e->op == Op::Const) return e;
     if (e->op == Op::Future) return e->kids[0];
@@ -427,6 +429,9 @@ E futureShift(const E& e) {
         // A local variable is assigned from shifted values too (16.10), so
         // it is read as it is.
         if (svaLocalSigs().count(e->sig) && !e->at) return e;
+        // A sequence end point with future functions is set one tick late
+        // already (futureEnds): read as it is.
+        if (futureEnds().count(e->sig) && !e->at) return e;
         // In a procedure, an automatic variable is captured per instance when
         // it is queued (16.14.6.1): a constant of the attempt.
         if (futureProc && !e->at && (isRel(e->sig) || automaticSigs().count(e->sig))) return e;
@@ -1178,7 +1183,9 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     if (b.clk.empty()) unsupported("an end point of a sequence with no clock (16.13.6)");
     svb = &b;
     sva::store().localAtoms = &b.atomLocal;
-    recIdxOf.clear();   // levels of recursive properties are per assertion
+    auto savedRecIdx = std::move(recIdxOf);   // the reading assertion's recursion state, kept
+    auto savedRecBody = std::move(recLevelBody);
+    recIdxOf.clear();
     recLevelBody.clear();
     int savedClk = sva::store().clk;
     sva::store().clk = 0;
@@ -1206,7 +1213,19 @@ int seqTracker(const slang::ast::AssertionInstanceExpression& ai) {
     c.acts = std::move(b.acts);
     c.endSig = sg;
     c.more = std::move(b.more);
-    if (b.future) unsupported("a future sampled value function in a sequence end point (16.9.4)");
+    if (b.future) {   // matched one global clock tick late, like an assertion (futureEnd); its readers are too
+        if (c.ev != gclkSampler().ev)
+            unsupported("a future sampled value function in a sequence end point not clocked by the global clock (16.9.4)");
+        if (b.matchItems)
+            throw std::runtime_error(whereStr() + "lower: a global clocking future sampled value function shall not be used "
+                                                  "in a sequence with match items (16.9.4)");
+        if (!c.more.empty()) unsupported("a future sampled value function with several clocks (16.9.4)");
+        futureLate(c);
+        futureEnds().insert(sg);
+        futureEnds().insert(sg + 1);
+    }
+    recIdxOf = std::move(savedRecIdx);
+    recLevelBody = std::move(savedRecBody);
     svb = saved;
     sva::store().localAtoms = savedLocal;
     sva::store().clk = savedClk;
@@ -1224,6 +1243,14 @@ E seqEndPoint(const slang::ast::Expression& arg, bool matched) {
     const Expression& x = peel(arg);
     if (x.kind != ExpressionKind::AssertionInstance) unsupported("triggered or matched of this expression");
     int k = seqTracker(x.as<AssertionInstanceExpression>());
+    if (futureEnds().count(concAsserts()[k].endSig)) {
+        // The end point is known one global clock tick after the match
+        // (16.9.4): an assertion reading it is checked that tick late too;
+        // nothing else can wait for it.
+        if (!svb) unsupported("reading outside an assertion a sequence end point that uses a future sampled value function (16.9.4)");
+        if (matched) unsupported("matched of a sequence end point that uses a future sampled value function (16.9.4)");
+        svb->future = true;
+    }
     if (matched && svb) {
         if (!mkSig) unsupported("matched here");
         int f = mkSig(asserts()[concAsserts()[k].id].name + "$m" + std::to_string(tempSeq ? (*tempSeq)++ : 0), 1, false);
@@ -1242,6 +1269,23 @@ int seqEventSig(const slang::ast::Expression& x) {
     return concAsserts()[seqTracker(peel(x).as<slang::ast::AssertionInstanceExpression>())].endSig;
 }
 
+// Check c one global clock tick late (16.9.4): its atoms and local
+// variable assignments read the values from the tick before, and future
+// values the values now. No attempt at the first tick: nothing was sampled
+// before it.
+void futureLate(ConcAssert& c) {
+    for (auto& act : c.acts)
+        for (auto& item : act) item.rhs = futureShift(item.rhs);
+    for (auto& at : c.atoms) at = futureShift(at);
+    if (c.clkIff) c.clkIff = futureShift(c.clkIff);
+    SampleClock::Line ln;
+    ln.src = konst(mk(1, 1));
+    ln.noInit = true;   // 0 until the first tick has passed
+    ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), 1, false));
+    E started = ref(ln.stages[0]);
+    gclkSampler().lines.push_back(std::move(ln));
+    c.clkIff = c.clkIff ? bin(Op::LogAnd, c.clkIff, started) : started;
+}
 // assert / assume / cover property, cover sequence (16.14).
 // The leading clock written inside a sequence or property operand, if any:
 // `cover property (s)` with s's own @(posedge clk) is clocked by it (16.16).
@@ -1351,21 +1395,8 @@ void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
             unsupported("a future sampled value function with several clocks (16.9.4)");
         c.future = !staticAssert;
         futureProc = !staticAssert;
-        for (auto& act : c.acts)
-            for (auto& item : act) {
-                item.rhs = futureShift(item.rhs);
-            }
-        for (auto& at : c.atoms) at = futureShift(at);
-        if (c.clkIff) c.clkIff = futureShift(c.clkIff);
+        futureLate(c);
         futureProc = false;
-        // No attempt at the first tick: nothing was sampled before it.
-        SampleClock::Line ln;
-        ln.src = konst(mk(1, 1));
-        ln.noInit = true;   // 0 until the first tick has passed
-        ln.stages.push_back(mkSig("$fut" + std::to_string((*tempSeq)++), 1, false));
-        E started = ref(ln.stages[0]);
-        g.lines.push_back(std::move(ln));
-        c.clkIff = c.clkIff ? bin(Op::LogAnd, c.clkIff, started) : started;
     }
     if (!staticAssert) {   // in a procedure (16.14.6): queued when the procedure reaches it
         c.procedural = true;
