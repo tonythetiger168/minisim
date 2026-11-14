@@ -184,6 +184,7 @@
 #include "upf_design.hpp"
 #include "upf_hdl.hpp"
 #include "dpi.inc"
+#include "vhdl_env.inc"
 #include "vpi.inc"
 #include "interactive.inc"
 #include "vendor_tasks.hpp"

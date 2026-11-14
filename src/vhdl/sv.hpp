@@ -91,6 +91,7 @@ public:
     };
     std::map<std::string, SvModule> svModules;   // lower-case name -> module
     std::string timeUnit = "1ns", timePrec = "1fs";
+    bool useEnv = false;   // the design calls std.env's calendar, directory or environment functions
     std::vector<std::string> warnings;
     std::map<std::string, std::string> condIds;   // conditional analysis identifiers from the command line (upper case)
     // For synthesis tools: a combinational process (a sensitivity list or an
@@ -130,7 +131,7 @@ public:
     std::string run() {
         builtins();
         std::ostringstream o;
-        o << rtPackage();
+        std::string rt = rtPackage();
         // packages in dependency order
         std::set<std::string> done;
         std::function<void(const UP&)> emitPkg = [&](const UP& u) {
@@ -188,7 +189,7 @@ public:
         }
         emitVariants();
         o << lateModules.str();
-        return o.str();
+        return rt + (useEnv ? envPackage() : std::string()) + o.str();
     }
 
 private:
@@ -371,6 +372,29 @@ private:
         fos->lits = {"open_ok", "status_error", "name_error", "mode_error"};
         fos->litSv = {"0", "1", "2", "3"};
         fos->sv = "int";
+        // std.env (VHDL-2019, 16.5): calendar time and directory status types
+        TP dow = mkType(Type::Enum, "dayofweek");
+        dow->lits = {"sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"};
+        for (int i = 0; i < 7; ++i) dow->litSv.push_back(std::to_string(i));
+        dow->sv = "int";
+        TP trec = mkType(Type::Record, "time_record");
+        trec->sv = "vhdl_env::time_record";
+        for (const char* f : {"microsecond", "second", "minute", "hour", "day", "month", "year", "weekday", "dayofyear"}) {
+            trec->fnames.push_back(f);
+            trec->ftext.push_back(f);
+            trec->ftypes.push_back(std::string(f) == "weekday" ? dow : integer);
+        }
+        auto statusType = [&](const std::string& n, std::vector<std::string> lits) {
+            TP t = mkType(Type::Enum, n);
+            t->lits = lits;
+            for (size_t i = 0; i < lits.size(); ++i) t->litSv.push_back(std::to_string(i));
+            t->sv = "int";
+            return t;
+        };
+        TP dos = statusType("dir_open_status", {"status_ok", "status_not_found", "status_no_directory", "status_access_denied", "status_error"});
+        TP dcs = statusType("dir_create_status", {"status_ok", "status_item_exists", "status_access_denied", "status_error"});
+        TP dds = statusType("dir_delete_status", {"status_ok", "status_no_directory", "status_not_empty", "status_access_denied", "status_error"});
+        TP fds = statusType("file_delete_status", {"status_ok", "status_no_file", "status_access_denied", "status_error"});
         TP side = mkType(Type::Enum, "side");
         side->lits = {"right", "left"};
         side->litSv = {"0", "1"};
@@ -427,6 +451,9 @@ private:
         for (size_t i = 0; i < fos->lits.size(); ++i) lit(fos->lits[i], fos, fos->litSv[i]);
         lit("right", side, "0");
         lit("left", side, "1");
+        for (size_t i = 0; i < dow->lits.size(); ++i) lit(dow->lits[i], dow, dow->litSv[i]);
+        for (auto& st : {dos, dcs, dds, fds})
+            for (size_t i = 0; i < st->lits.size(); ++i) lit(st->lits[i], st, st->litSv[i]);
         // the named (non-graphic) literals of CHARACTER (16.3)
         {
             static const char* ctl[] = {"nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel", "bs", "ht", "lf", "vt",
@@ -468,6 +495,7 @@ private:
         };
         obj("output", text, "32'h8000_0001", "file");
         obj("input", text, "32'h8000_0000", "file");
+        obj("dir_separator", str, "\"/\"");
         obj("math_pi", real, "3.14159265358979323846");
         obj("math_2_pi", real, "6.28318530717958647693");
         obj("math_pi_over_2", real, "1.57079632679489661923");
@@ -489,7 +517,10 @@ private:
                        "vhdl_version", "tool_type", "tool_vendor", "tool_name", "tool_edition", "tool_version", "file_name", "file_path",
                        "file_line", "getvhdlassertcount", "isvhdlassertfailed", "clearvhdlassert", "setvhdlassertenable",
                        "getvhdlassertenable", "setvhdlassertformat", "getvhdlassertformat", "setvhdlreadseverity",
-                       "getvhdlreadseverity"})
+                       "getvhdlreadseverity", "epoch", "localtime", "gmtime", "time_to_seconds", "seconds_to_time",
+                       "getenv", "dir_workingdir", "dir_itemexists", "dir_itemisdir", "dir_itemisfile", "dir_createdir",
+                       "dir_deletedir", "dir_deletefile", "pslassertfailed", "psliscovered", "pslisassertcovered",
+                       "getpslcoverassert", "setpslcoverassert", "clearpslstate"})
             addBuiltinFn(n);
     }
 
@@ -2586,6 +2617,11 @@ private:
             Val x = arg(0);
             v.t = bt["string"];
             TP b = baseOf(x.t);
+            if (id == "to_string" && b && b == bt["time_record"]) {   // ISO 8601 (16.5.5)
+                useEnv = true;
+                v.s = "vhdl_env::tm_str(" + x.s + ", " + (args.size() > 1 ? arg(1, bt["integer"]).s : std::string("0")) + ")";
+                return v;
+            }
             if (id == "to_string" && x.t && x.t->k == Type::Array && isScalarBit(x.t->elem)) {
                 v.s = x.t->elem->k == Type::Logic ? "vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t) + ")" : "$sformatf(\"%b\", " + x.s + ")";
                 return v;
@@ -2715,11 +2751,106 @@ private:
             return v;
         }
         if (id == "getvhdlreadseverity") { v.s = "vhdl_rt::read_sev"; v.t = bt["severity_level"]; return v; }
+        // std.env PSL API (16.5.10): msim's VHDL front end has no PSL, so nothing fails or is covered
+        if (id == "pslassertfailed" || id == "psliscovered" || id == "pslisassertcovered") { v.s = id == "pslassertfailed" ? "1'b0" : "1'b1"; v.t = bt["boolean"]; return v; }
+        if (id == "getpslcoverassert") { v.s = "vhdl_rt::psl_cover_assert"; v.t = bt["boolean"]; return v; }
+        // std.env calendar time, environment and directories (VHDL-2019, 16.5.5 - 16.5.7)
+        if (id == "epoch" || id == "localtime" || id == "gmtime" || id == "getenv" || id == "dir_workingdir" || id == "dir_itemexists" ||
+            id == "dir_itemisdir" || id == "dir_itemisfile" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
+            useEnv = true;
+            TP trec = bt["time_record"];
+            if (id == "epoch" || id == "localtime" || id == "gmtime") {
+                std::string loc = id == "gmtime" ? "0" : "1";
+                if (args.empty()) {
+                    if (id == "epoch") { v.s = "vhdl_env::msim_vhdl_epoch()"; v.t = bt["real"]; }
+                    else { v.s = "vhdl_env::tm(vhdl_env::msim_vhdl_epoch(), " + loc + ")"; v.t = trec; }
+                    return v;
+                }
+                Val x = arg(0);
+                bool isRec = x.t && baseOf(x.t) == trec;
+                if (!isRec) x = arg(0, bt["real"]);
+                if (id == "epoch") { v.s = isRec ? "vhdl_env::epoch_of(" + x.s + ", 1)" : x.s; v.t = bt["real"]; return v; }
+                // EPOCH and GMTIME take a time record in local time, LOCALTIME one in UTC
+                std::string secs = isRec ? "vhdl_env::epoch_of(" + x.s + ", " + (id == "gmtime" ? "1" : "0") + ")" : x.s;
+                v.s = "vhdl_env::tm(" + secs + ", " + loc + ")";
+                v.t = trec;
+                return v;
+            }
+            if (id == "getenv") { v.s = "vhdl_env::msim_vhdl_getenv(" + arg(0, bt["string"]).s + ")"; v.t = bt["string"]; return v; }
+            if (id == "dir_workingdir") {
+                if (args.empty()) { v.s = "vhdl_env::msim_vhdl_cwd()"; v.t = bt["string"]; }
+                else { v.s = "vhdl_env::msim_vhdl_chdir(" + arg(0, bt["string"]).s + ")"; v.t = bt["dir_open_status"]; }
+                return v;
+            }
+            if (id == "dir_itemexists" || id == "dir_itemisdir" || id == "dir_itemisfile") {
+                v.s = "bit'(vhdl_env::msim_vhdl_stat(" + arg(0, bt["string"]).s + ", " + (id == "dir_itemexists" ? "0" : id == "dir_itemisdir" ? "1" : "2") + "))";
+                v.t = bt["boolean"];
+                return v;
+            }
+            EP flag = named(id == "dir_createdir" ? "parents" : "recursive");
+            if (!flag && args.size() > 1 && !args[1].formal) flag = args[1].actual;
+            std::string f = flag ? ex(flag, bt["boolean"]).s : "1'b0";
+            std::string p = arg(0, bt["string"]).s;
+            if (id == "dir_createdir") { v.s = "vhdl_env::msim_vhdl_mkdir(" + p + ", " + f + ")"; v.t = bt["dir_create_status"]; }
+            else if (id == "dir_deletedir") { v.s = "vhdl_env::msim_vhdl_rmdir(" + p + ", " + f + ")"; v.t = bt["dir_delete_status"]; }
+            else { v.s = "vhdl_env::msim_vhdl_unlink(" + p + ")"; v.t = bt["file_delete_status"]; }
+            return v;
+        }
+        if (id == "time_to_seconds") { v.s = "(real'(" + arg(0, bt["time"]).s + ") * " + unitSeconds() + ")"; v.t = bt["real"]; return v; }
+        if (id == "seconds_to_time") { v.s = "(" + arg(0, bt["real"]).s + " / " + unitSeconds() + ")"; v.t = bt["time"]; return v; }
         if (id == "abs") { Val x = arg(0); v.t = x.t; v.s = "((" + x.s + ") < 0 ? -(" + x.s + ") : (" + x.s + "))"; return v; }
         if (id == "unsigned_num_bits") { Val x = arg(0); v.s = "vhdl_rt::num_bits(" + x.s + ")"; v.t = bt["integer"]; return v; }
         (void)named;
         (void)want;
         fail(line, "'" + id + "' is not supported as a function yet");
+    }
+
+    // std.env's calendar time, environment and directory functions (VHDL-2019,
+    // 16.5.5 - 16.5.7): DPI-C calls of helpers that msim itself exports
+    // (src/vhdl_env.inc). Emitted only for a design that uses them.
+    std::string envPackage() const {
+        return R"SV(package vhdl_env;
+  import "DPI-C" function real msim_vhdl_epoch();
+  import "DPI-C" function int msim_vhdl_tm(real t, int loc, int f);
+  import "DPI-C" function real msim_vhdl_mktime(int us, int s, int mi, int h, int d, int mo, int y, int loc);
+  import "DPI-C" function string msim_vhdl_getenv(string name);
+  import "DPI-C" function string msim_vhdl_cwd();
+  import "DPI-C" function int msim_vhdl_chdir(string path);
+  import "DPI-C" function int msim_vhdl_stat(string path, int what);
+  import "DPI-C" function int msim_vhdl_mkdir(string path, int parents);
+  import "DPI-C" function int msim_vhdl_rmdir(string path, int recursive);
+  import "DPI-C" function int msim_vhdl_unlink(string path);
+  typedef struct { int microsecond, second, minute, hour, day, month, year, weekday, dayofyear; } time_record;
+  function automatic time_record tm(real t, int loc);
+    time_record r;
+    r.microsecond = msim_vhdl_tm(t, loc, 0); r.second = msim_vhdl_tm(t, loc, 1); r.minute = msim_vhdl_tm(t, loc, 2);
+    r.hour = msim_vhdl_tm(t, loc, 3); r.day = msim_vhdl_tm(t, loc, 4); r.month = msim_vhdl_tm(t, loc, 5);
+    r.year = msim_vhdl_tm(t, loc, 6); r.weekday = msim_vhdl_tm(t, loc, 7); r.dayofyear = msim_vhdl_tm(t, loc, 8);
+    return r;
+  endfunction
+  function automatic real epoch_of(time_record r, int loc);
+    return msim_vhdl_mktime(r.microsecond, r.second, r.minute, r.hour, r.day, r.month, r.year, loc);
+  endfunction
+  function automatic string pad0(int v, int w);   // zero-padded decimal
+    string s = $sformatf("%0d", v);
+    while (s.len() < w) s = {"0", s};
+    return s;
+  endfunction
+  function automatic string tm_str(time_record r, int frac);   // ISO 8601
+    string s = {pad0(r.year, 4), "-", pad0(r.month + 1, 2), "-", pad0(r.day, 2), "T", pad0(r.hour, 2), ":", pad0(r.minute, 2), ":", pad0(r.second, 2)};
+    if (frac > 0) s = {s, ".", pad0(r.microsecond, 6).substr(0, frac - 1)};
+    return s;
+  endfunction
+endpackage
+)SV";
+    }
+
+    // seconds per unit of `timeUnit`, the unit of a VHDL time value in SystemVerilog
+    std::string unitSeconds() const {
+        static const std::map<std::string, std::string> u = {{"1s", "1.0"}, {"1ms", "1.0e-3"}, {"1us", "1.0e-6"}, {"1ns", "1.0e-9"}, {"1ps", "1.0e-12"}, {"1fs", "1.0e-15"},
+                                                              {"10ns", "1.0e-8"}, {"100ns", "1.0e-7"}, {"10ps", "1.0e-11"}, {"100ps", "1.0e-10"}};
+        auto it = u.find(timeUnit);
+        return it == u.end() ? "1.0e-9" : it->second;
     }
 
     // Built-in procedures (textio, env, file I/O, uniform)
@@ -2734,6 +2865,19 @@ private:
             return pos < args.size() && !args[pos].formal ? args[pos].actual : nullptr;
         };
         if (id == "clearvhdlassert") return "vhdl_rt::assert_clear();";
+        if (id == "setpslcoverassert") { EP e = by("enable", 0); return "vhdl_rt::psl_cover_assert = " + (e ? ex(e, bt["boolean"]).s : std::string("1'b1")) + ";"; }
+        if (id == "clearpslstate") return ";";
+        // std.env directory procedures: the last argument is the status (16.5.6)
+        if (id == "dir_workingdir" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
+            useEnv = true;
+            EP p = by("path", 0), st = by("status", args.size() - 1), flag = by(id == "dir_createdir" ? "parents" : "recursive", 99);
+            if (!flag && args.size() == 3 && !args[1].formal) flag = args[1].actual;
+            if (!p || !st) fail(line, id + ": missing argument");
+            std::string ps = ex(p, bt["string"]).s, f = flag ? ex(flag, bt["boolean"]).s : "1'b0";
+            std::string c = id == "dir_workingdir" ? "vhdl_env::msim_vhdl_chdir(" + ps + ")" : id == "dir_createdir" ? "vhdl_env::msim_vhdl_mkdir(" + ps + ", " + f + ")"
+                          : id == "dir_deletedir" ? "vhdl_env::msim_vhdl_rmdir(" + ps + ", " + f + ")" : "vhdl_env::msim_vhdl_unlink(" + ps + ")";
+            return target(st, false) + " = " + c + ";";
+        }
         if (id == "setvhdlassertenable") {   // (Enable) for every level, or (Level, Enable)
             EP lv, en;
             std::vector<EP> pos;
@@ -2993,6 +3137,7 @@ package vhdl_rt;
   bit aenable[4] = '{1, 1, 1, 1};
   string afmt[4];
   int read_sev = 2;
+  bit psl_cover_assert = 1;
   function automatic int assert_count(int lvl);
     if (lvl < 0) return acount[1] + acount[2] + acount[3];
     return acount[lvl];
