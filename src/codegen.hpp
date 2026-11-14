@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <map>
 #include <set>
+#include <array>
 #include <unordered_map>
 #include <unordered_set>
 #include <sstream>
@@ -431,6 +432,7 @@ public:
             initText.clear();
         }
         std::vector<std::string> outFiles;   // split: design.hpp, then each part (main() goes to design.cpp)
+        std::unordered_map<std::string, std::string> rename;   // split with relocText: function -> its name after its text
         if (nf > 1) {
             // Process functions become external, declared in the header.
             std::string protos;
@@ -449,10 +451,102 @@ public:
                 }
                 c = std::move(out);
             }
+            // Signal numbers in the parts: link-time symbols (relocText).
+            std::vector<std::set<std::string>> csyms(chunks.size());
+            const bool reloc = relocOn() && !std::getenv("MSIM_FULLHDR");
+            std::vector<char> global(chunks.size(), 0);   // design.cpp: dispatch and tables, renumbered by any edit
+            std::string globalCode;
+            std::vector<std::string> kinds(chunks.size()), pkey(chunks.size());
+            if (reloc) {
+                buildSymOf();
+                // Each chunk's function, by name; the code of one process or one
+                // shared template stays in the parts, the rest (combAll, twoNow,
+                // the calls of a template with an instance's distances, ...)
+                // goes to design.cpp, which every edit rebuilds anyway.
+                auto fnName = [](const std::string& c) {
+                    size_t at = 0;
+                    while (at < c.size() && c.compare(at, 2, "//") == 0) at = c.find('\n', at) + 1;
+                    size_t nl = c.find('\n', at);
+                    std::string ln = c.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+                    std::string name;
+                    for (size_t i = 0; i < ln.size();) {
+                        if (std::isalpha((unsigned char)ln[i]) || ln[i] == '_') {
+                            size_t j = i;
+                            while (j < ln.size() && (std::isalnum((unsigned char)ln[j]) || ln[j] == '_')) j++;
+                            std::string id = ln.substr(i, j - i);
+                            if (j < ln.size() && ln[j] == '(' && id != "__attribute__" && id != "noinline" && id != "cold" && id != "used") { name = id; break; }
+                            i = j;
+                        } else i++;
+                    }
+                    return name;
+                };
+                auto localKind = [](const std::string& n) {
+                    size_t a = 0;
+                    while (a < n.size() && std::isalpha((unsigned char)n[a])) a++;
+                    std::string pre = n.substr(0, a);
+                    if (a == n.size() || !std::isdigit((unsigned char)n[a])) return std::string();
+                    static const char* ok[] = {"proc", "ds", "dsT", "combP", "combQ", "combC", "combD", "combPT", "combQT", "combCT", "commitS"};
+                    for (const char* k : ok) if (pre == k) return pre + (n.size() > 2 && n.compare(n.size() - 2, 2, "_2") == 0 ? "2" : "");
+                    return std::string();
+                };
+                std::vector<std::string> names(chunks.size());
+                for (size_t i = 0; i < chunks.size(); i++) {
+                    names[i] = fnName(chunks[i]);
+                    std::string k = localKind(names[i]);
+                    kinds[i] = k;
+                    if (k.empty() || chunks[i].find("{ dsT") != std::string::npos) global[i] = 1;
+                }
+                // A process's or template's function and its part are named
+                // after a key that neither a logic edit nor renumbering
+                // changes: its kind and the first signal it writes (an NBA
+                // slot), else the first it names, by symbol (a hash of the
+                // signal's name), with an ordinal for the same key twice.
+                // So a logic edit changes only that function's text: its
+                // part is rebuilt and design.cpp (which calls it) is not.
+                // Only the parts' code goes by symbols; design.cpp keeps the
+                // numbers (it is rebuilt on any edit, and has no extern decls).
+                for (size_t i = 0; i < chunks.size(); i++)
+                    if (!global[i]) chunks[i] = localNames(relocText(chunks[i], csyms[i]));
+                auto mapIds = mapIdents;
+                std::unordered_map<std::string, int> taken;
+                for (size_t i = 0; i < chunks.size(); i++) {
+                    if (global[i] || names[i].empty()) continue;
+                    std::string k = kinds[i];   // a process's 2-state copy goes with it
+                    if (!k.empty() && k.back() == '2') k.pop_back();
+                    std::string m;
+                    bool sl = false;
+                    for (auto& y : csyms[i]) if (y.compare(0, 3, "SL_") == 0) { sl = true; break; }
+                    for (auto& y : csyms[i]) {
+                        if (sl && y.compare(0, 3, "SL_") != 0) continue;
+                        std::string b = y.size() > 3 ? y.substr(3) : y;
+                        if (m.empty() || b < m) m = b;
+                    }
+                    std::string key = k + ":" + m;
+                    key += "#" + std::to_string(taken[kinds[i] + ":" + m]++);
+                    pkey[i] = key;
+                    uint64_t h = 1469598103934665603ULL;
+                    for (char c : key) h = (h ^ (unsigned char)c) * 1099511628211ULL;
+                    char hx[24];
+                    std::snprintf(hx, sizeof hx, "%012llx", (unsigned long long)(h & 0xffffffffffffULL));
+                    rename[names[i]] = kinds[i] + "_" + hx;
+                }
+                auto ren = [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; };
+                for (auto& c : chunks) c = mapIds(c, ren);
+                protos = mapIds(protos, ren);
+                cycHdr = mapIds(cycHdr, ren);
+                std::string pre = mapIds(o.str(), ren);
+                o.str("");
+                o << pre;
+                for (size_t i = 0; i < chunks.size(); i++) if (global[i]) globalCode += chunks[i];
+            }
             // The header: what does not depend on the design's numbering
             // (declSplit); the rest goes to the parts that name it, and all of
             // it to design.cpp.
             std::string stable = o.str() + "\n" + protos + cycHdr;
+            if (reloc)
+                stable += "#define MSIM_RELOC 1   // parts and simv without PIE (msim.cpp runCompiled)\n"
+                          "#define SGS(o) (*(Sig*)((char*)S.sigs.data() + (o)))\n"
+                          "#define SNI(x) ((int)(intptr_t)(x))\n";
             std::vector<HdrItem> hitems;
             if (!std::getenv("MSIM_FULLHDR")) { std::string all = std::move(stable); declSplit(all, stable, hitems); }
             std::unordered_map<std::string, int> howner;
@@ -474,6 +568,7 @@ public:
             std::vector<size_t> load(nf, 0);
             std::unordered_map<std::string, int> seen;
             for (size_t i = 0; i < chunks.size(); i++) {
+                if (global[i]) continue;
                 const std::string& c = chunks[i];
                 size_t at = 0;
                 while (at < c.size() && c.compare(at, 2, "//") == 0) { size_t nl = c.find('\n', at); at = nl == std::string::npos ? c.size() : nl + 1; }
@@ -487,7 +582,8 @@ public:
                     }
                     sig += c[k];
                 }
-                sig += "#" + std::to_string(seen[sig]++);
+                if (!pkey[i].empty()) sig = pkey[i];
+                else sig += "#" + std::to_string(seen[sig]++);
                 uint64_t h = 1469598103934665603ULL;
                 for (char ch : sig) h = (h ^ (unsigned char)ch) * 1099511628211ULL;
                 h ^= h >> 29;
@@ -500,15 +596,16 @@ public:
             for (int f = 0; f < nf; f++) {
                 std::sort(mine[f].begin(), mine[f].end());   // process order within a file
                 std::string body;
-                for (size_t i : mine[f]) body += chunks[i];
-                outFiles.push_back("#include \"design.hpp\"\n\n" + partDecls(body, hitems, howner) + "\n" + body);
+                std::set<std::string> syms;
+                for (size_t i : mine[f]) { body += chunks[i]; syms.insert(csyms[i].begin(), csyms[i].end()); }
+                outFiles.push_back("#include \"design.hpp\"\n\n" + relocDecls(syms) + partDecls(body, hitems, howner) + "\n" + body);
             }
             o.str("");
             o << (kernelObj ? "#include \"design.hpp\"\n\n" : "#include \"design.hpp\"\n\nSim S;\n\n");
             for (auto& h : hitems) o << h.decl;
             o << "\n";
             for (auto& h : hitems) o << h.def;
-            o << "\n";
+            o << "\n" << relocAsm() << "\n" << globalCode;
         } else
             for (auto& c : chunks) o << c;
         o << cyc;
@@ -716,7 +813,8 @@ public:
         if (outFiles.empty()) return o.str();
         // Files after one another, each after a marker line msim splits on.
         std::string all = std::string(kFileMark) + "design.hpp\n" + outFiles[0];
-        all += std::string(kFileMark) + "design.cpp\n" + o.str();
+        all += std::string(kFileMark) + "design.cpp\n" +
+               (rename.empty() ? o.str() : mapIdents(o.str(), [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; }));
         for (size_t f = 1; f < outFiles.size(); f++) all += std::string(kFileMark) + "part" + std::to_string(f - 1) + ".cpp\n" + outFiles[f];
         return all;
     }
@@ -1598,6 +1696,223 @@ private:
     // when signals were added or removed elsewhere: it is not rebuilt
     // (msim.cpp runCompiled). Anything not understood stays in the header,
     // which only costs that (MSIM_FULLHDR=1 keeps the whole header).
+    // ---- link-time signal numbers (split builds) ----
+    // A part names signals by their place in the signal table (S.sigs[N],
+    // P<N>), so adding or removing a signal anywhere renumbered the rest and
+    // changed every part. relocText writes those numbers as symbols named
+    // after the signal (SO_<name>: its byte offset in S.sigs, SN_<name>: its
+    // number, PV_<name>: its private copy), defined once in design.cpp
+    // (relocAsm) and resolved by the linker. A part then compiles to the same
+    // object until its own signals change. The code is the same as with the
+    // numbers: an absolute displacement or immediate (the parts and simv are
+    // built without PIE for this; msim.cpp runCompiled, MSIM_RELOC).
+    // x86-64 Linux only; MSIM_NORELOC=1 keeps the numbers.
+    std::vector<std::string> symOf_;          // signal -> symbol stem ("" when not relocated)
+    std::vector<std::array<int, 3>> slotSig_;   // NBA slot -> its target (sig, hi, lo), for slot symbols
+    std::vector<std::string> slotSym_;          // NBA slot -> its symbol ("" when not relocated)
+    std::map<std::string, std::string> relocSyms_;   // symbol -> its .set expression
+    static bool relocOn() {
+#if defined(__linux__) && defined(__x86_64__)
+        return !std::getenv("MSIM_NORELOC");
+#else
+        return false;
+#endif
+    }
+    void buildSymOf() {
+        symOf_.assign(sigName_.size(), "");
+        std::unordered_map<std::string, int> used;
+        for (size_t s = 0; s < sigName_.size(); s++) {
+            const std::string& n = sigName_[s];
+            if (n.empty()) continue;
+            uint64_t h = 1469598103934665603ULL;
+            for (char c : n) h = (h ^ (unsigned char)c) * 1099511628211ULL;
+            std::string m;
+            for (size_t i = n.size() > 48 ? n.size() - 48 : 0; i < n.size(); i++)
+                m += std::isalnum((unsigned char)n[i]) ? n[i] : '_';
+            char hx[24];
+            std::snprintf(hx, sizeof hx, "%012llx", (unsigned long long)(h & 0xffffffffffffULL));
+            std::string stem = std::string(hx) + "_" + m;
+            int& k = used[stem];
+            if (k++) stem += "_" + std::to_string(k - 1);   // the same name twice: in table order
+            symOf_[s] = stem;
+        }
+        // An NBA slot: its target's name, bits and how many slots before it
+        // have that same target.
+        slotSym_.assign(slotSig_.size(), "");
+        std::map<std::array<int, 3>, int> nth;
+        for (size_t k = 0; k < slotSig_.size(); k++) {
+            auto [sg, hi, lo] = slotSig_[k];
+            if (sg < 0 || (size_t)sg >= symOf_.size() || symOf_[(size_t)sg].empty()) continue;
+            int i = nth[slotSig_[k]]++;
+            slotSym_[k] = "SL_" + symOf_[(size_t)sg] + (hi >= 0 ? "_" + std::to_string(hi) + "_" + std::to_string(lo) : std::string()) +
+                          (i ? "_" + std::to_string(i) : std::string());
+        }
+    }
+    std::string relocText(const std::string& t, std::set<std::string>& syms) {
+        std::string r;
+        r.reserve(t.size() + t.size() / 4);
+        size_t last = 0, skipTo = 0;
+        auto stem = [&](long long n) -> const std::string* {
+            if (n < 0 || (size_t)n >= symOf_.size() || symOf_[(size_t)n].empty()) return nullptr;
+            return &symOf_[(size_t)n];
+        };
+        auto use = [&](const std::string& sym, const std::string& def) { syms.insert(sym); relocSyms_.emplace(sym, def); };
+        refScan(t, [&](size_t start, size_t at, size_t e, long long n, int kind) {
+            if (start < skipTo) return;
+            if (kind == 1) {   // P<N>: the private copy
+                const std::string* m = stem(n);
+                if (!m || !priv_.size() || (size_t)n >= priv_.size() || !priv_[(size_t)n]) return;
+                r.append(t, last, start - last);
+                std::string sym = "PV_" + *m;
+                use(sym, "PA+" + std::to_string(n) + "*%c1");
+                r += sym;
+                last = e;
+                return;
+            }
+            if (kind != 0) return;
+            const std::string* m = stem(n);
+            if (!m) return;
+            if (t.compare(start, 7, "S.sigs[") == 0) {
+                size_t close = t.find(']', e);
+                if (close == std::string::npos) return;
+                std::string rest = t.substr(e, close - e);
+                if (rest.find_first_of("[(") != std::string::npos) return;
+                std::string sym = "SO_" + *m;
+                use(sym, std::to_string(n) + "*%c0");
+                r.append(t, last, start - last);
+                r += "SGS((intptr_t)" + sym + (rest.empty() ? "" : " + (0" + rest + ") * (intptr_t)sizeof(Sig)") + ")";
+                last = close + 1;
+                skipTo = last;
+                return;
+            }
+            std::string sym = "SN_" + *m;
+            use(sym, std::to_string(n));
+            r.append(t, last, at - last);
+            r += "SNI(" + sym + ")";
+            last = e;
+        });
+        r.append(t, last, std::string::npos);
+        // PA[N + D<c>] (shared comb code, refParam): the private copy of the
+        // first instance, moved by D.
+        std::string o;
+        o.reserve(r.size());
+        for (size_t i = 0; i < r.size();) {
+            if (r.compare(i, 3, "PA[") == 0 && (i == 0 || !(std::isalnum((unsigned char)r[i - 1]) || r[i - 1] == '_')) && i + 3 < r.size() &&
+                std::isdigit((unsigned char)r[i + 3])) {
+                size_t e = i + 3;
+                while (e < r.size() && std::isdigit((unsigned char)r[e])) e++;
+                long long n = std::strtoll(r.c_str() + i + 3, nullptr, 10);
+                const std::string* m = stem(n);
+                size_t close = r.find(']', e);
+                if (m && (size_t)n < priv_.size() && priv_[(size_t)n] && close != std::string::npos &&
+                    r.substr(e, close - e).find_first_of("[(") == std::string::npos) {
+                    std::string sym = "PV_" + *m;
+                    use(sym, "PA+" + std::to_string(n) + "*%c1");
+                    o += "(&" + sym + ")[0" + r.substr(e, close - e) + "]";
+                    i = close + 1;
+                    continue;
+                }
+            }
+            o += r[i++];
+        }
+        // NBA slots: VA[k], HA[k], FA[k], CLP(k), with k + D<c> in shared code.
+        r.clear();
+        for (size_t i = 0; i < o.size();) {
+            size_t n = 0;
+            for (const char* p : {"VA[", "HA[", "FA[", "CLP("}) {
+                size_t l = std::strlen(p);
+                if (o.compare(i, l, p) == 0 && (i == 0 || !(std::isalnum((unsigned char)o[i - 1]) || o[i - 1] == '_')) && i + l < o.size() &&
+                    std::isdigit((unsigned char)o[i + l])) { n = l; break; }
+            }
+            if (n) {
+                size_t e = i + n;
+                while (e < o.size() && std::isdigit((unsigned char)o[e])) e++;
+                long long k = std::strtoll(o.c_str() + i + n, nullptr, 10);
+                if (k >= 0 && (size_t)k < slotSym_.size() && !slotSym_[(size_t)k].empty()) {
+                    const std::string& sym = slotSym_[(size_t)k];
+                    use(sym, std::to_string(k));
+                    r.append(o, i, n);
+                    r += "(intptr_t)" + sym;
+                    i = e;
+                    continue;
+                }
+            }
+            r += o[i++];
+        }
+        return r;
+    }
+    // Text that names nothing by number: labels (p<proc>_<pc>, cb<proc>_<k>,
+    // cq<proc>_<k>) and cold counters numbered within the chunk, the process
+    // number left out of "// process N (...)" comments. Labels are local to
+    // a function, so numbering them in order keeps them distinct.
+    static std::string localNames(const std::string& t) {
+        std::string r;
+        r.reserve(t.size());
+        std::unordered_map<std::string, int> lab;
+        int cold = 0;
+        auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+        for (size_t i = 0; i < t.size();) {
+            if (t.compare(i, 11, "// process ") == 0 && (i == 0 || t[i - 1] == '\n')) {
+                size_t e = i + 11;
+                while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
+                r += "// process";
+                i = e;
+                continue;
+            }
+            if (t.compare(i, 5, "COLD(") == 0 && (i == 0 || !idc(t[i - 1]))) {
+                size_t e = i + 5;
+                while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
+                if (e > i + 5) { r += "COLD(" + std::to_string(cold++); i = e; continue; }
+            }
+            if ((t[i] == 'p' || t.compare(i, 2, "cb") == 0 || t.compare(i, 2, "cq") == 0) && (i == 0 || !idc(t[i - 1]))) {
+                size_t a = i + (t[i] == 'p' ? 1 : 2), e = a;
+                while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
+                if (e > a && e < t.size() && t[e] == '_') {
+                    size_t f = e + 1;
+                    while (f < t.size() && std::isdigit((unsigned char)t[f])) f++;
+                    if (f > e + 1 && (f >= t.size() || !idc(t[f]))) {
+                        std::string tok = t.substr(i, f - i);
+                        auto [it, fresh] = lab.emplace(tok, (int)lab.size());
+                        r += "L" + std::to_string(it->second) + "_";
+                        i = f;
+                        continue;
+                    }
+                }
+            }
+            r += t[i++];
+        }
+        return r;
+    }
+    // design.cpp: the symbols, in one asm block (sizes from the compiler).
+    std::string relocAsm() const {
+        if (relocSyms_.empty()) return "";
+        std::string a = "__attribute__((used)) static void msimRelocSyms() {\n    asm volatile(\n";
+        for (auto& [sym, def] : relocSyms_) a += "        \".globl " + sym + "\\n.set " + sym + ", " + def + "\\n\"\n";
+        a += "        :: \"i\"(sizeof(Sig)), \"i\"(sizeof(PSig)));\n}\n";
+        return a;
+    }
+    // Each identifier of t through f.
+    static std::string mapIdents(const std::string& t, const std::function<std::string(const std::string&)>& f) {
+        std::string r;
+        r.reserve(t.size());
+        for (size_t i = 0; i < t.size();) {
+            if ((std::isalpha((unsigned char)t[i]) || t[i] == '_') && (i == 0 || !(std::isalnum((unsigned char)t[i - 1]) || t[i - 1] == '_'))) {
+                size_t j = i;
+                while (j < t.size() && (std::isalnum((unsigned char)t[j]) || t[j] == '_')) j++;
+                r += f(t.substr(i, j - i));
+                i = j;
+            } else r += t[i++];
+        }
+        return r;
+    }
+    static std::string relocDecls(const std::set<std::string>& syms) {
+        std::string d, so, pv;
+        for (auto& x : syms) (x[0] == 'P' ? pv : so) += (x[0] == 'P' ? (pv.empty() ? "" : ", ") : (so.empty() ? "" : ", ")) + x + (x[0] == 'P' ? "" : "[]");
+        if (!so.empty()) d += "extern \"C\" char " + so + ";\n";
+        if (!pv.empty()) d += "extern \"C\" PSig " + pv + ";\n";
+        return d;
+    }
+
     struct HdrItem {
         std::vector<std::string> names;   // what it declares
         std::string decl;                 // into each part that names one of them, and design.cpp
@@ -3330,6 +3645,8 @@ private:
             dsTmp[n] = hasTmp;
         }
         emitDomainFns(fns, fns2, dom, procs, dsB4, dsB2, dsTmp);
+        slotSig_.clear();
+        for (auto& sl : slots) slotSig_.push_back({sl.sig, sl.hi, sl.lo});
         // Dense arrays: the hot V and H of neighbouring slots share cache
         // lines (a Val is 56 bytes; interleaved, each slot took its own line).
         o << "static Val FA[" << std::max<size_t>(slots.size(), 1) << "]; static uint64_t VA[" << std::max<size_t>(slots.size(), 1)

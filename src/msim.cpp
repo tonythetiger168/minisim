@@ -1658,6 +1658,10 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     if (!files.empty()) {
         std::string cflags = " -std=c++20 " + opt + " -I" + shq(inc) + fstC;
+        // Signal numbers resolved at link time (codegen.hpp relocText): absolute
+        // symbols as displacements and immediates, so no PIE.
+        const bool reloc = files[0].second.find("#define MSIM_RELOC 1") != std::string::npos;
+        if (reloc) cflags += " -fno-pie";
         stamp = cflags + fstL + "\n" + stamp;
         bool sameFlags = slurp(dir + "/simv.stamp") == stamp;
         bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
@@ -1729,7 +1733,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         if (failed) return 1;
         if (!kernelReady()) return 1;   // a new kernel object relinks (simv.kobj)
         if (!jobs.empty() || !std::filesystem::exists(exe, ec) || slurp(dir + "/simv.kobj") != kobj) {
-            std::string link = shq(cc) + " " + opt;
+            std::string link = shq(cc) + " " + opt + (reloc ? " -no-pie" : "");
             for (auto& o : objs) link += " " + shq(o);
             if (!kobj.empty()) link += " " + shq(kobj);
             link += fstL + " -o " + shq(exe);
