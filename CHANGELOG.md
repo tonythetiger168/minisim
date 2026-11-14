@@ -11,6 +11,9 @@ Spec references are IEEE 1800-2023 clauses.
 - mvplat: Zvbb (and Zvkb): vector and-not, rotates, bit and byte reverses,
   count leading/trailing zeros, population count and the widening shift
   `vwsll`, at SEW 8 to 64; `zvbb`/`zvkb` in the device tree.
+- mvplat: Zvfh (and Zvfhmin): vector half precision at SEW 16 for every
+  floating-point instruction, conversions to and from single and 8/16/32-bit
+  integers, widening and reductions; checked against Zfh in all rounding modes.
 - dw: `MW_reset_sync`, `MW_pulse_sync`, `MW_data_sync` (clock domain
   crossing), `MW_8b10b_enc`/`MW_8b10b_dec`, `MW_sincos` (CORDIC), `MW_fir`
   and `MW_tap` (IEEE 1149.1), checked by `tests/dw/xing.sv`.

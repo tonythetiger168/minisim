@@ -99,15 +99,15 @@ static const uint8_t* vrsqrt7Table() {
     return t;
 }
 
-// vfrec7.v on one element of `bits` (32 or 64).
+// vfrec7.v on one element of `bits` (16, 32 or 64).
 static uint64_t vfrec7(uint64_t u, unsigned bits, unsigned rm, uint32_t& fl) {
-    const unsigned eb = bits == 32 ? 8 : 11, mb = bits == 32 ? 23 : 52;
+    const unsigned eb = bits == 16 ? 5 : bits == 32 ? 8 : 11, mb = bits == 16 ? 10 : bits == 32 ? 23 : 52;
     const int bias = (1 << (eb - 1)) - 1;
     const uint64_t sign = u >> (bits - 1) & 1;
     int64_t e = (int64_t)((u >> mb) & ((1ull << eb) - 1));
     uint64_t m = u & ((1ull << mb) - 1);
     const uint64_t sbit = sign << (bits - 1), emax = (1ull << eb) - 1;
-    const uint64_t qnan = bits == 32 ? fpu::QNAN32 : fpu::QNAN64;
+    const uint64_t qnan = bits == 16 ? fpu::QNAN16 : bits == 32 ? fpu::QNAN32 : fpu::QNAN64;
     if (e == (int64_t)emax) {
         if (m) { if (!(m >> (mb - 1))) fl |= fpu::NV; return qnan; }  // NaN
         return sbit;                                                    // +-inf -> +-0
@@ -133,13 +133,13 @@ static uint64_t vfrec7(uint64_t u, unsigned bits, unsigned rm, uint32_t& fl) {
 }
 // vfrsqrt7.v on one element.
 static uint64_t vfrsqrt7(uint64_t u, unsigned bits, uint32_t& fl) {
-    const unsigned eb = bits == 32 ? 8 : 11, mb = bits == 32 ? 23 : 52;
+    const unsigned eb = bits == 16 ? 5 : bits == 32 ? 8 : 11, mb = bits == 16 ? 10 : bits == 32 ? 23 : 52;
     const int bias = (1 << (eb - 1)) - 1;
     const uint64_t sign = u >> (bits - 1) & 1;
     int64_t e = (int64_t)((u >> mb) & ((1ull << eb) - 1));
     uint64_t m = u & ((1ull << mb) - 1);
     const uint64_t emax = (1ull << eb) - 1;
-    const uint64_t qnan = bits == 32 ? fpu::QNAN32 : fpu::QNAN64;
+    const uint64_t qnan = bits == 16 ? fpu::QNAN16 : bits == 32 ? fpu::QNAN32 : fpu::QNAN64;
     if (e == (int64_t)emax && m) { if (!(m >> (mb - 1))) fl |= fpu::NV; return qnan; }
     if (e == 0 && m == 0) { fl |= fpu::DZ; return (sign << (bits - 1)) | (emax << mb); }  // +-0 -> +-inf
     if (sign) { fl |= fpu::NV; return qnan; }                                              // negative
@@ -313,7 +313,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
         uint32_t fl = 0;
         const bool vf = f3 == 5;
         auto fscal = [&](unsigned bits) -> uint64_t {                  // f[rs1] at `bits`
-            return bits == 32 ? fpu::unbox(h.f[rs1]) : h.f[rs1];
+            return bits == 16 ? fpu::unbox16(h.f[rs1]) : bits == 32 ? fpu::unbox(h.f[rs1]) : h.f[rs1];
         };
         auto fdone = [&] {
             if (fl) { h.fcsr |= fl; h.mstatus |= MSTATUS_FS; }
@@ -322,21 +322,33 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             return VOK;
         };
         auto ar = [&](fpu::Op o, uint64_t a, uint64_t b, uint64_t c, unsigned bits) -> uint64_t {
+            if (bits == 16) return fpu::harith(o, (uint16_t)a, (uint16_t)b, (uint16_t)c, frm, fl);
             return bits == 32 ? fpu::arith<float>(o, (uint32_t)a, (uint32_t)b, (uint32_t)c, frm, fl)
                               : fpu::arith<double>(o, a, b, c, frm, fl);
         };
         auto fmin = [&](uint64_t a, uint64_t b, bool mx, unsigned bits) -> uint64_t {
+            if (bits == 16) return fpu::hminmax((uint16_t)a, (uint16_t)b, mx, fl);
             return bits == 32 ? fpu::minmax<float>((uint32_t)a, (uint32_t)b, mx, fl) : fpu::minmax<double>(a, b, mx, fl);
         };
         auto fcmp = [&](uint64_t a, uint64_t b, unsigned kind, unsigned bits) -> uint64_t {
+            if (bits == 16) return fpu::compare<double>(fpu::h2d((uint16_t)a), fpu::h2d((uint16_t)b), kind, fl);
             return bits == 32 ? fpu::compare<float>((uint32_t)a, (uint32_t)b, kind, fl) : fpu::compare<double>(a, b, kind, fl);
         };
-        const bool fpSew = sew == 32 || sew == 64;
-        // Widening forms (SEW 32 only: 64 is the widest).
+        // A narrow float to twice its width, exactly (a signaling NaN raises NV).
+        auto widen = [&](uint64_t a) -> uint64_t {
+            return sew == 16 ? fpu::dToS(fpu::h2d((uint16_t)a), fpu::RNE, fl) : fpu::sToD((uint32_t)a, fl);
+        };
+        auto sgnj = [&](uint64_t a, uint64_t b, unsigned k) -> uint64_t {
+            if (sew == 16) return fpu::sgnj<uint16_t>((uint16_t)a, (uint16_t)b, k);
+            return sew == 32 ? fpu::sgnj<uint32_t>((uint32_t)a, (uint32_t)b, k) : fpu::sgnj<uint64_t>(a, b, k);
+        };
+        // Zvfh: SEW 16 is half precision.
+        const bool fpSew = sew == 16 || sew == 32 || sew == 64;
+        // Widening forms (SEW 16 or 32: 64 is the widest).
         const bool widening = f6 >= 0x30 || (f6 == 0x12 && rs1 >= 8 && rs1 < 16);
         // Conversions accept integer SEWs too; the rest need an FP SEW.
         if (f6 != 0x12 && !fpSew) return VILL;
-        if ((widening || f6 == 0x31 || f6 == 0x33) && f6 != 0x12 && sew != 32) return VILL;
+        if ((widening || f6 == 0x31 || f6 == 0x33) && f6 != 0x12 && sew == 64) return VILL;
         const uint64_t fsc = vf ? fscal(sew) : 0;
         auto op1 = [&](uint64_t i) -> uint64_t { return vf ? fsc : vget(h, rs1, i, sB); };
 
@@ -345,12 +357,12 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             if (vf || h.vstart) return VILL;
             if (vl == 0) return fdone();
             const bool wide = f6 == 0x31 || f6 == 0x33;
-            const unsigned ob = wide ? 64 : sew;
+            const unsigned ob = wide ? 2 * sew : sew;
             uint64_t acc = vget(h, rs1, 0, ob / 8);
             for (uint64_t i = 0; i < vl; i++) {
                 if (!active(i)) continue;
                 uint64_t e = vget(h, rs2, i, sB);
-                if (wide) e = fpu::sToD((uint32_t)e, fl);
+                if (wide) e = widen(e);
                 if (f6 == 0x05 || f6 == 0x07) acc = fmin(acc, e, f6 == 0x07, ob);
                 else acc = ar(fpu::Op::Add, acc, e, 0, ob);
             }
@@ -361,7 +373,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             if (!vf) {
                 if (rs1 || !vm) return VILL;
                 uint64_t e = vget(h, rs2, 0, sB);
-                h.f[rd] = sew == 32 ? fpu::box((uint32_t)e) : e;
+                h.f[rd] = sew == 16 ? fpu::box16((uint16_t)e) : sew == 32 ? fpu::box((uint32_t)e) : e;
                 h.mstatus |= MSTATUS_FS;
                 wrd = 32 + (int)rd; wval = h.f[rd];
                 h.vstart = 0;
@@ -420,7 +432,10 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                     if (!active(i)) continue;
                     uint64_t a = vget(h, rs2, i, sB), r;
                     const bool sg = k & 1;
-                    if (k == 0 || k == 1 || k == 6 || k == 7)
+                    if (sew == 16) {
+                        if (k == 0 || k == 1 || k == 6 || k == 7) r = fpu::toInt<double>(fpu::h2d((uint16_t)a), rmode, sg, 16, fl);
+                        else r = fpu::hFromInt(k == 3 ? vsext(a, 16) : a, k == 3, 32, rmode, fl);
+                    } else if (k == 0 || k == 1 || k == 6 || k == 7)
                         r = sew == 32 ? fpu::toInt<float>((uint32_t)a, rmode, sg, 32, fl) : fpu::toInt<double>(a, rmode, sg, 64, fl);
                     else
                         r = sew == 32 ? fpu::fromInt<float>(a, k == 3, 32, rmode, fl) : fpu::fromInt<double>(a, k == 3, 64, rmode, fl);
@@ -431,14 +446,24 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             const unsigned dregs = t.lmul + 1 > 0 ? 1u << (t.lmul + 1) : 1u;
             if (k < 16) {                                              // widening: SEW -> 2*SEW
                 if (k == 13 || t.lmul + 1 > 3) return VILL;
-                // from a float: single only; from an integer: 16 or 32 bits
-                if ((k == 10 || k == 11) ? (sew != 16 && sew != 32) : sew != 32) return VILL;
+                // from a float: half or single; from an integer: 8, 16 or 32 bits
+                if ((k == 10 || k == 11) ? (sew > 32) : (sew != 16 && sew != 32)) return VILL;
                 if (!aligned(rd, dregs) || !aligned(rs2, lregs)) return VILL;
                 if (rd < rs2 + lregs && rs2 < rd + dregs && !(rs2 == rd + dregs - lregs && t.lmul >= 0)) return VILL;
                 if (!vm && rd == 0) return VILL;
                 for (uint64_t i = h.vstart; i < vl; i++) {
                     if (!active(i)) continue;
                     uint64_t a = vget(h, rs2, i, sB), r;
+                    if (sew <= 16 && k != 10 && k != 11) {                // from half
+                        r = k == 12 ? widen(a) : fpu::toInt<double>(fpu::h2d((uint16_t)a), rmode, k & 1, 32, fl);
+                        vset(h, rd, i, 2 * sB, r & 0xffffffffu);
+                        continue;
+                    }
+                    if (sew == 8) {                                   // an 8-bit integer to half
+                        r = fpu::hFromInt(k == 11 ? vsext(a, 8) : a, k == 11, 32, rmode, fl);
+                        vset(h, rd, i, 2, r);
+                        continue;
+                    }
                     switch (k) {
                         case 8: case 14: r = fpu::toInt<float>((uint32_t)a, rmode, false, 64, fl); break;
                         case 9: case 15: r = fpu::toInt<float>((uint32_t)a, rmode, true, 64, fl); break;
@@ -456,14 +481,31 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             }
             // narrowing: 2*SEW -> SEW
             if (k > 23 || t.lmul + 1 > 3) return VILL;
-            // to an integer: 16 or 32 bits; to a float: single only
-            if ((k == 16 || k == 17 || k == 22 || k == 23) ? (sew != 16 && sew != 32) : sew != 32) return VILL;
+            // to an integer: 8, 16 or 32 bits; to a float: half or single
+            if ((k == 16 || k == 17 || k == 22 || k == 23) ? (sew > 32) : (sew != 16 && sew != 32)) return VILL;
             if (!aligned(rd, lregs) || !aligned(rs2, dregs)) return VILL;
             if (rd < rs2 + dregs && rs2 < rd + lregs && rd != rs2) return VILL;  // only the lowest part may overlap
             if (!vm && rd == 0) return VILL;
             for (uint64_t i = h.vstart; i < vl; i++) {
                 if (!active(i)) continue;
                 uint64_t a = vget(h, rs2, i, 2 * sB), r;
+                if (sew == 8) {                                       // half to an 8-bit integer
+                    r = fpu::toInt<double>(fpu::h2d((uint16_t)a), rmode, k & 1, 8, fl);
+                    vset(h, rd, i, 1, r & 0xff);
+                    continue;
+                }
+                if (sew == 16 && k >= 18 && k <= 21) {                // to half
+                    if (k == 18 || k == 19) r = fpu::hFromInt(a, k == 19, 32, rmode, fl);
+                    else if (k == 20) r = fpu::d2h(fpu::sToD((uint32_t)a, fl), rmode, fl);
+                    else {                                            // vfncvt.rod.f.f.w
+                        uint32_t f2 = 0;
+                        r = fpu::d2h(fpu::sToD((uint32_t)a, f2), fpu::RTZ, f2);
+                        if ((f2 & fpu::NX) && ((r >> 10) & 31) != 31) r |= 1;
+                        fl |= f2;
+                    }
+                    vset(h, rd, i, 2, r);
+                    continue;
+                }
                 switch (k) {
                     case 16: case 22:
                         r = sew == 16 ? fpu::toInt<float>((uint32_t)a, rmode, false, 16, fl) : fpu::toInt<double>(a, rmode, false, 32, fl);
@@ -497,7 +539,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                 if (k == 0) r = ar(fpu::Op::Sqrt, a, 0, 0, sew);
                 else if (k == 4) r = vfrsqrt7(a, sew, fl);
                 else if (k == 5) r = vfrec7(a, sew, frm, fl);
-                else r = sew == 32 ? fpu::classify<float>((uint32_t)a) : fpu::classify<double>(a);
+                else r = sew == 16 ? fpu::hclassify((uint16_t)a) : sew == 32 ? fpu::classify<float>((uint32_t)a) : fpu::classify<double>(a);
                 vset(h, rd, i, sB, r);
             }
             return fdone();
@@ -513,13 +555,13 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             auto clash = [&](unsigned s) { return s < rd + dregs && rd < s + lregs && !(s == rd + dregs - lregs && t.lmul >= 0); };
             if ((!wideSrc2 && clash(rs2)) || (!vf && clash(rs1))) return VILL;
         }
-        const unsigned ob = wideDst ? 64 : sew;
+        const unsigned ob = wideDst ? 2 * sew : sew;
         for (uint64_t i = h.vstart; i < vl; i++) {
             if (!active(i)) continue;
-            uint64_t a = vget(h, rs2, i, wideSrc2 ? 8 : sB), b = op1(i), d = vget(h, rd, i, ob / 8), r;
+            uint64_t a = vget(h, rs2, i, wideSrc2 ? 2 * sB : sB), b = op1(i), d = vget(h, rd, i, ob / 8), r;
             if (wideDst) {
-                if (!wideSrc2) a = fpu::sToD((uint32_t)a, fl);
-                b = fpu::sToD((uint32_t)b, fl);
+                if (!wideSrc2) a = widen(a);
+                b = widen(b);
             }
             switch (f6) {
                 case 0x00: case 0x30: case 0x34: r = ar(fpu::Op::Add, a, b, 0, ob); break;
@@ -527,9 +569,9 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                 case 0x27: if (!vf) return VILL; r = ar(fpu::Op::Sub, b, a, 0, ob); break;  // vfrsub
                 case 0x04: r = fmin(a, b, false, ob); break;
                 case 0x06: r = fmin(a, b, true, ob); break;
-                case 0x08: r = sew == 32 ? fpu::sgnj<uint32_t>((uint32_t)a, (uint32_t)b, 0) : fpu::sgnj<uint64_t>(a, b, 0); break;
-                case 0x09: r = sew == 32 ? fpu::sgnj<uint32_t>((uint32_t)a, (uint32_t)b, 1) : fpu::sgnj<uint64_t>(a, b, 1); break;
-                case 0x0a: r = sew == 32 ? fpu::sgnj<uint32_t>((uint32_t)a, (uint32_t)b, 2) : fpu::sgnj<uint64_t>(a, b, 2); break;
+                case 0x08: r = sgnj(a, b, 0); break;
+                case 0x09: r = sgnj(a, b, 1); break;
+                case 0x0a: r = sgnj(a, b, 2); break;
                 case 0x20: r = ar(fpu::Op::Div, a, b, 0, ob); break;
                 case 0x21: if (!vf) return VILL; r = ar(fpu::Op::Div, b, a, 0, ob); break;  // vfrdiv
                 case 0x24: case 0x38: r = ar(fpu::Op::Mul, a, b, 0, ob); break;
