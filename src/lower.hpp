@@ -3015,11 +3015,16 @@ struct Lowerer {
     }
 
     // string (6.16): a string-typed expression is lowered by exprStr.
+    // A literal's text as a string value: its \0 characters are dropped (6.16).
+    static std::string litText(const slang::ast::StringLiteral& l) {
+        std::string t(l.getValue());
+        std::erase(t, '\0');
+        return t;
+    }
     E strOf(const slang::ast::Expression& e) {   // a string, or an integral value as one
         if (e.type->isString()) return exprStr(e);
         const auto& p = peel(e);   // a literal keeps its text, whatever its length
-        if (p.kind == slang::ast::ExpressionKind::StringLiteral)
-            return konst(mkstr(std::string(p.as<slang::ast::StringLiteral>().getValue())));
+        if (p.kind == slang::ast::ExpressionKind::StringLiteral) return konst(mkstr(litText(p.as<slang::ast::StringLiteral>())));
         if (E j = streamStrings(p)) return j;
         if (p.kind == slang::ast::ExpressionKind::Concatenation) {   // {"ab", "cd"} given to a string
             bool lits = true;
@@ -3213,8 +3218,7 @@ struct Lowerer {
         using namespace slang::ast;
         if (const auto* ps = paramMember(e)) return constSym(*ps, e, ExprCtx{});   // h.P (8.25)
         switch (e.kind) {
-            case ExpressionKind::StringLiteral:
-                return konst(mkstr(std::string(e.as<StringLiteral>().getValue())));
+            case ExpressionKind::StringLiteral: return konst(mkstr(litText(e.as<StringLiteral>())));
             case ExpressionKind::Conversion: return strOf(e.as<ConversionExpression>().operand());
             case ExpressionKind::Concatenation: {
                 std::vector<E> parts;
@@ -3242,7 +3246,7 @@ struct Lowerer {
                     auto args = call.arguments();
                     auto f = node(Op::SFormat);
                     hierName = scopeName(call); libName = libCell(call);
-                    formatInto(args, 'd', f->fmt, f->kids);
+                    if (!dynFormat(args, f->fmt, f->kids)) formatInto(args, 'd', f->fmt, f->kids);
                     return f;
                 }
                 if (isStrMethodCall(call)) return strMethod(call, strMethodId(n));
@@ -3279,6 +3283,47 @@ struct Lowerer {
         } v;
         x.visit(v);
         return v.found;
+    }
+    // x[i++] += 2 (11.4.1): the target of a compound assignment is
+    // evaluated once. Selectors in it with side effects are taken into
+    // temporaries first, and both the read and the write use them.
+    std::vector<const slang::ast::Expression*> pinSelectors(const slang::ast::Expression& left) {
+        using namespace slang::ast;
+        std::vector<const Expression*> sels;
+        std::function<void(const Expression&)> walk = [&](const Expression& x) {
+            switch (x.kind) {
+            case ExpressionKind::ElementSelect: {
+                const auto& es = x.as<ElementSelectExpression>();
+                walk(es.value());
+                if (sideEffects(es.selector())) sels.push_back(&es.selector());
+                break;
+            }
+            case ExpressionKind::RangeSelect: {
+                const auto& rs = x.as<RangeSelectExpression>();
+                walk(rs.value());
+                if (sideEffects(rs.left())) sels.push_back(&rs.left());
+                if (sideEffects(rs.right())) sels.push_back(&rs.right());
+                break;
+            }
+            case ExpressionKind::MemberAccess: walk(x.as<MemberAccessExpression>().value()); break;
+            default: break;
+            }
+        };
+        walk(left);
+        std::erase_if(sels, [&](const Expression* x) { return exprOverride.count(x) > 0; });   // pinned by an outer ++
+        for (const Expression* sel : sels) {
+            int w = std::max(1, (int)sel->type->getBitWidth());
+            needWidth(w);
+            int t = fresh(w);
+            Instr h; h.k = IK::Assign; h.sig = t;
+            h.e = resize(expr(*sel), w, sel->type->isSigned(), sel->type->isSigned());
+            prog.emit(h);
+            exprOverride[sel] = t;
+        }
+        return sels;
+    }
+    void unpin(const std::vector<const slang::ast::Expression*>& sels) {
+        for (auto* x : sels) exprOverride.erase(x);
     }
     // The value of e as a new temporary, by its type.
     E asType(const slang::ast::Type& t, int sig, bool sgn) {
@@ -3495,7 +3540,10 @@ struct Lowerer {
                 left = fresh(1);
                 Instr s; s.k = IK::Assign; s.sig = left; s.e = ref(tmp); prog.emit(s);
             }
-            Instr j; j.k = IK::JmpIfNot; j.e = andOp ? ref(tmp) : un(Op::LogNot, ref(tmp));
+            // The right side is skipped only when the left decides: a known 0
+            // for &&, a known 1 for ||; an x or z left side runs it (11.4.7).
+            Instr j; j.k = IK::JmpIfNot;
+            j.e = un(Op::LogNot, bin(Op::CaseEq, ref(tmp), konst(make(andOp ? 0 : 1, 0, 1))));
             size_t jf = prog.emit(j);
             Instr r; r.k = IK::Assign; r.sig = tmp; r.e = bin(andOp ? Op::LogAnd : Op::LogOr, ref(tmp), truthE(b.right()));
             prog.emit(r);
@@ -3548,8 +3596,20 @@ struct Lowerer {
         if (!raw && e.type->isFloating()) return exprReal(e);
         if (!raw && e.type->isString()) return exprStr(e);
         switch (e.kind) {
-            case ExpressionKind::IntegerLiteral:
-                return svLit(e.as<IntegerLiteral>().getValue(), e.type->isSigned(), ctx);
+            case ExpressionKind::IntegerLiteral: {
+                const auto& il = e.as<IntegerLiteral>();
+                const slang::SVInt& sv = il.getValue();
+                // An unsized unsigned literal whose top bit is x or z ('hx1,
+                // 'bz) extends with that bit to the width of its expression (5.7.1).
+                int bw = (int)sv.getBitWidth();
+                int to = std::max((int)e.type->getBitWidth(), ctx.live && ctx.w > 0 ? ctx.w : 0);
+                if (il.isDeclaredUnsized && !sv.isSigned() && sv.hasUnknown() && to > bw && sv[bw - 1].isUnknown()) {
+                    slang::SVInt wide = sv.sext((slang::bitwidth_t)to);
+                    wide.setSigned(false);
+                    return svLit(wide, false, ctx);
+                }
+                return svLit(sv, e.type->isSigned(), ctx);
+            }
             case ExpressionKind::NullLiteral: {     // a chandle's null (6.14)
                 Val z = make(0, 0, ctx.live && ctx.w > 0 ? ctx.w : 64);
                 return konst(z);
@@ -5512,10 +5572,12 @@ struct Lowerer {
                     needWidth(w);
                     bool post = u.op == UnaryOperator::Postincrement || u.op == UnaryOperator::Postdecrement;
                     int tmp = fresh(w);
+                    auto pins = pinSelectors(u.operand());
                     Instr save; save.k = IK::Assign; save.sig = tmp; save.e = expr(u.operand());
                     if (post) prog.emit(save);
                     exprStmt(e);
                     if (!post) { save.e = expr(u.operand()); prog.emit(save); }
+                    unpin(pins);
                     return sized(ref(tmp, u.operand().type->isSigned()), w, u.operand().type->isSigned(), ctx);
                 }
                 // ~a, -a, +a are context-determined (11.6.1): the operand is
@@ -5933,7 +5995,7 @@ struct Lowerer {
 
     // ---------- statements ----------
     // Collect (signal, edge) pairs from a SignalEvent or EventList control.
-    // BothEdges is approximated as ANY. (@* is handled in timing()/finishImplicit().)
+    // BothEdges is a posedge and a negedge entry. (@* is handled in timing()/finishImplicit().)
     void collectEvents(const slang::ast::TimingControl& t, std::vector<std::pair<int, Edge>>& ev) {
         using namespace slang::ast;
         if (t.kind == TimingControlKind::SignalEvent) {
@@ -5970,6 +6032,11 @@ struct Lowerer {
                 // edge is that value's least significant bit (9.4.2).
                 if (!eventExprHook()) unsupported("event on non-signal");
                 sig = eventExprHook()(s.expr);
+            }
+            if (s.edge == EdgeKind::BothEdges) {   // edge = posedge or negedge: not x <-> z (9.4.2)
+                ev.push_back({sig, POS});
+                ev.push_back({sig, NEG});
+                return;
             }
             Edge e = s.edge == EdgeKind::PosEdge ? POS : s.edge == EdgeKind::NegEdge ? NEG : ANY;
             ev.push_back({sig, e});
@@ -7303,6 +7370,20 @@ struct Lowerer {
         if (x.type->isUnpackedStruct() || x.type->isUnpackedUnion()) { pfmtStruct(*x.type, expr(x), fmt, out); return; }
         pfmtSingular(*x.type, expr(x), fmt, out);
     }
+    // $sformat / $sformatf take their format from the second (first)
+    // argument even when it is a variable (21.3.3): if it is not a literal,
+    // the format is read when the call runs.
+    template <typename Args>
+    bool dynFormat(const Args& argv, std::string& fmt, std::vector<E>& out) {
+        using namespace slang::ast;
+        if (argv.empty()) return false;
+        const Expression& f = peel(*argv[0]);
+        if (f.kind == ExpressionKind::StringLiteral || f.kind == ExpressionKind::EmptyArgument) return false;
+        fmt = "%Y";
+        out.push_back(strOf(*argv[0]));
+        for (size_t k = 1; k < argv.size(); k++) out.push_back(expr(*argv[k]));
+        return true;
+    }
     template <typename Args>
     void formatInto(const Args& argv, char dflt, std::string& fmt, std::vector<E>& out) {
         using namespace slang::ast;
@@ -8090,7 +8171,8 @@ struct Lowerer {
             lhs(*dst, i);
             auto f = node(Op::SFormat);
             hierName = scopeName(call); libName = libCell(call);
-            formatInto(args.subspan(1), 'd', f->fmt, f->kids);
+            if (n == "$swrite" || !dynFormat(args.subspan(1), f->fmt, f->kids))
+                formatInto(args.subspan(1), 'd', f->fmt, f->kids);
             i.e = dst->type->isString() ? f : E(node(Op::StrToInt, {f}));
             if (!dst->type->isString()) i.e->hi = (int)dst->type->getBitWidth();
             prog.emit(i);
@@ -9360,6 +9442,8 @@ struct Lowerer {
             }
             Instr i;
             i.k = a.isNonBlocking() ? IK::Nba : IK::Assign;
+            std::vector<const Expression*> pins;
+            if (a.isCompound()) pins = pinSelectors(a.left());
             lhs(a.left(), i);
             if (i.dyn >= 0 && (a.isNonBlocking() || a.timingControl))
                 unsupported("nonblocking or delayed write to a container element");
@@ -9367,6 +9451,7 @@ struct Lowerer {
             if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
             lvalue = saved;
+            unpin(pins);
             if (!a.isCompound()) i.e = cloneConts(*a.left().type, i.e);   // a struct's containers are copied (7.2)
             if (const TimingControl* tc = a.timingControl; tc && tc->kind != TimingControlKind::Delay) {
                 // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
@@ -9478,8 +9563,14 @@ struct Lowerer {
             bool dec = u.op == UnaryOperator::Predecrement || u.op == UnaryOperator::Postdecrement;
             if (!inc && !dec) unsupported("unary operator as statement");
             Instr i; i.k = IK::Assign;
+            auto pins = pinSelectors(u.operand());   // a[i++]++ reads and writes one element
             lhs(u.operand(), i);
-            i.e = bin(inc ? Op::Add : Op::Sub, expr(u.operand()), konst(mk(1, 32)));
+            if (u.operand().type->isFloating()) {   // r++ on a real adds 1.0 (11.4.2)
+                i.e = bin(inc ? Op::FAdd : Op::FSub, exprReal64(u.operand()), realK(1.0));
+                if (u.operand().type->getBitWidth() == 32) { auto m = node(Op::FMath, {i.e}); m->hi = M_F32; i.e = m; }
+            } else
+                i.e = bin(inc ? Op::Add : Op::Sub, expr(u.operand()), konst(mk(1, 32)));
+            unpin(pins);
             prog.emit(i);
         } else if (ex.kind == ExpressionKind::Call) {
             const auto& call = ex.as<CallExpression>();
