@@ -1525,7 +1525,7 @@ private:
     std::string assign(const Instr& i, std::string val = "") {
         if (val.empty()) val = fast(i.e);
         std::ostringstream o;
-        if (i.tmp || i.xq) {   // a temporary of the process, or a quiet -xprop write: no change event
+        if ((i.tmp || i.xq) && !isPriv(i.sig)) {   // a temporary of the process, or a quiet -xprop write: no change event
             o << " S.poke(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
             return o.str();
         }
@@ -2575,6 +2575,7 @@ private:
         std::vector<int> arms;
         std::vector<int> whyL(ns, 0), whyP(ns, -1);   // MSIM_WHYPRIV: the line that kept each candidate in S.sigs
         std::vector<int> owner(ns, -1);   // the branching comb process that writes a candidate
+        std::vector<int> tmpOwner(ns, -1);   // the domain process whose temporary a candidate is
         std::vector<char> mine(procs.size(), 0);
         for (int i : dom) mine[i] = 1;
         for (size_t i = 0; i < procs.size(); i++) if (procs[i].combRank >= 0) mine[i] = 1;
@@ -2616,7 +2617,15 @@ private:
                 for (auto& in : procs[i].prog->code)
                     if (in.k == IK::Nba && in.sig >= 0 && (size_t)in.sig < ns) {
                         if (in.hi < 0 || sigs[in.sig].w > 64) cand[in.sig] = 1; else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
-                    } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) (bad[in.sig] = 1, whyL[in.sig] = __LINE__);   // a temporary: kept in S.sigs
+                    } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) {
+                        // A temporary of this process (a decoder's locals): private
+                        // when it is written whole, by this process only. Two
+                        // processes would race on it when the domain runs in parallel.
+                        bool whole = in.tmp && in.hi < 0 && in.drv < 0 && !in.arr && in.aidx.empty() && !in.bidx &&
+                                     sigs[in.sig].w <= 64 && !std::getenv("MSIM_NOPRIVTMP");
+                        if (whole && (tmpOwner[in.sig] < 0 || tmpOwner[in.sig] == (int)i)) { tmpOwner[in.sig] = (int)i; cand[in.sig] = 1; }
+                        else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
+                    }
                 continue;
             }
             if (armShape(procs[i], sigs)) { arms.push_back((int)i); continue; }   // its wait: armChk
@@ -3282,7 +3291,12 @@ private:
                         if (!i.tmp) throw CodegenUnsupported("instruction in a clocked process");
                         for (auto& a : i.aidx) noteRefs(a);
                         if (i.bidx) { noteRefs(i.bidx); fns << dynTarget(i, fast(i.e), " S.poke(s, v, hi, lo);", true); }
-                        else fns << assign(i);
+                        else if (isPriv(i.sig) && i.hi < 0) {   // a private temporary (privateSigs): no write through the kernel
+                            std::string g, u, sl;
+                            if (!split(i.e, g, u, sl)) fns << " " << pw(i.sig, sl) << "\n";
+                            else if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
+                            else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(pw(i.sig, sl)) << "\n";
+                        } else fns << assign(i);
                         hasTmp = true;
                         break;
                     default: throw CodegenUnsupported("instruction in a clocked process");
