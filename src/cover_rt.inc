@@ -320,6 +320,29 @@ struct WideValIt {
 // a `with` bin keeps those for which the expression is true (19.5.1.1); in a
 // wildcard bin x, z and ? bits take both values (19.5.1); and the single
 // values of a transition step make name[] transition bins (19.5.2).
+// Whether the items of a bin of a wide coverpoint hold more than 2^24
+// values (too many to list for a with clause).
+inline bool wideMany(const CgCpDef& c, const std::vector<CgItem>& items) {
+    int W = c.w + 2;
+    Val lim = mk(1u << 24, W), total = mk(0, W);
+    for (const auto& it : items) {
+        if (!it.range) { total = v_add(total, mk(1, W)); continue; }
+        if (it.loMin || it.hiMax) return true;
+        Val lo = eval(it.lo, rd), hi = eval(it.hi, rd);
+        if (unknownAny(lo) || unknownAny(hi)) continue;
+        auto off = [&](Val v) {   // the value's place from the lowest, unsigned
+            v = v_resize(v, c.w, false);
+            if (c.sgn) v = v_insert(v, mk(~v_slice(v, c.w - 1, c.w - 1).v & 1, 1), c.w - 1, c.w - 1);
+            v.sgn = false;
+            return v_resize(v, W, false);
+        };
+        Val a = off(lo), b = off(hi);
+        if (v_lt(b, a).v & 1) std::swap(a, b);
+        total = v_add(total, v_add(v_sub(b, a), mk(1, W)));
+        if (!(v_lt(total, lim).v & 1)) return true;
+    }
+    return false;
+}
 inline std::vector<Val> wideValues(const CgCpDef& c, const std::vector<CgItem>& items, const CgBinDef* with, bool wildcard) {
     int W = c.w + 2;
     auto off = [&](Val v) {
@@ -647,6 +670,7 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
     std::vector<std::pair<Val, Val>> wideAuto;   // a wide coverpoint's automatic bins, [lo, hi]
     std::unordered_map<size_t, std::vector<std::vector<std::pair<Val, Val>>>> wideParts;   // array bins of a wide coverpoint
     std::unordered_map<size_t, std::vector<Val>> wideWith;   // with bins of a wide coverpoint: the values kept
+    std::unordered_set<size_t> predWide;   // with bins of a wide coverpoint over too many values to list
     if (c.wide) {   // the bounds of every value bin, in order (keyOf)
         if (std::none_of(c.bins.begin(), c.bins.end(), [](const CgBinDef& b) { return b.kind == 0 || b.dflt; })) {
             // Automatic bins (19.5.3): the 2^w values in autoBinMax equal parts,
@@ -685,6 +709,10 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
         // become bounds too, so each bin is a run of keys.
         for (size_t bi = 0; bi < c.bins.size(); bi++) {
             const CgBinDef& bd = c.bins[bi];
+            if (bd.with && !bd.array && (bd.allValues || bd.wildcard || wideMany(c, bd.items))) {
+                predWide.insert(bi);   // checked when sampled (CgBin::pred)
+                continue;
+            }
             if (bd.with || (bd.array && bd.wildcard) || bd.setIdx >= 0) {   // each value its own bound
                 std::vector<CgItem> items = bd.items;
                 if (bd.setIdx >= 0) {   // bins b = q; (19.5.1.2): the container's values now
@@ -776,6 +804,14 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
                 uint64_t k = keyOf(c, v);
                 seq.push_back({k, k});
             }
+        }
+        // A single with bin over more values than can be listed: the with
+        // expression is checked on each sampled value instead (CgBin::pred).
+        bool predBin = bd.with && !bd.array &&
+                       (c.wide ? predWide.count((size_t)(&bd - c.bins.data())) > 0
+                               : rangesSize(seq) > (i128)(1u << 24) || !wild.empty());
+        if (predBin) {
+        } else if (c.wide && wideWith.count((size_t)(&bd - c.bins.data()))) {   // the values were found above
         } else if (bd.with) {   // keep the values for which the with expression is true (19.5.1.1)
             std::vector<KR> kept;
             size_t n = 0;
@@ -800,7 +836,7 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
                     if (k == kmask(c.w)) break;
                 }
             }
-        if (bd.kind == 1 || bd.kind == 2)
+        if ((bd.kind == 1 || bd.kind == 2) && !predBin)   // a with bin checked on the value excludes at sampling
             for (auto& r : seq) excl.push_back(r);
         if (bd.kind == 0) explicitBins = true;
         auto mkBin = [&](std::string name, std::vector<KR> rs) {
@@ -828,6 +864,14 @@ inline void buildCp(const CgCpDef& c, CgCpInst& ci, int64_t autoBinMax, double r
                 ci.bins.back().wild = wild;
                 ci.bins.back().wwild = std::move(wwild);
                 ci.bins.back().xvals = xv;
+            }
+            if (predBin) {
+                CgBin& b = ci.bins.back();
+                b.pred = bd.with;
+                b.predItem = bd.itemSig;
+                b.predW = c.w;
+                b.predSgn = c.sgn;
+                b.xvals.clear();   // with is on known values only
             }
         } else if (!bd.count) {   // name[]: one bin per distinct value
             std::unordered_set<uint64_t> seen;
@@ -894,15 +938,21 @@ inline bool binMatch(const CgBin& b, uint64_t k, const Val& v, bool hasX) {
             if (x.w > 64 ? x == v : ((x.v ^ v.v) & kmask(x.w)) == 0 && ((x.x ^ v.x) & kmask(x.w)) == 0 && ((x.z ^ v.z) & kmask(x.w)) == 0) return true;
         return false;
     }
-    if (inPairs(b.ranges, k)) return true;
+    bool in = inPairs(b.ranges, k);
     for (auto& [care, val] : b.wild)
-        if ((k & care) == val) return true;
+        if (!in && (k & care) == val) in = true;
     for (auto& [care, val] : b.wwild) {
-        bool ok = true;
+        bool ok = !in;
         for (size_t i = 0; i < care.size() && ok; i++) ok = (limbV(v, (int)i) & care[i]) == val[i];
-        if (ok) return true;
+        if (ok) in = true;
     }
-    return false;
+    if (in && b.pred) {   // a with bin checked on the value (19.5.1.1)
+        Val x = v_resize(v, b.predW, false);
+        x.sgn = b.predSgn;
+        S.set(b.predItem, x);
+        in = truth(eval(b.pred, rd)) == 1;
+    }
+    return in;
 }
 // A cross bin select expression on one tuple (19.6.1).
 struct SelCtx {
@@ -925,6 +975,8 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
             for (size_t j = 0; j < n; j++) {
                 int bi = cx.xi->dims[j][tuple[j]];
                 rs[j] = cx.in->cps[cx.xd->cps[j]].bins[bi].ranges;
+                if (cx.in->cps[cx.xd->cps[j]].bins[bi].pred)
+                    fail("a cross with filter over a with bin of too many values to list (19.6.1.2)");
                 if (rs[j].empty()) return false;
             }
             uint64_t need = 1;
@@ -961,6 +1013,8 @@ inline bool selEval(const CgSel& s, const std::vector<int>& tuple, SelCtx& cx) {
                 for (size_t j = 0; j < n && in; j++) {
                     const CgCpDef& c = cx.d->cps[cx.xd->cps[j]];
                     int bi = cx.xi->dims[j][tuple[j]];
+                    if (cx.in->cps[cx.xd->cps[j]].bins[bi].pred)
+                        fail("a cross set expression over a with bin of too many values to list (19.6.1.3)");
                     const std::vector<Val>* saved = g_cgWide;
                     g_cgWide = c.wide ? &cx.in->cps[cx.xd->cps[j]].wb : nullptr;   // a wide value's key among its bounds
                     uint64_t key = keyOf(c, vt[j]);

@@ -39,7 +39,7 @@ names what is missing. Sections marked *(extension)* describe these parts.
 
 ## What it simulates
 
-**Harts.** RV32GCB or RV64GCB (IMAFDC with Zicsr and Zifencei, the B
+**Harts.** RV32GCBV or RV64GCBV (IMAFDC with Zicsr and Zifencei, the B
 extension's Zba, Zbb and Zbs, Zbc, Zicond, the scalar-crypto bit
 manipulation Zbkb and Zbkx, the byte and halfword atomics Zabha, compare and
 swap Zacas (AMOCAS.W/D, AMOCAS.Q on RV64 and AMOCAS.D on RV32 with register
@@ -60,6 +60,23 @@ NA4 and NAPOT, locked entries, MPRV), and the Sdtrig CSRs reporting no
 triggers. One instruction per cycle; WFI sleeps
 until an interrupt is pending. Misaligned loads and stores are done, not
 trapped.
+
+**Vectors.** The V extension 1.0: VLEN 128 bits unless `-vlen` (or the
+platform's `"vlen"`) says 256, 512 or 1024, ELEN 64. `vsetvl`, `vsetvli`
+and `vsetivli` with every SEW from 8 to 64 and LMUL from 1/8 to 8 (a
+reserved combination sets `vill`); unit-stride, strided, indexed (ordered
+and unordered), segment (2 to 8 fields), whole-register, mask and
+fault-only-first loads and stores; the integer, fixed-point (`vxrm`'s four
+rounding modes, `vxsat`), mask, reduction and permutation instructions; and
+vector floating point at SEW 32 and 64 with the scalar FPU's rounding,
+flags and NaNs, the widening and narrowing forms (round-to-odd included),
+and `vfrec7`/`vfrsqrt7` from the specification's tables. Tails and inactive
+elements are left undisturbed, which the agnostic policies allow. A load or
+store that faults leaves `vstart` at the element and `mtval` at its address;
+a fault-only-first load past element 0 trims `vl` instead. `mstatus.VS`
+works as `FS` does (off until software turns it on, dirty after a write,
+with `SD`); `vstart`, `vxsat`, `vxrm`, `vcsr`, `vl`, `vtype` and `vlenb`
+are there. Linux turns the vector unit on for the processes that use it.
 
 **Supervisor mode and the MMU.** `medeleg` and `mideleg` hand exceptions
 and interrupts to supervisor mode; `sstatus`, `sie` and `sip` are the
@@ -85,8 +102,17 @@ The RISC-V architecture tests all pass, 837 programs: ui, um, ua, uc, uf,
 ud, uzba, uzbb, uzbc, uzbs, uzicond, uzbkb, uzbkx, uzabha, uzacas,
 uzabha_zacas and uzfh for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
 paging on (`v`, Sv32 and Sv39, and RV64's ui, um, ua and uc under Sv48
-too), mi and si for both, and RV64's mzicbo and ssvnapot. `tests/mvplat_isa.sh`
-runs them.
+too), mi and si for both, and RV64's mzicbo and ssvnapot; and the vector
+benchmarks vec-daxpy, vec-memcpy, vec-sgemm and vec-strcmp at VLEN 128 and
+512, 845 runs. `tests/mvplat_isa.sh` runs them. riscv-tests has no
+instruction-level vector suite, so `tests/mvplat.sh` adds two: loops that
+clang vectorizes, each compared with the same loop compiled scalar (at VLEN
+128 and 1024, with LMUL 1 to 8 groups), and the
+instructions a vectorizer seldom emits (slides, gathers, compress, fixed
+point in every rounding mode, segments, strides, fault-only-first, `vstart`
+after a trap, `vsetvl` corners, the estimates) against scalar models; both
+on RV32 and RV64; together they use 226 distinct vector instruction forms.
+The vector loops run under Linux too, in three processes at once.
 
 **Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000) on
 its own and then the platform synchronises: devices see time move and
@@ -117,6 +143,7 @@ hex, with `K`, `M`, `G` suffixes for sizes. Paths are relative to the file.
   "mtime_hz": 10000000,      // CLINT mtime rate (default 10 MHz)
   "quantum": 1000,           // cycles between synchronisations
   "reset": "0x80000000",     // the pc before an ELF entry point overrides it
+  "vlen": 128,               // vector register bits: 128 (default), 256, 512, 1024
   "devices": [
     {"type": "finisher",  "base": "0x00100000"},
     {"type": "clint",     "base": "0x02000000"},
@@ -282,10 +309,13 @@ compared line by line with another simulator.
 *(extension)* `-gdb PORT` waits for gdb before the first instruction (`-gdb 0` takes any
 free port and `-gdb-portfile FILE` writes it down). gdb sees one thread per
 hart and needs no setup: the server sends the `riscv:rv32` or `riscv:rv64` target
-description, with the machine CSRs. Supported: breakpoints (`Z0`, `Z1`),
+description, with the machine CSRs and the vector unit (`v0`-`v31` at
+VLEN bits and the vector CSRs). Supported: breakpoints (`Z0`, `Z1`),
 watchpoints on write, read and access (`Z2`, `Z3`, `Z4`), single step,
 continue, Ctrl-C, register and memory reads and writes, detach and kill. An `ebreak` in the program stops in gdb rather
-than trapping when gdb is attached. The platform is all-stop.
+than trapping when gdb is attached. The platform is all-stop. Checkpoints
+keep the vector registers, `vl`, `vtype`, `vstart`, `vxrm` and `vxsat`; a
+checkpoint restores only at the VLEN it was saved with.
 
 *(extension)* `-profile FILE` (or `-` for stdout) writes the instruction mix of every hart,
 the hot functions (from the ELF symbols), and the accesses each peripheral
@@ -382,6 +412,7 @@ for it.
 | `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
 | `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |
 | `-mmu sv39\|sv48\|sv57` | the largest paging mode the device tree offers an RV64 OS (default `sv39`; the platform file's `"mmu"` too). The harts take Sv39, Sv48 and Sv57 whatever it says |
+| `-vlen BITS` | the vector registers' length: 128 (default), 256, 512 or 1024 (the platform file's `"vlen"` too) |
 | `-disk FILE`, `-disk-write` | a raw disk image on virtio-blk; let writes reach the file (see "Disks") |
 | `-vcon` | a virtio console; `-input` goes to it (see "A virtio console") |
 | `-net user`, `-net dgram:LOCAL,REMOTE`, `-net-pcap FILE` | a virtio-net interface and its back end; record its frames (see "Networks") |
@@ -422,8 +453,9 @@ simulation time.
 
 ## Limits / Not yet
 
-- No V, no Zbkb/Zbkc/Zbkx (crypto bit-manipulation), no Zfh, no Svadu (hardware
-  A/D update), and every hart of a platform has the program's width. F and D
+- No Zvfh (vector half precision), no vector crypto (Zvk*) or Zvbb, no Zbkc,
+  no Svadu (hardware A/D update), no Svpbmt, and every hart of a platform
+  has the program's width. F and D
   round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions
   to integers; other RMM results round as ties-to-even (differs only for a
   value exactly half way). Bare-metal software, RTOSes (FreeRTOS, Zephyr),

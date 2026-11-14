@@ -122,6 +122,7 @@ set(MINISIM_CORE_VP_HEADERS
     json.hpp
     machine.hpp
     rv32.hpp
+    vector.inc
     virtio.hpp)
 list(TRANSFORM MINISIM_CORE_VP_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vp/
      OUTPUT_VARIABLE MINISIM_CORE_VP_HEADER_PATHS)

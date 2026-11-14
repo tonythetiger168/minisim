@@ -466,10 +466,12 @@ public:
     }
 
     static constexpr uint64_t MISA_EXT =
-        (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20);
-    // mstatus.SD: set when the FP state is dirty (FS = 3); bit XLEN-1.
+        (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 5) | (1u << 8) | (1u << 12) | (1u << 18) | (1u << 20) |
+        (1u << 21);
+    // mstatus.SD: set when the FP or vector state is dirty (FS or VS = 3); bit XLEN-1.
     static uint64_t sd(const Hart& h) {
-        return (h.mstatus & MSTATUS_FS) == MSTATUS_FS ? (h.rv64 ? 1ull << 63 : 1ull << 31) : 0;
+        return ((h.mstatus & MSTATUS_FS) == MSTATUS_FS || (h.mstatus & MSTATUS_VS) == MSTATUS_VS)
+                   ? (h.rv64 ? 1ull << 63 : 1ull << 31) : 0;
     }
     // UXL and SXL in mstatus (sstatus has UXL): XLEN 64, fixed.
     static constexpr uint64_t MSTATUS_XL64 = (2ull << 32) | (2ull << 34);
@@ -488,6 +490,17 @@ public:
             case 0x001: if (!(h.mstatus & MSTATUS_FS)) return false; v = h.fcsr & 0x1f; return true;
             case 0x002: if (!(h.mstatus & MSTATUS_FS)) return false; v = (h.fcsr >> 5) & 7; return true;
             case 0x003: if (!(h.mstatus & MSTATUS_FS)) return false; v = h.fcsr & 0xff; return true;
+            // V: vstart, vxsat, vxrm, vcsr, vl, vtype, vlenb.
+            case 0x008: if (!(h.mstatus & MSTATUS_VS)) return false; v = h.vstart; return true;
+            case 0x009: if (!(h.mstatus & MSTATUS_VS)) return false; v = h.vxsat; return true;
+            case 0x00a: if (!(h.mstatus & MSTATUS_VS)) return false; v = h.vxrm; return true;
+            case 0x00f: if (!(h.mstatus & MSTATUS_VS)) return false; v = (uint64_t)h.vxrm << 1 | h.vxsat; return true;
+            case 0xc20: if (!(h.mstatus & MSTATUS_VS)) return false; v = h.vl; return true;
+            case 0xc21:
+                if (!(h.mstatus & MSTATUS_VS)) return false;
+                v = h.vill ? (h.rv64 ? 1ull << 63 : 1ull << 31) : h.vtypeRaw;
+                return true;
+            case 0xc22: if (!(h.mstatus & MSTATUS_VS)) return false; v = h.vlen / 8; return true;
             case 0x301: v = (h.rv64 ? 2ull << 62 : 1ull << 30) | MISA_EXT; return true;
             case 0x302: v = h.medeleg; return true;
             case 0x303: v = h.mideleg; return true;
@@ -558,13 +571,21 @@ public:
                 uint64_t mpp = (v >> 11) & 3;
                 if (mpp == 2) mpp = h.mstatus >> 11 & 3;  // WARL: M, S or U
                 h.mstatus = (v & (MSTATUS_MIE | MSTATUS_MPIE | MSTATUS_MPRV | MSTATUS_TW | MSTATUS_SIE | MSTATUS_SPIE |
-                                  MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR | MSTATUS_FS)) |
+                                  MSTATUS_SPP | MSTATUS_SUM | MSTATUS_MXR | MSTATUS_TVM | MSTATUS_TSR | MSTATUS_FS |
+                                  MSTATUS_VS)) |
                             mpp << 11;
                 return true;
             }
             case 0x001: if (!(h.mstatus & MSTATUS_FS)) return false; h.fcsr = (h.fcsr & ~0x1fu) | (v & 0x1f); h.mstatus |= MSTATUS_FS; return true;
             case 0x002: if (!(h.mstatus & MSTATUS_FS)) return false; h.fcsr = (h.fcsr & 0x1f) | (v & 7) << 5; h.mstatus |= MSTATUS_FS; return true;
             case 0x003: if (!(h.mstatus & MSTATUS_FS)) return false; h.fcsr = v & 0xff; h.mstatus |= MSTATUS_FS; return true;
+            case 0x008: if (!(h.mstatus & MSTATUS_VS)) return false; h.vstart = v & (h.vlen - 1); h.mstatus |= MSTATUS_VS; return true;
+            case 0x009: if (!(h.mstatus & MSTATUS_VS)) return false; h.vxsat = v & 1; h.mstatus |= MSTATUS_VS; return true;
+            case 0x00a: if (!(h.mstatus & MSTATUS_VS)) return false; h.vxrm = v & 3; h.mstatus |= MSTATUS_VS; return true;
+            case 0x00f:
+                if (!(h.mstatus & MSTATUS_VS)) return false;
+                h.vxsat = v & 1; h.vxrm = (v >> 1) & 3; h.mstatus |= MSTATUS_VS;
+                return true;
             case 0x301: return true;  // misa: fixed
             case 0x304: h.mie = (uint32_t)v & (MIP_MSIP | MIP_MTIP | MIP_MEIP | MIP_SSIP | MIP_STIP | MIP_SEIP); if (h.wfi && (h.mip & h.mie)) h.wfi = false; return true;
             case 0x302: h.medeleg = (uint32_t)v & 0xb3ffu; return true;  // not ecall from M
@@ -1251,6 +1272,8 @@ private:
                 if (hp->stop == Stop::Break) { breakHart(*hp); hp->stop = Stop::Budget; }
         }
     }
+
+#include "vector.inc"
 };
 
 // ------------------------------------------------------------------ exec
@@ -1674,8 +1697,22 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 memAcc = true; memW = true; memA = a; memN = n; memV = n == 8 ? w : w & ((1ull << (8 * n)) - 1);
                 break;
             }
+            case 0x57:                                                 // OP-V
+            vector: {
+                uint32_t vc = 0;
+                uint64_t vtv = 0;
+                cls = op == 0x57 ? C_ALU : op == 0x07 ? C_LOAD : C_STORE;
+                switch (vexec(h, insn, vc, vtv, wrd, wval)) {
+                    case VOK: break;
+                    case VILL: ILLEGAL();
+                    case VPEND: return Stop::Pending;
+                    default: TRAP(vc, vtv);
+                }
+                break;
+            }
             case 0x07:                                                 // FLW, FLD
             case 0x27: {                                               // FSW, FSD
+                if (f3 == 0 || f3 >= 5) goto vector;                   // vector loads and stores
                 if (!(h.mstatus & MSTATUS_FS) || f3 < 1 || f3 > 3) ILLEGAL();  // FLH, FSH (Zfh) too
                 unsigned n = 1u << f3;
                 if (op == 0x07) {
