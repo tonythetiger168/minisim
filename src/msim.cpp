@@ -794,6 +794,34 @@ static void localizeSeqBlocking(LowerResult& lowered) {
 // caller shares; the expanded copy gets its own, when no value ever travels
 // between callers through them: here and in every other process each read
 // follows a whole write in the same activation.
+// A call of a task that does nothing (PicoRV32's `assert in a non-formal
+// build calls `task empty_statement; begin end endtask`) becomes a jump to
+// the next instruction: a call keeps a clocked block out of the static
+// schedule and the cycle domain, where one empty call per block made two
+// PicoRV32 blocks per core run as coroutines on every clock edge.
+// MSIM_NOEMPTYCALL=1 keeps the calls.
+static void dropEmptyCalls(LowerResult& lowered) {
+    size_t n = 0;
+    auto empty = [](const Prog* c) {
+        if (!c) return false;
+        for (auto& x : c->code) if (x.k != IK::Ret) return false;
+        return c->roots.empty() && c->spans.empty();
+    };
+    for (auto& pr : lowered.procs)
+        for (size_t pc = 0; pc < pr.prog.code.size(); pc++) {
+            Instr& i = pr.prog.code[pc];
+            if (i.k != IK::Call || !empty(i.callee) || i.lay || !i.init.empty()) continue;
+            Instr j;
+            j.k = IK::Jmp;
+            j.target = pc + 1;
+            j.line = i.line;
+            j.file = i.file;
+            i = std::move(j);
+            n++;
+        }
+    if (std::getenv("MSIM_WHYATSTAR")) std::cerr << "empty task calls dropped: " << n << "\n";
+}
+
 static void inlineCombCalls(LowerResult& lowered) {
     const bool dbg = std::getenv("MSIM_WHYINLINE") != nullptr;
     auto plainAssign = [](const Instr& i) {
@@ -3294,6 +3322,7 @@ int main(int argc, char** argv) {
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);
+    if (!vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOEMPTYCALL")) dropEmptyCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL"))

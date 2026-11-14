@@ -35,6 +35,7 @@ set(CASES
   "examples/seqtemp.sv"
   "examples/seqtmpidx.sv +define+LFSR"
   "examples/atstarpriv.sv"
+  "examples/emptycall.sv"
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
