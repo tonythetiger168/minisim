@@ -1487,6 +1487,8 @@ struct Sim {
     // %b/%o/%h/%d of a value that does not fit in one limb. Digit rules match
     // the single-word formatter: an all-x digit is x, a mixed digit is X.
     static string fmtWide(char c, Val v, int minW, bool zero) {
+        bool zfill = zero && minW > 0;   // %05d / %02h: a zero-filled field
+        if (zfill) zero = false;
         auto digits = [&](int bits) {
             int n = (v.w + bits - 1) / bits;
             string s(n, '0');
@@ -1550,11 +1552,19 @@ struct Sim {
                 break;
             }
         }
+        if (zfill) {   // the field filled with zeros, after any sign
+            size_t at = !body.empty() && body[0] == '-' ? 1 : 0;
+            if ((int)body.size() < minW && c != 'c' && c != 's') body.insert(at, string(minW - body.size(), '0'));
+            else if ((int)body.size() < minW) body = string(minW - body.size(), ' ') + body;
+            return body;
+        }
         int width = zero ? 0 : (minW > 0 ? minW : (pad ? natural : 0));
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
         return body;
     }
     static string fmtVal(char c, Val v, int minW, bool zero) {
+        bool zfill = zero && minW > 0;   // %05d / %02h: a zero-filled field
+        if (zfill) zero = false;
         if (v.str) {   // a string (6.16) prints its text with %s, and as bytes otherwise
             if (c == 's') {
                 string t = v_str(v);
@@ -1629,6 +1639,12 @@ struct Sim {
                 }
                 break;
             }
+        }
+        if (zfill) {   // the field filled with zeros, after any sign
+            size_t at = !body.empty() && body[0] == '-' ? 1 : 0;
+            if ((int)body.size() < minW && c != 'c' && c != 's') body.insert(at, string(minW - body.size(), '0'));
+            else if ((int)body.size() < minW) body = string(minW - body.size(), ' ') + body;
+            return body;
         }
         int width = zero ? 0 : (minW > 0 ? minW : (pad ? natural : 0));
         if ((int)body.size() < width) body = string(width - body.size(), ' ') + body;
@@ -1747,6 +1763,13 @@ struct Sim {
                 prec = 0;
                 c = fmt[++i];
                 while (isdigit((unsigned char)c) && i + 1 < fmt.size()) { prec = prec * 10 + (c - '0'); c = fmt[++i]; }
+            }
+            if (c == 'Y') {   // internal: a format string known only at run time ($sformat, 21.3.3)
+                if (ai >= args.size()) continue;
+                string f = v_str(eval(args[ai++], rd));
+                cout << sformat(f, vector<E>(args.begin() + (long)ai, args.end()), rd);
+                ai = args.size();
+                continue;
             }
             if (c == 'R') {   // internal: a real argument with no specifier
                 if (ai >= args.size()) continue;
