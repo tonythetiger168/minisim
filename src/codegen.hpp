@@ -1201,8 +1201,24 @@ private:
                 return true;
             }
             case Op::Slice: {
-                if (!kid(0, A, fa)) return false;
                 int w = e->hi - e->lo + 1;
+                const E& r = e->kids.empty() ? e : e->kids[0];
+                if (r && r->op == Op::Ref && r->sig >= 0 && r->sig < (int)sigW_.size() && sigW_[r->sig] > 64 && !isPriv(r->sig) &&
+                    e->lo >= 0 && w >= 1 && w <= 64 && e->hi < sigW_[r->sig]) {
+                    // Up to 64 bits of a wider signal in S.sigs: from its limbs
+                    // (one or two), known when those limbs are.
+                    int l0 = e->lo / 64, l1 = e->hi / 64, sh = e->lo % 64;
+                    std::string val = "S.sigs[" + std::to_string(r->sig) + "].val";
+                    auto lv = [&](int l) { return "limbV(" + val + ", " + std::to_string(l) + ")"; };
+                    auto lx = [&](int l) { return "limbX(" + val + ", " + std::to_string(l) + ")"; };
+                    std::string a = "(" + lv(l0) + " >> " + std::to_string(sh) + ")";
+                    if (l1 != l0) a = "(" + a + " | (" + lv(l1) + " << " + std::to_string(64 - sh) + "))";
+                    out = "(" + a + " & " + M(w) + ")";
+                    fxXg_.push_back(l1 != l0 ? lx(l0) + " | " + lx(l1) : lx(l0));
+                    fi = {w, false};
+                    return true;
+                }
+                if (!kid(0, A, fa)) return false;
                 if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64) return false;
                 out = "((" + A + " >> " + std::to_string(e->lo) + ") & " + M(w) + ")";
                 fi = {w, false};
@@ -1488,6 +1504,7 @@ private:
         FastInfo fi{};
         std::vector<int> refs;
         fxOor_.clear();
+        fxXg_.clear();
         if (!fx(e, u64, fi, refs)) return false;
         // A run-time select that may fall outside its vector (the result is
         // then X): only where the caller tests the guard (dynOk_).
@@ -1496,11 +1513,13 @@ private:
         refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
         std::string g;
         for (int r : refs) g += (g.empty() ? "" : " | ") + xRef(r);
+        for (auto& x : fxXg_) g += (g.empty() ? "" : " | ") + x;
         guard = g.empty() ? "" : "(" + g + ") == 0";
         for (auto& c : fxOor_) guard += (guard.empty() ? "" : " && ") + ("!(" + c + ")");
         return true;
     }
     std::vector<std::string> fxOor_;   // fx: conditions under which the 2-state value does not hold
+    std::vector<std::string> fxXg_;    // fx: X words to test besides those of the refs (limbs of wide signals)
     bool dynOk_ = false;
     std::string fast(const E& e) {
         std::string slow = ex(e);
@@ -1509,11 +1528,13 @@ private:
         FastInfo fi{};
         std::vector<int> refs;
         fxOor_.clear();
+        fxXg_.clear();
         if (!fx(e, f, fi, refs)) return slow;
         std::sort(refs.begin(), refs.end());
         refs.erase(std::unique(refs.begin(), refs.end()), refs.end());
         std::string g;
         for (int r : refs) g += (g.empty() ? "" : " | ") + xRef(r);
+        for (auto& x : fxXg_) g += (g.empty() ? "" : " | ") + x;
         if (!g.empty()) g = "(" + g + ") == 0";
         for (auto& c : fxOor_) g += (g.empty() ? "" : " && ") + ("!(" + c + ")");
         std::string val = "Val{" + f + ", 0, " + std::to_string(fi.w) + ", 0, " + (fi.sgn ? "true" : "false") + "}";
@@ -3516,7 +3537,8 @@ private:
             o << "    static const int T[] = {-1";
             for (int e : ext) if (!scratch(e)) o << ", " << e;
             o << "};\n    if (!pclean) return false;\n    uint64_t x = 0;\n"
-                 "    for (size_t k = 1; k < sizeof T / sizeof T[0]; k++) x |= S.sigs[T[k]].val.x;\n    return x == 0;\n";
+                 "    for (size_t k = 1; k < sizeof T / sizeof T[0]; k++) { const Val& v = S.sigs[T[k]].val; x |= v.x; for (auto& h : v.hi) x |= h.x; }\n"
+                 "    return x == 0;\n";   // every limb: fx reads up to 64 bits of a wider signal
         } else
             o << "    return false;\n";
         o << "}\n";
