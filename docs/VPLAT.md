@@ -77,6 +77,14 @@ a fault-only-first load past element 0 trims `vl` instead. `mstatus.VS`
 works as `FS` does (off until software turns it on, dirty after a write,
 with `SD`); `vstart`, `vxsat`, `vxrm`, `vcsr`, `vl`, `vtype` and `vlenb`
 are there. Linux turns the vector unit on for the processes that use it.
+Zvbb (with Zvkb, its subset) adds `vandn`, `vror`/`vrol` (6-bit `vror.vi`),
+`vbrev8`, `vrev8`, `vbrev`, `vclz`, `vctz`, `vcpop.v` and the widening
+`vwsll`, checked at every SEW by `tests/vplat/zvbb.c`. Zvfh (with
+Zvfhmin) makes SEW 16 half precision for every vector floating-point
+instruction, widening to single and narrowing from it, and the conversions
+to and from 8, 16 and 32-bit integers; `tests/vplat/zvfh.c` checks each one
+against the scalar Zfh instruction in all five rounding modes, flags
+included.
 
 **Supervisor mode and the MMU.** `medeleg` and `mideleg` hand exceptions
 and interrupts to supervisor mode; `sstatus`, `sie` and `sip` are the
@@ -453,7 +461,7 @@ simulation time.
 
 ## Limits / Not yet
 
-- No Zvfh (vector half precision), no vector crypto (Zvk*) or Zvbb, no Zbkc,
+- No vector crypto beyond Zvkb, no Zvfbfmin/Zvfbfwma (BF16), no Zbkc,
   no Svadu (hardware A/D update), no Svpbmt, and every hart of a platform
   has the program's width. F and D
   round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions
