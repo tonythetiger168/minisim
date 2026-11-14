@@ -90,7 +90,16 @@ matching relational operators and `??`, `justify`, and VHDL-2019's
 `file_name`, `file_path`, `file_line`). VHDL-2019 also brings mode views
 (`view`, `'converse` through an alias, 6.5.2), conditional analysis
 (`` `if ``, `` `elsif ``, `` `else ``, `` `end ``, `` `warning ``, `` `error ``,
-24.2), sequential block statements (10.15) and `return x when c else y`.
+24.2), sequential block statements (10.15), `return x when c else y`,
+conditional expressions in initial values, defaults and parentheses
+(`constant c : integer := 1 when n > 3 else 2;`, 9.1), empty records,
+`'image` of records and of string and bit-vector types (16.2.2), an
+interface list ending in `;`, generic type classes (`type t is (<>)`,
+`range <>`, `range <>.<>`, `array (i range <>) of type is private`, 6.5.3)
+and the std.env report and assert API (`GetVhdlAssertCount`,
+`IsVhdlAssertFailed`, `ClearVhdlAssert`, `SetVhdlAssertEnable`,
+`GetVhdlAssertEnable`, `SetVhdlAssertFormat` with `{s}` `{S}` `{r}` `{t}`
+`{i}`, `GetVhdlAssertFormat`, `Set/GetVhdlReadSeverity`; 16.5.9).
 Attributes: `'event`, `'active`,
 `'last_value`, `'last_event`, `'last_active`, `'stable`, `'stable(T)`,
 `'quiet`, `'quiet(T)`, `'delayed`, `'delayed(T)`, `'transaction`, `'length`, `'range`, `'reverse_range`, `'left`,
@@ -140,5 +149,10 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   enumeration or real value, index, or actual in a port or parameter
   association is not checked.
 - VHDL-2019: a mode view as the mode of a record element, mode views of
-  arrays, `'converse` used directly in a port (use an alias); interfaces
-  and the other 2019 additions not listed under "Supported language".
+  arrays, `'converse` used directly in a port (use an alias); std.env's
+  time (`epoch`, `localtime`, `gmtime`, `time_record`), directory
+  (`dir_open`, `dir_createdir`, ...), `getenv` and call path functions;
+  `'image` of arrays of other element types; the read severity is kept
+  but textio reads do not report with it; `{i}` in an assert format is the
+  source position, not the instance path; the reflection API
+  (`'reflect`, std.reflection).

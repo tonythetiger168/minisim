@@ -487,7 +487,9 @@ private:
                        "resolution_limit", "find_leftmost", "find_rightmost", "and_reduce", "or_reduce", "xor_reduce", "nand_reduce",
                        "nor_reduce", "xnor_reduce", "to_real", "justify", "abs", "std_logic_vector", "tee", "fwrite", "unsigned_num_bits", "signed_num_bits",
                        "vhdl_version", "tool_type", "tool_vendor", "tool_name", "tool_edition", "tool_version", "file_name", "file_path",
-                       "file_line"})
+                       "file_line", "getvhdlassertcount", "isvhdlassertfailed", "clearvhdlassert", "setvhdlassertenable",
+                       "getvhdlassertenable", "setvhdlassertformat", "getvhdlassertformat", "setvhdlreadseverity",
+                       "getvhdlreadseverity"})
             addBuiltinFn(n);
     }
 
@@ -819,6 +821,14 @@ private:
     TP typeOfMark(const EP& m) {
         if (!m) return bt["integer"];
         if (m->k == EK::Attr) {
+            // T'element / T'base with a type prefix
+            if ((m->name == "element" || m->name == "base") && m->a && (m->a->k == EK::Name || m->a->k == EK::Sel)) {
+                const Sym* py = m->a->k == EK::Name ? lookup(m->a->name) : lookupSel(m->a);
+                if (py && py->k == Sym::TypeK && py->type) {
+                    if (m->name == "base") return baseOf(py->type);
+                    return py->type->elem ? py->type->elem : py->type;
+                }
+            }
             if (m->name == "subtype" || m->name == "base") {
                 Val v = ex(m->a, nullptr);
                 if (m->name == "base") return baseOf(v.t);
@@ -1110,6 +1120,15 @@ private:
         }
         case EK::Un: return unary(e, want);
         case EK::Bin: return binary(e, want);
+        case EK::Cond: {   // 9.1: the first value whose condition is true
+            Val c = boolOf(ex(e->b, bt["boolean"]));
+            Val x = ex(e->a, want);
+            Val y = ex(e->args[0].actual, want ? want : x.t);
+            if (!want && ambiguous(e->a) && y.t) x = ex(e->a, y.t);
+            v.s = "(" + c.s + " ? " + x.s + " : " + y.s + ")";
+            v.t = want ? want : x.t ? x.t : y.t;
+            return v;
+        }
         case EK::Name: case EK::Sel: case EK::Call: case EK::Attr: return nameExpr(e, want);
         case EK::Others: fail(e->line, "'others' outside an aggregate");
         case EK::Open: v.s = ""; v.t = want; return v;
@@ -1969,7 +1988,7 @@ private:
         }
         if (a == "image") {
             Val x = ex(e->b, pt);
-            return image(pt, x);
+            return attrImage(pt, x);
         }
         if (a == "value") {
             Val x = ex(e->b, bt["string"]);
@@ -2067,6 +2086,35 @@ private:
         fail(e->line, "unsupported attribute '" + e->text + "'");
     }
 
+    // T'IMAGE (16.2.2): VHDL-2019 also takes a composite type. A one-dimensional array of
+    // character literals is its string in double quotes; a record is the images of its
+    // elements, separated by commas, in parentheses.
+    Val attrImage(const TP& t, const Val& x) {
+        TP b = baseOf(t);
+        Val v;
+        v.t = bt["string"];
+        if (b && (b->k == Type::String || (b->k == Type::Array && b->elem && isScalarBit(b->elem)) ||
+                  (b->k == Type::Array && b->elem && baseOf(b->elem)->k == Type::Char))) {
+            std::string s;
+            if (b->k == Type::String || baseOf(b->elem)->k == Type::Char) s = "vhdl_rt::dquote(" + x.s + ")";
+            else if (baseOf(b->elem)->k == Type::Logic) s = "{\"\\\"\", vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t && !isUnconstrained(x.t) ? x.t : t) + "), \"\\\"\"}";
+            else s = "$sformatf(\"\\\"%b\\\"\", " + x.s + ")";
+            v.s = s;
+            return v;
+        }
+        if (b && b->k == Type::Record) {
+            std::string s = "{\"(\"";
+            for (size_t f = 0; f < b->fnames.size(); ++f) {
+                Val y;
+                y.s = x.s + "." + svId(b->ftext[f]);
+                y.t = b->ftypes[f];
+                s += std::string(f ? ", \",\"" : "") + ", " + attrImage(b->ftypes[f], y).s;
+            }
+            v.s = s + ", \")\"}";
+            return v;
+        }
+        return image(t, x);
+    }
     Val image(const TP& t, const Val& x) {
         Val v;
         v.t = bt["string"];
@@ -2649,6 +2697,24 @@ private:
         }
         if (id == "file_line") { v.s = "\"" + std::to_string(line) + "\""; v.t = bt["string"]; return v; }
         if (id == "resolution_limit") { v.s = "(1fs)"; v.t = bt["time"]; return v; }
+        // std.env report and assert API (VHDL-2019, 16.5.9)
+        if (id == "getvhdlassertcount" || id == "isvhdlassertfailed") {
+            EP l = named("level");
+            if (!l && !args.empty() && !args[0].formal) l = args[0].actual;
+            std::string c = "vhdl_rt::assert_count(" + (l ? ex(l, bt["severity_level"]).s : std::string("-1")) + ")";
+            if (id == "getvhdlassertcount") { v.s = c; v.t = bt["natural"]; }
+            else { v.s = "bit'(" + c + " > 0)"; v.t = bt["boolean"]; }
+            return v;
+        }
+        if (id == "getvhdlassertenable" || id == "getvhdlassertformat") {
+            EP l = named("level");
+            if (!l && !args.empty() && !args[0].formal) l = args[0].actual;
+            std::string lv = l ? ex(l, bt["severity_level"]).s : "0";
+            if (id == "getvhdlassertenable") { v.s = "vhdl_rt::aenable[" + lv + "]"; v.t = bt["boolean"]; }
+            else { v.s = "vhdl_rt::afmt[" + lv + "]"; v.t = bt["string"]; }
+            return v;
+        }
+        if (id == "getvhdlreadseverity") { v.s = "vhdl_rt::read_sev"; v.t = bt["severity_level"]; return v; }
         if (id == "abs") { Val x = arg(0); v.t = x.t; v.s = "((" + x.s + ") < 0 ? -(" + x.s + ") : (" + x.s + "))"; return v; }
         if (id == "unsigned_num_bits") { Val x = arg(0); v.s = "vhdl_rt::num_bits(" + x.s + ")"; v.t = bt["integer"]; return v; }
         (void)named;
@@ -2662,6 +2728,39 @@ private:
             if (i >= args.size()) fail(line, id + ": missing argument");
             return ex(args[i].actual, w);
         };
+        // std.env report and assert API (VHDL-2019, 16.5.9); `by` finds an argument by name or position
+        auto by = [&](const char* name, size_t pos) -> EP {
+            for (auto& a : args) if (a.formal && a.formal->k == EK::Name && a.formal->name == name) return a.actual;
+            return pos < args.size() && !args[pos].formal ? args[pos].actual : nullptr;
+        };
+        if (id == "clearvhdlassert") return "vhdl_rt::assert_clear();";
+        if (id == "setvhdlassertenable") {   // (Enable) for every level, or (Level, Enable)
+            EP lv, en;
+            std::vector<EP> pos;
+            for (auto& a : args) {
+                if (!a.formal) pos.push_back(a.actual);
+                else if (a.formal->k == EK::Name && a.formal->name == "level") lv = a.actual;
+                else if (a.formal->k == EK::Name && a.formal->name == "enable") en = a.actual;
+            }
+            if (pos.size() == 2) { lv = pos[0]; en = pos[1]; }
+            else if (pos.size() == 1) {
+                Val x = ex(pos[0], nullptr);
+                if (x.t && baseOf(x.t) == bt["boolean"] && !lv) en = pos[0];
+                else lv = pos[0];
+            }
+            return "vhdl_rt::assert_enable(" + (lv ? ex(lv, bt["severity_level"]).s : std::string("-1")) + ", " + (en ? ex(en, bt["boolean"]).s : "1'b1") + ");";
+        }
+        if (id == "setvhdlassertformat") {
+            EP lv = by("level", 0), f = by("format", 1), ok = by("valid", 2);
+            if (!lv || !f) fail(line, "SetVhdlAssertFormat: missing argument");
+            std::string c = "vhdl_rt::assert_format(" + ex(lv, bt["severity_level"]).s + ", " + ex(f, bt["string"]).s + ", " + (ok ? "1" : "0") + ")";
+            if (ok) return target(ok, false) + " = " + c + ";";
+            return "void'(" + c + ");";
+        }
+        if (id == "setvhdlreadseverity") {
+            EP lv = by("level", 0);
+            return "vhdl_rt::read_sev = " + (lv ? ex(lv, bt["severity_level"]).s : std::string("3")) + ";";
+        }
         if (id == "stop" || id == "finish") {
             if (id == "stop") return "$stop;";
             return "$finish;";
@@ -2770,6 +2869,11 @@ package vhdl_rt;
   endfunction
   function automatic string lower(string s);
     return s.tolower();
+  endfunction
+  function automatic string dquote(string s);   // a string's 'image: quoted, quotes doubled
+    string r = "\"";
+    for (int i = 0; i < s.len(); i++) r = {r, s[i] == "\"" ? "\"\"" : string'(s[i])};
+    return {r, "\""};
   endfunction
   function automatic string justify(string s, int left, int field);
     string pad = "";
@@ -2884,10 +2988,101 @@ package vhdl_rt;
     end
     return int'(v);
   endfunction
+  // std.env report and assert API (VHDL-2019, 16.5.9): counts, enables and formats per severity
+  int acount[4];
+  bit aenable[4] = '{1, 1, 1, 1};
+  string afmt[4];
+  int read_sev = 2;
+  function automatic int assert_count(int lvl);
+    if (lvl < 0) return acount[1] + acount[2] + acount[3];
+    return acount[lvl];
+  endfunction
+  function automatic void assert_clear();
+    acount = '{0, 0, 0, 0};
+  endfunction
+  function automatic void assert_enable(int lvl, bit en);
+    if (lvl < 0) aenable = '{en, en, en, en};
+    else aenable[lvl] = en;
+  endfunction
+  function automatic string fmt_field(string s, byte fill, byte align, int width);
+    string l = "", r = "";
+    int pad = width - s.len();
+    for (int k = 0; k < pad; k++)
+      if (align == "<" || (align == "^" && k >= pad / 2)) r = {r, string'(fill)};
+      else l = {l, string'(fill)};
+    return {l, s, r};
+  endfunction
+  // Apply an assert format string (16.5.9); 0 when the string is not valid.
+  function automatic bit fmt_apply(string f, string sev, string msg, string loc, output string o);
+    o = "";
+    for (int i = 0; i < f.len(); i++) begin
+      if (f[i] != "{") begin o = {o, string'(f[i])}; continue; end
+      if (i + 1 < f.len() && f[i + 1] == "{") begin o = {o, "{"}; i++; continue; end
+      begin
+        int j = i + 1, k, width = 0;
+        byte var_, fill = " ", align = 0;
+        string spec, unit = "", val;
+        while (j < f.len() && f[j] != "}") j++;
+        if (j >= f.len() || j == i + 1) return 0;
+        var_ = f[i + 1];
+        if (!(var_ inside {"s", "S", "r", "t", "i"})) return 0;
+        if (j > i + 2) begin
+          if (f[i + 2] == ":") spec = f.substr(i + 3, j - 1);
+          else if (f[i + 2] == ".") spec = f.substr(i + 2, j - 1);   // {t.ns}, as in the 16.5.9 example
+          else return 0;
+          k = 0;
+          if (spec.len() >= 2 && spec[1] inside {"<", ">", "^"}) begin fill = spec[0]; align = spec[1]; k = 2; end
+          else if (spec.len() >= 1 && spec[0] inside {"<", ">", "^"}) begin align = spec[0]; k = 1; end
+          while (k < spec.len() && spec[k] >= "0" && spec[k] <= "9") begin width = width * 10 + (spec[k] - "0"); k++; end
+          if (k < spec.len()) begin
+            if (spec[k] != "." || var_ != "t") return 0;
+            unit = spec.substr(k + 1, spec.len() - 1);
+            if (!(unit inside {"fs", "ps", "ns", "us", "ms", "sec", "m", "min", "hr"})) return 0;
+          end
+        end
+        case (var_)
+          "s": val = sev;
+          "S": val = sev.toupper();
+          "r": val = msg;
+          "i": val = loc;
+          default: begin
+            longint fs = longint'($realtime * 1.0e6), u = 1;
+            case (unit)
+              "": u = 0;
+              "ps": u = 64'd1000; "ns": u = 64'd1000000; "us": u = 64'd1000000000; "ms": u = 64'd1000000000000;
+              "sec": u = 64'd1000000000000000; "m", "min": u = 64'd60000000000000000; "hr": u = 64'd3600000000000000000;
+              default: u = 1;
+            endcase
+            val = u == 0 ? at_time() : $sformatf("%0d %s", fs / u, unit == "m" ? "min" : unit);
+          end
+        endcase
+        if (align == 0) align = var_ == "t" ? ">" : "<";
+        o = {o, fmt_field(val, fill, align, width)};
+        i = j;
+      end
+    end
+    return 1;
+  endfunction
+  function automatic bit assert_format(int lvl, string f, bit quiet);
+    string o;
+    if (!fmt_apply(f, "note", "", "", o)) begin
+      if (!quiet) report({"SetVhdlAssertFormat: invalid format string \"", f, "\""}, 3, "std.env", 0);
+      return 0;
+    end
+    afmt[lvl] = f;
+    return 1;
+  endfunction
   function automatic void report(string msg, int sev, string loc, bit is_assert);
     string sv;
     case (sev) 0: sv = "note"; 1: sv = "warning"; 2: sv = "error"; default: sv = "failure"; endcase
-    $display("%s:@%s:(%s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
+    if (!aenable[sev]) return;
+    acount[sev]++;
+    if (afmt[sev] != "") begin
+      string o;
+      void'(fmt_apply(afmt[sev], sv, msg, loc, o));
+      $display("%s", o);
+    end else
+      $display("%s:@%s:(%s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
     if (sev >= 2) errors++;
     if (sev >= 3) $fatal(0, "VHDL severity failure");
   endfunction
@@ -3442,6 +3637,7 @@ endpackage
                     fields += " " + svDecl(ft, svId(f->texts[k])) + ";";
                 }
             }
+            if (fields.empty()) fields = " bit empty__;";   // an empty record (5.3.3, VHDL-2019)
             out << pre << "typedef struct " << (packed ? "packed " : "") << "{" << fields << " } " << t->sv << ";\n";
             Sym y;
             y.k = Sym::TypeK;
@@ -3945,7 +4141,7 @@ endpackage
                 if (a->k == EK::Call && r.idx.empty()) { r.mark = a->a; for (auto& x : a->args) r.idx.push_back(x.actual); }
                 else r.mark = a;
             }
-        }
+        } else if (si.mark) r.mark = substE(si.mark, m);   // A'element, p.T
         for (auto& x : r.idx) x = substE(x, m);
         r.range = substE(r.range, m);
         return r;
@@ -4305,6 +4501,7 @@ endpackage
         switch (e->k) {
         case EK::Int: case EK::Real: case EK::Char: case EK::Str: case EK::BitStr: case EK::Phys: return true;
         case EK::Un: case EK::Bin: return isStatic(e->a) && isStatic(e->b);
+        case EK::Cond: return isStatic(e->a) && isStatic(e->b) && isStatic(e->args[0].actual);
         case EK::Name: {
             const Sym* y = lookup(e->name);
             return y && (y->k == Sym::Lit || (y->k == Sym::Obj && y->cls == "constant" && !y->decl) || (y->k == Sym::Obj && y->cls == "constant" && y->decl && y->decl->k == DK::Constant));
@@ -4694,6 +4891,9 @@ endpackage
         case EK::Agg:
             for (auto& a : e->agg) { readSignals(a.value, out); for (auto& c : a.choices) readSignals(c, out); }
             return;
+        case EK::Cond:
+            readSignals(e->args[0].actual, out);
+            [[fallthrough]];
         case EK::Range: case EK::Bin: case EK::Un: case EK::Qual:
             readSignals(e->a, out);
             readSignals(e->b, out);
