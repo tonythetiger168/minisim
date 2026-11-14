@@ -306,10 +306,11 @@ private:
         do { auto [l, x] = ident(); d->names.push_back(l); d->texts.push_back(x); } while (accept(","));
         expect(":");
         if (isKw("in") || isKw("out") || isKw("inout") || isKw("buffer") || isKw("linkage")) { d->mode = cur().low; next(); }
-        else if (isKw("view")) {   // mode view (6.5.2, VHDL-2019): view v [of T]
+        else if (isKw("view")) {   // mode view (6.5.2, VHDL-2019): view v [of T], view (v) of T
             next();
             d->mode = "view";
-            d->target = name();
+            if (accept("(")) { d->arrayView = true; d->target = name(); expect(")"); }
+            else d->target = name();
             if (accept("of")) d->type = subtypeIndication();
             return d;
         }
@@ -523,9 +524,14 @@ private:
                 f->line = cur().line;
                 do { auto [fl, fx] = ident(); f->names.push_back(fl); f->texts.push_back(fx); } while (accept(","));
                 expect(":");
-                if (isKw("view")) fail("a mode view as the mode of a record element is not supported yet");
-                f->mode = cur().low;
-                next();
+                if (accept("view")) {   // element_mode_view_indication: view v | view (v)
+                    f->mode = "view";
+                    if (accept("(")) { f->arrayView = true; f->target = name(); expect(")"); }
+                    else f->target = name();
+                } else {
+                    f->mode = cur().low;
+                    next();
+                }
                 expect(";");
                 d->tdef = d->tdef ? d->tdef : std::make_shared<TypeDef>();
                 d->tdef->fields.push_back(f);

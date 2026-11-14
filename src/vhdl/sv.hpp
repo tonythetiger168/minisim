@@ -4083,8 +4083,46 @@ endpackage
         DP decl;
         bool converse = false;
         TP rec;
-        std::map<std::string, std::string> modes;   // element (lower) -> in / out / inout / buffer
+        std::map<std::string, std::string> modes;   // element (lower) -> in / out / inout / buffer / view
+        std::map<std::string, DP> nested;           // element (lower) -> its field declaration, for a view mode
     };
+    // A mode-view port flattened to one port per scalar or plain element (6.5.2):
+    // `suffix` is appended to the port's SystemVerilog name, `access` to the
+    // record object's ("." element, "[i]" array index).
+    struct ViewLeaf { std::string suffix, access, mode; TP type; };
+    void viewLeaves(const ViewInfo& vi, const std::string& sfx, const std::string& acc, int line, std::vector<ViewLeaf>& out) {
+        const TP& t = vi.rec;
+        for (size_t f = 0; f < t->fnames.size(); ++f) {
+            const std::string& fn = t->fnames[f];
+            std::string fs = sfx + "__" + svId(t->ftext[f]), fa = acc + "." + svId(t->ftext[f]);
+            auto m = vi.modes.find(fn);
+            if (m == vi.modes.end()) fail(line, "mode view gives no mode for element '" + t->ftext[f] + "'");
+            if (m->second != "view") { out.push_back({fs, fa, m->second, t->ftypes[f]}); continue; }
+            const DP& fd = vi.nested.at(fn);
+            EP vn = fd->target;
+            if (vi.converse) { auto c = std::make_shared<Expr>(EK::Attr, line); c->name = "converse"; c->a = vn; vn = c; }
+            if (!fd->arrayView) { viewLeaves(resolveView(vn), fs, fa, line, out); continue; }
+            viewArrayLeaves(resolveView(vn), t->ftypes[f], fs, fa, line, out);
+        }
+    }
+    // `view (V)` of an array of records: the elements' views, index by index
+    void viewArrayLeaves(const ViewInfo& vi, const TP& at, const std::string& sfx, const std::string& acc, int line, std::vector<ViewLeaf>& out) {
+        if (!at || at->k != Type::Array || at->dims.size() != 1) fail(line, "an array mode view needs a one-dimensional array type");
+        const Rng& g = at->dims[0];
+        if (!g.lv || !g.rv) fail(line, "an array mode view needs an array with static bounds");
+        int64_t lo = std::min(*g.lv, *g.rv), hi = std::max(*g.lv, *g.rv);
+        for (int64_t i = lo; i <= hi; ++i)
+            viewLeaves(vi, sfx + "__" + (i < 0 ? "m" + std::to_string(-i) : std::to_string(i)), acc + "[" + std::to_string(i) + "]", line, out);
+    }
+    std::vector<ViewLeaf> portViewLeaves(const DP& p) {
+        std::vector<ViewLeaf> out;
+        ViewInfo vi = resolveView(p->target);
+        if (p->arrayView) {
+            if (!p->type.present()) fail(p->line, "an array mode view port needs `of` an array subtype");
+            viewArrayLeaves(vi, subtype(p->type), "", "", p->line, out);
+        } else viewLeaves(vi, "", "", p->line, out);
+        return out;
+    }
     ViewInfo resolveView(const EP& e) {
         ViewInfo vi;
         EP n = e;
@@ -4102,6 +4140,7 @@ endpackage
                     std::string m = f->mode;
                     if (vi.converse) m = m == "in" ? "out" : m == "out" || m == "buffer" ? "in" : m;
                     vi.modes[fn] = m;
+                    if (m == "view") vi.nested[fn] = f;
                 }
         return vi;
     }
@@ -5514,7 +5553,7 @@ endpackage
             std::vector<std::pair<std::string, TP>> portSigs;
             std::map<std::string, TP> unconPort;   // lower-case port -> its type with parameter bounds
             for (auto& p : ent->ports) {
-                TP t = p->mode == "view" ? resolveView(p->target).rec : subtype(p->type);
+                TP t = p->mode == "view" ? (p->arrayView ? subtype(p->type) : resolveView(p->target).rec) : subtype(p->type);
                 if (isUnconstrained(t)) {
                     // an unconstrained array port (6.5.6.3): the actual gives its range, through
                     // two parameters per port; the direction is the module's (see variant)
@@ -5557,20 +5596,19 @@ endpackage
             std::string viewBody;   // mode-view ports: the record signal and its element connections
             for (auto& p : ent->ports) {
                 if (p->mode == "view") {   // one port per record element, in its mode (6.5.2)
-                    ViewInfo vi = resolveView(p->target);
-                    TP t = vi.rec;
+                    TP t = p->arrayView ? subtype(p->type) : resolveView(p->target).rec;
+                    std::vector<ViewLeaf> leaves = portViewLeaves(p);
                     for (size_t k = 0; k < p->names.size(); ++k) {
                         std::string sv = svId(p->texts[k]);
                         viewBody += "  " + svDecl(t, sv) + ";\n";
-                        for (size_t f = 0; f < t->fnames.size(); ++f) {
-                            std::string m = vi.modes.count(t->fnames[f]) ? vi.modes[t->fnames[f]] : "";
-                            if (m.empty()) fail(p->line, "mode view gives no mode for element '" + t->ftext[f] + "'");
-                            std::string ps = sv + "__" + svId(t->ftext[f]);
+                        for (auto& lf : leaves) {
+                            const std::string& m = lf.mode;
+                            std::string ps = sv + lf.suffix;
                             std::string dir = m == "in" ? "input" : m == "inout" ? "inout" : "output";
-                            portList.push_back(dir + " " + (m == "inout" && isPackable(t->ftypes[f]) && isFourState(t->ftypes[f]) ? svDeclNet(t->ftypes[f], ps) : svDecl(t->ftypes[f], ps)));
+                            portList.push_back(dir + " " + (m == "inout" && isPackable(lf.type) && isFourState(lf.type) ? svDeclNet(lf.type, ps) : svDecl(lf.type, ps)));
                             portLines.push_back(p->line);
-                            if (m == "in") viewBody += "  assign " + sv + "." + svId(t->ftext[f]) + " = " + ps + ";\n";
-                            else viewBody += "  assign " + ps + " = " + sv + "." + svId(t->ftext[f]) + ";\n";
+                            if (m == "in") viewBody += "  assign " + sv + lf.access + " = " + ps + ";\n";
+                            else viewBody += "  assign " + ps + " = " + sv + lf.access + ";\n";
                         }
                     }
                     continue;
@@ -6199,7 +6237,7 @@ endpackage
         if (comp && comp->k != Sym::Comp) comp = nullptr;
         // component without an entity: an SV module of the same name (case-insensitively)
         std::shared_ptr<GenBind> genBind;
-        std::map<std::string, std::vector<std::string>> viewFields;   // mode-view port -> its elements (SV names)
+        std::map<std::string, std::vector<ViewLeaf>> viewFields;   // mode-view port -> its flattened elements
         if (ent && hasTypeGenerics(ent)) genBind = genericBinding(ent, s.genericMap, s.line);
         if (ent) {
             modName = svId(ent->text);
@@ -6246,9 +6284,9 @@ endpackage
                 for (auto& p : ent->ports) {
                     TP t;
                     if (p->mode == "view") {
-                        t = resolveView(p->target).rec;
-                        for (auto& n : p->names)
-                            for (auto& ft : t->ftext) viewFields[n].push_back(svId(ft));
+                        t = p->arrayView ? subtype(p->type) : resolveView(p->target).rec;
+                        std::vector<ViewLeaf> leaves = portViewLeaves(p);
+                        for (auto& n : p->names) viewFields[n] = leaves;
                     } else
                     try { t = subtype(p->type); } catch (const Error&) { t = nullptr; }
                     for (size_t k = 0; k < p->names.size(); ++k) {
@@ -6374,7 +6412,7 @@ endpackage
                     }
                 }
                 if (auto vf = viewFields.find(fl); vf != viewFields.end()) {   // one connection per element
-                    for (auto& f : vf->second) items.push_back("." + formalSv + "__" + f + "(" + (act.empty() ? "" : act + "." + f) + ")");
+                    for (auto& lf : vf->second) items.push_back("." + formalSv + lf.suffix + "(" + (act.empty() ? "" : act + lf.access) + ")");
                     continue;
                 }
                 items.push_back("." + formalSv + "(" + act + ")");

@@ -53,7 +53,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | generic package, package instantiation (4.7, 4.9) | in a library, architecture, block, process or subprogram; one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals, and a package generic (6.5.6.4) names the actual instance |
 | an integer assigned to a subtype with a range (5.2.1) | a range check: out of range prints `file:line:@time:(bound check failure)` on stderr and stops the run with a non-zero exit, as GHDL does |
 | conditional analysis (24.2) | done on the source text before parsing. `TOOL_TYPE` is `"SIMULATION"`, `VHDL_VERSION` `"2019"`, `TOOL_VENDOR` `"minisim"`, `TOOL_NAME` `"msim"`; `+define+NAME=VALUE` (or `-D`) adds or overrides an identifier |
-| mode view port (6.5.2) | one SystemVerilog port per record element in the element's mode; inside the module the port is a record signal |
+| mode view port (6.5.2) | one SystemVerilog port per record element in the element's mode (`<port>__<element>`), recursively through element views and, for `view (v) of t`, through each array index (`<port>__<i>__<element>`); inside the module the port is a record signal |
 | `report`, `assert` | a message in GHDL's format (`file:line:col:@time:(report note): text`); severity failure stops the run with a non-zero exit |
 | `std.env.stop` / `finish` | `$stop` / `$finish` |
 | enumerations, records, arrays | enum, packed or unpacked struct, packed (bit-like elements) or unpacked arrays |
@@ -88,7 +88,8 @@ readline/writeline, files), `std.env`, `ieee.std_logic_1164`,
 matching relational operators and `??`, `justify`, and VHDL-2019's
 `std.env` tool and source queries (`tool_name`, `vhdl_version`,
 `file_name`, `file_path`, `file_line`). VHDL-2019 also brings mode views
-(`view`, `'converse` through an alias, 6.5.2), conditional analysis
+(`view`, `'converse`, a view as an element's mode, `view (v) of t` on
+arrays of records, 6.5.2), conditional analysis
 (`` `if ``, `` `elsif ``, `` `else ``, `` `end ``, `` `warning ``, `` `error ``,
 24.2), sequential block statements (10.15), `return x when c else y`,
 conditional expressions in initial values, defaults and parentheses
@@ -148,8 +149,7 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   integer subtype (`natural`, `integer range 0 to 15`); an out-of-range
   enumeration or real value, index, or actual in a port or parameter
   association is not checked.
-- VHDL-2019: a mode view as the mode of a record element, mode views of
-  arrays, `'converse` used directly in a port (use an alias); std.env's
+- VHDL-2019: an array mode view needs an array with static bounds; std.env's
   time (`epoch`, `localtime`, `gmtime`, `time_record`), directory
   (`dir_open`, `dir_createdir`, ...), `getenv` and call path functions;
   `'image` of arrays of other element types; the read severity is kept
