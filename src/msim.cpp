@@ -2632,6 +2632,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> svLibs, cFiles, soFiles;
     std::vector<std::string> vhdlFiles;
     std::string vhdlSv;
+    bool vhdl4 = false;   // -vhdl4: VHDL std_logic with four values (faster; see vhdl::Translator::nine)
     std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
     std::string uvmHome;    // -uvm / -uvmhome: a uvm-core checkout
@@ -2929,6 +2930,7 @@ int main(int argc, char** argv) {
         // VHDL sources (docs/VHDL.md): translated for the same engine after slang reads the SV files
         if (a.size() && a[0] != '-' && vhdl::isVhdlFile(a)) { vhdlFiles.push_back(a); continue; }
         if (a == "-vhdl-sv") { vhdlSv = next("a file name"); continue; }
+        if (a == "-vhdl4") { vhdl4 = true; continue; }
         if (a == "-v93" || a == "-v2008" || a == "-vhdl2008" || a == "-v200x" || a == "-vhdl93" || a == "-vhdl87") continue;
         fwd.push_back(a);
     }
@@ -3055,6 +3057,7 @@ int main(int argc, char** argv) {
     if (!driver.parseAllSources()) return 1;
     if (!vhdlFiles.empty()) {
         vhdl::Translator vtr;
+        vtr.nine = !vhdl4;
         if (!vhdl::addVhdl(driver, vhdlFiles, vhdlSv, "msim", vtr)) return 1;
     }
     if (parseOnly) return driver.reportParseDiags() ? 0 : 1;

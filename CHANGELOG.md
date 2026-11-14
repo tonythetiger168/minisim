@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- msim: VHDL std_logic keeps all nine values (U X 0 1 Z W L H -) by default:
+  operators, comparisons, `'image`, `to_x01`, ports between VHDL units and
+  weak-driver resolution match GHDL. SystemVerilog, UPF and waveforms see the
+  four-value view; `-vhdl4` keeps the old four-value mode (faster).
+  Procedures without `wait` lower to void functions.
 - mvplat: vector cryptography: Zvkned (AES), Zvknha/Zvknhb (SHA-256 and
   SHA-512), Zvkg (GHASH), Zvksed (SM4), Zvksh (SM3), Zvbc (carry-less
   multiply) and Zvkt, on element groups; checked against FIPS-197, FIPS
