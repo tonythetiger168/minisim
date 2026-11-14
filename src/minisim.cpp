@@ -376,6 +376,7 @@ struct Sim {
     uint64_t sampledAt = 0;
     struct Mon {
         bool on = false, queued = false;
+        bool off = false;   // $monitoroff (21.2.3)
         string fmt;
         vector<E> args;
         vector<int> watch;
@@ -1842,13 +1843,25 @@ struct Sim {
     void printSys(const string& fmt, const vector<E>& args, bool newline = true);   // kernel object (MSIM_KDEF below)
     void strobe(const string& fmt, const vector<E>& args) { postq.push_back({false, fmt, args}); }
     void queueMon() {
-        if (!mon.on || mon.queued) return;
+        if (!mon.on || mon.off || mon.queued) return;
         postq.push_back({true, mon.fmt, mon.args});
         mon.queued = true;
     }
     // A new $monitor cancels the previous one. The call itself schedules a
     // print, like $strobe; a later change in this slot does not schedule another.
     void armMon(const string& fmt, const vector<E>& args) {
+        if (fmt == kMonitorOff || fmt == kMonitorOn) {   // 21.2.3
+            mon.off = fmt == kMonitorOff;
+            if (mon.off) {
+                if (mon.queued)
+                    for (auto it = postq.begin(); it != postq.end(); ++it)
+                        if (it->mon) { postq.erase(it); break; }
+                mon.queued = false;
+            } else {
+                queueMon();   // $monitoron prints the monitored values at once
+            }
+            return;
+        }
         if (mon.queued) {
             for (auto it = postq.begin(); it != postq.end(); ++it)
                 if (it->mon) { postq.erase(it); break; }

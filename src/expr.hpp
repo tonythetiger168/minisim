@@ -1444,7 +1444,7 @@ enum SysFnId : int {
     SF_SCAN_TEXT,    // scanText() as a string
     SF_FTELL,        // $ftell(fd)
     SF_FSEEK,        // $fseek(fd, offset, whence), $rewind(fd) is fseek(fd, 0, 0)
-    SF_FERROR,       // $ferror(fd, str): 0, no error text kept
+    SF_FERROR,       // $ferror(fd) (21.3.7): 0 for an open descriptor, else EBADF
     SF_SR2BITS,      // $shortrealtobits (20.5)
     SF_BITS2SR,      // $bitstoshortreal
     SF_OBJ_SRANDOM,  // obj.srandom(seed) (18.13.3): kid0 the object
@@ -2370,6 +2370,12 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             int c = f ? ungetc((int)(u64(a[0]) & 0xff), f) : EOF;
             return sint(c == EOF ? -1 : 0);
         }
+        case SF_FERROR: {
+            uint32_t fd = (uint32_t)u64(a[0]);
+            // a multichannel descriptor (bits 30:0, bit 31 clear) or an open file
+            bool ok = (!(fd & 0x80000000u) && fd != 0) || fdFile(fd) != nullptr;
+            return sint(ok ? 0 : EBADF);
+        }
         case SF_FEOF: {
             FILE* f = fdFile((uint32_t)u64(a[0]));
             if (!f) return sint(1);
@@ -2418,7 +2424,6 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             int r = f ? fseek(f, off, wh == 1 ? SEEK_CUR : wh == 2 ? SEEK_END : SEEK_SET) : -1;
             return sint(r == 0 ? 0 : -1);
         }
-        case SF_FERROR: return sint(0);
         case SF_SR2BITS: { float f = (float)v_real(a[0]); uint32_t b; memcpy(&b, &f, 4); return make(b, 0, 32, 0); }
         case SF_CG: return g_cgHook ? g_cgHook(ctl, a) : mkreal(0);
         case SF_ANNEXD: return g_annexHook ? g_annexHook(ctl, a) : sint(0);
