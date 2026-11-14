@@ -288,6 +288,34 @@ inline Shape shapeOf(const ProceduralBlockSymbol& p) {
             }
         }
     }
+    // always begin @(posedge clk); <body> end: the same flop as always
+    // @(posedge clk) <body>. VHDL's "wait until rising_edge(clk);" at the top of
+    // a process arrives in this form. Only when nothing else in the body waits.
+    if (p.procedureKind == ProceduralBlockKind::Always && !s.outerTimed && !s.trailing &&
+        body.kind == StatementKind::Block && body.as<BlockStatement>().body.kind == StatementKind::List) {
+        auto list = body.as<BlockStatement>().body.as<StatementList>().list;
+        if (list.size() >= 2 && list.front()->kind == StatementKind::Timed) {
+            const auto& t = list.front()->as<TimedStatement>();
+            TimingControlKind k = t.timing.kind;
+            bool waits = false;
+            for (size_t i = 1; i < list.size(); i++)
+                list[i]->visit(makeVisitor([&](auto&, const TimedStatement&) { waits = true; },
+                                           [&](auto&, const WaitStatement&) { waits = true; },
+                                           [&](auto&, const WaitForkStatement&) { waits = true; },
+                                           [&](auto&, const WaitOrderStatement&) { waits = true; }));
+            if (!waits && t.stmt.kind == StatementKind::Empty &&
+                (k == TimingControlKind::SignalEvent || k == TimingControlKind::EventList)) {
+                std::vector<const SignalEventControl*> evs;
+                clocksOf(t.timing, evs);
+                bool edge = !evs.empty();
+                for (auto* e : evs) edge &= e->edge != EdgeKind::None;
+                if (edge) {
+                    s.edges = evs;
+                    s.outerTimed = list.front();
+                }
+            }
+        }
+    }
     switch (p.procedureKind) {
         case ProceduralBlockKind::Initial: s.cls = Cls::Init; break;
         case ProceduralBlockKind::Final: s.cls = Cls::Final; break;
@@ -933,7 +961,8 @@ struct BodyRules : ASTVisitor<BodyRules, VisitFlags::AllGood> {
                 rep.add("COMB001", p.location,
                         list + (missing.size() == 1 ? " is" : " are") +
                             " read here but missing from the sensitivity list, so simulation does not follow "
-                            "the hardware; use always_comb or @*");
+                            "the hardware; " +
+                            (vhdlProc() ? "list it, or use process (all) (VHDL-2008)" : "use always_comb or @*"));
             }
         }
     }
@@ -1773,7 +1802,10 @@ struct Global : ASTVisitor<Global, VisitFlags::Symbols> {
                     readsAsData(a.right(), firstTarget(a.left()));
                     (void)v;
                 },
-                [&](auto&, const NamedValueExpression& n) { noteRead(n.symbol, n.sourceRange.start()); }));
+                [&](auto&, const NamedValueExpression& n) { noteRead(n.symbol, n.sourceRange.start()); },
+                [&](auto& v, const TimedStatement& t) {   // the leading @(posedge clk); is the clock
+                    if (&t != s.outerTimed) v.visitDefault(t);
+                }));
         }
     }
 

@@ -106,6 +106,20 @@ struct Report {
         os << (first ? "" : ")") << "\n";
     }
 
+    // A finding at a place in a file slang did not read (VHDL source, lintvhdl.hpp).
+    void addAt(std::string_view rule, std::string file, size_t line, size_t col, std::string text) {
+        if (!rules.enabled(rule)) return;
+        Finding f;
+        f.rule = std::string(rule);
+        f.file = std::move(file);
+        f.line = line;
+        f.col = col;
+        f.text = std::move(text);
+        if (!seen.insert({f.rule, f.file + ":" + std::to_string(line) + ":" + std::to_string(col) + ":" + f.text}).second)
+            return;
+        out.push_back(std::move(f));
+    }
+
     void add(std::string_view rule, SourceLocation loc, std::string text, std::string signal = {}) {
         if (!rules.enabled(rule)) return;
         if (pc && pc->hidden(loc)) {

@@ -115,6 +115,7 @@ a module with no ports, or a module named in `tb.modules`.
 |---|---|---|---|
 | `L004` | warning | on | One value is assigned by more than one process |
 | `L005` | warning | on | A resolved (VHDL std_logic) signal driven by several processes, not all of them tri-state |
+| `VHD001`..`VHD009` | | | VHDL-only rules, see [VHDL](#vhdl) |
 
 ### Widths and signs (`width`)
 
@@ -481,7 +482,29 @@ What is left out, because it would describe the translation and not the VHDL:
   std_logic `=`), `TIDY006` (the integer cast of `to_integer`), and
   `FSM003` (a VHDL `case` must list every value);
 - a resolved signal (std_logic, a tri-state bus) with several drivers is
-  legal VHDL and is not an `L004`.
+  legal VHDL and is not an `L004` (several drivers that are not all
+  tri-state are `L005`).
+
+What the translation erases is checked on the VHDL text itself
+(`src/lintvhdl.hpp`, group `vhdl`, in the `lint_rtl`, `starc` and
+`openmore` goals):
+
+| Rule | Severity | Default | What |
+|---|---|---|---|
+| `VHD001` | warning | on | `ieee.std_logic_arith`, `std_logic_unsigned` or `std_logic_signed`: vendor packages; use `ieee.numeric_std` |
+| `VHD002` | info | on | `clk'event and clk = '1'`: also true for X to 1; use `rising_edge(clk)` |
+| `VHD003` | warning | on | a `buffer` port |
+| `VHD004` | info | off | a signal with an initial value (loaded by FPGA tools, ignored by ASIC synthesis) |
+| `VHD005` | warning | on | a `shared variable` |
+| `VHD006` | warning | on | a `port map` or `generic map` by position (the VHDL `CON003`) |
+| `VHD007` | info | off | a process with no label |
+| `VHD008` | warning | on | an `integer`, `natural` or `positive` signal or port with no range (32 bits in synthesis) |
+| `VHD009` | info | off | a port of type `bit` or `bit_vector` |
+
+VHDL forms the rules above understand: a process with a sensitivity list is
+combinational logic (`COMB001` says to list the signal or use
+`process (all)`), and a process that starts with `wait until
+rising_edge(clk);` is a flop, not an implicit state machine (`SYN012`).
 
 Checked on NEORV32 (50 files, its default configuration): no finding about
 the translation is left; what remains are inputs and signals that
