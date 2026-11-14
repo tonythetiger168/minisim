@@ -8,6 +8,12 @@
 # Each test runs in its own directory, so a data file is a relative path.
 # "//! icarus-vpi: <file.c> ..." builds those C files into a VPI module
 # with iverilog-vpi for the Icarus run (iverilog -m names it, vvp -M finds it).
+# -DTIMEOUT=<s>: how long the run may take (default 20 s); the datapath
+# benches, which sweep whole input spaces, pass more so a loaded machine
+# (ctest -j8) does not time them out.
+if(NOT DEFINED TIMEOUT)
+  set(TIMEOUT 20)
+endif()
 get_filename_component(dir ${SV} DIRECTORY)
 get_filename_component(base ${SV} NAME)   # run as a relative name, so `__FILE__ and messages are stable
 file(STRINGS ${SV} lines)
@@ -63,14 +69,14 @@ if(VVP)
       list(APPEND plus ${a})
     endif()
   endforeach()
-  execute_process(COMMAND ${VVP} -n ${vvp_args} ${out} ${plus} OUTPUT_VARIABLE got RESULT_VARIABLE rc TIMEOUT 20
+  execute_process(COMMAND ${VVP} -n ${vvp_args} ${out} ${plus} OUTPUT_VARIABLE got RESULT_VARIABLE rc TIMEOUT ${TIMEOUT}
                   WORKING_DIRECTORY ${dir})
   string(REGEX REPLACE "[^\n]*\\$finish called[^\n]*\n" "" got "${got}")
   string(REGEX REPLACE "VCD info:[^\n]*\n" "" got "${got}")
   string(REGEX REPLACE "WARNING: [^\n]*\n" "" got "${got}")   # vvp's warnings go to stdout
 else()
   execute_process(COMMAND ${SIM} ${base} ${extra} OUTPUT_VARIABLE got ERROR_VARIABLE err
-                  RESULT_VARIABLE rc TIMEOUT 20 WORKING_DIRECTORY ${dir})
+                  RESULT_VARIABLE rc TIMEOUT ${TIMEOUT} WORKING_DIRECTORY ${dir})
   if(NOT rc STREQUAL want_rc)
     message(FATAL_ERROR "msim exited ${rc} (expected ${want_rc}) on ${SV}:\n${err}")
   endif()

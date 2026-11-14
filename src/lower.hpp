@@ -1024,6 +1024,7 @@ struct Lowerer {
     }
     // The slot that holds a ref formal's address (a frame slot or a signal).
     int refSlot(const slang::ast::Symbol* sym) const {
+        if (auto it = forkOwn.find(sym); it != forkOwn.end()) return relIn(it->second.lay, it->second.off);
         if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
         auto it = sigmap.find(sym);
         if (it == sigmap.end()) unsupported("ref argument with no slot");
@@ -1036,6 +1037,7 @@ struct Lowerer {
             if (auto it = cgIterSigs.find(std::string(sym->name)); it != cgIterSigs.end()) return it->second;
         if (auto rf = refFormals().find(sym); rf != refFormals().end())
             return rf->second.kind == 0 ? indThrough(refSlot(sym)) : -1;
+        if (auto it = forkOwn.find(sym); it != forkOwn.end()) return relIn(it->second.lay, it->second.off);
         if (auto it = localMap().find(sym); it != localMap().end()) return relIn(it->second.lay, it->second.off);
         if (auto it = propMap().find(sym); it != propMap().end() && it->second.kind == 0) return thisRel(it->second.off);
         auto it = sigmap.find(sym);
@@ -7307,6 +7309,44 @@ struct Lowerer {
     // ---------- constrained randomization (18) ----------
     std::unordered_map<const slang::ast::Symbol*, Val> constVals;     // foreach indices of a constraint, unrolled
     std::unordered_map<const slang::ast::Symbol*, int> symOverride;   // with {...}: the caller's properties, copied
+    // Block automatics a fork's processes keep their own copy of (forkOwnVars):
+    // the slot in the fork's frame, and the ones to copy at the next fork.
+    std::unordered_map<const slang::ast::Symbol*, LocalSlot> forkOwn;
+    std::vector<const slang::ast::VariableSymbol*> forkCopy;
+    // The automatic variables declared in `list` before the fork at `k` that
+    // the fork reads and nothing after it in the list does. Each entry of the
+    // block makes new ones (6.21), and only this fork's processes go on using
+    // them, so a copy taken when the fork starts behaves the same: a fork in
+    // a loop body sees each pass's value, not the last one.
+    std::vector<const slang::ast::VariableSymbol*> forkOwnVars(std::span<const slang::ast::Statement* const> list, size_t k) const {
+        using namespace slang::ast;
+        std::vector<const VariableSymbol*> out;
+        if (frames.empty()) return out;
+        std::set<const Symbol*> cand;
+        for (size_t j = 0; j < k; j++)
+            if (list[j]->kind == StatementKind::VariableDeclaration) {
+                const auto& v = list[j]->as<VariableDeclStatement>().symbol;
+                auto it = localMap().find(&v);
+                if (v.lifetime == VariableLifetime::Automatic && it != localMap().end() &&
+                    std::find(frames.begin(), frames.end(), it->second.lay) != frames.end())
+                    cand.insert(&v);
+            }
+        if (cand.empty()) return out;
+        struct Uses : ASTVisitor<Uses, VisitFlags::Statements | VisitFlags::Expressions> {
+            const std::set<const Symbol*>* c; std::set<const Symbol*> hit;
+            void handle(const NamedValueExpression& n) { if (c->count(&n.symbol)) hit.insert(&n.symbol); }
+        };
+        Uses later; later.c = &cand;
+        for (size_t j = k + 1; j < list.size(); j++) list[j]->visit(later);
+        Uses in; in.c = &cand;
+        list[k]->visit(in);
+        for (size_t j = 0; j < k; j++)
+            if (list[j]->kind == StatementKind::VariableDeclaration) {
+                const auto* v = &list[j]->as<VariableDeclStatement>().symbol;
+                if (cand.count(v) && in.hit.count(v) && !later.hit.count(v)) out.push_back(v);
+            }
+        return out;
+    }
     const slang::ast::Expression* to2State = nullptr;   // the conversion being lowered without its x/z clearing
     // with {...}: an element of the caller's array or container, by an index
     // the caller knows (addrs[i]), read into a signal before the call.
@@ -9477,7 +9517,16 @@ struct Lowerer {
             }
             case StatementKind::List:
                 if ((!loops.empty() && loops.back().xpBrk >= 0) || (!xp.dis.empty() && !xp.clean)) { xpList(s.as<StatementList>().list, 0); break; }   // -xprop
-                for (auto* st : s.as<StatementList>().list) stmt(*st);
+                {
+                    auto list = s.as<StatementList>().list;
+                    for (size_t k = 0; k < list.size(); k++) {
+                        const Statement* st = list[k];
+                        if (st->kind == StatementKind::Block && st->as<BlockStatement>().blockKind != StatementBlockKind::Sequential)
+                            forkCopy = forkOwnVars(list, k);
+                        stmt(*st);
+                        forkCopy.clear();
+                    }
+                }
                 break;
             case StatementKind::Block: {
                 const auto& b = s.as<BlockStatement>();
@@ -9523,6 +9572,16 @@ struct Lowerer {
                         const Expression* init = v.getInitializer();
                         f.init.push_back({localMap().at(&v).off, init ? expr(*init) : konst(initOf(v.getType()))});
                     }
+                // Block automatics before the fork that only it goes on
+                // using: a copy for its processes (forkOwnVars).
+                std::vector<std::pair<const slang::ast::Symbol*, int>> own;
+                for (const auto* v : std::exchange(forkCopy, {})) {
+                    const LocalSlot& ls = localMap().at(v);
+                    if (!flay) flay = newLayout("fork");
+                    int off = flay->add(ls.lay->w[(size_t)ls.off], ls.lay->init[(size_t)ls.off]);
+                    f.init.push_back({off, ref(relIn(ls.lay, ls.off), v->getType().isSigned())});
+                    own.push_back({v, off});
+                }
                 f.lay = flay;
                 auto branch = [&](const Statement& st) {
                     Lowerer lw(sigmap);
@@ -9539,6 +9598,8 @@ struct Lowerer {
                     lw.frames = frames;
                     if (flay) lw.frames.push_back(flay);
                     lw.frames.push_back(bl);
+                    lw.forkOwn = forkOwn;
+                    for (auto& [v, off] : own) lw.forkOwn[v] = {flay, off};
                     lw.declLocals(st, bl);
                     bool framed = !frames.empty() || flay || !bl->w.empty();
                     if (!framed) lw.frames.clear();

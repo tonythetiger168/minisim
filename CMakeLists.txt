@@ -436,9 +436,10 @@ if(MINISIM_WITH_SLANG)
   foreach(sv IN LISTS DW_TESTS)
     get_filename_component(name ${sv} NAME_WE)
     add_test(NAME dw/${name}
-             COMMAND ${CMAKE_COMMAND} -DSIM=$<TARGET_FILE:msim> -DSV=${sv}
+             COMMAND ${CMAKE_COMMAND} -DSIM=$<TARGET_FILE:msim> -DSV=${sv} -DTIMEOUT=120
                      -P ${CMAKE_SOURCE_DIR}/tests/spec/run_spec.cmake)
-    set_tests_properties(dw/${name} PROPERTIES LABELS "dw")
+    # xing and arith take 5 to 12 s alone; under ctest -j8 they passed 20 s
+    set_tests_properties(dw/${name} PROPERTIES LABELS "dw" TIMEOUT 180)
   endforeach()
 
   # UVM (IEEE 1800.2-2020) tests: tests/uvm/*.sv run against the Accellera
