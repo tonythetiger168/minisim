@@ -23,7 +23,7 @@ endif()
 string(REPLACE "${SRC}/" "" out "${out}")
 string(REGEX REPLACE "\\$finish[^\n]*\n" "" out "${out}")
 # severity failure: msim's own $fatal lines are not part of the VHDL output
-string(REGEX REPLACE "Fatal: [^\n]*\nVHDL severity failure\n" "" out "${out}")
+string(REGEX REPLACE "Fatal: [^\n]*\nVHDL (severity|bound check) failure\n" "" out "${out}")
 file(READ ${SRC}/${TOP}.out want)
 if(NOT out STREQUAL want)
   message(FATAL_ERROR "output differs from ${TOP}.out\n--- got:\n${out}\n--- want:\n${want}")
