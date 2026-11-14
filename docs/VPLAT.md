@@ -84,7 +84,11 @@ Zvfhmin) makes SEW 16 half precision for every vector floating-point
 instruction, widening to single and narrowing from it, and the conversions
 to and from 8, 16 and 32-bit integers; `tests/vplat/zvfh.c` checks each one
 against the scalar Zfh instruction in all five rounding modes, flags
-included.
+included. Vector cryptography: Zvkned (AES rounds, `vaesz`, the AES-128 and
+AES-256 key schedules), Zvknha and Zvknhb (SHA-256 and SHA-512 message
+schedule and rounds), Zvkg (GHASH), Zvbc (`vclmul`, `vclmulh`) and Zvkt;
+`tests/vplat/zvk.c` checks them on FIPS-197, FIPS 180-4 and GCM published
+answers.
 
 **Supervisor mode and the MMU.** `medeleg` and `mideleg` hand exceptions
 and interrupts to supervisor mode; `sstatus`, `sie` and `sip` are the
@@ -461,7 +465,7 @@ simulation time.
 
 ## Limits / Not yet
 
-- No vector crypto beyond Zvkb, no Zvfbfmin/Zvfbfwma (BF16), no Zbkc,
+- No ShangMi vector crypto (Zvksed, Zvksh), no Zvfbfmin/Zvfbfwma (BF16), no Zbkc,
   no Svadu (hardware A/D update), no Svpbmt, and every hart of a platform
   has the program's width. F and D
   round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions

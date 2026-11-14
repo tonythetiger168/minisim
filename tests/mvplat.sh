@@ -76,6 +76,8 @@ for x in 32 64; do
     expect "Zvbb, RV$x, VLEN $v: every instruction at SEW 8 to 64" 0 zvbb${x}_$v.out "checks passed, all"
     "$MVPLAT" "$E/zvfh$x.elf" -vlen $v -q > zvfh${x}_$v.out 2>&1; rc=$?
     expect "Zvfh, RV$x, VLEN $v: half precision against Zfh, five rounding modes" 0 zvfh${x}_$v.out "checks passed, all"
+    "$MVPLAT" "$E/zvk$x.elf" -vlen $v -q > zvk${x}_$v.out 2>&1; rc=$?
+    expect "Zvkned/Zvknhb/Zvkg/Zvbc, RV$x, VLEN $v: AES, SHA-2, GHASH known answers" 0 zvk${x}_$v.out "checks passed, all"
   done
 done
 

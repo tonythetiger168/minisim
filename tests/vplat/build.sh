@@ -34,6 +34,8 @@ for x in 32 64; do
     crt0.S zvbb.c -o "$out/zvbb$x.elf"
   $V -march=rv${x}gcv_zfh_zvfh -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fuse-ld=lld -Wl,-T,link.ld \
     -Wl,--build-id=none -static crt0.S zvfh.c -o "$out/zvfh$x.elf"
+  $V -march=rv${x}gcv_zvkned_zvknhb_zvkg_zvbc -fno-vectorize -fno-slp-vectorize -fuse-ld=lld -Wl,-T,link.ld \
+    -Wl,--build-id=none -static crt0.S zvk.c -o "$out/zvk$x.elf"
 done
 # ... and as a Linux program, for the BusyBox test.
 V="${CLANG:-clang} --target=riscv64-unknown-linux-gnu -mabi=lp64d $VF -fno-stack-protector"
