@@ -3851,10 +3851,21 @@ private:
         // took the compiler 12 GB and 80 s.
         o << "static bool twoNow() {\n";
         if (two) {
+            // The x words of the narrow signals by address (taken once: S.sigs
+            // does not move after startup), then the wide ones limb by limb:
+            // a loop over Val and its limbs cost about 14 instructions a
+            // signal, 30% of Ibex's run time once it was all 2-state.
             o << "    static const int T[] = {-1";
-            for (int e : ext) if (!scratch(e)) o << ", " << e;
-            o << "};\n    if (!pclean) return false;\n    uint64_t x = 0;\n"
-                 "    for (size_t k = 1; k < sizeof T / sizeof T[0]; k++) { const Val& v = S.sigs[T[k]].val; x |= v.x; for (auto& h : v.hi) x |= h.x; }\n"
+            for (int e : ext) if (!scratch(e) && sigW_[e] <= 64) o << ", " << e;
+            o << "};\n    static const int TW[] = {-1";
+            for (int e : ext) if (!scratch(e) && sigW_[e] > 64) o << ", " << e;
+            o << "};\n    constexpr size_t NT = sizeof T / sizeof T[0] - 1;\n"
+                 "    static const uint64_t* TX[NT ? NT : 1];\n"
+                 "    static bool init = false;\n"
+                 "    if (!init) { for (size_t k = 0; k < NT; k++) TX[k] = &S.sigs[T[k + 1]].val.x; init = true; }\n"
+                 "    if (!pclean) return false;\n    uint64_t x = 0;\n"
+                 "    for (size_t k = 0; k < NT; k++) x |= *TX[k];\n"
+                 "    for (size_t k = 1; k < sizeof TW / sizeof TW[0]; k++) { const Val& v = S.sigs[TW[k]].val; x |= v.x; for (auto& h : v.hi) x |= h.x; }\n"
                  "    return x == 0;\n";   // every limb: fx reads up to 64 bits of a wider signal
         } else
             o << "    return false;\n";
@@ -3994,7 +4005,11 @@ private:
                  "      S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }, use); S.domainTune[1].done(S.threads); }\n";
         else if (multi) {
             o << "    const int grp = (int)(intptr_t)ctx;\n";
-            if (two) o << "    if (twoNow()) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
+            // The groups of one runSeqs run back to back and write no signal
+            // in between (NBAs only): one twoNow() for all of them.
+            if (two) o << "    static uint64_t tAt = ~0ULL; static bool tNow = false;\n"
+                          "    if (S.seqRun != tAt) { tAt = S.seqRun; tNow = twoNow(); }\n"
+                          "    if (tNow) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
             o << "    for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS[DSO[k]]();\n"
                  "    if (dpend) return;\n    dpend = true;\n";
         } else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
