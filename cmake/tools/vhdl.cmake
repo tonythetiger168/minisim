@@ -29,6 +29,8 @@ if(TARGET msim)
     "blockhdr_tb|blockhdr.vhd|ghdl"
     "localpkg_tb|localpkg.vhd|ghdl"
     "subgen_tb|subgen.vhd|"
+    "guarded_tb|guarded.vhd|ghdl"
+    "localpkg2_tb|localpkg2.vhd|"
     "pkggen_tb|pkggen.vhd|ghdl"
     "pkggen_types_tb|pkggen_types.vhd|"
     "vhdl2019_tb|vhdl2019.vhd|"

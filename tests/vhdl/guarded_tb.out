@@ -1,0 +1,6 @@
+guarded.vhd:44:5:@1ns:(report note): t1 b='Z' v=0000 r='0' r2=00 p='1'
+guarded.vhd:47:5:@6ns:(report note): t6 b='1' v=0011 r='1' r2=10
+guarded.vhd:50:5:@11ns:(report note): t11 v=0XX1 r2=XX
+guarded.vhd:53:5:@12ns:(report note): t12 b='Z' v=0XX1 r='1' r2=01
+guarded.vhd:55:5:@14ns:(report note): t14 v=0101
+guarded.vhd:58:5:@17ns:(report note): t17 v=ZZZZ r2=01 p='Z'
