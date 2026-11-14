@@ -461,9 +461,15 @@ files: an edit to the CPU, its wrapper or the testbench rebuilt all 4 files
 before and rebuilds 1 now (about 32 s -> 24 to 34 s on 4 cores; the CPU time
 drops from about 120 s to 30 s). More files make an edit cheaper and a full
 build dearer: `-cfiles 16`, 15 s per edit, 70 s for a full build (51 s with
-4). An edit that adds or removes signals renumbers them, and the shared
-header changes, so every file is still rebuilt then. `MSIM_WHYPARTS=1`
-prints each file's share.
+4). The shared header `design.hpp` holds only what does not depend on the
+design's numbering (the kernel, helper functions, types). The variables
+and tables are defined in `design.cpp`, and each part declares just the
+ones it names, so a change to a table rebuilds `design.cpp` and the parts
+that use it rather than everything; it also made the full build of 16
+PicoRV32 cores 51 -> 47 s. An edit that adds or removes signals still
+rebuilds every file: the signals after it are renumbered, and the parts
+name signals by number. `MSIM_WHYPARTS=1` prints each file's share,
+`MSIM_FULLHDR=1` keeps everything in the header.
 
 ### Static combinational schedule
 
