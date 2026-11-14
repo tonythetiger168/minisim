@@ -466,10 +466,19 @@ design's numbering (the kernel, helper functions, types). The variables
 and tables are defined in `design.cpp`, and each part declares just the
 ones it names, so a change to a table rebuilds `design.cpp` and the parts
 that use it rather than everything; it also made the full build of 16
-PicoRV32 cores 51 -> 47 s. An edit that adds or removes signals still
-rebuilds every file: the signals after it are renumbered, and the parts
-name signals by number. `MSIM_WHYPARTS=1` prints each file's share,
-`MSIM_FULLHDR=1` keeps everything in the header.
+PicoRV32 cores 51 -> 47 s. On Linux x86-64 the parts do not name signals
+or NBA slots by number at all: each is a link-time symbol (`SO_`, `SN_`,
+`PV_`, `SL_`, from a hash of the signal's name) that `design.cpp` sets to
+the current number, and the parts and `simv` are built without PIE so the
+linker can fill them in. Each generated function and its file are named
+after the signal it writes, not its number or text. So an edit that adds or
+removes signals rebuilds only `design.cpp` and the parts whose code changed:
+a signal and a process added to one module of `examples/partsig.sv` rebuild
+2 of 4 parts (`tests/msim_parts.cmake`), and a logic edit leaves
+`design.cpp` alone. The absolute addresses are also a little faster (16
+PicoRV32 cores 2.95G -> 2.65G instructions). `MSIM_WHYPARTS=1` prints each
+file's share, `MSIM_NORELOC=1` goes back to numbers, `MSIM_FULLHDR=1` keeps
+everything in the header.
 
 ### Static combinational schedule
 
