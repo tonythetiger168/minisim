@@ -808,7 +808,7 @@ public:
                  "        return 1;\n"
                  "    }\n";
         if (cov) o << "    if (covOut && !writeCov(covOut)) { std::cerr << \"simv: cannot write \" << covOut << \"\\n\"; return 1; }\n";
-        o << "    return 0;\n"
+        o << "    return S.exitCode;\n"
              "}\n";
         if (outFiles.empty()) return o.str();
         // Files after one another, each after a marker line msim splits on.
@@ -4372,10 +4372,10 @@ private:
                 bool dynW = (i.k == IK::Assign || i.k == IK::Nba) && (i.arr || i.bidx);
                 if (dynW && ((i.k != IK::Assign && i.k != IK::Nba) || i.drv >= 0))
                     throw CodegenUnsupported(std::string("array or variable-index ") + (i.drv >= 0 ? "continuous assign" : "write (instruction " + std::to_string((int)i.k) + ")"));
-                if (i.de || i.nbaLater) throw CodegenUnsupported("delay expression or intra-assignment delay");
+                if (i.nbaLater && i.k != IK::Nba) throw CodegenUnsupported("intra-assignment delay");
+                if (i.de && i.k != IK::Nba && i.k != IK::WaitDelay) throw CodegenUnsupported("delay expression");
                 if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
                 if (!p.roots.empty() || !p.spans.empty()) throw CodegenUnsupported("disable of a named block");
-                if (i.k == IK::Finish && i.hi > 0) throw CodegenUnsupported("$fatal exit status");
                 if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
                 if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
                 if (i.k == IK::ReadMem || i.k == IK::WriteMem) {   // $readmem / $writemem (21.4, 21.5)
@@ -4400,7 +4400,11 @@ private:
                 switch (i.k) {
                     case IK::Assign: o << (pd >= 0 ? assign(i, W(i, fast(i.e))) : assign(i)); break;
                     case IK::Nba:
-                        o << " S.nba(" << i.sig << ", " << W(i, fast(i.e)) << ", " << i.hi << ", " << i.lo << ");\n";
+                        if (i.nbaLater)   // x <= #d v: the update d ticks later (9.4.5)
+                            o << " S.nbaAt(S.now + " << (i.de ? "v_time(" + fast(i.de) + ")" : std::to_string(i.delay) + "ULL") << ", " << i.sig
+                              << ", " << W(i, fast(i.e)) << ", " << i.hi << ", " << i.lo << ");\n";
+                        else
+                            o << " S.nba(" << i.sig << ", " << W(i, fast(i.e)) << ", " << i.hi << ", " << i.lo << ");\n";
                         break;
                     case IK::JmpIfNot:
                         o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, tgt(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, tgt(i.xt)));
@@ -4421,7 +4425,9 @@ private:
                         o << gate;
                         break;
                     }
-                    case IK::WaitDelay: o << " co_await Delay{" << i.delay << "ULL};\n" << gate; break;
+                    case IK::WaitDelay:
+                        o << " co_await Delay{" << (i.de ? "v_time(" + fast(i.de) + ")" : std::to_string(i.delay) + "ULL") << "};\n" << gate;
+                        break;
                     case IK::Display:
                     case IK::Strobe:
                     case IK::Monitor: {
@@ -4444,7 +4450,10 @@ private:
                         o << "); if (S.finished) co_return;\n";
                         break;
                     }
-                    case IK::Finish: o << " S.finished = true; co_return;\n"; break;
+                    case IK::Finish:   // $fatal: its exit status (the interpreter: exec.inc)
+                        o << " S.finished = true;" << (i.hi > 0 ? " if (S.exitCode < " + std::to_string(i.hi) + ") S.exitCode = " + std::to_string(i.hi) + ";" : "")
+                          << " co_return;\n";
+                        break;
                     case IK::Assert: {   // an immediate assertion (16.3, 16.4), through the kernel's runAssert
                         if (i.join > 2) throw CodegenUnsupported("a procedural concurrent assertion or expect");
                         const AssertInfo& a = asserts().at(i.sig);

@@ -38,6 +38,7 @@ set(CASES
   "examples/emptycall.sv"
   "examples/privtmp.sv"
   "examples/wideslice.sv"
+  "examples/nbadelay.sv"
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
@@ -154,6 +155,21 @@ if(mine EQUAL SHARD)
   file(READ ${OUT}/lpcov.cov got)
   if(NOT rc EQUAL 0 OR NOT want STREQUAL got)
     message(FATAL_ERROR "upf lpcov: -compile coverage differs: ${rc}\n${err}--- got\n${got}--- want\n${want}")
+  endif()
+  math(EXPR ran "${ran} + 1")
+endif()
+# $fatal: the same exit status and output from the compiled simv.
+math(EXPR n "${n} + 1")
+math(EXPR mine "${n} % ${SHARDS}")
+if(mine EQUAL SHARD)
+  execute_process(COMMAND ${MSIM} -threads 1 ${SRC}/examples/fatalexit.sv OUTPUT_VARIABLE want RESULT_VARIABLE r1 ERROR_VARIABLE e1)
+  execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/fatalexit ${SRC}/examples/fatalexit.sv
+                  OUTPUT_VARIABLE got RESULT_VARIABLE r2 ERROR_VARIABLE err)
+  if(err MATCHES "using the interpreter")
+    message(FATAL_ERROR "fatalexit: -compile fell back to the interpreter\n${err}")
+  endif()
+  if(NOT r1 EQUAL 1 OR NOT r2 EQUAL 1 OR NOT want STREQUAL got)
+    message(FATAL_ERROR "fatalexit: exit ${r1} / ${r2} (want 1)\n--- interpreter\n${want}--- compiled\n${got}")
   endif()
   math(EXPR ran "${ran} + 1")
 endif()
