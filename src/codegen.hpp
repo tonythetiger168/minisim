@@ -3655,7 +3655,10 @@ private:
              "}\n";
         o << "static void fcommit() {" << (multi ? " dpend = false;" : "");
         o << " const bool obs = S.observed;"
-             " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) commitOne(CL[j], obs); }"
+             // The common slot inline: a private signal given a known value.
+             " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) { const uint32_t k = CL[j]; const uint8_t h = HA[k];"
+             " if (h == 1) { const CTRow& t = CTAB[k]; if (t.kind == 0) { HA[k] = 0; PSig& p = *t.p; p.v = VA[k] & t.m; p.x = 0; p.z = 0; continue; } }"
+             " if (h) commitOne(k, obs); } }"
              " else for (uint32_t k = 0; k < " << slots.size() << "; k++) commitOne(k, obs);"
              " CN = 0; CLOVF = false;" << (armIns_.empty() ? "" : " if (ARMLEFT) armChk();");
         // The comb pass is queued, not run here: other NBAs of this time
