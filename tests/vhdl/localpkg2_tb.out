@@ -1,0 +1,3 @@
+localpkg2.vhd:36:5:@1ns:(report note): block: 20
+localpkg2.vhd:37:5:@1ns:(report note): process: 42
+localpkg2.vhd:38:5:@1ns:(report note): function: 33

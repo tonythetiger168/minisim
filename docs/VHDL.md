@@ -39,7 +39,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | `q <= d when rising_edge(clk);` | `always @(posedge clk)` |
 | variable | a static variable of the process |
 | component / entity / SV module instance | a module instance; a VHDL component binds to the VHDL entity or SV module with its name, matched case-insensitively |
-| for / if / case generate, block | generate blocks; a block's generics are localparams with the mapped values and its ports name their actuals; a guarded block has the signal `GUARD`, and a guarded assignment is `if GUARD then ... end if` (11.6) |
+| for / if / case generate, block | generate blocks; a block's generics are localparams with the mapped values and its ports name their actuals; a guarded block has the signal `GUARD`, and a guarded assignment is `if GUARD then ... end if` (11.6); to a guarded signal (`bus`, `register`, 6.4.2.3) it disconnects the driver when GUARD is false, after the disconnection specification's delay (7.4); `s <= null` disconnects too (10.5.2.2); a disconnected `bus` signal resolves with no drivers (`'Z'`), a `register` signal keeps its value |
 | a resolved signal with several drivers (tri-state buses) | a wire; every driving process drives its own variable |
 | `S'delayed(T)`, `S'stable(T)`, `S'last_event`, `S'transaction` and the other implicit signals (16.2.4) | one helper process per signal keeps the time and value of its last event and transaction; `S'delayed(T)` is a nonblocking assignment delayed by T. A process with a sensitivity list reads `'event` from the value at its last resume |
 | function, procedure | `function automatic`; a procedure is a `function automatic void` unless it waits or assigns a signal (then a `task automatic`), so VHDL functions can call it. Ones with unconstrained array parameters or results, or signal parameters, are specialized per call so the widths are known |
@@ -50,7 +50,7 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | entity generic type and subprogram (6.5.6.1) | one copy of the module per set of actuals (`e__g1`, `e__g2`, ...), where the type and subprogram names stand for the actuals |
 | `conv(formal) => actual` on an out port (6.5.7.3) | the port drives a signal of its own type, and a process assigns `conv()` of it to the actual; a conversion on the actual of an in port is an expression |
 | generic subprogram, subprogram instantiation (4.2.1, 4.4) | each instance is a copy of the subprogram in which the generics' names stand for the actuals (a subprogram generic can be `T'image`) |
-| generic package, package instantiation (4.7, 4.9) | one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals, and a package generic (6.5.6.4) names the actual instance |
+| generic package, package instantiation (4.7, 4.9) | in a library, architecture, block, process or subprogram; one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals, and a package generic (6.5.6.4) names the actual instance |
 | an integer assigned to a subtype with a range (5.2.1) | a range check: out of range prints `file:line:@time:(bound check failure)` on stderr and stops the run with a non-zero exit, as GHDL does |
 | conditional analysis (24.2) | done on the source text before parsing. `TOOL_TYPE` is `"SIMULATION"`, `VHDL_VERSION` `"2019"`, `TOOL_VENDOR` `"minisim"`, `TOOL_NAME` `"msim"`; `+define+NAME=VALUE` (or `-D`) adds or overrides an identifier |
 | mode view port (6.5.2) | one SystemVerilog port per record element in the element's mode; inside the module the port is a record signal |
@@ -113,12 +113,15 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
 - A character of a `string(1 to n)` variable that was never assigned is a
   space, where VHDL has NUL (SystemVerilog strings hold no NUL).
 - A conversion on the formal of an `inout` port (out ports have it).
-- Guarded signals (`bus`, `register`: a guarded assignment to one does not
-  disconnect its driver); package instantiation inside a
-  block, process or subprogram (in an architecture and at library level
-  they work; an architecture's instance is a package of the same name, so
-  two of them need distinct names, and its generic actuals cannot name the
-  architecture's own constants).
+- A package instance declared in an architecture, block, process or
+  subprogram is a package of the same name, so two of them in the design
+  need distinct names, and its generic actuals cannot name the enclosing
+  region's own constants or signals.
+- A register signal with several drivers keeps its value when the resolved
+  value is all `'Z'` (every driver disconnected, or a connected driver
+  driving `'Z'`). A guarded signal must have a scalar or vector `std_logic`
+  type to disconnect; a disconnection delay is not checked against later
+  ordinary `after` transactions of the same driver.
 - The actual of an entity's generic subprogram is declared in a package (or
   predefined), and the actual of a generic type is a predefined type or one
   declared in a package. A SystemVerilog parent cannot instantiate an

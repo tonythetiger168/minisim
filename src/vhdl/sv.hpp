@@ -160,11 +160,11 @@ public:
         };
         for (auto& u : order)
             if (u->k == Unit::Package || u->k == Unit::PackageInst) emitPkg(u);
-        // package instances declared in an architecture (4.9): a package of their own
+        // package instances declared in an architecture, block, process or subprogram (4.9):
+        // a package of their own
         for (auto& [en, list] : archs)
             for (auto& a : list)
-                for (auto& d : a->decls) {
-                    if (d->k != DK::PackageInst || !d->cfg) continue;
+                for (auto& d : localPkgInsts(*a)) {
                     UP pu = d->cfg;
                     if (pu->file.empty()) {
                         pu->file = a->file;
@@ -192,6 +192,29 @@ public:
     }
 
 private:
+    // the package instantiations an architecture declares anywhere: in its declarative part,
+    // its blocks, generate statements, processes and subprograms (nested ones included)
+    static std::vector<DP> localPkgInsts(const Unit& a) {
+        std::vector<DP> r;
+        std::function<void(const std::vector<DP>&)> decls;
+        std::function<void(const std::vector<SP>&)> stmts = [&](const std::vector<SP>& ss) {
+            for (auto& s : ss) {
+                if (!s) continue;
+                decls(s->decls);
+                stmts(s->body);
+                for (auto& al : s->alts) { decls(al.decls); stmts(al.body); }
+            }
+        };
+        decls = [&](const std::vector<DP>& ds) {
+            for (auto& d : ds) {
+                if (d->k == DK::PackageInst && d->cfg) r.push_back(d);
+                if (d->sub) decls(d->sub->decls);
+            }
+        };
+        decls(a.decls);
+        stmts(a.stmts);
+        return r;
+    }
     std::map<std::string, UP> entities, packages, bodies, configs, contexts;
     std::map<std::string, std::vector<UP>> archs;
     std::vector<UP> order;
@@ -231,6 +254,10 @@ private:
         std::string file;
         int indent = 1;
         std::map<std::string, std::string> drvNames;   // module: signals with driver variables
+        // guarded signals (6.4.2.3): disconnection delays (7.4), register signals whose
+        // drivers can all disconnect (a resolved net plus a held value), driver initial values
+        std::map<std::string, std::string> discDelay, guardInit;
+        std::set<std::string> regNets;
         UP cfgUnit;                     // module: bindings from a configuration
         std::vector<UP> cfgSpecs;       // module: configuration specifications of the architecture
         std::ostringstream* helpers = nullptr;   // module: implicit-signal helpers, before the processes
@@ -3095,8 +3122,27 @@ endpackage
             return;
         }
         case DK::Library: case DK::Context: case DK::Attribute: case DK::AttrSpec: case DK::Config: case DK::Group:
-        case DK::Disconnect: case DK::Ignored: case DK::PackageInst:
+        case DK::Ignored: case DK::PackageInst:
             return;
+        case DK::Disconnect: {   // 7.4: the delay of a guarded signal's disconnection
+            std::string dl = ex(d->init, bt["time"]).s;
+            TP t = subtype(d->type);
+            auto guarded = [](const Sym& y) { return y.k == Sym::Obj && y.decl && !y.decl->sigKind.empty(); };
+            auto sameType = [&](const Sym& y) { return y.type == t || (y.type && t && !t->name.empty() && y.type->name == t->name); };
+            if (d->names[0] == "all" || d->names[0] == "others") {
+                for (auto& [n, ys] : cx->scopes.back())
+                    for (auto& y : ys)
+                        if (guarded(y) && sameType(y) && !(d->names[0] == "others" && cx->discDelay.count(y.sv))) cx->discDelay[y.sv] = dl;
+                return;
+            }
+            for (auto& n : d->names) {
+                const Sym* y = lookup(n);
+                if (!y || !guarded(*y)) fail(d->line, "'" + n + "' in a disconnection specification is not a guarded signal");
+                if (!sameType(*y)) fail(d->line, "the type mark of a disconnection specification must be the type of '" + n + "'");
+                cx->discDelay[y->sv] = dl;
+            }
+            return;
+        }
         case DK::Type: return emitTypeDecl(o, d, where);
         case DK::Subtype: {
             TP t = subtype(d->type);
@@ -3810,6 +3856,14 @@ endpackage
             else if (d->k == DK::Variable && d->shared) kw = "";
             std::string dname = y.sv;
             if (d->k == DK::Signal && cx->drvNames.count(dname) && !(isPackable(ot) && isFourState(ot))) cx->drvNames.erase(dname);
+            if (d->k == DK::Signal && !d->sigKind.empty() && cx->drvNames.count(dname)) cx->guardInit[dname] = init.empty() ? "'z" : init;
+            if (d->k == DK::Signal && cx->drvNames.count(dname) && cx->regNets.count(dname)) {
+                // register signal (6.4.2.3): keeps its value while every driver is disconnected
+                o << ind() << svDeclNet(ot, dname + "__res") << ";\n";
+                o << ind() << svDecl(ot, dname) << (init.empty() ? "" : " = " + init) << ";\n";
+                o << ind() << "always @(" << dname << "__res) if (" << dname << "__res !== 'z) " << dname << " = " << dname << "__res;\n";
+                continue;
+            }
             if (d->k == DK::Signal && cx->drvNames.count(dname)) {
                 // resolved signal with several drivers: a wire, each driver is a variable
                 o << ind() << svDeclNet(ot, dname) << ";\n";
@@ -4358,7 +4412,11 @@ endpackage
             std::string tg = target(s.target, true);
             if (s.waves.empty()) break;
             for (auto& w : s.waves) {
-                if (w.val->k == EK::Null) continue;
+                if (w.val->k == EK::Null) {   // 10.5.2.2: a null waveform element disconnects a guarded signal's driver
+                    std::string dc = disconnectOf(s.target, w.after);
+                    if (!dc.empty()) r += I + dc.substr(6) + "\n";
+                    continue;
+                }
                 std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
                 r += I + tg + " <= " + d + assignRhs(w.val, tt) + ";" + transactionOf(s.target) + "\n";
             }
@@ -5290,6 +5348,7 @@ endpackage
                     y.sv = svId(p->texts[k]);
                     y.type = t;
                     y.mode = p->mode;
+                    if (!p->sigKind.empty()) y.decl = p;
                     declare(y);
                     portSigs.push_back({y.sv, t});
                 }
@@ -5322,7 +5381,7 @@ endpackage
                     std::string sv = svId(p->texts[k]);
                     std::string dir = p->mode == "in" ? "input" : p->mode == "inout" ? "inout" : "output";
                     std::string decl;
-                    bool net = p->mode == "inout" || di.needsNet(p->names[k]);
+                    bool net = p->mode == "inout" || di.needsNet(p->names[k]) || (p->sigKind == "bus" && di.procDrivers.count(p->names[k]));
                     if (net && isPackable(t) && isFourState(t)) decl = dir + " " + svDeclNet(t, sv);
                     else decl = dir + " " + svDecl(t, sv);
                     if (p->mode == "in" && p->init) decl += " = " + ex(p->init, t).s;
@@ -5350,8 +5409,13 @@ endpackage
             if (arch) {
                 for (auto& d : arch->decls)
                     if (d->k == DK::Signal)
-                        for (auto& n : d->names)
-                            if (di.needsNet(n)) c.drvNames[svId(d->texts[std::find(d->names.begin(), d->names.end(), n) - d->names.begin()])] = n;
+                        for (size_t k = 0; k < d->names.size(); ++k) {
+                            const std::string& n = d->names[k];
+                            std::string sv = svId(d->texts[k]);
+                            // a guarded bus signal disconnects to its resolution of no drivers: a net
+                            if (di.needsNet(n) || (d->sigKind == "bus" && di.procDrivers.count(n))) c.drvNames[sv] = n;
+                            if (d->sigKind == "register" && di.needsNet(n)) c.regNets.insert(sv);
+                        }
             }
             body << viewBody;
             emitDecls(body, ent->decls, "module");
@@ -5549,7 +5613,7 @@ endpackage
             if (s.guarded) {   // 11.6: if GUARD then <assignment> end if
                 const Sym* g = lookup("guard");
                 if (!g || g->k != Sym::Obj) fail(s.line, "a guarded assignment outside a guarded block");
-                body = "    if (" + g->sv + ") begin\n" + body + "    end\n";
+                body = "    if (" + g->sv + ") begin\n" + body + "    end" + disconnectOf(s.target, nullptr, g->sv) + "\n";
                 sigs.push_back(g->sv);
             }
             std::vector<SP> one{std::make_shared<Stmt>(q)};
@@ -5732,6 +5796,20 @@ endpackage
         }
     }
 
+    // " else <driver> <= #(delay) 'z;" disconnecting the current process's driver of a
+    // guarded signal (11.6, 10.5.2.2); "" for other targets and for a register signal
+    // with a single driver (it keeps its value)
+    // `guard`: a delayed disconnection is dropped when GUARD is true again before it
+    // matures (the new transaction deletes it, 10.5.2.2)
+    std::string disconnectOf(const EP& tgt, const EP& after, const std::string& guard = "") {
+        const Sym* y = lookup(baseName(tgt));
+        if (!y || y->k != Sym::Obj || !y->decl || y->decl->sigKind.empty() || !cx->proc || !cx->proc->drv.count(y->sv)) return "";
+        std::string d = after ? ex(after, bt["time"]).s : cx->discDelay.count(y->sv) ? cx->discDelay.at(y->sv) : "";
+        std::string tg = target(tgt, true);
+        if (!d.empty() && !guard.empty()) return " else fork #(" + d + ") if (!" + guard + ") " + tg + " <= 'z; join_none";
+        return " else " + tg + " <= " + (d.empty() ? "" : "#(" + d + ") ") + "'z;";
+    }
+
     // signals this statement drives that need their own driver variable
     void setupDrivers(Proc& pr, const Stmt& s) {
         std::set<std::string> a;
@@ -5750,7 +5828,8 @@ endpackage
         std::string r;
         for (auto& [sig, dv] : pr.drv) {
             TP t = pr.drvTypes.at(dv);
-            r += "  " + svDecl(t, dv) + " = 'z;\n  assign " + sig + " = " + dv + ";\n";
+            std::string init = cx->guardInit.count(sig) ? cx->guardInit.at(sig) : "'z";
+            r += "  " + svDecl(t, dv) + " = " + init + ";\n  assign " + sig + (cx->regNets.count(sig) ? "__res" : "") + " = " + dv + ";\n";
         }
         return r;
     }
