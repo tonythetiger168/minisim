@@ -2645,7 +2645,7 @@ struct Sim {
             g.p0 = (uint8_t)o; g.at = now;
             if (o == 2 || n == 2) xAt = now;
         }
-        dump(s);
+        if (observed) dump(s);   // a VCD or FST open sets observed (dumpvars)
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
         if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
