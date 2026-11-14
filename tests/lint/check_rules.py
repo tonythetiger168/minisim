@@ -51,6 +51,10 @@ for name in sorted(os.listdir(rules_dir)):
     args = [x.replace("$DIR", here) for x in re.search(r"^(?://|--)! args: (.*)$", text, re.M).group(1).split()]
     want = []
     for n, line in enumerate(text.splitlines(), 1):
+        m = re.search(r"(?://|--)~@ (\S+):(\d+) (.*)$", line)
+        if m:  # "//~@ other.sdc:3 RULE": a finding in another file the test reads
+            want += [(f"{m.group(1)}:{m.group(2)}", r) for r in m.group(3).split()]
+            continue
         m = re.search(r"(?://|--)~(v?) (.*)$", line)
         if m:  # "//~v RULE" marks the line below, for rules about the end of a line
             want += [(n + (m.group(1) == "v"), r) for r in m.group(2).split()]
@@ -58,11 +62,14 @@ for name in sorted(os.listdir(rules_dir)):
     if rc not in (0, 1) or "error:" in err:
         fail(f"{name}: mlint exited {rc}\n{out}{err}")
         continue
-    got = sorted((int(f[1]), f[4]) for f in findings(out))
+    def where(f):
+        return int(f[1]) if os.path.basename(f[0]) == name else f"{os.path.basename(f[0])}:{f[1]}"
+    got = sorted(((where(f), f[4]) for f in findings(out)), key=str)
+    want = sorted(want, key=str)
     tested |= {r for _, r in got}
-    if got != sorted(want):
-        missing = sorted(set(want) - set(got))
-        extra = sorted(set(got) - set(want))
+    if got != want:
+        missing = sorted(set(want) - set(got), key=str)
+        extra = sorted(set(got) - set(want), key=str)
         fail(f"{name}: missing {missing}, unexpected {extra}\n{out}")
     rc4, out4, _ = run([path] + args + ["-threads", "4"])
     if out4 != out or rc4 != rc:
