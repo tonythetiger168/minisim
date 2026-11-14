@@ -851,8 +851,8 @@ inline bool solveOnce(const std::vector<int>& order) {
 // constraint holds is a uniform draw over the solutions. This is tried
 // first when nothing asks for another distribution (no dist, randc,
 // solve-before or function calls); when the solutions are too thin in the
-// box to be hit within the tries, the variable-by-variable search below
-// is used instead.
+// box to be hit within the tries, they are listed depth first when there
+// are few of them; else the variable-by-variable search below is used.
 inline bool sampleExact(int tries) {
     for (auto& v : g_ctx->vars) { v.set = false; v.lo = rMin(v.w, v.sgn); v.hi = rMax(v.w, v.sgn); }
     if (!propagate()) return false;
@@ -899,11 +899,60 @@ inline bool sampleExact(int tries) {
         }
         if (allOk()) return true;
     }
-    for (size_t k = 0; k < g_ctx->vars.size(); k++) {
+    auto reset = [&]() {
+        for (size_t k = 0; k < g_ctx->vars.size(); k++) {
+            auto& v = g_ctx->vars[k];
+            v.set = false; v.lo = box[k].first; v.hi = box[k].second;
+        }
+    };
+    reset();
+    if (tries == 0) return false;
+    // Few solutions in a big box, too thin to be hit: list them, depth
+    // first, each value of a variable narrowing the ones after it
+    // (propagate), and take one of them. More than 4096 values left for a
+    // variable, more than 4096 solutions, or too much work: give up and let
+    // the variable-by-variable search below decide.
+    size_t n = g_ctx->vars.size();
+    std::vector<std::vector<i128>> sols;
+    std::vector<i128> cur(n);
+    bool gave = false;
+    long nodes = 0;
+    long budget0 = g_ctx->budget;
+    g_ctx->budget = 1L << 22;
+    struct Snap { i128 lo, hi, val; bool set; };
+    std::function<void(size_t)> dfs = [&](size_t k) {
+        if (k == n) {
+            if (allOk()) {
+                sols.push_back(cur);
+                if (sols.size() > 4096) gave = true;
+            }
+            return;
+        }
         auto& v = g_ctx->vars[k];
-        v.set = false; v.lo = box[k].first; v.hi = box[k].second;
-    }
-    return false;
+        i128 lo = v.lo, hi = v.hi;
+        if (hi - lo + 1 > 4096) { gave = true; return; }
+        std::vector<Snap> snap(n);
+        for (size_t j = 0; j < n; j++) snap[j] = {g_ctx->vars[j].lo, g_ctx->vars[j].hi, g_ctx->vars[j].val, g_ctx->vars[j].set};
+        for (i128 x = lo; x <= hi && !gave; x++) {
+            if (++nodes > 200000) { gave = true; break; }
+            v.val = v.lo = v.hi = x;
+            v.set = true;
+            cur[k] = x;
+            if (k + 1 == n || propagate()) dfs(k + 1);
+            if (g_ctx->budget < 0) gave = true;   // pruned for lack of budget: not exact
+            for (size_t j = 0; j < n; j++) {
+                auto& u = g_ctx->vars[j];
+                u.lo = snap[j].lo; u.hi = snap[j].hi; u.val = snap[j].val; u.set = snap[j].set;
+            }
+        }
+    };
+    dfs(0);
+    g_ctx->budget = budget0;
+    reset();
+    if (gave) return false;
+    if (sols.empty()) return false;   // no solution at all
+    setAll(sols[(size_t)below((i128)sols.size())]);
+    return true;
 }
 inline bool exactEligible(const std::vector<int>& rank) {
     for (auto& v : g_ctx->vars)
