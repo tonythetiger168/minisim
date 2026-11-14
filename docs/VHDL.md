@@ -118,6 +118,27 @@ Attributes: `'event`, `'active`,
 
 ## Checking against an independent simulator
 
+## Nine-value std_logic
+
+`std_logic` and `std_logic_vector` keep all nine values `U X 0 1 Z W L H -`
+(IEEE 1076-2019 16.7): a signal never assigned prints `'U'`, two `'H'`
+pull-ups resolve to `'H'`, `'L' and '1'` is `'0'`, `'U' or '0'` is `'U'`,
+and `to_x01`, `'image`, `to_string`, `=` and `textio` see every value.
+
+Each `std_logic` object is a four-state SystemVerilog variable (its
+four-value view: `L`/`H` read as `0`/`1`, `U`/`W` as `x`, `'-'` as `z`)
+plus a companion `<name>__9` that holds the weak/uninitialized bit. The
+four-value view is what SystemVerilog, UPF, waveforms and VPI see, so a
+mixed design needs no conversion at the boundary: an SV module driving a
+VHDL `in` port drives strong values, and a VHDL `out` port read by SV gives
+`0`/`1`/`x`/`z`. A resolved signal with weak drivers resolves with
+SystemVerilog drive strengths (`weak0`/`weak1`), as 16.7's resolution table.
+
+`msim -vhdl4` turns the companions off: std_logic then runs on the four
+values only (`'U'`, `'W'`, `'-'` are `'X'`, `'L'` is `'0'`, `'H'` is `'1'`).
+That is about twice as fast in the interpreter (NEORV32's processor test:
+55 s with `-vhdl4`, 103 s with nine values, for 300 µs).
+
 Every VHDL test in `tests/vhdl` has a golden output made with GHDL, an
 independent open-source VHDL simulator. `ctest -R vhdl` runs msim against the
 goldens; when `ghdl` is installed, the `vhdl_ghdl_*` tests also re-make each
@@ -125,10 +146,11 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
 
 ## Limits / Not yet
 
-- std_logic's nine values run on SystemVerilog's four: `'U'`, `'W'`, `'-'`
-  become `'X'`, `'L'` becomes `'0'`, `'H'` becomes `'1'`. `std_logic'image`
-  and `to_string` therefore print `X` where GHDL prints `U` for a signal
-  never assigned.
+- std_logic keeps all nine values (see "Nine-value std_logic" above) for
+  signals, variables, ports between VHDL units and literals. Record fields,
+  arrays of vectors, subprogram parameters and `inout` ports carry only the
+  four-value view: `'L'`/`'H'` read as `'0'`/`'1'` and `'U'`/`'W'` as `'X'`
+  there. A `case` selector compares the four-value view only.
 - A character of a `string(1 to n)` variable that was never assigned is a
   space, where VHDL has NUL (SystemVerilog strings hold no NUL).
 - A conversion on the formal of an `inout` port (out ports have it).

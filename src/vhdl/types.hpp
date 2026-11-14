@@ -122,6 +122,7 @@ struct Sym {
     std::string pkgOfSub;   // subprogram declared in this package
     bool member = false;    // a method or variable of a protected type
     TP owner;               // method: its protected type
+    bool aux = false;       // std_logic object with a nine-value companion <sv>__9 (Translator::nine)
 };
 
 using Scope = std::map<std::string, std::vector<Sym>>;

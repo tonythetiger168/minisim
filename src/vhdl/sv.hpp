@@ -79,6 +79,12 @@ struct Val {
     bool isConst = false;
     std::optional<int64_t> iv;   // folded integer value
     std::string accObj;          // p.all of an access-to-array object: p (the elements are p.a)
+    // std_logic values: the companion plane that refines the four-value s into
+    // VHDL's nine (Translator::nine); "" when every element is a strong 0 1 X Z
+    std::string a;
+    // the 'U' marker of a logical operator's result: x where an operand is 'U', 0
+    // elsewhere (such a result is never weak); "" for other values
+    std::string u;
 };
 
 class Translator {
@@ -99,6 +105,14 @@ public:
     // 'event history) becomes `always @*` instead of a loop that waits on its
     // signals, which simulates the same but is not a synthesizable form.
     bool synth = false;
+    // std_logic with all nine values (IEEE 1164): every std_logic object keeps its
+    // four-value SystemVerilog variable (what SystemVerilog, UPF and waveforms
+    // see) plus a companion <name>__9 of the same shape. Per element, (companion,
+    // value) is 0:(0,0) 1:(0,1) X:(0,x) Z:(0,z) L:(1,0) H:(1,1) W:(1,x) -:(1,z)
+    // U:(x,x), so an object never assigned reads 'U'. A companion that is unknown
+    // while the value is known reads as strong (a write that did not update it).
+    // false (msim -vhdl4, mlint): std_logic is four-valued.
+    bool nine = false;
     bool firstRunWait = true;   // false for mlint: the #0 before a process's first run is a simulation detail
 
     void add(const std::vector<UP>& units) {
@@ -231,6 +245,7 @@ private:
         bool waits = false;   // a process with wait statements (no sensitivity list)
         std::string label;
         std::map<std::string, TP> drvTypes;
+        std::set<std::string> weakDrv;   // drivers that may hold L H W - (see `nine`)
     };
     struct Loop {
         std::string label;   // lower
@@ -259,6 +274,10 @@ private:
         // drivers can all disconnect (a resolved net plus a held value), driver initial values
         std::map<std::string, std::string> discDelay, guardInit;
         std::set<std::string> regNets;
+        // resolved std_logic signals with several drivers and a companion (see `nine`):
+        // each driver adds to the nets <sig>__u, __s, __w that resolve the companion
+        std::set<std::string> resAux, resWeak;   // resWeak: some driver may be weak
+        std::map<std::string, TP> resTypes;
         UP cfgUnit;                     // module: bindings from a configuration
         std::vector<UP> cfgSpecs;       // module: configuration specifications of the architecture
         std::ostringstream* helpers = nullptr;   // module: implicit-signal helpers, before the processes
@@ -1018,8 +1037,146 @@ private:
         case '0': case 'l': return "0";
         case '1': case 'h': return "1";
         case 'z': return "z";
+        case '-': return nine ? "z" : "x";
         default: return "x";
         }
+    }
+    // ---------------------------------------------- nine-value std_logic
+    // The image of a std_logic value or vector (with its companion when it has one).
+    static std::string slStr(const Val& x) {
+        return x.a.empty() ? "vhdl_rt::sl_str(" + x.s + ")" : "vhdl_rt::sl_str9(" + x.s + ", " + x.a + ")";
+    }
+    static std::string slvStr(const Val& x, const std::string& w) {
+        return x.a.empty() ? "vhdl_rt::slv_str(" + x.s + ", " + w + ")" : "vhdl_rt::slv_str9(" + x.s + ", " + x.a + ", " + w + ")";
+    }
+    // The companion of an aggregate of std_logic literals ((others => 'L'), ('H', '0')):
+    // the same aggregate of each element's companion bit; "" when all are strong
+    // or an element is not a literal.
+    std::string auxAggregate(const EP& e, const TP& want) {
+        auto mapLit = [](const EP& x) -> EP {
+            if (!x || (x->k != EK::Char && x->k != EK::Str)) return nullptr;
+            auto y = std::make_shared<Expr>(*x);
+            for (char& c : y->text) { char a = auxChar(c); c = a == '1' ? '1' : a == 'x' ? 'X' : '0'; }
+            return y;
+        };
+        bool any = false;
+        auto c = std::make_shared<Expr>(*e);
+        for (auto& el : c->agg) {
+            EP m = mapLit(el.value);
+            if (!m) return "";
+            for (char ch : el.value->text) any |= auxChar(ch) != '0';
+            el.value = m;
+        }
+        if (!any) return "";
+        return aggregate(c, want).s;
+    }
+    // The companions of the module's resolved std_logic signals (see `nine`): 'U' from
+    // the wired 'U' markers; L H W from the net's strength where a driver may be weak.
+    std::string resolvedAux() {
+        std::string r;
+        for (auto& [sig, t] : cx->resTypes) {
+            if (!cx->resWeak.count(sig)) { r += "  assign " + sig + "__9 = " + sig + "__u;\n"; continue; }
+            // __wk is 1 while some driver holds a weak value: then each bit's strength decides
+            r += "  event " + sig + "__e9;\n";
+            r += "  always @(" + sig + " or " + sig + "__u or " + sig + "__wk) if (" + sig + "__wk !== 1'b1) " + sig + "__9 = " + sig + "__u; else ->" + sig + "__e9;\n";
+            if (t->k == Type::Array) {
+                std::string g = sig + "__g9";
+                r += "  for (genvar " + g + " = $low(" + sig + "); " + g + " <= $high(" + sig + "); " + g + "++) always @(" + sig + "__e9) " +
+                     sig + "__9[" + g + "] = vhdl_rt::res9($sformatf(\"%v\", " + sig + "[" + g + "]), " + sig + "__u[" + g + "]);\n";
+            } else r += "  always @(" + sig + "__e9) " + sig + "__9 = vhdl_rt::res9($sformatf(\"%v\", " + sig + "), " + sig + "__u);\n";
+        }
+        return r;
+    }
+    // Does entity port p (of type t) have a companion (see `nine`)?
+    bool auxPort(const DP& p, const TP& t) {
+        return nine && (p->mode == "in" || p->mode == "out" || p->mode == "buffer") && slT(t) && p->sigKind.empty();
+    }
+    // The companion bit of a std_logic character (see `nine`).
+    static char auxChar(char c) {
+        switch (std::tolower((unsigned char)c)) {
+        case 'l': case 'h': case 'w': case '-': return '1';
+        case 'u': return 'x';
+        default: return '0';
+        }
+    }
+    // The companion of a std_logic string literal, "" when every element is strong.
+    std::string auxBits(const std::string& bits) {
+        if (!nine) return "";
+        std::string r;
+        bool any = false;
+        for (char c : bits) { r += auxChar(c); any |= auxChar(c) != '0'; }
+        return any ? std::to_string(bits.size()) + "'b" + r : "";
+    }
+    // std_logic or a one-dimensional packed array of it (std_logic_vector,
+    // unsigned, signed): the objects that get a companion
+    bool slT(const TP& t) {
+        if (!nine || !t) return false;
+        if (baseOf(t)->k == Type::Logic) return true;
+        return t->k == Type::Array && t->dims.size() == 1 && t->elem && isScalarBit(t->elem) && baseOf(t->elem)->k == Type::Logic;
+    }
+    // The companion of a logical operator's result `m` (IEEE 1164 tables): 'U'
+    // where the result is unknown and an operand is 'U', strong elsewhere.
+    static std::string uOf(const Val& x) {
+        if (!x.u.empty()) return x.u;
+        return x.a.empty() ? "" : "(" + x.a + " & ~" + x.a + ")";
+    }
+    // the U marker of the operands (set in v.u) and the companion of the result m
+    // in v.a; m is only evaluated again when an operand is 'U'
+    void auxOp(Val& v, std::initializer_list<const Val*> xs) {
+        std::string u;
+        for (const Val* x : xs) {
+            std::string ux = uOf(*x);
+            if (!ux.empty()) u += (u.empty() ? "" : " | ") + ux;
+        }
+        if (u.empty()) return;
+        v.u = "(" + u + ")";
+        v.a = "((" + v.u + " === '0) ? '0 : ((" + v.s + " ^ " + v.s + ") & " + v.u + "))";
+    }
+    // `x = lit`, `x /= lit`: the companion part of the comparison of a std_logic
+    // object (or one with a companion) with any value: equal classes per element
+    // the bits of a sized binary literal "N'b0101", or "" for any other text
+    static std::string litBits(const std::string& s) {
+        size_t q = s.find("'b");
+        if (q == std::string::npos || q == 0) return "";
+        for (size_t i = 0; i < q; ++i) if (!std::isdigit((unsigned char)s[i])) return "";
+        std::string b = s.substr(q + 2);
+        for (char c : b) if (c != '0' && c != '1' && c != 'x' && c != 'z') return "";
+        if ((size_t)std::stoi(s.substr(0, q)) != b.size()) return "";
+        return b;
+    }
+    // x compared with a literal: each element's companion class must match
+    std::string auxEqLit(const Val& x, const std::string& mb, const std::string& ab) {
+        std::string m1, m0, mx, mn, px;
+        for (size_t i = 0; i < mb.size(); ++i) {
+            char a = ab.empty() ? '0' : ab[i];
+            bool w = a == '1', u = a == 'x', xx = a == '0' && mb[i] == 'x';
+            m1 += w ? '1' : '0';
+            m0 += xx ? '1' : '0';
+            mx += u ? '1' : '0';
+            px += u ? 'x' : '0';
+            mn += (!w && !u && !xx) ? '1' : '0';
+        }
+        std::string n = std::to_string(mb.size()) + "'b", xa = x.a.empty() ? "'0" : x.a;
+        std::vector<std::string> c;
+        if (m1.find('1') != std::string::npos) c.push_back("((" + xa + " & " + n + m1 + ") === " + n + m1 + ")");
+        if (m0.find('1') != std::string::npos) c.push_back("((" + xa + " & " + n + m0 + ") === " + n + std::string(mb.size(), '0') + ")");
+        if (mx.find('1') != std::string::npos) c.push_back("((" + xa + " & " + n + mx + ") === " + n + px + ")");
+        if (mn.find('0') == std::string::npos && !x.a.empty()) c.push_back(mb.size() == 1 ? "(" + xa + " !== 1'b1)" : "((|" + xa + ") !== 1'b1)");
+        else if (mn.find('1') != std::string::npos && !x.a.empty()) c.push_back("((|(" + xa + " & " + n + mn + ")) !== 1'b1)");
+        std::string r;
+        for (auto& k : c) r += (r.empty() ? "" : " && ") + k;
+        return r.empty() ? "" : "(" + r + ")";
+    }
+    std::string auxEq(const Val& x, const Val& y) {
+        if (y.isConst && !litBits(y.s).empty() && (y.a.empty() || !litBits(y.a).empty()) && (!x.a.empty() || !y.a.empty())) return auxEqLit(x, litBits(y.s), litBits(y.a));
+        if (x.isConst && !litBits(x.s).empty() && (x.a.empty() || !litBits(x.a).empty()) && (!x.a.empty() || !y.a.empty())) return auxEqLit(y, litBits(x.s), litBits(x.a));
+        if (x.a.empty() && y.a.empty()) return "";
+        // a value with no companion is strong: no element of the other may be weak
+        if (y.a.empty()) return "((|" + x.a + ") !== 1'b1)";
+        if (x.a.empty()) return "((|" + y.a + ") !== 1'b1)";
+        if (y.isConst) return "(" + x.a + " === " + y.a + ")";
+        if (x.isConst) return "(" + y.a + " === " + x.a + ")";
+        return "(" + x.a + " === " + y.a + ")";
     }
     std::string bitsLit(const std::string& bits, bool fourState = true) {
         if (bits.empty()) return "0";
@@ -1047,6 +1204,7 @@ private:
         } else {
             v.s = "1'b" + logicChar(c);
             v.t = bt["std_ulogic"];
+            if (nine && auxChar(c) != '0') v.a = std::string("1'b") + auxChar(c);
         }
         v.isConst = true;
         return v;
@@ -1064,6 +1222,7 @@ private:
         if (w && w->k == Type::Array && isScalarBit(w->elem)) {
             bool four = w->elem->k == Type::Logic;
             v.s = bitsLit(text, four);
+            if (four) v.a = auxBits(text);
             v.t = vecOf(want, std::to_string(text.size()), wantDownto(want), wantLeft(want, text.size()));
             if (want && want->k == Type::Array) v.t->flavor = want->flavor;
             return v;
@@ -1133,6 +1292,7 @@ private:
             if (w && w->k == Type::String) return strLit(e->text, want, e->line);
             bool four = !(w && w->k == Type::Array && w->elem && w->elem->k == Type::Bit);
             v.s = bitsLit(e->text, four);
+            if (four) v.a = auxBits(e->text);
             v.t = vecOf(want && want->k == Type::Array ? want : bt["std_logic_vector"], std::to_string(e->text.size()), wantDownto(want), wantLeft(want, e->text.size()));
             if (want && want->k == Type::Array) v.t->flavor = want->flavor;
             v.isConst = true;
@@ -1141,7 +1301,11 @@ private:
         case EK::Null:
             if (want && want->k == Type::Access) { v.s = "null"; v.t = want; return v; }
             v.s = "\"\""; v.t = want ? want : bt["line"]; return v;
-        case EK::Agg: return aggregate(e, want);
+        case EK::Agg: {
+            Val r = aggregate(e, want);
+            if (slT(r.t) && r.a.empty()) r.a = auxAggregate(e, want);
+            return r;
+        }
         case EK::Qual: {
             TP t = typeOfMark(e->a);
             Val x = ex(e->b, t);
@@ -1158,6 +1322,7 @@ private:
             if (!want && ambiguous(e->a) && y.t) x = ex(e->a, y.t);
             v.s = "(" + c.s + " ? " + x.s + " : " + y.s + ")";
             v.t = want ? want : x.t ? x.t : y.t;
+            if (!x.a.empty() || !y.a.empty()) v.a = "(" + c.s + " ? " + (x.a.empty() ? "'0" : x.a) + " : " + (y.a.empty() ? "'0" : y.a) + ")";
             return v;
         }
         case EK::Name: case EK::Sel: case EK::Call: case EK::Attr: return nameExpr(e, want);
@@ -1465,7 +1630,7 @@ private:
         }
         if (e->op == "not") {
             if (t && t->k == Type::Bool) v.s = "(!" + x.s + ")";
-            else v.s = "(~" + x.s + ")";
+            else { v.s = "(~" + x.s + ")"; auxOp(v, {&x}); }
             return v;
         }
         // VHDL-2008 reduction operators
@@ -1474,6 +1639,10 @@ private:
         if (it != red.end()) {
             v.s = "(" + it->second + x.s + ")";
             v.t = x.t && x.t->elem ? x.t->elem : bt["std_ulogic"];
+            if (!x.a.empty()) {
+                v.u = "(|" + uOf(x) + ")";
+                v.a = "((" + v.u + " === 1'b0) ? 1'b0 : ((" + v.s + " ^ " + v.s + ") & " + v.u + "))";
+            }
             return v;
         }
         fail(e->line, "unsupported operator " + e->op);
@@ -1525,10 +1694,20 @@ private:
                 return v;
             }
             // std_logic scalar mixed with a vector (VHDL-2008): replicate
-            if (a.t && b.t && a.t->k == Type::Array && isScalarBit(b.t)) b.s = "{" + widthOf(a.t) + "{" + b.s + "}}";
-            if (a.t && b.t && b.t->k == Type::Array && isScalarBit(a.t)) { a.s = "{" + widthOf(b.t) + "{" + a.s + "}}"; v.t = b.t; }
+            if (a.t && b.t && a.t->k == Type::Array && isScalarBit(b.t)) {
+                b.s = "{" + widthOf(a.t) + "{" + b.s + "}}";
+                if (!b.a.empty()) b.a = "{" + widthOf(a.t) + "{" + b.a + "}}";
+                if (!b.u.empty()) b.u = "{" + widthOf(a.t) + "{" + b.u + "}}";
+            }
+            if (a.t && b.t && b.t->k == Type::Array && isScalarBit(a.t)) {
+                a.s = "{" + widthOf(b.t) + "{" + a.s + "}}";
+                if (!a.a.empty()) a.a = "{" + widthOf(b.t) + "{" + a.a + "}}";
+                if (!a.u.empty()) a.u = "{" + widthOf(b.t) + "{" + a.u + "}}";
+                v.t = b.t;
+            }
             v.s = "(" + a.s + " " + lg.at(op) + " " + b.s + ")";
             if (op == "nand" || op == "nor" || op == "xnor") v.s = "(~" + v.s + ")";
+            auxOp(v, {&a, &b});
             return v;
         }
         // relational
@@ -1541,7 +1720,12 @@ private:
             bool four = isFourState(a.t) || isFourState(b.t);
             if (op == "=" || op == "/=") {
                 bool strs = (ta && (ta->k == Type::String || ta->k == Type::Line)) || (tb && (tb->k == Type::String || tb->k == Type::Line));
-                if (four && !(isNumVec(a.t) || isNumVec(b.t))) v.s = "(" + a.s + (op == "=" ? " === " : " !== ") + b.s + ")";
+                if (four && !(isNumVec(a.t) || isNumVec(b.t))) {
+                    std::string ae = auxEq(a, b);
+                    if (ae.empty()) v.s = "(" + a.s + (op == "=" ? " === " : " !== ") + b.s + ")";
+                    else if (op == "=") v.s = "((" + a.s + " === " + b.s + ") && " + ae + ")";
+                    else v.s = "(!((" + a.s + " === " + b.s + ") && " + ae + "))";
+                }
                 else if (four) v.s = "bit'(" + numCmpOperand(a, b) + (op == "=" ? " == " : " != ") + numCmpOperand(b, a) + ")";
                 else if (strs) v.s = "(" + a.s + (op == "=" ? " == " : " != ") + b.s + ")";
                 else v.s = "(" + a.s + (op == "=" ? " == " : " != ") + b.s + ")";
@@ -1568,7 +1752,9 @@ private:
         if (op == "sll" || op == "srl" || op == "sla" || op == "sra" || op == "rol" || op == "ror") {
             Val a = ex(e->a, want);
             Val b = ex(e->b, bt["integer"]);
-            return shiftOp(op, a, b);
+            Val r = shiftOp(op, a, b);
+            if (!a.a.empty()) { Val aa = a; aa.s = a.a; r.a = shiftOp(op, aa, b).s; }
+            return r;
         }
         // arithmetic
         return arith(e, want);
@@ -1661,18 +1847,28 @@ private:
         std::string w = "0";
         std::string s = "{";
         bool packed = arrT ? isScalarBit(elemT) : true;
+        std::vector<std::string> auxParts;
+        bool anyAux = false;
         for (size_t i = 0; i < parts.size(); ++i) {
             Val x = vals[i].s.empty() ? ex(parts[i], parts[i]->k == EK::Char ? elemT : (arrT ? arrT : bt["std_logic_vector"])) : vals[i];
             if (parts[i]->k == EK::Agg && x.t && x.t->k == Type::Array && !x.t->dims.empty() && x.t->dims[0].box) {
                 // others in a concatenation: unknown width
                 fail(parts[i]->line, "aggregate with 'others' in a concatenation needs a qualified type");
             }
-            w = addText(w, x.t && x.t->k == Type::Array ? widthOf(x.t) : "1");
+            std::string wi = x.t && x.t->k == Type::Array ? widthOf(x.t) : "1";
+            w = addText(w, wi);
             s += (i ? ", " : "") + x.s;
+            auxParts.push_back(x.a.empty() ? "(" + wi + ")'(0)" : x.a);
+            anyAux |= !x.a.empty();
         }
         s += "}";
         if (!packed) s = "'" + s;   // unpacked arrays: assignment pattern of elements
         v.s = s;
+        if (packed && anyAux) {
+            v.a = "{";
+            for (size_t i = 0; i < auxParts.size(); ++i) v.a += (i ? ", " : "") + auxParts[i];
+            v.a += "}";
+        }
         TP base = arrT ? arrT : bt["std_logic_vector"];
         v.t = vecOf(base, w, wantDownto(want ? want : base));
         v.t->elem = elemT;
@@ -1843,7 +2039,11 @@ private:
         }
         // indexed or sliced object (or a function result)
         Val p = ex(pre, nullptr);
-        return indexOrSlice(p, e);
+        Val r = indexOrSlice(p, e);
+        // the companion of an element or slice: the same selection of p's companion
+        if (!p.a.empty() && p.accObj.empty() && r.s.size() > p.s.size() && r.s.compare(0, p.s.size(), p.s) == 0 && slT(r.t))
+            r.a = p.a + r.s.substr(p.s.size());
+        return r;
     }
 
     Val symVal(const Sym& y, const EP& e) {
@@ -1860,6 +2060,7 @@ private:
             if (cx->proc && cx->proc->active && y.cls == "signal") {
                 // reading a signal through a driver variable is not possible; read the signal
             }
+            if (y.aux) v.a = v.s + "__9";
             return v;
         case Sym::Lit: v.s = y.home == "*" ? y.sv : (y.home.empty() || y.home == cx->container ? y.sv : svId(y.home) + "::" + y.sv); v.t = y.type; v.isConst = true; return v;
         case Sym::Alias: v.s = y.aliasSv; v.t = y.type; return v;
@@ -2158,7 +2359,7 @@ private:
                   (b->k == Type::Array && b->elem && baseOf(b->elem)->k == Type::Char))) {
             std::string s;
             if (b->k == Type::String || baseOf(b->elem)->k == Type::Char) s = "vhdl_rt::dquote(" + x.s + ")";
-            else if (baseOf(b->elem)->k == Type::Logic) s = "{\"\\\"\", vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t && !isUnconstrained(x.t) ? x.t : t) + "), \"\\\"\"}";
+            else if (baseOf(b->elem)->k == Type::Logic) s = "{\"\\\"\", " + slvStr(x, widthOf(x.t && !isUnconstrained(x.t) ? x.t : t)) + ", \"\\\"\"}";
             else s = "$sformatf(\"\\\"%b\\\"\", " + x.s + ")";
             v.s = s;
             return v;
@@ -2190,7 +2391,7 @@ private:
         case Type::Time: v.s = "vhdl_rt::time_image(" + x.s + ")"; break;
         case Type::Bool: v.s = "((" + x.s + ") ? \"true\" : \"false\")"; break;
         case Type::Bit: v.s = "((" + x.s + ") ? \"'1'\" : \"'0'\")"; break;
-        case Type::Logic: v.s = "{\"'\", vhdl_rt::sl_str(" + x.s + "), \"'\"}"; break;
+        case Type::Logic: v.s = "{\"'\", " + slStr(x) + ", \"'\"}"; break;
         case Type::Char: v.s = "{\"'\", string'(" + x.s + "), \"'\"}"; break;
         case Type::Enum:
             if (b->sv == "int") {
@@ -2461,7 +2662,18 @@ private:
     Val callSub(const EP& nameE, const std::vector<Sym>& syms, const std::vector<Assoc>& args, const TP& want, const std::string& recv = "") {
         int line = nameE->line;
         const Sym* s = pickOverload(syms, args, want, line);
-        if (!s->builtin.empty() && !s->sub) return builtinCall(s->builtin, args, want, line);
+        if (!s->builtin.empty() && !s->sub) {
+            Val r = builtinCall(s->builtin, args, want, line);
+            if (nine && !r.a.empty()) {
+                // conversions between std_logic types keep the nine values; to_ux01 keeps 'U';
+                // the other IEEE functions give strong values
+                static const std::set<std::string> keep = {"to_stdulogicvector", "to_stdlogicvector", "to_slv", "to_sulv", "to_stdulogic",
+                                                           "std_logic_vector", "std_ulogic_vector"};
+                if (s->builtin == "to_ux01") r.a = "(" + r.a + " & ~" + r.a + ")";
+                else if (!keep.count(s->builtin)) r.a.clear();
+            }
+            return r;
+        }
         if (!s->sub) fail(line, "not a subprogram");
         return userCall(*s, args, want, line, recv);
     }
@@ -2622,7 +2834,12 @@ private:
         }
         if (id == "to_bit") { Val x = arg(0); v.s = "bit'(" + x.s + ")"; v.t = bt["bit"]; return v; }
         if (id == "to_stdulogic") { Val x = arg(0); v.s = "logic'(" + x.s + ")"; v.t = bt["std_ulogic"]; return v; }
-        if (id == "to_x01" || id == "to_x01z" || id == "to_ux01") { Val x = arg(0); v = x; return v; }
+        if (id == "to_x01" || id == "to_x01z" || id == "to_ux01") {
+            Val x = arg(0);
+            v = x;
+            if (id != "to_x01z") v.s = "(" + x.s + " | " + x.s + ")";   // 'Z' and '-' become 'X'
+            return v;
+        }
         if (id == "to_01") {
             Val x = arg(0);
             v.t = x.t;
@@ -2657,13 +2874,13 @@ private:
                 return v;
             }
             if (id == "to_string" && x.t && x.t->k == Type::Array && isScalarBit(x.t->elem)) {
-                v.s = x.t->elem->k == Type::Logic ? "vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t) + ")" : "$sformatf(\"%b\", " + x.s + ")";
+                v.s = x.t->elem->k == Type::Logic ? slvStr(x, widthOf(x.t)) : "$sformatf(\"%b\", " + x.s + ")";
                 return v;
             }
             if (id == "to_hstring" || id == "to_hex_string") { v.s = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 4)"; return v; }
             if (id == "to_ostring" || id == "to_octal_string") { v.s = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 3)"; return v; }
-            if (id == "to_bstring") { v.s = "vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t) + ")"; return v; }
-            if (b && b->k == Type::Logic) { v.s = "vhdl_rt::sl_str(" + x.s + ")"; return v; }
+            if (id == "to_bstring") { v.s = slvStr(x, widthOf(x.t)); return v; }
+            if (b && b->k == Type::Logic) { v.s = slStr(x); return v; }
             if (b && b->k == Type::Char) { v.s = "string'(" + x.s + ")"; return v; }
             if (b && b->k == Type::Real && args.size() > 1) {
                 Val f = arg(1);
@@ -2962,8 +3179,8 @@ endpackage
             TP b = baseOf(x.t);
             if (id == "hwrite") img = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 4)";
             else if (id == "owrite") img = "vhdl_rt::hstr(" + x.s + ", " + widthOf(x.t) + ", 3)";
-            else if (b && b->k == Type::Array && isScalarBit(b->elem)) img = b->elem->k == Type::Logic ? "vhdl_rt::slv_str(" + x.s + ", " + widthOf(x.t) + ")" : "$sformatf(\"%b\", " + x.s + ")";
-            else if (b && b->k == Type::Logic) img = "vhdl_rt::sl_str(" + x.s + ")";
+            else if (b && b->k == Type::Array && isScalarBit(b->elem)) img = b->elem->k == Type::Logic ? slvStr(x, widthOf(x.t)) : "$sformatf(\"%b\", " + x.s + ")";
+            else if (b && b->k == Type::Logic) img = slStr(x);
             else if (b && b->k == Type::Bit) img = "((" + x.s + ") ? \"1\" : \"0\")";
             else if (b && b->k == Type::Char) img = "string'(" + x.s + ")";
             else if (b && b->k == Type::Real && args.size() > 4) { Val d = arg(4, bt["integer"]); img = "vhdl_rt::real_digits(" + x.s + ", " + d.s + ")"; }
@@ -2996,10 +3213,10 @@ endpackage
             else fail(line, "read of this type is not supported yet");
             std::string tmp = "vhdl_rt::" + fn;
             if (fn == "read_slv" || fn == "read_hex") {
-                return "begin logic [" + widthOf(x.t) + "-1:0] t__; bit ok__; ok__ = vhdl_rt::" + fn + "(" + l.s + ", t__, " + widthOf(x.t) + extra + "); " + x.s + " = t__;" + (good.empty() ? "" : " " + good + " = ok__;") + " end";
+                return "begin logic [" + widthOf(x.t) + "-1:0] t__; bit ok__; ok__ = vhdl_rt::" + fn + "(" + l.s + ", t__, " + widthOf(x.t) + extra + "); " + x.s + " = t__;" + (x.a.empty() ? "" : " " + x.a + " = '0;") + (good.empty() ? "" : " " + good + " = ok__;") + " end";
             }
             if (fn == "read_str") return "begin bit ok__; ok__ = vhdl_rt::read_str(" + l.s + ", " + x.s + ", " + widthOf(x.t) + ");" + (good.empty() ? "" : " " + good + " = ok__;") + " end";
-            return "begin bit ok__; ok__ = " + tmp + "(" + l.s + ", " + x.s + ");" + (good.empty() ? "" : " " + good + " = ok__;") + " end";
+            return "begin bit ok__; ok__ = " + tmp + "(" + l.s + ", " + x.s + ");" + (x.a.empty() ? "" : " " + x.a + " = '0;") + (good.empty() ? "" : " " + good + " = ok__;") + " end";
         }
         if (id == "file_open") {
             // file_open([status,] f, name, mode)
@@ -3094,6 +3311,35 @@ package vhdl_rt;
       1'bz: return "Z";
       default: return "X";
     endcase
+  endfunction
+  // nine-value std_logic (Translator::nine): v is the value, a its companion
+  function automatic string sl_str9(logic v, logic a);
+    if (a === 1'b1) return v === 1'b0 ? "L" : v === 1'b1 ? "H" : v === 1'bz ? "-" : "W";
+    if (v === 1'b0) return "0";
+    if (v === 1'b1) return "1";
+    if (v === 1'bz) return "Z";
+    return a === 1'b0 ? "X" : "U";
+  endfunction
+  function automatic string slv_str9(logic [4095:0] v, logic [4095:0] a, int n);
+    string s = "";
+    for (int i = n - 1; i >= 0; i--) s = {s, sl_str9(v[i], a[i])};
+    return s;
+  endfunction
+  // a driver (v, a) of a resolved std_logic net that may be weak: k = 0 its strong
+  // part, 1 its weak part (L H W), z elsewhere
+  function automatic logic [4095:0] drv9(logic [4095:0] v, logic [4095:0] a, int k, int n);
+    logic [4095:0] r = 'z;
+    for (int i = 0; i < n; i++) begin
+      bit wk = a[i] === 1'b1;
+      if (k == 0) r[i] = wk ? (v[i] === 1'bz ? 1'bx : 1'bz) : v[i];   // '-' resolves as X
+      else r[i] = wk && v[i] !== 1'bz ? v[i] : 1'bz;
+    end
+    return r;
+  endfunction
+  // the companion bit of a resolved net's bit from its strength (%v) and 'U' marker
+  function automatic logic res9(string st, logic u);
+    if (u !== 1'b0) return 1'bx;
+    return st.len() >= 2 && ((st[0] == "W" && st[1] == "e") || (st[0] == "P" && st[1] == "u")) ? 1'b1 : 1'b0;
   endfunction
   function automatic int sl_pos(logic v);
     case (v) 1'b0: return 2; 1'b1: return 3; 1'bz: return 4; default: return 1; endcase
@@ -4214,6 +4460,19 @@ endpackage
                 }
             }
             y.type = ot;
+            // a std_logic signal or variable gets a companion (see `nine`); a resolved
+            // signal with several drivers stays four-valued
+            std::string auxInit;
+            bool multi = d->k == DK::Signal && cx->drvNames.count(y.sv) && isPackable(ot) && isFourState(ot);
+            if ((d->k == DK::Signal || (d->k == DK::Variable && !d->shared)) && (where == "module" || where == "process") && slT(ot) &&
+                !(multi && (!d->sigKind.empty() || cx->regNets.count(y.sv)))) {
+                y.aux = true;
+                if (multi) cx->resAux.insert(y.sv);
+                if (d->init) {
+                    std::string a = ex(d->init, t).a;
+                    auxInit = a.empty() ? "'0" : a;
+                }
+            }
             if (d->k == DK::Constant && init.empty() && cx->isPackage) {
                 // deferred constant: the value is in the package body
                 y.deferred = true;
@@ -4255,11 +4514,18 @@ endpackage
             if (d->k == DK::Signal && cx->drvNames.count(dname)) {
                 // resolved signal with several drivers: a wire, each driver is a variable
                 o << ind() << svDeclNet(ot, dname) << ";\n";
+                if (cx->resAux.count(dname)) {
+                    // its companion: 'U' where a driver is 'U', else strong where a driver is
+                    // strong (not Z), else weak where a driver is weak (IEEE 1164 resolution)
+                    o << ind() << svDeclNet(ot, dname + "__u") << ";\n" << ind() << svDecl(ot, dname + "__9") << ";\n" << ind() << "wire " << dname << "__wk;\n";
+                    cx->resTypes[dname] = ot;
+                }
                 continue;
             }
             o << ind() << kw << svDecl(ot, dname);
             if (!init.empty()) o << " = " << init;
             o << ";\n";
+            if (y.aux) o << ind() << kw << svDecl(ot, dname + "__9") << (auxInit.empty() ? "" : " = " + auxInit) << ";\n";
         }
     }
     std::string svDeclNet(const TP& t, const std::string& name) {
@@ -4606,14 +4872,6 @@ endpackage
         return pre;
     }
     std::set<const Subprog*> voidFns;   // procedures emitted as void functions
-    static bool assignsSignal(const std::vector<SP>& b) {
-        for (auto& s : b) {
-            if (s->k == SK::SigAssign || s->k == SK::CondSigAssign || s->k == SK::SelSigAssign || s->k == SK::Force || s->k == SK::Release) return true;
-            for (auto& a : s->alts) if (assignsSignal(a.body)) return true;
-            if (assignsSignal(s->body)) return true;
-        }
-        return false;
-    }
     // every procedure the body calls is built in or already a void function
     bool callsOnlyFunctions(const std::vector<SP>& b) {
         for (auto& s : b) {
@@ -4633,7 +4891,9 @@ endpackage
     bool procIsFunction(const Subprog& sp) {
         for (auto& p : sp.params)
             if (p->cls == "signal") return false;
-        return !containsWait(sp.body) && !assignsSignal(sp.body) && callsOnlyFunctions(sp.body);
+        // a signal assignment is a nonblocking assignment, which a function may do: a void
+        // function is not a task, so msim -compile runs it (tasks need call frames)
+        return !containsWait(sp.body) && callsOnlyFunctions(sp.body);
     }
     static bool containsWait(const std::vector<SP>& b) {
         for (auto& s : b) {
@@ -4785,6 +5045,42 @@ endpackage
         Val v = ex(val, tt);
         return rangeCheck(val, v, tt, fitTo(v, tt));
     }
+    // assignRhs with the value's companion in .a
+    Val assignRhsV(const EP& val, const TP& tt) {
+        Val v = ex(val, tt);
+        v.s = rangeCheck(val, v, tt, fitTo(v, tt));
+        // a logical operator's result: computed once into a module-level temporary,
+        // and its companion is only worked out when the result is unknown
+        if (!v.u.empty() && cx->proc && !cx->inFunc && cx->helpers && tt && slT(tt) && (baseOf(tt)->k == Type::Logic || parseInt(widthOf(tt)))) {
+            std::string tmp = "vhdl_t9__" + std::to_string(++uniq);
+            *cx->helpers << "  " << svDecl(baseOf(tt)->k == Type::Logic ? bt["std_ulogic"] : vecOf(bt["std_logic_vector"], widthOf(tt)), tmp) << ";\n";
+            v.s = "(" + tmp + " = " + v.s + ")";
+            v.a = "(((" + tmp + " ^ " + tmp + ") === '0) ? '0 : ((" + tmp + " ^ " + tmp + ") & " + v.u + "))";
+        }
+        return v;
+    }
+    // The companion's half of `target op value` (op " <= #(d) " or " = "): the
+    // value's companion, or strong when it has none; "" when the target has no companion.
+    std::string auxWrite(const EP& t, const std::string& op, const Val& rhs, bool isSignal = true) {
+        if (!nine) return "";
+        if (t->k == EK::Agg) {
+            std::string r;
+            for (auto& a : t->agg) r += auxWrite(a.value, op, Val{}, isSignal);
+            return r;
+        }
+        Val v = ex(t, nullptr);
+        if (v.a.empty()) return "";
+        std::string at = v.a;
+        if (isSignal && cx->proc)   // the process's driver of a resolved signal has its own companion
+            for (auto& [sig, drv] : cx->proc->drv)
+                if (v.s == sig || v.s.rfind(sig + "[", 0) == 0) {
+                    if (!cx->resAux.count(sig)) return "";
+                    at = drv + "__9" + v.s.substr(sig.size());
+                    if (!rhs.a.empty() && rhs.u.empty()) cx->proc->weakDrv.insert(drv);   // a name or a literal may be weak
+                    break;
+                }
+        return " " + at + op + (rhs.a.empty() ? "'0" : rhs.a) + ";";
+    }
     // An integer value assigned to a subtype with a range is checked (5.2.1,
     // 14.7.4): out of range stops the run like GHDL's bound check failure.
     int chkLine = 0;
@@ -4832,7 +5128,8 @@ endpackage
                 }
             }
             TP tt = targetType(s.target);
-            r = I + target(s.target, false) + " = " + assignRhs(s.value, tt) + ";\n";
+            Val rv = assignRhsV(s.value, tt);
+            r = I + target(s.target, false) + " = " + rv.s + ";" + auxWrite(s.target, " = ", rv, false) + "\n";
             break;
         }
         case SK::SigAssign: {
@@ -4846,7 +5143,8 @@ endpackage
                     continue;
                 }
                 std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                r += I + tg + " <= " + d + assignRhs(w.val, tt) + ";" + transactionOf(s.target) + "\n";
+                Val rv = assignRhsV(w.val, tt);
+                r += I + tg + " <= " + d + rv.s + ";" + auxWrite(s.target, " <= " + d, rv) + transactionOf(s.target) + "\n";
             }
             break;
         }
@@ -4859,7 +5157,8 @@ endpackage
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + ";" + (sig ? transactionOf(s.target) : "") + " ";
+                    Val rv = assignRhsV(w.val, tt);
+                    body += tg + (sig ? " <= " + d : " = ") + rv.s + ";" + auxWrite(s.target, sig ? " <= " + d : " = ", rv, sig) + (sig ? transactionOf(s.target) : "") + " ";
                 }
                 if (a.cond) r += I + (i ? "else if (" : "if (") + boolOf(ex(a.cond, bt["boolean"])).s + ") begin " + body + "end\n";
                 else r += I + "else begin " + body + "end\n";
@@ -4878,7 +5177,8 @@ endpackage
                 std::string body;
                 for (auto& w : a.waves) {
                     std::string d = w.after ? "#(" + ex(w.after, bt["time"]).s + ") " : "";
-                    body += tg + (sig ? " <= " + d : " = ") + assignRhs(w.val, tt) + ";" + (sig ? transactionOf(s.target) : "") + " ";
+                    Val rv = assignRhsV(w.val, tt);
+                    body += tg + (sig ? " <= " + d : " = ") + rv.s + ";" + auxWrite(s.target, sig ? " <= " + d : " = ", rv, sig) + (sig ? transactionOf(s.target) : "") + " ";
                 }
                 r += I + "  " + labels[ai] + ": begin " + body + "end\n";
             }
@@ -5080,6 +5380,7 @@ endpackage
                 Val v = ex(e, nullptr);
                 if (v.t && (isPackable(v.t) || v.t->k == Type::Real || v.t->k == Type::Time)) addUnique(out, v.s);
                 else if (v.t) addEvent(out, v.s, v.t);
+                if (!v.a.empty()) addUnique(out, v.a);   // 0 -> L is an event too
             } else if (y && y->k == Sym::Alias) {
                 addUnique(out, y->aliasSv);
             }
@@ -5207,6 +5508,7 @@ endpackage
         for (auto& n : s.on) {
             Val v = ex(n, nullptr);
             addEvent(sigs, v.s, v.t);
+            if (!v.a.empty()) addUnique(sigs, v.a);
         }
         if (s.on.empty() && s.cond) readSignals(s.cond, sigs);
         std::string tm = s.forTime ? ex(s.forTime, bt["time"]).s : "";
@@ -5743,6 +6045,7 @@ endpackage
             std::vector<std::string> portList;
             std::vector<int> portLines;   // each port's VHDL line, for diagnostics about it
             std::vector<std::pair<std::string, TP>> portSigs;
+            std::vector<std::string> auxPorts;
             std::map<std::string, TP> unconPort;   // lower-case port -> its type with parameter bounds
             for (auto& p : ent->ports) {
                 TP t = p->mode == "view" ? (p->arrayView ? subtype(p->type) : resolveView(p->target).rec) : subtype(p->type);
@@ -5780,6 +6083,7 @@ endpackage
                     y.type = t;
                     y.mode = p->mode;
                     if (!p->sigKind.empty()) y.decl = p;
+                    y.aux = auxPort(p, t);
                     declare(y);
                     portSigs.push_back({y.sv, t});
                 }
@@ -5818,8 +6122,21 @@ endpackage
                     portList.push_back(decl);
                     portLines.push_back(p->line);
                     if (net) c.drvNames[sv] = sv;
+                    if (auxPort(p, t)) {
+                        // the companion (see `nine`): an input port after every VHDL port, strong
+                        // when SystemVerilog leaves it unconnected; an output's companion is a
+                        // variable the instantiating VHDL reads by name
+                        if (p->mode == "in") auxPorts.push_back("input " + svDecl(t, sv + "__9") + " = " + (p->init ? (ex(p->init, t).a.empty() ? "'0" : ex(p->init, t).a) : "'0"));
+                        else if (!net) viewBody += "  " + svDecl(t, sv + "__9") + ";\n";
+                        else if (isPackable(t) && isFourState(t)) {   // several drivers: resolved like a signal's
+                            c.resAux.insert(sv);
+                            c.resTypes[sv] = t;
+                            viewBody += "  " + svDeclNet(t, sv + "__u") + ";\n  " + svDecl(t, sv + "__9") + ";\n  wire " + sv + "__wk;\n";
+                        } else viewBody += "  " + svDecl(t, sv + "__9") + " = '0;\n";
+                    }
                 }
             }
+            for (auto& ap : auxPorts) { portList.push_back(ap); portLines.push_back(0); }
             // module header
             std::string imports = "import vhdl_rt::*;";
             for (auto& pk : c.usePkgs) imports += " import " + svId(pk) + "::*;";
@@ -5861,7 +6178,7 @@ endpackage
             curDrivers = &di;
             for (auto& s : stmts) conc << concStmt(*s, "");
             curDrivers = nullptr;
-            o << body.str() << helpers.str() << conc.str() << extra.str() << "endmodule\n";
+            o << body.str() << helpers.str() << conc.str() << extra.str() << resolvedAux() << "endmodule\n";
         } catch (...) {
             cx = saved;
             throw;
@@ -6061,9 +6378,12 @@ endpackage
                     p2.drv = pr.drv;
                     cx->proc = &p2;
                     std::string tg = target(s.target, true);
-                    std::string rhs = assignRhs(s.alts[0].waves[0].val, tt);
+                    Val rv = assignRhsV(s.alts[0].waves[0].val, tt);
+                    std::string rhs = rv.s;
+                    std::string aw = auxWrite(s.target, " <= ", rv);
                     cx->proc = sp;
-                    if (p2.prev.empty()) return r + decl + "  always @(" + e + ") " + tg + " <= " + rhs + ";\n";
+                    if (p2.prev.empty() && aw.empty()) return r + decl + "  always @(" + e + ") " + tg + " <= " + rhs + ";\n";
+                    if (p2.prev.empty()) return r + decl + "  always @(" + e + ") begin " + tg + " <= " + rhs + ";" + aw + " end\n";
                 }
             }
             // a plain `assign` would lose VHDL's delta; keep the process
@@ -6259,6 +6579,20 @@ endpackage
         for (auto& [sig, dv] : pr.drv) {
             TP t = pr.drvTypes.at(dv);
             std::string init = cx->guardInit.count(sig) ? cx->guardInit.at(sig) : "'z";
+            if (cx->resAux.count(sig)) {
+                // a strong and a weak part, so the net resolves L and H as IEEE 1164 does
+                r += "  " + svDecl(t, dv) + " = " + init + ";\n  " + svDecl(t, dv + "__9") + " = '0;\n";
+                r += "  assign " + sig + "__u = " + dv + "__9 & ~" + dv + "__9;\n";   // 'U' wins (x on the wire)
+                if (pr.weakDrv.count(dv)) {
+                    cx->resWeak.insert(sig);
+                    // split only while the driver holds a weak value
+                    std::string wk = "((|" + dv + "__9) === 1'b1)";
+                    r += "  assign " + sig + " = " + wk + " ? vhdl_rt::drv9(" + dv + ", " + dv + "__9, 0, " + widthOf(t) + ") : " + dv + ";\n";
+                    r += "  assign (weak0, weak1) " + sig + " = " + wk + " ? vhdl_rt::drv9(" + dv + ", " + dv + "__9, 1, " + widthOf(t) + ") : 'z;\n";
+                    r += "  assign " + sig + "__wk = " + wk + " ? 1'b1 : 1'bz;\n";
+                } else r += "  assign " + sig + " = " + dv + ";\n";   // never weak: the four-value net resolves it
+                continue;
+            }
             r += "  " + svDecl(t, dv) + " = " + init + ";\n  assign " + sig + (cx->regNets.count(sig) ? "__res" : "") + " = " + dv + ";\n";
         }
         return r;
@@ -6288,7 +6622,7 @@ endpackage
                 std::string body = seqStmts(s.body);
                 std::vector<std::string> sens;
                 if (s.sensAll) readSignalsStmts(s.body, sens);
-                else for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); }
+                else for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); if (!v.a.empty()) addUnique(sens, v.a); }
                 if (s.hasSens && containsWait(s.body)) fail(s.line, "a process with a sensitivity list cannot contain wait");
                 // previous values for 'event / rising_edge
                 std::string prevDecl, prevUpd;
@@ -6346,7 +6680,7 @@ endpackage
         if (!s.hasSens || s.sensAll || s.body.size() != 1 || s.body[0]->k != SK::If) return "";
         const Stmt& iff = *s.body[0];
         std::vector<std::string> sens;
-        for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); }
+        for (auto& n : s.sens) { Val v = ex(n, nullptr); addEvent(sens, v.s, v.t); if (!v.a.empty()) addUnique(sens, v.a); }
         auto edgeSig = [&](const EP& c) -> std::string {
             std::string e = edgeOf(c);
             return e;
@@ -6522,6 +6856,7 @@ endpackage
         std::vector<std::string> unconGens;
         std::set<std::string> unconAsc;
         std::string convPre;   // signals and processes of conversions on formals
+        std::string auxPost;   // companions of out ports read from the instance (see `nine`)
         auto mapList = [&](const std::vector<Assoc>& m, const std::vector<std::string>& order, const std::vector<std::string>& lowerNames,
                            const std::vector<TP>& types, const std::vector<std::string>& compOrder, const std::vector<TP>& compTypes, bool isPort) {
             std::vector<std::string> items;
@@ -6588,11 +6923,12 @@ endpackage
                 std::string formalSv;
                 for (size_t i = 0; i < lowerNames.size(); ++i) if (lowerNames[i] == fl) formalSv = order[i];
                 if (formalSv.empty()) formalSv = svId(fl);
-                std::string act;
+                std::string act, actA;
                 if (a.actual->k == EK::Open) act = "";
                 else {
                     Val x = ex(a.actual, ft);
                     act = x.s;
+                    actA = x.a;
                     if (isPort && ft && isUnconstrained(ft) && ft->k == Type::Array && ft->dims.size() == 1 && ent) {
                         // an unconstrained port takes the actual's range (6.5.6.3)
                         if (!x.t || x.t->dims.empty() || x.t->dims[0].box || x.t->dims[0].l.empty())
@@ -6608,6 +6944,16 @@ endpackage
                     continue;
                 }
                 items.push_back("." + formalSv + "(" + act + ")");
+                // the companion of a VHDL entity's port (see `nine`)
+                if (isPort && ent && nine)
+                    for (auto& p : ent->ports)
+                        if (std::find(p->names.begin(), p->names.end(), fl) != p->names.end() && auxPort(p, ft ? ft : subtype(p->type))) {
+                            if (p->mode == "in") items.push_back("." + formalSv + "__9(" + (actA.empty() ? "'0" : actA) + ")");
+                            else if (!act.empty()) {
+                                Val tv = ex(a.actual, nullptr);
+                                if (!tv.a.empty()) auxPost += "  assign " + tv.a + " = " + svId(label) + "." + formalSv + "__9;\n";
+                            }
+                        }
             }
             for (auto& [fl, parts] : partial) {
                 // a(1) => x, a(0) => y: concatenate in the formal's index order
@@ -6695,7 +7041,7 @@ endpackage
         r += " " + svId(label) + " (";
         for (size_t i = 0; i < ports.size(); ++i) r += (i ? ",\n      " : "\n      ") + ports[i];
         r += ");\n";
-        return r;
+        return r + auxPost;
     }
     static bool lookupFormal(const std::string& n, const std::vector<std::string>& names) {
         return std::find(names.begin(), names.end(), n) != names.end();

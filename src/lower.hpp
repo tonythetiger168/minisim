@@ -929,6 +929,22 @@ struct Lowerer {
         e.visit(v);
         return v.hit;
     }
+    // Does e read nothing but parameters and enum values (no variable, net
+    // or call), so that it can be folded once?
+    static bool paramsOnly(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        struct V : ASTVisitor<V, VisitFlags::Expressions> {
+            bool ok = true;
+            void handle(const NamedValueExpression& n) {
+                auto k = n.symbol.kind;
+                ok &= k == SymbolKind::Parameter || k == SymbolKind::EnumValue || k == SymbolKind::Specparam;
+            }
+            void handle(const HierarchicalValueExpression&) { ok = false; }
+            void handle(const CallExpression& c) { if (!c.isSystemCall()) ok = false; visitDefault(c); }
+        } v;
+        e.visit(v);
+        return v.ok;
+    }
     // Does e read a specparam that an SDF LABEL changed?
     static bool readsLabel(const slang::ast::Expression& e) {
         using namespace slang::ast;
@@ -958,7 +974,15 @@ struct Lowerer {
         const Expression& x = peel(d);
         if (x.kind == ExpressionKind::RealLiteral) { i.delay = ticksOf(x.as<RealLiteral>().getValue()); return; }
         if (x.kind == ExpressionKind::TimeLiteral) { i.delay = ticksOf(x.as<TimeLiteral>().getValue()); return; }
-        if (const auto* cv = d.getConstant()) {
+        // A constant that slang did not fold, such as #(t_c / 2.0) with a
+        // localparam realtime (VHDL `after` / `wait for` on a constant)
+        slang::ConstantValue folded;
+        const slang::ConstantValue* cv = d.getConstant();
+        if (!cv && paramsOnly(d)) {
+            folded = tryConst(d);
+            if (folded) cv = &folded;
+        }
+        if (cv) {
             if (cv->isReal()) { i.delay = ticksOf(cv->real()); return; }
             if (cv->isInteger() && !cv->integer().hasUnknown()) {
                 auto v = cv->integer().as<int64_t>();
