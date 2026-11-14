@@ -1,0 +1,21 @@
+# Prints the test groups this build does not register (build/skipped-tests.txt,
+# written by cmake/gates.cmake). Always passes: a missing optional tool is not
+# a failure, but it must not be invisible either.
+if(NOT EXISTS ${FILE})
+  message(STATUS "no skipped-tests.txt: configure again")
+  return()
+endif()
+file(STRINGS ${FILE} lines)
+if(NOT lines)
+  message(STATUS "every optional test group is registered in this build")
+  return()
+endif()
+list(LENGTH lines n)
+message(STATUS "${n} test group(s) are NOT registered in this build; a green run here does not cover them:")
+foreach(l ${lines})
+  string(REPLACE "\t" ";" l "${l}")
+  list(GET l 0 label)
+  list(GET l 1 missing)
+  list(GET l 2 fix)
+  message(STATUS "  - ${label}: needs ${missing}  (${fix})")
+endforeach()

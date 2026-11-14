@@ -30,6 +30,8 @@ if(TARGET msim)
     "localpkg_tb|localpkg.vhd|ghdl"
     "subgen_tb|subgen.vhd|"
     "guarded_tb|guarded.vhd|ghdl"
+    "std9_tb|std9.vhd|ghdl"
+    "ioconv_tb|ioconv.vhd|ghdl"
     "localpkg2_tb|localpkg2.vhd|"
     "pkggen_tb|pkggen.vhd|ghdl"
     "pkggen_types_tb|pkggen_types.vhd|"
@@ -39,6 +41,8 @@ if(TARGET msim)
     "vhdl2019_assert_tb|vhdl2019_assert.vhd|"
     "vhdl2019_views_tb|vhdl2019_views.vhd|"
     "vhdl2019_env_tb|vhdl2019_env.vhd|"
+    "dir2019_tb|dir2019.vhd|"
+    "callpath2019_tb|callpath2019.vhd|"
     "mixed_sv_top|counter.vhd,mixed_sv_top.sv|"
     "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|"
     "mixed_uncon|uncon_ports.vhd,mixed_uncon.sv|")

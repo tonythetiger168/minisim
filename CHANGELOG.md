@@ -8,6 +8,19 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- msim: VHDL-2019 std.env `get_call_path` and `to_string` of
+  `call_path_element`, `call_path_vector` and `call_path_vector_ptr`
+  (IEEE 1076-2019 16.5.7). Only a design that calls it pays for the frames.
+- msim: VHDL-2019 std.env `dir_open` (procedure and function) and `dir_close`
+  with the `directory` record and `directory_items`, and std.textio's
+  `line_vector` (IEEE 1076-2019 16.5.5). Items are listed in name order.
+- msim: VHDL type conversions on an `inout` port's formal and actual
+  (`std_logic_vector(io) => unsigned(bus)`, IEEE 1076-2019 6.5.7.3).
+- msim: VHDL std_logic keeps all nine values (U X 0 1 Z W L H -) by default:
+  operators, comparisons, `'image`, `to_x01`, ports between VHDL units and
+  weak-driver resolution match GHDL. SystemVerilog, UPF and waveforms see the
+  four-value view; `-vhdl4` keeps the old four-value mode (faster).
+  Procedures without `wait` lower to void functions.
 - mvplat: vector cryptography: Zvkned (AES), Zvknha/Zvknhb (SHA-256 and
   SHA-512), Zvkg (GHASH), Zvksed (SM4), Zvksh (SM3), Zvbc (carry-less
   multiply) and Zvkt, on element groups; checked against FIPS-197, FIPS
