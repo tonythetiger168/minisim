@@ -1,9 +1,10 @@
 // vcrypto.inc - the vector cryptography extensions, included in class
 // Machine by vector.inc: Zvkned (AES), Zvknha/Zvknhb (SHA-256, SHA-512),
-// Zvkg (GHASH) on the OP-VE major opcode, and Zvbc (carry-less multiply)
-// from the OP-V integer path. Every instruction works on element groups of
-// four elements (128 bits at SEW 32, 256 at SEW 64): vl and vstart must be
-// multiples of four, and a register group must hold a whole element group.
+// Zvkg (GHASH), Zvksed (SM4) and Zvksh (SM3) on the OP-VE major opcode, and
+// Zvbc (carry-less multiply) from the OP-V integer path. Every instruction
+// works on element groups of four elements (128 bits at SEW 32, 256 at SEW
+// 64; SM3 eight at SEW 32): vl and vstart must be multiples of the group
+// size, and a register group must hold a whole element group.
 // Zvkt (data-independent timing) holds trivially in an instruction set
 // simulator.
 
@@ -123,6 +124,48 @@ static U128 ghashMul(U128 s, U128 h) {
     return brev8x(z);
 }
 
+// ---- SM4 (GB/T 32907): the S-box is an inverse in GF(2^8) mod x^8 + x^7 +
+// x^6 + x^5 + x^4 + x^2 + 1 between two copies of the same affine map.
+static const uint8_t* sm4Sbox() {
+    static uint8_t s[256];
+    static const bool init = [] {
+        auto gm = [](unsigned a, unsigned b) {
+            unsigned p = 0;
+            while (b) {
+                if (b & 1) p ^= a;
+                a <<= 1;
+                if (a & 0x100) a ^= 0x1f5;
+                b >>= 1;
+            }
+            return p;
+        };
+        auto aff = [](unsigned x) {
+            unsigned o = 0;
+            for (int i = 0; i < 8; i++) {
+                unsigned r = (0xa7u << i | 0xa7u >> (8 - i)) & 0xff;
+                o |= (unsigned)(__builtin_popcount(x & r) & 1) << i;
+            }
+            return o ^ 0xd3;
+        };
+        for (unsigned x = 0; x < 256; x++) {
+            unsigned a = aff(x), inv = 0;
+            for (unsigned c = 1; c < 256 && a; c++)
+                if (gm(a, c) == 1) { inv = c; break; }
+            s[x] = (uint8_t)aff(inv);
+        }
+        return true;
+    }();
+    (void)init;
+    return s;
+}
+static uint32_t rol32(uint32_t x, unsigned n) { return n ? x << n | x >> (32 - n) : x; }
+static uint32_t sm4Sub(uint32_t w) {
+    const uint8_t* t = sm4Sbox();
+    return (uint32_t)t[w & 0xff] | (uint32_t)t[w >> 8 & 0xff] << 8 | (uint32_t)t[w >> 16 & 0xff] << 16 |
+           (uint32_t)t[w >> 24] << 24;
+}
+static uint32_t rev8w(uint32_t x) { return __builtin_bswap32(x); }
+
 int vcrypto(Hart& h, uint32_t insn) {
     const unsigned rd = (insn >> 7) & 31, f3 = (insn >> 12) & 7, rs1 = (insn >> 15) & 31, rs2 = (insn >> 20) & 31,
                    vm = (insn >> 25) & 1, f6 = insn >> 26;
@@ -130,16 +173,17 @@ int vcrypto(Hart& h, uint32_t insn) {
     const unsigned sew = t.sew;
     const uint64_t vl = h.vl;
     if (f3 != 2 || !vm) return VILL;
-    const bool sha = f6 >= 0x2d && f6 <= 0x2f;
+    const bool sha = f6 >= 0x2d && f6 <= 0x2f, sm3 = f6 == 0x20 || f6 == 0x2b;
     if (sha ? (sew != 32 && sew != 64) : sew != 32) return VILL;
-    if (vl % 4 || h.vstart % 4) return VILL;
+    const unsigned egs = sm3 ? 8 : 4;
+    if (vl % egs || h.vstart % egs) return VILL;
     // A register group must hold one element group (EGW = 4 * SEW).
     const unsigned lregs = t.lmul > 0 ? 1u << t.lmul : 1u;
     const uint64_t groupBits = t.lmul >= 0 ? (uint64_t)h.vlen << t.lmul : (uint64_t)h.vlen >> -t.lmul;
-    if (groupBits < 4u * sew) return VILL;
+    if (groupBits < egs * sew) return VILL;
     auto aligned = [&](unsigned r) { return r % lregs == 0 && r + lregs <= 32; };
-    const uint64_t g0 = h.vstart / 4, gn = vl / 4;
-    const unsigned gB = sew / 2;                                        // bytes per element group
+    const uint64_t g0 = h.vstart / egs, gn = vl / egs;
+    const unsigned gB = egs * sew / 8;                                  // bytes per element group
     auto grp = [&](unsigned r, uint64_t g) { return h.vr + (size_t)r * (h.vlen / 8) + g * gB; };
     auto done = [&] { h.vstart = 0; h.mstatus |= MSTATUS_VS; return VOK; };
 
@@ -184,15 +228,14 @@ int vcrypto(Hart& h, uint32_t insn) {
         if (!aligned(rd) || !aligned(rs2)) return VILL;
         static const uint8_t rcon[10] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36};
         unsigned rnd = rs1 & 15;
+        if (f6 == 0x22 ? rnd == 0 || rnd > 10 : rnd < 2 || rnd > 14) rnd ^= 8;   // out of range: flip bit 3
         for (uint64_t g = g0; g < gn; g++) {
             uint32_t cur[4], o[4];
             memcpy(cur, grp(rs2, g), 16);
             if (f6 == 0x22) {
-                if (rnd == 0 || rnd > 10) rnd ^= 8;
                 uint32_t w = aesSubWord(cur[3] >> 8 | cur[3] << 24) ^ rcon[rnd - 1];
                 o[0] = w ^ cur[0];
             } else {
-                if (rnd < 2 || rnd > 14) rnd ^= 8;
                 uint32_t prev[4];
                 memcpy(prev, grp(rd, g), 16);
                 uint32_t w = rnd & 1 ? aesSubWord(cur[3]) : aesSubWord(cur[3] >> 8 | cur[3] << 24) ^ rcon[rnd / 2 - 1];
@@ -242,6 +285,77 @@ int vcrypto(Hart& h, uint32_t insn) {
                 else sha2c<uint64_t>(d, a, f6 == 0x2e ? b[2] : b[0], f6 == 0x2e ? b[3] : b[1]);
                 memcpy(grp(rd, g), d, 32);
             }
+        }
+        return done();
+    }
+    // SM4: vsm4k.vi (four round keys), vsm4r.vv / .vs (four rounds). The
+    // words are used as they are: software byte-swaps the big-endian data.
+    if (f6 == 0x21 || ((f6 == 0x28 || f6 == 0x29) && rs1 == 0x10)) {
+        const bool vs = f6 == 0x29;
+        if (!aligned(rd) || (!vs && !aligned(rs2))) return VILL;
+        if (vs && rs2 >= rd && rs2 < rd + lregs) return VILL;
+        auto L = [](uint32_t s, bool key) {
+            return key ? s ^ rol32(s, 13) ^ rol32(s, 23) : s ^ rol32(s, 2) ^ rol32(s, 10) ^ rol32(s, 18) ^ rol32(s, 24);
+        };
+        for (uint64_t g = g0; g < gn; g++) {
+            uint32_t x[8], k[4];
+            if (f6 == 0x21) {
+                const unsigned rnd = rs1 & 7;
+                memcpy(x, grp(rs2, g), 16);
+                for (unsigned j = 0; j < 4; j++) {
+                    const unsigned n = 4 * rnd + j;                    // CK: bytes (4n + b) * 7 mod 256, big-endian
+                    uint32_t ck = 0;
+                    for (unsigned b = 0; b < 4; b++) ck = ck << 8 | ((4 * n + b) * 7 & 0xff);
+                    x[4 + j] = x[j] ^ L(sm4Sub(x[j + 1] ^ x[j + 2] ^ x[j + 3] ^ ck), true);
+                }
+            } else {
+                memcpy(x, grp(rd, g), 16);
+                memcpy(k, vs ? grp(rs2, 0) : grp(rs2, g), 16);
+                for (unsigned j = 0; j < 4; j++) x[4 + j] = x[j] ^ L(sm4Sub(x[j + 1] ^ x[j + 2] ^ x[j + 3] ^ k[j]), false);
+            }
+            memcpy(grp(rd, g), x + 4, 16);
+        }
+        return done();
+    }
+    // SM3: vsm3me.vv (message expansion, W[16..23] from W[0..15]) and
+    // vsm3c.vi (rounds 2*uimm and 2*uimm+1). Words are big-endian in the
+    // registers: the instructions swap bytes on the way in and out.
+    if (sm3) {
+        if (!aligned(rd) || !aligned(rs2) || (f6 == 0x20 && !aligned(rs1))) return VILL;
+        if ((rd >= rs2 && rd < rs2 + lregs) || (rs2 >= rd && rs2 < rd + lregs)) return VILL;
+        auto P0 = [](uint32_t x) { return x ^ rol32(x, 9) ^ rol32(x, 17); };
+        auto P1 = [](uint32_t x) { return x ^ rol32(x, 15) ^ rol32(x, 23); };
+        for (uint64_t g = g0; g < gn; g++) {
+            uint32_t v[8], w[24];
+            if (f6 == 0x20) {
+                memcpy(w, grp(rs1, g), 32);
+                memcpy(w + 8, grp(rs2, g), 32);
+                for (auto& e : w) e = rev8w(e);
+                for (unsigned j = 16; j < 24; j++)
+                    w[j] = P1(w[j - 16] ^ w[j - 9] ^ rol32(w[j - 3], 15)) ^ rol32(w[j - 13], 7) ^ w[j - 6];
+                for (unsigned j = 0; j < 8; j++) v[j] = rev8w(w[16 + j]);
+            } else {
+                uint32_t st[8], m[8];
+                memcpy(st, grp(rd, g), 32);
+                memcpy(m, grp(rs2, g), 32);
+                uint32_t A = rev8w(st[0]), B = rev8w(st[1]), C = rev8w(st[2]), D = rev8w(st[3]);
+                uint32_t E = rev8w(st[4]), F = rev8w(st[5]), G = rev8w(st[6]), H = rev8w(st[7]);
+                const unsigned r0 = 2 * (rs1 & 31);
+                for (unsigned k = 0; k < 2; k++) {
+                    const unsigned j = r0 + k;
+                    const uint32_t wj = rev8w(m[k]), xj = wj ^ rev8w(m[4 + k]);
+                    const uint32_t T = j <= 15 ? 0x79cc4519u : 0x7a879d8au;
+                    const uint32_t ss1 = rol32(rol32(A, 12) + E + rol32(T, j % 32), 7), ss2 = ss1 ^ rol32(A, 12);
+                    const uint32_t ff = j <= 15 ? A ^ B ^ C : (A & B) | (A & C) | (B & C);
+                    const uint32_t gg = j <= 15 ? E ^ F ^ G : (E & F) | (~E & G);
+                    const uint32_t tt1 = ff + D + ss2 + xj, tt2 = gg + H + ss1 + wj;
+                    D = C; C = rol32(B, 9); B = A; A = tt1;
+                    H = G; G = rol32(F, 19); F = E; E = P0(tt2);
+                }
+                const uint32_t o[8] = {A, B, C, D, E, F, G, H};
+                for (unsigned j = 0; j < 8; j++) v[j] = rev8w(o[j]);
+            }
+            memcpy(grp(rd, g), v, 32);
         }
         return done();
     }

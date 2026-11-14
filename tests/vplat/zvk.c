@@ -2,8 +2,9 @@
 // AES-128 and AES-256 (FIPS-197 appendix C) encrypted and decrypted with
 // Zvkned, one block (.vs round keys) and four blocks at once (.vv); SHA-256
 // and SHA-512 of "abc" (FIPS 180-4) with Zvknha/Zvknhb; GHASH with Zvkg on
-// GCM's test case 2 (McGrew and Viega); and Zvbc's carry-less multiply
-// against a scalar model. clang 18 has no intrinsics for these, so each
+// GCM's test case 2 (McGrew and Viega); SM4 (GB/T 32907 example 1) with
+// Zvksed; SM3 of "abc" (GB/T 32905) with Zvksh; and Zvbc's carry-less
+// multiply against a scalar model. clang 18 has no intrinsics for these, so each
 // instruction runs from a small assembly helper on element groups in memory.
 #include "rt.h"
 
@@ -88,6 +89,31 @@ KF2(2) KF2(3) KF2(4) KF2(5) KF2(6) KF2(7) KF2(8) KF2(9) KF2(10) KF2(11) KF2(12) 
 static void (*const kf1[11])(void*, const void*) = {0, kf1_1, kf1_2, kf1_3, kf1_4, kf1_5, kf1_6, kf1_7, kf1_8, kf1_9, kf1_10};
 static void (*const kf2[15])(void*, const void*) = {0, 0, kf2_2, kf2_3, kf2_4, kf2_5, kf2_6, kf2_7, kf2_8, kf2_9,
                                                     kf2_10, kf2_11, kf2_12, kf2_13, kf2_14};
+
+OP2(sm4r_vs, 32, "vsm4r.vs")
+#define SM4K(R) static void sm4k_##R(void* d, const void* s) {                                  \
+        __asm__ volatile("vsetivli zero, 4, e32, m1, ta, ma\n vle32.v v1, (%1)\n"              \
+                         "vsm4k.vi v2, v1, " #R "\n vse32.v v2, (%0)"                           \
+                         :: "r"(d), "r"(s) : "memory", "v1", "v2"); }
+SM4K(0) SM4K(1) SM4K(2) SM4K(3) SM4K(4) SM4K(5) SM4K(6) SM4K(7)
+static void (*const sm4k[8])(void*, const void*) = {sm4k_0, sm4k_1, sm4k_2, sm4k_3, sm4k_4, sm4k_5, sm4k_6, sm4k_7};
+// SM3: element groups of eight words (256 bits; LMUL 2 at VLEN 128).
+static void sm3me(void* d, const void* s2, const void* s1) {
+    __asm__ volatile("vsetivli zero, 8, e32, m2, ta, ma\n vle32.v v2, (%1)\n vle32.v v4, (%2)\n"
+                     "vsm3me.vv v6, v2, v4\n vse32.v v6, (%0)"
+                     :: "r"(d), "r"(s2), "r"(s1) : "memory", "v2", "v3", "v4", "v5", "v6", "v7");
+}
+#define SM3C(R) static void sm3c_##R(void* st, const void* w) {                                 \
+        __asm__ volatile("vsetivli zero, 8, e32, m2, ta, ma\n vle32.v v2, (%0)\n vle32.v v4, (%1)\n" \
+                         "vsm3c.vi v2, v4, " #R "\n vse32.v v2, (%0)"                           \
+                         :: "r"(st), "r"(w) : "memory", "v2", "v3", "v4", "v5"); }
+SM3C(0) SM3C(1) SM3C(2) SM3C(3) SM3C(4) SM3C(5) SM3C(6) SM3C(7) SM3C(8) SM3C(9) SM3C(10) SM3C(11) SM3C(12)
+SM3C(13) SM3C(14) SM3C(15) SM3C(16) SM3C(17) SM3C(18) SM3C(19) SM3C(20) SM3C(21) SM3C(22) SM3C(23) SM3C(24)
+SM3C(25) SM3C(26) SM3C(27) SM3C(28) SM3C(29) SM3C(30) SM3C(31)
+static void (*const sm3c[32])(void*, const void*) = {
+    sm3c_0, sm3c_1, sm3c_2, sm3c_3, sm3c_4, sm3c_5, sm3c_6, sm3c_7, sm3c_8, sm3c_9, sm3c_10,
+    sm3c_11, sm3c_12, sm3c_13, sm3c_14, sm3c_15, sm3c_16, sm3c_17, sm3c_18, sm3c_19, sm3c_20, sm3c_21,
+    sm3c_22, sm3c_23, sm3c_24, sm3c_25, sm3c_26, sm3c_27, sm3c_28, sm3c_29, sm3c_30, sm3c_31};
 
 static uint8_t hexv(char c) { return (uint8_t)(c <= '9' ? c - '0' : c - 'a' + 10); }
 static void unhex(uint8_t* o, const char* s) { for (; *s; s += 2) *o++ = (uint8_t)(hexv(s[0]) << 4 | hexv(s[1])); }
@@ -218,6 +244,35 @@ static void t_sha512(void) {
     check("SHA-512(\"abc\") (SEW 64)", same(out, want, 64));
 }
 
+static void t_sm4(void) {
+    uint8_t kb[16], ct[16];
+    unhex(kb, "0123456789abcdeffedcba9876543210");
+    static const uint32_t FK[4] = {0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc};
+    uint32_t k[4], rkg[8][4], x[4];
+    for (int i = 0; i < 4; i++) k[i] = be32(kb + 4 * i) ^ FK[i];
+    sm4k[0](rkg[0], k);
+    for (int r = 1; r < 8; r++) sm4k[r](rkg[r], rkg[r - 1]);
+    check("SM4 first round key (vsm4k)", rkg[0][0] == 0xf12186f9 && rkg[7][3] == 0x9124a012);
+    for (int i = 0; i < 4; i++) x[i] = be32(kb + 4 * i);  // the plaintext is the key
+    for (int r = 0; r < 8; r++) sm4r_vs(x, rkg[r], 4);
+    unhex(ct, "681edf34d206965e86b3e94f536e4246");
+    check("SM4 encrypt (vsm4r.vs)", x[3] == be32(ct) && x[2] == be32(ct + 4) && x[1] == be32(ct + 8) && x[0] == be32(ct + 12));
+}
+
+static void t_sm3(void) {
+    // The message words stay big-endian in memory: the instructions swap.
+    static uint8_t W[72 * 4];
+    W[0] = 'a'; W[1] = 'b'; W[2] = 'c'; W[3] = 0x80; W[63] = 24;
+    for (int q = 0; q < 7; q++) sm3me(W + 64 + 32 * q, W + 32 + 32 * q, W + 32 * q);
+    uint8_t iv[32], st[32], want[32];
+    unhex(iv, "7380166f4914b2b9172442d7da8a0600a96f30bc163138aae38dee4db0fb0e4e");
+    memcpy(st, iv, 32);
+    for (int r = 0; r < 32; r++) sm3c[r](st, W + 8 * r);
+    for (int i = 0; i < 32; i++) st[i] ^= iv[i];
+    unhex(want, "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0");
+    check("SM3(\"abc\") (vsm3me, vsm3c)", same(st, want, 32));
+}
+
 static void t_clmul(void) {
     static uint64_t a[8], b[8], lo[8], hi[8];
     uint64_t sd = 0x9e3779b97f4a7c15ull;
@@ -248,6 +303,8 @@ int main(int hart) {
     t_ghash();
     t_sha256();
     t_sha512();
+    t_sm4();
+    t_sm3();
     t_clmul();
     puts_("zvk: ");
     putd((uint32_t)(checks - fails));
