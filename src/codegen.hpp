@@ -485,7 +485,7 @@ public:
                     while (a < n.size() && std::isalpha((unsigned char)n[a])) a++;
                     std::string pre = n.substr(0, a);
                     if (a == n.size() || !std::isdigit((unsigned char)n[a])) return std::string();
-                    static const char* ok[] = {"proc", "ds", "dsT", "combP", "combQ", "combC", "combD", "combPT", "combQT", "combCT", "commitS"};
+                    static const char* ok[] = {"proc", "ds", "dsT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS"};
                     for (const char* k : ok) if (pre == k) return pre + (n.size() > 2 && n.compare(n.size() - 2, 2, "_2") == 0 ? "2" : "");
                     return std::string();
                 };
@@ -708,9 +708,18 @@ public:
             std::sort(ins.begin(), ins.end());
             ins.erase(std::unique(ins.begin(), ins.end()), ins.end());
             if (!coneIns_.empty()) {   // the clock cone runs first, on the clocks alone
-                o << "    S.addComb(combCone, nullptr, {";
-                for (size_t j = 0; j < coneIns_.size(); j++) o << (j ? ", " : "") << coneIns_[j];
-                o << "});\n";
+                std::vector<int> rest;
+                for (int x : coneIns_) if (!coneK_ || !std::binary_search(coneClkIns_.begin(), coneClkIns_.end(), x)) rest.push_back(x);
+                if (coneK_) {
+                    o << "    S.addComb(combConeK, nullptr, {";
+                    for (size_t j = 0; j < coneClkIns_.size(); j++) o << (j ? ", " : "") << coneClkIns_[j];
+                    o << "});\n";
+                }
+                if (!rest.empty()) {
+                    o << "    S.addComb(combCone, nullptr, {";
+                    for (size_t j = 0; j < rest.size(); j++) o << (j ? ", " : "") << rest[j];
+                    o << "});\n";
+                }
                 std::erase_if(ins, [&](int x) {
                     return std::binary_search(coneIns_.begin(), coneIns_.end(), x) || std::binary_search(coneOuts_.begin(), coneOuts_.end(), x);
                 });
@@ -3061,6 +3070,11 @@ private:
     std::vector<int> coneOuts_;
     std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
+    // Of those, the clocks themselves, and their own smaller cone (combConeK):
+    // a clock edge runs only that. The others (a debug request, an enable
+    // feeding a clock gate) run the whole cone, rarely.
+    std::vector<int> coneClkIns_;
+    bool coneK_ = false;
     std::string cold(const std::string& stmt) {
         return "[&]() __attribute__((noinline, cold)) { COLD(" + std::to_string(colds_++) + ") " + stmt + " }();";
     }
@@ -3519,8 +3533,17 @@ private:
                     else if (in.k != IK::Assign && in.k != IK::Jmp && in.k != IK::JmpIfNot) u.live = true;
                 }
             }
+            // A clocked process's clock edge is a copy's root (the domain
+            // waits on that): a port's private clk_i copy nobody else reads
+            // is dead (1125 of them in Ibex, two passes a cycle).
             for (int n : dom)
-                for (auto& in : procs[n].prog->code) touchAll(in, live);
+                for (auto& in : procs[n].prog->code) {
+                    if (in.k == IK::WaitEdge && !std::getenv("MSIM_NOCLKALIAS")) {
+                        exprs(in, [&](Expr& x) { if (ok(x.sig)) live[x.sig] = 1; });
+                        if (ok(in.sig)) live[alias[in.sig] >= 0 && !wakeSig(in.sig) ? root(in.sig) : in.sig] = 1;
+                        for (auto& [sg, ed] : in.events) if (ok(sg)) live[alias[sg] >= 0 && !wakeSig(sg) ? root(sg) : sg] = 1;
+                    } else touchAll(in, live);
+                }
             for (bool ch = true; ch;) {
                 ch = false;
                 for (auto& u : us) {
@@ -3851,10 +3874,21 @@ private:
         // took the compiler 12 GB and 80 s.
         o << "static bool twoNow() {\n";
         if (two) {
+            // The x words of the narrow signals by address (taken once: S.sigs
+            // does not move after startup), then the wide ones limb by limb:
+            // a loop over Val and its limbs cost about 14 instructions a
+            // signal, 30% of Ibex's run time once it was all 2-state.
             o << "    static const int T[] = {-1";
-            for (int e : ext) if (!scratch(e)) o << ", " << e;
-            o << "};\n    if (!pclean) return false;\n    uint64_t x = 0;\n"
-                 "    for (size_t k = 1; k < sizeof T / sizeof T[0]; k++) { const Val& v = S.sigs[T[k]].val; x |= v.x; for (auto& h : v.hi) x |= h.x; }\n"
+            for (int e : ext) if (!scratch(e) && sigW_[e] <= 64) o << ", " << e;
+            o << "};\n    static const int TW[] = {-1";
+            for (int e : ext) if (!scratch(e) && sigW_[e] > 64) o << ", " << e;
+            o << "};\n    constexpr size_t NT = sizeof T / sizeof T[0] - 1;\n"
+                 "    static const uint64_t* TX[NT ? NT : 1];\n"
+                 "    static bool init = false;\n"
+                 "    if (!init) { for (size_t k = 0; k < NT; k++) TX[k] = &S.sigs[T[k + 1]].val.x; init = true; }\n"
+                 "    if (!pclean) return false;\n    uint64_t x = 0;\n"
+                 "    for (size_t k = 0; k < NT; k++) x |= *TX[k];\n"
+                 "    for (size_t k = 1; k < sizeof TW / sizeof TW[0]; k++) { const Val& v = S.sigs[TW[k]].val; x |= v.x; for (auto& h : v.hi) x |= h.x; }\n"
                  "    return x == 0;\n";   // every limb: fx reads up to 64 bits of a wider signal
         } else
             o << "    return false;\n";
@@ -3994,7 +4028,11 @@ private:
                  "      S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); }, use); S.domainTune[1].done(S.threads); }\n";
         else if (multi) {
             o << "    const int grp = (int)(intptr_t)ctx;\n";
-            if (two) o << "    if (twoNow()) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
+            // The groups of one runSeqs run back to back and write no signal
+            // in between (NBAs only): one twoNow() for all of them.
+            if (two) o << "    static uint64_t tAt = ~0ULL; static bool tNow = false;\n"
+                          "    if (S.seqRun != tAt) { tAt = S.seqRun; tNow = twoNow(); }\n"
+                          "    if (tNow) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
             o << "    for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS[DSO[k]]();\n"
                  "    if (dpend) return;\n    dpend = true;\n";
         } else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
@@ -4092,7 +4130,10 @@ private:
             std::vector<int> cands;
             cands.swap(coneIns_);
             std::fill(coneSig.begin(), coneSig.end(), 0);
-            size_t nCone = 0;
+            size_t nCone = 0, nClk = 0;
+            std::vector<char> inClk(procs.size(), 0);
+            coneClkIns_.clear();
+            coneK_ = false;
             for (int c : cands) {
                 std::vector<char> in1(procs.size(), 0), sg1(sigW_.size(), 0);
                 sg1[c] = 1;
@@ -4118,6 +4159,13 @@ private:
                 coneIns_.push_back(c);
                 for (int i : byRank)
                     if (in1[i] && !inCone[i]) { inCone[i] = 1; nCone++; }
+                bool clk = clock_[c];   // a clock, or the source its copies down the hierarchy come from
+                for (size_t x = 0; x < clock_.size() && !clk; x++) clk = clock_[x] && x < domRoot_.size() && domRoot_[x] == c;
+                if (clk) {
+                    coneClkIns_.push_back(c);
+                    for (int i : byRank)
+                        if (in1[i] && !inClk[i]) { inClk[i] = 1; nClk++; }
+                }
             }
             if (nCone == 0) coneIns_.clear();
             // What the cone writes, only the cone reads: those signals do not wake combAll either.
@@ -4140,6 +4188,25 @@ private:
                 for (auto& c : callsC) o << "    " << c << ";\n";
                 if (privW) o << "    scanP();\n";
                 o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
+                // The clocks' own cone: when it is smaller, a clock edge runs
+                // only it (Ibex: the clock gate and the clock copies, not the
+                // controller logic behind the gate's enable).
+                std::sort(coneClkIns_.begin(), coneClkIns_.end());
+                if (!coneClkIns_.empty() && nClk < nCone && !std::getenv("MSIM_NOCONEK")) {
+                    coneK_ = true;
+                    std::vector<size_t> kUnits;
+                    bool kPriv = false;
+                    for (size_t j : coneUnits)
+                        if (inClk[unitProc[j]]) {
+                            kUnits.push_back(j);
+                            for (auto* in : unitIns[j]) kPriv |= isPriv(in->sig);
+                        }
+                    std::vector<std::string> callsK = shareChunks(o, "combK", kUnits, combStmts, unitProc, unitIns, procs, kChunk);
+                    o << "static void combConeK(const void*) {\n" << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
+                    for (auto& c : callsK) o << "    " << c << ";\n";
+                    if (kPriv) o << "    scanP();\n";
+                    o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
+                } else coneClkIns_.clear();
             }
         }
         // armChk before the pass (a testbench write to a private input) and

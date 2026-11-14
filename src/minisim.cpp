@@ -760,7 +760,9 @@ struct Sim {
         if (seqOf.size() < sigs.size()) seqOf.resize(sigs.size());
         for (auto& [sg, e] : ev) seqOf[sg].push_back({id, e});
     }
+    uint64_t seqRun = 0;   // counts runSeqs: the compiled clock groups of one run share a twoNow() (codegen dseq)
     void runSeqs() {
+        seqRun++;
         if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
         // The compiled cycle domain's clock groups (one dseq each) share the

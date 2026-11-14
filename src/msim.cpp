@@ -437,6 +437,29 @@ static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
         auto c = std::make_shared<Expr>(*e);
         c->at = sub(c->at, var, v);
         for (auto& k : c->kids) k = sub(k, var, v);
+        // Fold what is constant now (rf[i - 1], irq[i] with i known): the
+        // generated code then indexes a fixed bit instead of computing one.
+        bool pure = !c->at && !c->arr && c->op >= Op::Not && c->op <= Op::Mux && !c->kids.empty();
+        for (auto& k : c->kids) pure &= k && k->op == Op::Const;
+        // a[i +: w] with i known and in range: a fixed part select.
+        if (c->op == Op::DynSlice && !c->at && c->kids.size() == 2 && c->kids[1]->op == Op::Const && !c->kids[1]->k.x && c->kids[0]) {
+            const E& a = c->kids[0];
+            int aw = a->op == Op::Slice ? a->hi - a->lo + 1 : a->op == Op::Ref && !a->at && !a->arr ? S.sigs[(size_t)a->sig].w : -1;
+            int64_t st = v_to_i64(c->kids[1]->k);
+            if (c->lo) st = st - c->hi + 1;
+            if (aw > 0 && st >= 0 && st + c->hi <= aw) {
+                auto sl = node(Op::Slice);
+                sl->kids = {a};
+                sl->hi = (int)st + c->hi - 1;
+                sl->lo = (int)st;
+                return sl;
+            }
+        }
+        if (pure) {
+            Val r;
+            Reader none = [](int s) -> Val { return S.sigs[(size_t)s].val; };
+            try { r = eval(c, none); return konst(r); } catch (...) {}
+        }
         return c;
     };
     std::set<int> used;
