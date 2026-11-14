@@ -388,6 +388,63 @@ static void mergePartialDrivers(LowerResult& lowered) {
     }
 }
 
+// -x-assign 0 / -x-initial 0 (Verilator's options of the same names): the
+// design runs as a 2-state model would. Every X bit of a literal becomes 0
+// (picorv32 writes 'bx as a don't-care into a dozen registers every cycle,
+// which kept a 4-state simulator on its 4-state path for the whole run).
+// The patterns of ===, !==, case, casez, casex and ==? keep their X bits:
+// there an X is a value to match or a wildcard, not an assignment.
+static void xAssignZero(LowerResult& lowered) {
+    std::unordered_set<Expr*> seen;
+    auto zero = [](const E& e) -> E {
+        Val k = e->k;
+        if (k.real || k.str) return e;
+        bool any = (k.x & ~k.z) != 0;
+        for (auto& h : k.hi) any |= (h.x & ~h.z) != 0;
+        if (!any) return e;
+        auto clr = [](uint64_t& v, uint64_t& x, uint64_t z) { uint64_t m = x & ~z; v &= ~m; x &= ~m; };
+        clr(k.v, k.x, k.z);
+        for (auto& h : k.hi) clr(h.v, h.x, h.z);
+        return konst(k);
+    };
+    std::function<void(E&)> walk = [&](E& e) {
+        if (!e) return;
+        if (e->op == Op::Const) { e = zero(e); return; }
+        if (!seen.insert(e.get()).second) return;
+        const bool pat = e->op == Op::CaseEq || e->op == Op::CaseZEq || e->op == Op::CaseXEq || e->op == Op::WildEq ||
+                         (e->op == Op::LogNot && !e->kids.empty() && e->kids[0] && e->kids[0]->op == Op::CaseEq);
+        for (auto& k : e->kids)
+            if (!(pat && k && k->op == Op::Const)) walk(k);
+        if (e->at) walk(e->at);
+    };
+    auto prog = [&](Prog& p) {
+        for (auto& i : p.code) {
+            walk(i.e);
+            walk(i.fd);
+            walk(i.bidx);
+            walk(i.de);
+            for (auto& a : i.args) walk(a);
+            for (auto& a : i.aidx) walk(a);
+            for (auto& a : i.init) walk(a.second);
+        }
+    };
+    for (auto& lp : lowered.procs) prog(lp.prog);
+    for (auto& lp : lowered.finals) prog(lp.prog);
+    for (auto& sp : lowered.subs)
+        if (sp) prog(*sp);
+}
+
+// -x-initial 0: every variable starts at 0 instead of X (6.8); nets keep
+// their Z until a driver runs. Declaration initializers still run at time 0.
+static void xInitialZero() {
+    for (auto& g : S.sigs) {
+        if (g.net || g.val.real || g.val.str) continue;
+        g.val.v &= ~g.val.x;
+        g.val.x = g.val.z = 0;
+        for (auto& h : g.val.hi) { h.v &= ~h.x; h.x = h.z = 0; }
+    }
+}
+
 // A for loop with a constant trip count in a clocked process (the reset of
 // a register file: for (int i = 0; i < 16; i++) rf[i] <= 0) is unrolled:
 // each copy reads i as a constant, so an array write gets its fixed
@@ -1562,7 +1619,21 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // the runtime sees every signal, so no private ones.
     const bool upf = upfrt::rt().on;
     std::vector<CodegenSig> sigs;
-    for (auto& g : S.sigs) sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
+    for (auto& g : S.sigs) {
+        sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
+        const uint64_t all = g.w >= 64 ? ~0ULL : (1ULL << g.w) - 1;
+        if (g.w <= 64 && !g.net && !g.val.real && !g.val.str && (g.val.x & all) != all) {
+            auto& c = sigs.back();
+            c.init = true;
+            c.v = g.val.v;
+            c.x = g.val.x;
+            c.z = g.val.z;
+        } else if (g.w > 64 && !g.net && !g.val.real && !g.val.str && !g.val.v && !g.val.x && !g.val.z) {
+            bool z = true;
+            for (auto& h : g.val.hi) z &= !h.v && !h.x && !h.z;
+            sigs.back().zeroWide = z;
+        }
+    }
     std::vector<CodegenProc> procs;
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         CodegenProc c{&lowered.procs[i].prog, lowered.procs[i].kind, pl.rank[i], pl.ins[i]};
@@ -2538,6 +2609,9 @@ static void usage() {
                  "  -pin, -no-pin  pin worker threads to cores (default: yes, not under a VM)\n"
                  "  -cpuinfo       print the detected cores / SMT / P+E topology\n"
               << protfront::Options::help() <<
+                 "  -x-assign 0     every X bit of a literal is 0 (not in ===, case patterns, ==?), as Verilator\n"
+                 "  -x-initial 0    variables start at 0, not X, as Verilator; with -x-assign 0 a design\n"
+                 "                  runs as a 2-state model and -compile stays on its 2-state path\n"
                  "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
                  "                 merges the branches instead of picking one (docs/XPROP.md)\n"
                  "  -xprop=<file>, -xprop-config <file>  X-propagation set per instance or module\n"
@@ -2620,6 +2694,7 @@ int main(int argc, char** argv) {
     bool elabOnly = false;   // -elab: stop after elaboration (xrun -elaborate)
     bool parseOnly = false;  // -parse: stop after parsing (the analysis steps of mstep.inc)
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
+    bool xAssign0 = false, xInitial0 = false;   // -x-assign 0, -x-initial 0
     int threads = defaultThreads();
     bool threadsGiven = false;
     std::string buildDir = "msim.d", opt = "-O2";
@@ -2659,6 +2734,13 @@ int main(int argc, char** argv) {
         if (a == "-no-static-seq") { staticSeq = false; continue; }
         if (a == "-no-partition") { staticPart = false; continue; }
         if (a == "-no-2state") { twoState = false; continue; }
+        if (a == "-x-assign" || a == "-x-initial" || a == "-x-assign=0" || a == "-x-initial=0") {   // Verilator's names
+            bool init = a.rfind("-x-initial", 0) == 0;
+            std::string v = a.find('=') != std::string::npos ? "0" : next("0 or keep");
+            if (v != "0" && v != "keep") { std::cerr << "msim: " << a << " takes 0 or keep\n"; return 2; }
+            (init ? xInitial0 : xAssign0) = v == "0";
+            continue;
+        }
         if (a == "-no-cycle") { cycle = false; continue; }
         if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
         if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
@@ -3350,6 +3432,8 @@ int main(int argc, char** argv) {
                     v[(size_t)i.drv] = lp.scope;
                 }
     }
+    if (xAssign0) xAssignZero(lowered);
+    if (xInitial0) xInitialZero();
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty() && !dumpPorts)
         mergePartialDrivers(lowered);

@@ -40,6 +40,8 @@ set(CASES
   "examples/wideslice.sv"
   "examples/nbadelay.sv"
   "examples/conek.sv"
+  "examples/xassign.sv"
+  "-x-assign 0 -x-initial 0 examples/xassign.sv"
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
@@ -171,6 +173,27 @@ if(mine EQUAL SHARD)
   endif()
   if(NOT r1 EQUAL 1 OR NOT r2 EQUAL 1 OR NOT want STREQUAL got)
     message(FATAL_ERROR "fatalexit: exit ${r1} / ${r2} (want 1)\n--- interpreter\n${want}--- compiled\n${got}")
+  endif()
+  math(EXPR ran "${ran} + 1")
+endif()
+# -x-assign 0 -x-initial 0: no X left, the counter counts, and -compile
+# stays on its 2-state path (MSIM_WHY4 names nothing).
+math(EXPR n "${n} + 1")
+math(EXPR mine "${n} % ${SHARDS}")
+if(mine EQUAL SHARD)
+  execute_process(COMMAND ${MSIM} -x-assign 0 -x-initial 0 ${SRC}/examples/xassign.sv OUTPUT_VARIABLE got RESULT_VARIABLE r1)
+  if(NOT r1 EQUAL 0 OR got MATCHES "x" OR NOT got MATCHES "cnt=04 dc=00 w=00 a=00 r=1 c=3 y=05 wide=0 eqx=0")
+    message(FATAL_ERROR "xassign: X left or wrong values\n${got}")
+  endif()
+  execute_process(COMMAND ${MSIM} ${SRC}/examples/xassign.sv OUTPUT_VARIABLE got RESULT_VARIABLE r1)
+  if(NOT got MATCHES "cnt=xx dc=xx w=xx a=xx r=1 c=7 y=63 wide=x eqx=1")
+    message(FATAL_ERROR "xassign: 4-state run changed\n${got}")
+  endif()
+  execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/xassign -x-assign 0 -x-initial 0 ${SRC}/examples/xassign.sv
+                  RESULT_VARIABLE r2 ERROR_VARIABLE err)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E env MSIM_WHY4=3 ${OUT}/xassign/simv OUTPUT_VARIABLE got2 ERROR_VARIABLE why)
+  if(NOT r2 EQUAL 0 OR err MATCHES "using the interpreter" OR why MATCHES "4-state")
+    message(FATAL_ERROR "xassign: -compile left its 2-state path\n${err}${why}")
   endif()
   math(EXPR ran "${ran} + 1")
 endif()
