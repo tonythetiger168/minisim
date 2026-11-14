@@ -8,6 +8,22 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- dw: `MW_reset_sync`, `MW_pulse_sync`, `MW_data_sync` (clock domain
+  crossing), `MW_8b10b_enc`/`MW_8b10b_dec`, `MW_sincos` (CORDIC), `MW_fir`
+  and `MW_tap` (IEEE 1149.1), checked by `tests/dw/xing.sv`.
+- mvplat: the V extension 1.0 on RV32 and RV64 (VLEN 128 to 1024 with
+  `-vlen` or the platform's `"vlen"`, ELEN 64): every load and store form,
+  integer, fixed point, mask, reduction, permutation and SEW 32/64 floating
+  point, `vstart` on traps, `mstatus.VS`; `v` in `misa` and the device tree.
+  Tested with riscv-tests' vector benchmarks (845 programs now), clang's
+  vectorized loops against its scalar ones, single-instruction checks, and
+  under Linux. EXT_ABI 8: the extension library needs a rebuild.
+- msim VHDL-2019: mode views and `'converse` (6.5.2), conditional analysis
+  directives (24.2, identifiers from `+define+`), sequential block
+  statements (10.15) and conditional `return`.
+- msim VHDL: package generics (6.5.6.4), a generic package taking an
+  instance of another; `use n.all` on one reaches its generic types and
+  subprograms.
 - msim VHDL: unconstrained array ports (6.5.6.3). Each port's index range
   comes from the actual, ascending or descending, also through another
   unconstrained port; a SystemVerilog parent sets `<port>__L`/`<port>__R`.
@@ -192,6 +208,7 @@ Spec references are IEEE 1800-2023 clauses.
   `LAT001`, `SEQ001`, `EXP001`, `CLK001`, `CLK004`), which `-json` and
   `mdebug -lint` use too.
 - mlint: VHDL-only rules VHD001..VHD009 on the VHDL text (vendor arithmetic packages, 'event clock edges, buffer ports, initial values, shared variables, positional port maps, unlabeled processes, integers with no range, bit ports). A process starting with `wait until rising_edge(clk)` is a flop, not an implicit state machine, and `COMB001` on VHDL suggests `process (all)`.
+- mlint: with `-sdc`, rules SDC001..SDC005 check the constraints against the design (inputs and outputs with no I/O delay, a clock on a port that clocks nothing or on a reset, objects the design does not have). STY016 (off by default) reports glue logic in a module that also instantiates submodules. The STARC table in docs/LINT.md now lists every topic of the guide as covered or not a lint check.
 
 ### Changed
 - `msim -compile` builds the kernel once into a cached object

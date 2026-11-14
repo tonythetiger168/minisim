@@ -430,8 +430,8 @@ int cgDefOf(const slang::ast::CovergroupType& t) {
             for (const auto& b : c.bins) {
                 if (b.dfltSeq)
                     unsupported("a default sequence bin of a coverpoint wider than 64 bits");
-                if (b.with && (b.allValues || b.wildcard))   // every value of the type: 2^w of them
-                    unsupported("a with bin over all values, or a wildcard with bin, of a coverpoint wider than 64 bits (19.5.1.1)");
+                if (b.with && b.array && (b.allValues || b.wildcard))   // a bin for each of up to 2^w values
+                    unsupported("an array of with bins over all values, or of wildcard with bins, of a coverpoint wider than 64 bits (19.5.1.1)");
             }
         }
         if (auto it = cpByName.find(c.name); it != cpByName.end()) {   // replaces the base's (19.4.1)

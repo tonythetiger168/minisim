@@ -31,6 +31,7 @@
 #include "lintrules.hpp"
 #include "lintformal.hpp"
 #include "lintsoc.hpp"
+#include "lintsdc.hpp"
 #include "lintsrc.hpp"
 #include "lintvhdl.hpp"
 #include "vhdl/front.hpp"
@@ -820,6 +821,8 @@ int main(int argc, char** argv) {
     lap("text and syntax rules");
     // What the VHDL translation erases: the VHDL text itself (lintvhdl.hpp).
     if (!vhdlFiles.empty()) lintvhdl::run(vhdlFiles, rep, threads);
+    // The constraints against the design (lintsdc.hpp).
+    lintsdc::run(*fe.comp, global, cdcOpt.sdcFiles, rep);
 #ifdef MINISIM_TIDY
     if (tidy) linttidy::run(*fe.comp, *am, fe.driver.diagEngine, rep, threads);
     lap("slang-tidy checks");

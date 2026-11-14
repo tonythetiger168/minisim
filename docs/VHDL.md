@@ -50,8 +50,10 @@ listed below. `-top` names a VHDL entity case-insensitively.
 | entity generic type and subprogram (6.5.6.1) | one copy of the module per set of actuals (`e__g1`, `e__g2`, ...), where the type and subprogram names stand for the actuals |
 | `conv(formal) => actual` on an out port (6.5.7.3) | the port drives a signal of its own type, and a process assigns `conv()` of it to the actual; a conversion on the actual of an in port is an expression |
 | generic subprogram, subprogram instantiation (4.2.1, 4.4) | each instance is a copy of the subprogram in which the generics' names stand for the actuals (a subprogram generic can be `T'image`) |
-| generic package, package instantiation (4.7, 4.9) | one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals |
+| generic package, package instantiation (4.7, 4.9) | one SystemVerilog package per instance: generic constants are localparams, generic types and subprograms are names for the actuals, and a package generic (6.5.6.4) names the actual instance |
 | an integer assigned to a subtype with a range (5.2.1) | a range check: out of range prints `file:line:@time:(bound check failure)` on stderr and stops the run with a non-zero exit, as GHDL does |
+| conditional analysis (24.2) | done on the source text before parsing. `TOOL_TYPE` is `"SIMULATION"`, `VHDL_VERSION` `"2019"`, `TOOL_VENDOR` `"minisim"`, `TOOL_NAME` `"msim"`; `+define+NAME=VALUE` (or `-D`) adds or overrides an identifier |
+| mode view port (6.5.2) | one SystemVerilog port per record element in the element's mode; inside the module the port is a record signal |
 | `report`, `assert` | a message in GHDL's format (`file:line:col:@time:(report note): text`); severity failure stops the run with a non-zero exit |
 | `std.env.stop` / `finish` | `$stop` / `$finish` |
 | enumerations, records, arrays | enum, packed or unpacked struct, packed (bit-like elements) or unpacked arrays |
@@ -85,7 +87,11 @@ readline/writeline, files), `std.env`, `ieee.std_logic_1164`,
 `to_hstring`, `to_ostring`, `minimum`, `maximum`, reduction operators,
 matching relational operators and `??`, `justify`, and VHDL-2019's
 `std.env` tool and source queries (`tool_name`, `vhdl_version`,
-`file_name`, `file_path`, `file_line`). Attributes: `'event`, `'active`,
+`file_name`, `file_path`, `file_line`). VHDL-2019 also brings mode views
+(`view`, `'converse` through an alias, 6.5.2), conditional analysis
+(`` `if ``, `` `elsif ``, `` `else ``, `` `end ``, `` `warning ``, `` `error ``,
+24.2), sequential block statements (10.15) and `return x when c else y`.
+Attributes: `'event`, `'active`,
 `'last_value`, `'last_event`, `'last_active`, `'stable`, `'stable(T)`,
 `'quiet`, `'quiet(T)`, `'delayed`, `'delayed(T)`, `'transaction`, `'length`, `'range`, `'reverse_range`, `'left`,
 `'right`, `'high`, `'low`, `'ascending`, `'image`, `'value`, `'pos`, `'val`,
@@ -108,8 +114,7 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   space, where VHDL has NUL (SystemVerilog strings hold no NUL).
 - A conversion on the formal of an `inout` port (out ports have it).
 - Guarded signals (`bus`, `register`: a guarded assignment to one does not
-  disconnect its driver); package generics (a generic
-  package passed to another); package instantiation inside a
+  disconnect its driver); package instantiation inside a
   block, process or subprogram (in an architecture and at library level
   they work; an architecture's instance is a package of the same name, so
   two of them need distinct names, and its generic actuals cannot name the
@@ -131,4 +136,6 @@ golden with GHDL. GHDL is GPL and only ever runs as an external program.
   integer subtype (`natural`, `integer range 0 to 15`); an out-of-range
   enumeration or real value, index, or actual in a port or parameter
   association is not checked.
-- VHDL-2019 additions.
+- VHDL-2019: a mode view as the mode of a record element, mode views of
+  arrays, `'converse` used directly in a port (use an alias); interfaces
+  and the other 2019 additions not listed under "Supported language".

@@ -95,6 +95,7 @@ void usage() {
         "  -dump-dtb FILE     write the platform's device tree blob and exit\n"
         "  -mmu MODE          the largest paging mode the device tree offers an RV64 OS:\n"
         "                     sv39 (default), sv48 or sv57\n"
+        "  -vlen BITS         the vector registers' length: 128 (default), 256, 512 or 1024\n"
         "  -map               print the memory map\n"
         "  -q                 no summary line on stderr\n"
         "  -version           print the version\n"
@@ -110,6 +111,7 @@ struct Options {
     std::string netPcap;
     bool vcon = false;
     std::string mmu;
+    unsigned vlen = 0;
     bool diskWrite = false;
     bool haveAppend = false;
     int harts = -1;
@@ -172,6 +174,11 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     if (!m.quantum) throw std::runtime_error("the quantum must be at least one cycle");
     uint64_t reset = pl.get("reset") ? pl.get("reset")->u64() : 0x80000000u;
     m.addHarts(nh, reset);
+    unsigned vlen = pl.get("vlen") ? (unsigned)pl.get("vlen")->u64() : 128;
+    if (o.vlen) vlen = o.vlen;
+    if (vlen < 128 || vlen > Hart::VLEN_MAX || (vlen & (vlen - 1)))
+        throw std::runtime_error("vlen must be 128, 256, 512 or 1024");
+    for (auto& h : m.harts) h->vlen = vlen;
 
     const json::Value* devs = pl.get("devices");
     if (!devs || devs->kind != json::Value::Arr) throw std::runtime_error("the platform has no \"devices\" list");
@@ -505,6 +512,7 @@ int main(int argc, char** argv) {
         else if (s == "-net-pcap") o.netPcap = next("a file");
         else if (s == "-vcon") o.vcon = true;
         else if (s == "-mmu") o.mmu = next("sv39, sv48 or sv57");
+        else if (s == "-vlen") o.vlen = (unsigned)std::stoul(next("128, 256, 512 or 1024"));
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
         else if (!s.empty() && s[0] == '-') {

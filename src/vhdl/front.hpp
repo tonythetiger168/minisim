@@ -60,6 +60,14 @@ inline void collectSvModules(slang::driver::Driver& driver, Translator& tr) {
 inline bool addVhdl(slang::driver::Driver& driver, const std::vector<std::string>& files, const std::string& dumpSv,
                     const std::string& tool, Translator& tr) {
     try {
+        // +define+NAME=VALUE / -D NAME=VALUE also name VHDL conditional analysis identifiers (24.2)
+        for (auto& d : driver.options.defines) {
+            size_t eq = d.find('=');
+            std::string k = d.substr(0, eq), v = eq == std::string::npos ? "" : d.substr(eq + 1);
+            for (auto& c : k) c = (char)std::toupper((unsigned char)c);
+            if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+            tr.condIds[k] = v;
+        }
         readFiles(tr, files);
         collectSvModules(driver, tr);
         static std::string text;   // the source manager keeps a view of it

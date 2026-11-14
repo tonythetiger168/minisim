@@ -49,6 +49,7 @@ Conventions:
 | `MW_div_seq` | the same, one quotient bit per clock, `start` / `done` |
 | `MW_sqrt` | integer square root and remainder |
 | `MW_sat` | narrow to `OUT_WIDTH` bits with clipping |
+| `MW_sincos` | sine and cosine of an angle in turns (CORDIC), within 2 units of `$sin`/`$cos` |
 
 ## Shifting, counting and coding
 
@@ -68,6 +69,7 @@ Conventions:
 | `MW_parity` | parity generator and checker |
 | `MW_mux`, `MW_mux_onehot` | `NUM`-to-1 multiplexer, binary or one-hot select |
 | `MW_ecc` | Hamming SECDED: generate check bits, correct one error, flag two |
+| `MW_8b10b_enc`, `MW_8b10b_dec` | IEEE 802.3 clause 36 8b/10b line code with running disparity; the decoder flags codes no character has and disparity errors |
 
 ## Floating point
 
@@ -111,6 +113,11 @@ Division and square root reuse `MW_div` and `MW_sqrt` on the significands.
 | `MW_lfsr` | Galois LFSR |
 | `MW_crc` | parallel CRC, any polynomial, `DATA_WIDTH` bits per clock, normal or reflected |
 | `MW_sync` | multi-flop synchronizer |
+| `MW_reset_sync` | reset synchronizer: asserts at once, deasserts `STAGES` clocks after release |
+| `MW_pulse_sync` | single-clock pulse into another clock domain (toggle handshake), with `busy` |
+| `MW_data_sync` | a `WIDTH`-bit word into another clock domain (four-phase handshake), with `busy` and `data_avail` |
+| `MW_fir` | transposed-form FIR filter, `TAPS` signed coefficients from an input vector, full-precision output |
+| `MW_tap` | IEEE 1149.1 TAP controller with IR, BYPASS and IDCODE registers and strobes for user data registers |
 | `MW_ram` | flip-flop memory, one write and one read port, registered or combinational read |
 | `MW_fifo_sync` | single-clock FIFO with count, almost-full / almost-empty and error flags |
 | `MW_fifo_async` | dual-clock FIFO with Gray code pointers |
@@ -123,7 +130,8 @@ Division and square root reuse `MW_div` and `MW_sqrt` on the significands.
 instantiates the modules at several widths and in every architecture, drives
 random and corner-case inputs, and compares the outputs with the
 SystemVerilog operators or a behavioural model: `arith.sv`, `muldiv.sv`,
-`bits.sv`, `seq.sv`, `more.sv`. The CRC bench checks the published check values of
+`bits.sv`, `seq.sv`, `more.sv`, `xing.sv`. The 8b/10b bench round-trips all
+268 characters at both disparities and checks every 10-bit code at the decoder. The CRC bench checks the published check values of
 CRC-16/CCITT-FALSE and CRC-32. The same benches also pass on Verilator 5, and
 the library is clean under `verilator --lint-only -Wall`.
 

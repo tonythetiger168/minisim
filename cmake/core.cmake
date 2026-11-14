@@ -122,6 +122,7 @@ set(MINISIM_CORE_VP_HEADERS
     json.hpp
     machine.hpp
     rv32.hpp
+    vector.inc
     virtio.hpp)
 list(TRANSFORM MINISIM_CORE_VP_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vp/
      OUTPUT_VARIABLE MINISIM_CORE_VP_HEADER_PATHS)
@@ -131,7 +132,7 @@ install(FILES ${MINISIM_CORE_VP_HEADER_PATHS}
 # The VHDL front end (src/vhdl) is header-only and keeps its directory too:
 # a tool that reads VHDL includes "vhdl/front.hpp" (slang-based hook) or
 # "vhdl/vhdl.hpp" (translator only), as msim does.
-set(MINISIM_CORE_VHDL_HEADERS ast.hpp front.hpp lex.hpp parse.hpp sv.hpp types.hpp vhdl.hpp)
+set(MINISIM_CORE_VHDL_HEADERS ast.hpp cond.hpp front.hpp lex.hpp parse.hpp sv.hpp types.hpp vhdl.hpp)
 list(TRANSFORM MINISIM_CORE_VHDL_HEADERS PREPEND ${CMAKE_SOURCE_DIR}/src/vhdl/
      OUTPUT_VARIABLE MINISIM_CORE_VHDL_HEADER_PATHS)
 install(FILES ${MINISIM_CORE_VHDL_HEADER_PATHS}
