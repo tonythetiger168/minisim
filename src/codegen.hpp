@@ -448,18 +448,35 @@ public:
                 c = std::move(out);
             }
             outFiles.push_back(o.str() + "\n" + protos + cycHdr);
-            // Largest first, each to the smallest file so far.
-            std::vector<size_t> ord(chunks.size());
-            for (size_t i = 0; i < ord.size(); i++) ord[i] = i;
-            std::stable_sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return chunks[a].size() > chunks[b].size(); });
-            std::vector<std::string> part(nf);
+            // Each chunk goes to the file its key picks: a hash of its text
+            // with the numbers left out. An edit changes only the chunks of
+            // what was edited, so only their files are rebuilt (a part is
+            // rebuilt when its text changes, msim.cpp runCompiled); the
+            // instances of one process (the same text but for signal numbers
+            // and constants) share a file, and renumbering moves nothing.
+            // Filling the smallest file first balanced the files better (a
+            // full build of 4 Ibex cores took 6% less) but moved chunks between
+            // them on any edit, so every file was rebuilt; so did a load cap.
             std::vector<std::vector<size_t>> mine(nf);
             std::vector<size_t> load(nf, 0);
-            for (size_t i : ord) {
-                int f = (int)(std::min_element(load.begin(), load.end()) - load.begin());
-                load[f] += chunks[i].size();
+            for (size_t i = 0; i < chunks.size(); i++) {
+                uint64_t h = 1469598103934665603ULL;
+                const std::string& c = chunks[i];
+                for (size_t k = 0; k < c.size(); k++) {
+                    if (c[k] >= '0' && c[k] <= '9') {   // a number: 12, 0x1fULL
+                        if (c[k] == '0' && k + 1 < c.size() && c[k + 1] == 'x') k++;
+                        while (k + 1 < c.size() && std::isxdigit((unsigned char)c[k + 1])) k++;
+                        continue;
+                    }
+                    h = (h ^ (unsigned char)c[k]) * 1099511628211ULL;
+                }
+                h ^= h >> 29;
+                int f = (int)(h % (uint64_t)nf);
+                load[f] += c.size();
                 mine[f].push_back(i);
             }
+            if (std::getenv("MSIM_WHYPARTS"))
+                for (int f = 0; f < nf; f++) std::fprintf(stderr, "part%d: %zu chunks, %zu bytes\n", f, mine[f].size(), load[f]);
             for (int f = 0; f < nf; f++) {
                 std::sort(mine[f].begin(), mine[f].end());   // process order within a file
                 std::string t = "#include \"design.hpp\"\n\n";
