@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- msim: VHDL-2019 std.env `get_call_path` and `to_string` of
+  `call_path_element`, `call_path_vector` and `call_path_vector_ptr`
+  (IEEE 1076-2019 16.5.7). Only a design that calls it pays for the frames.
 - msim: VHDL-2019 std.env `dir_open` (procedure and function) and `dir_close`
   with the `directory` record and `directory_items`, and std.textio's
   `line_vector` (IEEE 1076-2019 16.5.5). Items are listed in name order.
