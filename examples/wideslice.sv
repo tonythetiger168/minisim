@@ -29,7 +29,7 @@ module wideslice;
         u.cap[90] = 1'bx;
         #1 $display("x: a=%h b=%h c=%h d=%b", a, b, c, d);
         u.cap = 112'h1234_5678_9abc_def0_1357_9bdf_2468;
-        repeat (30) @(posedge clk) seed = seed * 32'd1664525 + 32'd1013904223;
+        repeat (30) @(negedge clk) seed = seed * 32'd1664525 + 32'd1013904223;
         #1 $display("a=%h b=%h c=%h d=%b acc=%h", a, b, c, d, acc);
         $finish;
     end
