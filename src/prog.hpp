@@ -327,6 +327,7 @@ struct Instr {
     // A driver (drv >= 0) with a delay (10.3.3, 28.16): 1 to 3 values in
     // ticks, rise / fall / turn-off. Updates are inertial.
     std::vector<uint64_t> dly;
+    std::vector<E> dlyE;   // assign #(expr) (10.3.3): the delays in ticks, read at each change
     int pw = 0;
     bool pdown = false;
     bool hex = false;

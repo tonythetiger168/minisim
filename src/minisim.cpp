@@ -1394,6 +1394,7 @@ struct Sim {
         bool allZ = true, zero = true, fromZero = true;
         for (int k = 0; k < to.w; k++) {
             int t = bitAt(to, k), f = bitAt(from, k);   // 0, 1, 2 = x, 3 = z
+            if (t == 3 && f == 3) continue;   // a bit this driver leaves alone (assign #(r, f) v[3] = ...)
             if (t != 3) allZ = false;
             if (t != 0) zero = false;
             if (f != 0) fromZero = false;
