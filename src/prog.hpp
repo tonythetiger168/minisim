@@ -30,6 +30,10 @@ enum DynCmd { D_SET, D_NEW, D_DELETE, D_DELETE_AT, D_PUSH_BACK, D_PUSH_FRONT, D_
               D_DEFAULT };               // '{default: v} of an associative array (7.9.11): a missing element reads as e
 // IK::ProcOp operations (9.7).
 enum ProcOpKind { PO_SELF, PO_STATUS, PO_KILL, PO_AWAIT, PO_SUSPEND, PO_RESUME };
+// $monitoron / $monitoroff (21.2.3) are IK::Monitor with these formats, so
+// they take the $monitor path in every mode.
+inline const char* const kMonitorOn = "\x01$monitoron";
+inline const char* const kMonitorOff = "\x01$monitoroff";
 enum class IK {
     Assign,     // sig = e            (blocking)
     Nba,        // sig <= e           (non-blocking)
@@ -485,6 +489,7 @@ struct RandVar {
     bool sgn = false, randc = false, obj = false;
     bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
     int depth = 1;      // containers of containers (int m[][]): how many levels
+    bool stat = false;  // a static rand property (18.6.3): off and mode are signals shared by every object
 };
 struct RandSpec {
     std::vector<RandVar> vars;

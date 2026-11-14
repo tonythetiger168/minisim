@@ -1069,7 +1069,7 @@ static void randObjects(int obj, std::vector<int>& out) {
     const ClassRt& cr = classRt()[(size_t)S.sigs[obj].val.v];
     if (!cr.rand) return;
     for (const RandVar& rv : cr.rand->vars) {
-        if (!rv.obj || (S.get(obj + rv.mode).v & 1) == 0) continue;
+        if (!rv.obj || (S.get(obj + rv.mode).v & 1) == 0) continue;   // (a static one is never a handle)
         if (rv.dyn) {   // a rand container of handles: each element's object, at every level
             std::vector<int> hs;
             std::function<void(int, int)> walk = [&](int cid, int depth) {
@@ -1359,7 +1359,7 @@ static int doRandomize(int obj, const RandCall* rc) {
             if (obj > 0 && !S.sigs[obj].val.x && S.sigs[obj].val.v < classRt().size())
                 if (const auto& sp = classRt()[(size_t)S.sigs[obj].val.v].rand)
                     for (const RandVar& rv : sp->vars)
-                        if (!rv.dyn && !rv.obj && addr >= obj + rv.off && addr < obj + rv.off + rv.count) cyc = rv.randc;
+                        if (!rv.dyn && !rv.obj && !rv.stat && addr >= obj + rv.off && addr < obj + rv.off + rv.count) cyc = rv.randc;
             scalars.push_back({addr, S.sigs[addr].w, a->sgn, cyc, obj});
         }
         for (const auto& ca : rc->contArgs) {   // randomize(q): its size and elements
@@ -1381,6 +1381,15 @@ static int doRandomize(int obj, const RandCall* rc) {
         Frame* fr = frameFor(o);
         if (!(rc && rc->argsGiven))
             for (const RandVar& rv : sp->vars) {
+                if (rv.stat) {   // shared by every object: its mode is on unless set to 0 (18.8)
+                    Val m = S.get(rv.mode);
+                    if (m.x || (m.v & 1)) {
+                        bool seen = false;
+                        for (auto& sc : scalars) seen |= sc.addr == rv.off;
+                        if (!seen) scalars.push_back({rv.off, rv.w, rv.sgn, rv.randc, o});
+                    }
+                    continue;
+                }
                 if (rv.obj || !(S.get(o + rv.mode).v & 1)) continue;
                 if (rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // int q[4][$]: each queue
                     RCont c;
@@ -1816,6 +1825,6 @@ static void randModeAll(int obj, bool blocks, bool on) {
     if (blocks) {
         for (const auto& b : sp->blocks) if (b->mode >= 0) S.set(b->staticMode ? b->mode : obj + b->mode, mk(on));
     } else {
-        for (const RandVar& rv : sp->vars) if (rv.mode >= 0) S.set(obj + rv.mode, mk(on));
+        for (const RandVar& rv : sp->vars) if (rv.mode >= 0) S.set(rv.stat ? rv.mode : obj + rv.mode, mk(on));
     }
 }
