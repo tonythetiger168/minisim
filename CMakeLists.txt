@@ -58,7 +58,8 @@ if(OPENSSL_FOUND)
   # Interop: envelopes msim did not make, built with the openssl command line
   # tool alone in the shapes other IEEE 1735 encryptors emit.
   find_program(MINISIM_OPENSSL_CLI openssl)
-  if(MINISIM_OPENSSL_CLI AND UNIX)
+  # msim exists only with the slang front end (MINISIM_WITH_SLANG, below).
+  if(MINISIM_OPENSSL_CLI AND UNIX AND MINISIM_WITH_SLANG)
     add_test(NAME protect_interop
              COMMAND sh ${CMAKE_SOURCE_DIR}/tests/protect_interop.sh $<TARGET_FILE:msim>
                      ${MINISIM_OPENSSL_CLI} ${CMAKE_SOURCE_DIR}

@@ -18,8 +18,20 @@ if(TARGET msim)
     "access_tb|access.vhd|ghdl"
     "generic_pkg_tb|generic_pkg.vhd|ghdl"
     "sim_order_tb|sim_order.vhd|ghdl"
+    "uncon_ports_tb|uncon_ports.vhd|ghdl"
+    "sigattr_tb|sigattr.vhd|ghdl"
+    "config_tb|config.vhd|ghdl"
+    "top_cfg|config.vhd|ghdl"
+    "gentype_tb|gentype.vhd|ghdl"
+    "rangechk_tb|rangechk.vhd|ghdl||1"
+    "portconv_tb|portconv.vhd|ghdl"
+    "realimg_tb|realimg.vhd|ghdl"
+    "blockhdr_tb|blockhdr.vhd|ghdl"
+    "localpkg_tb|localpkg.vhd|ghdl"
+    "subgen_tb|subgen.vhd|"
     "mixed_sv_top|counter.vhd,mixed_sv_top.sv|"
-    "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|")
+    "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|"
+    "mixed_uncon|uncon_ports.vhd,mixed_uncon.sv|")
   foreach(t ${VHDL_TESTS})
     string(REPLACE "|" ";" parts "${t}")
     list(GET parts 0 top)

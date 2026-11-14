@@ -1,0 +1,5 @@
+uncon_ports.vhd:11:5:@0ms:(report note): par: d'left=5 d'right=0 asc=false len=6 d=101100
+uncon_ports.vhd:23:5:@0ms:(report note): inv: a'high=3 a'low=0 y'left=3 a=1100
+p=1 n=6 y=0011
+uncon_ports.vhd:11:5:@1ns:(report note): par: d'left=5 d'right=0 asc=false len=6 d=000001
+p=1 y=1110
