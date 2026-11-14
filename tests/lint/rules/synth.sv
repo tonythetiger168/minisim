@@ -32,6 +32,7 @@ module synth(input logic clk, rst_n, input logic [7:0] a, b, output logic [7:0] 
   always begin
     @(posedge clk);                         //~ SYN012
     force bus = 1'b0;                       //~ SYN004
+    @(posedge clk);                         //~ SYN012
     release bus;                            //~ SYN004
   end
 
