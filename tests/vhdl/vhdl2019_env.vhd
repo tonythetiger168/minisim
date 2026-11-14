@@ -5,13 +5,15 @@ entity vhdl2019_env_tb is end;
 architecture t of vhdl2019_env_tb is
 begin
   process
-    variable tr : time_record;
+    variable tr, tr2 : time_record;
     variable e : real;
     variable cs : dir_create_status;
     variable ds : dir_delete_status;
   begin
     tr := gmtime(1.0e9 + 0.25);
     report "gm=" & to_string(tr) & " frac=" & to_string(tr, 3) & " wd=" & dayofweek'image(tr.weekday) & " yday=" & integer'image(tr.dayofyear);
+    tr2 := tr + 86400.5;
+    report "plus=" & to_string(tr2, 2) & " diff=" & real'image(tr2 - tr) & " lplus=" & to_string(3600.0 + tr) & " minus=" & to_string(tr - 60.0);
     e := epoch(localtime(1.0e9));
     report "round=" & real'image(e);
     report "now>2020=" & boolean'image(epoch > 1.6e9) & " year>2020=" & boolean'image(localtime.year > 2020);
