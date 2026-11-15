@@ -997,7 +997,7 @@ struct Sim {
     // The strength with which bit b of signal s is driven to level lvl (0 or 1):
     // its strongest driver of that level (or of x). A variable, or a net
     // msim writes directly, is strong; supply nets are supply; an undriven
-    // tri0 / tri1 is pull and an undriven trireg holds its charge (28.15).
+    // tri0 / tri1 adds its pull and an undriven trireg holds its charge (28.15).
     uint8_t levelStrength(int s, int b, int lvl) const {
         const Sig& g = sigs[(size_t)s];
         if (g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1) return STR_SUPPLY;
@@ -1007,10 +1007,8 @@ struct Sim {
             int v = bitAt(dr.v, b);
             if (v == 2 || v == lvl) best = std::max(best, lvl ? dr.s1 : dr.s0);
         }
-        if (best == STR_HIZ) {
-            if (g.kind == NR_TRI0 || g.kind == NR_TRI1) return STR_PULL;
-            if (g.kind == NR_TRIREG) return chargeOf(s);
-        }
+        if ((g.kind == NR_TRI0 && lvl == 0) || (g.kind == NR_TRI1 && lvl == 1)) best = std::max<uint8_t>(best, STR_PULL);   // its pull (6.6.5)
+        if (best == STR_HIZ && g.kind == NR_TRIREG) return chargeOf(s);
         return best;
     }
     void mosStrength(const MosLink& L, int& s0, int& s1) const {
@@ -1344,12 +1342,21 @@ struct Sim {
     // The value net n sees: the drivers of every net it reaches through
     // switches that are on (and, when unkOn, those with an unknown control).
     Val tranValue(int n, bool unkOn, vector<int>& seen) {
+        uint8_t kind;
+        vector<Drv> all = tranDrivers(n, unkOn, seen, kind);
+        const Sig& g = sigs[(size_t)n];
+        return kind != NR_WIRE ? resolveNet(kind, all.data(), all.size(), g.w, g.val)
+                               : resolveDrives(all.data(), all.size(), g.w);
+    }
+    // Those drivers, as n's bits and with the strengths they arrive with
+    // (28.13, 28.14), and the kind of net the group resolves as.
+    vector<Drv> tranDrivers(int n, bool unkOn, vector<int>& seen, uint8_t& kindOut, bool lh = false) {
         // Best path to each net: the fewest resistive steps, then any switch
         // at all. Bit b of n is bit b + delta of the net reached, for b in [lo, hi).
         // A net can be reached more than once, each time for a different
         // range of n's bits (an inout port on {p[0], p[1]}), so a path is
         // keyed by the net, the shift and the first bit.
-        struct Reach { int k; bool crossed; int delta, lo, hi; };
+        struct Reach { int k; bool crossed; int delta, lo, hi; bool unk = false; };   // unk: through a switch whose control is x or z
         const Sig& g = sigs[(size_t)n];
         map<std::tuple<int, int, int>, Reach> best;
         deque<std::tuple<int, int, int>> q{{n, 0, 0}};
@@ -1360,9 +1367,9 @@ struct Sim {
             Reach r = best[key];
             for (int id : tranOf[(size_t)m]) {
                 const TranSw& t = trans[(size_t)id];
-                if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn)) continue;
+                if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn && !lh)) continue;
                 int o = t.a == m ? t.b : t.a;
-                Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi};
+                Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi, r.unk || t.state == 2};
                 if (t.w >= 0) {   // only the joined bits, moved to o's place
                     int mLo = t.a == m ? t.aLo : t.bLo, oLo = t.a == m ? t.bLo : t.aLo;
                     nb.lo = std::max(r.lo, mLo - r.delta);
@@ -1391,6 +1398,26 @@ struct Sim {
                     d.s1 = tranReduce(d.s1, false);
                 }
                 for (int k = 0; k < r.k; k++) { d.s0 = tranReduce(d.s0, true); d.s1 = tranReduce(d.s1, true); }
+                if (lh && r.unk) {   // maybe on, maybe off: a 0 arrives as L (0 or z), a 1 as H (28.12.1)
+                    Drv l = d, h = d;
+                    l.s1 = STR_HIZ; h.s0 = STR_HIZ;
+                    for (int b = 0; b < sm.w; b++) {
+                        int v = bitAt(d.v, b);
+                        setBit(l.v, b, v == 0 || v == 2 ? 2 : 3);
+                        setBit(h.v, b, v == 1 || v == 2 ? 2 : 3);
+                    }
+                    if (!same) {
+                        Val lv = make(0, 0, g.w), hv = make(0, 0, g.w);
+                        for (int b = 0; b < g.w; b++) {
+                            bool in = b >= r.lo && b < r.hi;
+                            setBit(lv, b, in ? bitAt(l.v, b + r.delta) : 3);
+                            setBit(hv, b, in ? bitAt(h.v, b + r.delta) : 3);
+                        }
+                        l.v = lv; h.v = hv;
+                    }
+                    all.push_back(l); all.push_back(h);
+                    continue;
+                }
                 if (!same) {   // as n's bits: those outside the joined range are Z
                     Val v = make(0, 0, g.w);
                     for (int b = 0; b < g.w; b++) setBit(v, b, b >= r.lo && b < r.hi ? bitAt(d.v, b + r.delta) : 3);
@@ -1399,8 +1426,8 @@ struct Sim {
                 all.push_back(d);
             }
         }
-        return kind != NR_WIRE ? resolveNet(kind, all.data(), all.size(), g.w, g.val)
-                               : resolveDrives(all.data(), all.size(), g.w);
+        kindOut = kind;
+        return all;
     }
     void tranResolve(int s) {
         vector<int> group, scratch;
@@ -1772,7 +1799,26 @@ struct Sim {
         bool have = false;
         if (sig >= 0 && self) {
             const Sig& g = self->sigs[sig];
-            if (!g.drv.empty() && g.kind == NR_WIRE) {
+            if ((size_t)sig < self->tranOf.size() && !self->tranOf[(size_t)sig].empty()) {   // the drivers of its switch group (28.8)
+                vector<int> seen;
+                uint8_t kind;
+                vector<Drv> all = self->tranDrivers(sig, false, seen, kind, true);
+                if (kind == NR_TRI0 || kind == NR_TRI1) sb = kind == NR_TRI1 ? sbit_1(STR_PULL) : sbit_0(STR_PULL);
+                for (const Drv& d : all) {
+                    int t = bitAt(d.v, bit);
+                    SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                    sb = sbit_resolv(sb, cur);
+                }
+                have = true;
+            } else if (!g.drv.empty() && g.kind == NR_WIRE) {
+                for (const Drv& d : g.drv) {
+                    int t = bitAt(d.v, bit);
+                    SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
+                    sb = sbit_resolv(sb, cur);
+                }
+                have = true;
+            } else if (g.kind == NR_TRI0 || g.kind == NR_TRI1) {   // its drivers and its own pull (6.6.5)
+                sb = g.kind == NR_TRI1 ? sbit_1(STR_PULL) : sbit_0(STR_PULL);
                 for (const Drv& d : g.drv) {
                     int t = bitAt(d.v, bit);
                     SBit cur = t == 3 ? SBit{} : t == 2 ? sbit_x(d.s0, d.s1) : t == 1 ? sbit_1(d.s1) : sbit_0(d.s0);
@@ -1802,9 +1848,15 @@ struct Sim {
         if (!have) sb = v == 3 ? SBit{} : v == 1 ? sbit_1(STR_STRONG) : v == 0 ? sbit_0(STR_STRONG) : sbit_x(STR_STRONG, STR_STRONG);
         if (sbit_z(sb)) return "HiZ";
         int lg = sbit_logic(sb);
-        if (lg == 0 || lg == 1) return string(MN[sb.s0]) + (lg ? "1" : "0");
-        // x: one strength on both sides, else the two levels as digits
+        if (lg == 0 || lg == 1) {   // a range of strengths: the highest and the lowest level as digits
+            if (sb.s0 == sb.s1) return string(MN[sb.s0]) + (lg ? "1" : "0");
+            return std::to_string(std::max(sb.s0, sb.s1)) + std::to_string(std::min(sb.s0, sb.s1)) + (lg ? "1" : "0");
+        }
+        // x: one strength on both sides, H / L when one side is high
+        // impedance (a 1 or z, a 0 or z), else the two levels as digits
         if (sb.s0 == sb.s1) return string(MN[sb.s0]) + "X";
+        if (sb.s0 == 0) return string(MN[sb.s1]) + "H";
+        if (sb.s1 == 0) return string(MN[sb.s0]) + "L";
         return std::to_string(sb.s0) + std::to_string(sb.s1) + "X";
     }
     // The text of a format and its arguments ($display, $sformatf).
