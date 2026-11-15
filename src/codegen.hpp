@@ -802,9 +802,10 @@ public:
                            std::to_string(procs[i].seqEv.size()) + ", 0},\n";
                     off += procs[i].seqEv.size();
                 } else {
-                    // Time 0 order as the interpreter's (msim.cpp): constant
-                    // continuous assigns after the other processes, initial
-                    // blocks last; each Task is still made in declaration order.
+                    // Time 0 order as the interpreter's (msim.cpp): declaration
+                    // order, except that constant continuous assigns before the
+                    // first initial block start just before it (or last if there
+                    // is none); each Task is still made in declaration order.
                     const int late = procs[i].kind == "assign" && !procs[i].loops ? 1 : procs[i].kind == "Initial" ? 2 : 0;
                     tab += "        {nullptr, proc" + std::to_string(i) + ", 0, 0, " + std::to_string(late) + "},\n";
                 }
@@ -813,12 +814,15 @@ public:
                 o << "    static const std::pair<int, Edge> SEV[] = {" << evs << "{0, ANY}};\n"
                      "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; } PROCS[] = {\n"
                   << tab << "    };\n"
-                     "    std::vector<Task> late[2];\n"
+                     "    std::vector<Task> held;\n    bool init1 = false;\n"
                      "    for (auto& p : PROCS)\n"
                      "        if (p.s) S.addSeq(p.s, nullptr, std::vector<std::pair<int, Edge>>(SEV + p.at, SEV + p.at + p.n));\n"
-                     "        else if (p.late) late[p.late - 1].push_back(p.p());\n"
-                     "        else S.spawn(p.p());\n"
-                     "    for (auto& v : late) for (auto& t : v) S.spawn(t);\n";
+                     "        else if (p.late == 1 && !init1) held.push_back(p.p());\n"
+                     "        else if (p.late == 2 && !init1) {\n"
+                     "            init1 = true;\n            Task t = p.p();\n"
+                     "            for (auto& h : held) S.spawn(h);\n            held.clear();\n            S.spawn(t);\n"
+                     "        } else S.spawn(p.p());\n"
+                     "    for (auto& h : held) S.spawn(h);\n";
             }
         }
         if (!dom.empty()) o << "    S.fastInit();\n";
