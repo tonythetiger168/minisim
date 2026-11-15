@@ -3677,6 +3677,27 @@ int main(int argc, char** argv) {
     }
     for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist, t.aLo, t.bLo, t.w);
     for (auto& m : lowered.mos) S.addMos(m.out, m.drv, m.src, m.bit, m.resist, m.part);   // 28.13
+    if (!lowered.portStr.empty()) {   // one-bit port connections that pass on a strength other than strong (23.3.3.7)
+        std::vector<char> weak(S.sigs.size(), 0);
+        for (auto& [s, k] : lowered.netKinds) if (k != NR_WIRE) weak[(size_t)s] = 1;
+        for (auto& m : lowered.mos) weak[(size_t)m.out] = 1;
+        for (auto& t : lowered.trans) weak[(size_t)t.a] = weak[(size_t)t.b] = 1;
+        for (auto& lp : lowered.procs)
+            for (auto& i : lp.prog.code)
+                if (i.drv >= 0 && i.sig >= 0 && (i.s0 != STR_STRONG || i.s1 != STR_STRONG)) weak[(size_t)i.sig] = 1;
+        std::vector<char> used(lowered.portStr.size(), 0);
+        for (bool more = true; more;) {
+            more = false;
+            for (size_t k = 0; k < lowered.portStr.size(); k++) {
+                auto& m = lowered.portStr[k];
+                if (used[k] || !weak[(size_t)m.src]) continue;
+                used[k] = 1;
+                more = true;
+                weak[(size_t)m.out] = 1;
+                S.addMos(m.out, m.drv, m.src, m.bit, false, false, true);
+            }
+        }
+    }
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
@@ -3690,7 +3711,11 @@ int main(int argc, char** argv) {
             for (auto& i : lp.prog.code)
                 if (!i.dly.empty() && i.drv >= 0) {
                     int w = S.sigs[i.sig].w;
-                    S.sigs[i.sig].drv[i.drv].v = i.hi >= 0 ? v_insert(allz(w), allx(i.hi - i.lo + 1), i.hi, i.lo) : allx(w);
+                    auto& dr = S.sigs[i.sig].drv[i.drv];
+                    dr.v = i.hi >= 0 ? v_insert(allz(w), allx(i.hi - i.lo + 1), i.hi, i.lo) : allx(w);
+                    // with the driver's own strengths: a (strong0, pull1) gate's
+                    // x is St0..Pu1, not StX (28.12)
+                    dr.s0 = i.s0; dr.s1 = i.s1;
                     touched.insert(i.sig);
                 }
         for (int s : touched) {
