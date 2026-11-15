@@ -1260,6 +1260,15 @@ enum NetResolve : uint8_t { NR_WIRE, NR_WAND, NR_WOR, NR_TRI0, NR_TRI1, NR_TRIRE
 // which a trireg keeps on bits no driver drives (charge storage, 6.6.4).
 inline Val resolveDrives(const Drv* d, size_t n, int w);
 inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev) {
+    if (k == NR_TRI0 || k == NR_TRI1) {   // a wire with a pull 0 / pull 1 always driving it (6.6.5)
+        std::vector<Drv> all(d, d + n);
+        Drv p;
+        p.v = k == NR_TRI1 ? v_ones(w) : make(0, 0, w);
+        p.s0 = k == NR_TRI0 ? STR_PULL : STR_HIZ;
+        p.s1 = k == NR_TRI1 ? STR_PULL : STR_HIZ;
+        all.push_back(p);
+        return resolveDrives(all.data(), all.size(), w);
+    }
     Val r = make(0, 0, w);
     for (int b = 0; b < w; b++) {
         int t = 3;
@@ -1276,7 +1285,7 @@ inline Val resolveNet(uint8_t k, const Drv* d, size_t n, int w, const Val& prev)
         } else {
             t = 3;
             if (n) t = bitAt(resolveDrives(d, n, w), b);
-            if (t == 3) t = k == NR_TRI0 ? 0 : k == NR_TRI1 ? 1 : k == NR_TRIREG ? bitAt(prev, b) : 3;
+            if (t == 3) t = k == NR_TRIREG ? bitAt(prev, b) : 3;
         }
         setBit(r, b, t);
     }
