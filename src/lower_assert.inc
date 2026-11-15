@@ -1305,9 +1305,13 @@ const slang::ast::TimingControl* leadingClock(const slang::ast::AssertionExpr& a
         default: return nullptr;
     }
 }
+// msim -noassert (xrun -noassert, vcs -assert disable, vsim -nosva):
+// concurrent assertions, assumptions and covers are left out of the build.
+static bool& noConcAssert() { static bool b = false; return b; }
 void concAssert(const slang::ast::ConcurrentAssertionStatement& s) {
     using namespace slang::ast;
     if (s.assertionKind == AssertionKind::Restrict) return;   // for formal tools only (16.14.4)
+    if (noConcAssert() && s.assertionKind != AssertionKind::Expect) return;
     bool expect = s.assertionKind == AssertionKind::Expect;
     if (expect && staticAssert) unsupported("expect outside a procedure (16.17)");
     SvaBuild b;
