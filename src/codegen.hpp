@@ -372,7 +372,7 @@ public:
         o << SV << "Instr AIA[" << std::max<size_t>(asrts_.size(), 1) << "];\n";
         for (size_t i = 0; i < asrts_.size(); i++) o << SV << "Instr& AI" << i << " = AIA[" << i << "];\n";
         o << SV << "std::shared_ptr<ProcCtl> CCA[" << ccMax_ + 1 << "];\n";
-        o << SV << "bool CIVA[" << ccMax_ + 1 << "];\n" << SV << "uint64_t* CIP[" << ccMax_ + 1 << "];\n";
+        o << SV << "uint8_t CIVA[" << ccMax_ + 1 << "];\n" << SV << "uint64_t* CIP[" << ccMax_ + 1 << "];\n";
         for (int i = 0; i < nAct; i++) o << SV << "Prog AP" << i << ";\n";
         for (int i = 0; i < nSlots; i++) o << SV << "E SL" << i << ";\n";
         if (nSlots) {
@@ -4049,32 +4049,38 @@ private:
                     if (w.events.size() > 1) for (auto& [sg, ed] : w.events) ins.push_back(sg);
                     else ins.push_back(w.sig);
                     // Reached through tables by process (CIVA, CIP), so that shared code moves them.
-                    std::string I_ = std::to_string(i), chk = "    { bool ch = !CIVA[" + I_ + "]; CIVA[" + I_ + "] = true;\n";
+                    // CIVA: 1 seen once, 2 every x / z word below is 0. In
+                    // 2-state mode (every input known) only the values compare.
+                    std::string I_ = std::to_string(i), chk = "    { bool ch = !CIVA[" + I_ + "]; CIVA[" + I_ + "] = 1;\n";
+                    std::string chk2 = "    { bool ch = !CIVA[" + I_ + "];\n", xz2;
                     size_t nw = 0;
                     auto CI = [&](size_t k) { return "CIP[" + I_ + "][" + std::to_string(k) + "]"; };
                     for (int sg : ins) {
                         std::string G_ = std::to_string(sg);
-                        if (isPriv(sg)) {
+                        if (isPriv(sg) || sigW_[sg] <= 64) {
+                            const std::string src = isPriv(sg) ? "P" + G_ : "S.sigs[" + G_ + "].val";
                             for (const char* f : {".v", ".x", ".z"})
-                                chk += "      ch |= UPD(" + CI(nw++) + ", P" + G_ + f + ");\n";
-                        } else if (sigW_[sg] <= 64) {
-                            for (const char* f : {".v", ".x", ".z"})
-                                chk += "      ch |= UPD(" + CI(nw++) + ", S.sigs[" + G_ + "].val" + f + ");\n";
+                                chk += "      ch |= UPD(" + CI(nw++) + ", " + src + f + ");\n";
+                            chk2 += "      ch |= UPD(" + CI(nw - 3) + ", " + src + ".v);\n";
+                            xz2 += " o |= " + CI(nw - 2) + " | " + CI(nw - 1) + "; " + CI(nw - 2) + " = 0; " + CI(nw - 1) + " = 0;";
                         } else {
                             o << "static Val CW" << I_ << "_" << G_ << ";\n";
                             chk += "      ch |= UPDV(CW" + I_ + "_" + G_ + ", S.sigs[" + G_ + "].val);\n";
+                            chk2 += "      ch |= UPDV(CW" + I_ + "_" + G_ + ", S.sigs[" + G_ + "].val);\n";
                         }
                         if (!isPriv(sg)) ext.insert(sg);   // a private one is in P, and S.sigs keeps its first X
                     }
                     o << "static uint64_t CI" << I_ << "[" << std::max<size_t>(nw, 1) << "]; static const bool CIR" << I_ << " = (CIP[" << I_
                       << "] = CI" << I_ << ", true);\n";
                     chk += "      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n";
+                    chk2 += "      if (__builtin_expect(CIVA[" + I_ + "] != 3, 0)) { uint64_t o = 0;" + xz2 + " ch |= o != 0; CIVA[" + I_ + "] = 3; }\n"
+                            "      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n";
                     auto withEnd = [&](std::string c, const std::string& lab) {
                         c.replace(c.find("@END@"), 5, lab);
                         return c;
                     };
                     c4 += withEnd(chk, L4(cp.code.size() - 2));
-                    c2 += withEnd(chk, L2(cp.code.size() - 2));
+                    c2 += withEnd(chk2, L2(cp.code.size() - 2));
                     serialOnly = true;
                 }
                 unitIns.emplace_back();
