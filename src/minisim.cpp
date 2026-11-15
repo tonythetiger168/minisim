@@ -984,17 +984,17 @@ struct Sim {
     // for the 1); a link gives such a driver the strength its data bit has
     // now, and a change of the data net's drivers that changes that strength
     // drives the output again, even when the data value stays the same.
-    struct MosLink { int out, drv, src, bit; bool resist, part; };
+    struct MosLink { int out, drv, src, bit; bool resist, part, port = false; };   // port: both strengths, as they are
     vector<MosLink> mosLinks;
     vector<vector<int>> mosOf;                // data signal -> its links
     unordered_map<uint64_t, int> mosAt;       // (out, drv) -> link
     int mosDepth = 0;
     static uint64_t mosKey(int s, int d) { return (uint64_t)(uint32_t)s << 32 | (uint32_t)d; }
-    void addMos(int out, int drv, int src, int bit, bool resist, bool part) {
+    void addMos(int out, int drv, int src, int bit, bool resist, bool part, bool port = false) {
         if (mosOf.size() < sigs.size()) mosOf.resize(sigs.size());
         mosAt[mosKey(out, drv)] = (int)mosLinks.size();
         mosOf[(size_t)src].push_back((int)mosLinks.size());
-        mosLinks.push_back({out, drv, src, bit, resist, part});
+        mosLinks.push_back({out, drv, src, bit, resist, part, port});
     }
     // The strength with which bit b of signal s is driven to level lvl (0 or 1):
     // its strongest driver of that level (or of x). A variable, or a net
@@ -1014,6 +1014,7 @@ struct Sim {
         return best;
     }
     void mosStrength(const MosLink& L, int& s0, int& s1) const {
+        if (L.port) { s0 = levelStrength(L.src, L.bit, 0); s1 = levelStrength(L.src, L.bit, 1); return; }
         if (L.part) s1 = tranReduce(levelStrength(L.src, L.bit, 1), L.resist);
         else s0 = tranReduce(levelStrength(L.src, L.bit, 0), L.resist);
     }

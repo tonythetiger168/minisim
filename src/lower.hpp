@@ -724,6 +724,11 @@ struct LowerResult {
     // takes the strength bit `bit` of signal src has, reduced if resistive.
     struct MosDecl { int out, drv, src, bit; bool resist, part; };
     std::vector<MosDecl> mos;
+    // A one-bit port connection between nets (23.3.3.7): driver drv of net
+    // out passes on the strengths that bit `bit` of net src has, so a
+    // (strong0, pull1) gate behind a port stays St0..Pu1 outside it.
+    // msim keeps only those whose source can be other than strong.
+    std::vector<MosDecl> portStr;
     std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive; w >= 0: only bits [aLo, aLo+w) of a and [bLo, bLo+w) of b
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
@@ -11430,6 +11435,15 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         i.drv = newDriver(i.sig);
         if (linkFormal >= 0 && i.hi < 0) outLinks().push_back({linkFormal, i.sig, i.drv});
+        if (portConn && i.dly.empty() && i.s0 == STR_STRONG && i.s1 == STR_STRONG && !isVarSig(i.sig) &&
+            (i.hi >= 0 ? i.hi == i.lo : portConn == 1)) {
+            E k = i.e;   // the source as one bit of a net
+            int bit = 0;
+            if (k->op == Op::Resize && k->hi == 1 && k->kids.size() == 1) k = k->kids[0];
+            if (k->op == Op::Slice && k->hi == k->lo && k->kids.size() == 1) { bit = k->lo; k = k->kids[0]; }
+            if (k->op == Op::Ref && !k->at && k->sig >= 0 && !isVarSig(k->sig))
+                out.portStr.push_back({i.sig, i.drv, k->sig, bit, false, false});
+        }
         lw.prog.emit(i);
         auto rs = combReadSet(lw.prog);
         bool loops = !rs.empty();
@@ -11949,6 +11963,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     int gateBit = -1, gateArrN = 0;
     int curGate = -1;                                    // its gateRecs() entry
     int linkFormal = -1;                                 // the output port being connected (outLinks)
+    int portConn = 0;                                    // finishAssign is connecting a port of this width (portStr)
     int outBit = -1;   // driveOut drives only this bit of the terminal (a gate array element)
     void driveOut(const slang::ast::Expression& out, E rhs, uint8_t s0, uint8_t s1) {
         Lowerer lw(sigmap);
@@ -12521,11 +12536,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
     }
 
-    void driveSig(int sig, const slang::ast::Expression& rhs) {
+    void driveSig(int sig, const slang::ast::Expression& rhs, int portW = 0) {
         Lowerer lw(sigmap);
         prep(lw);
         Instr i; i.k = IK::Assign; i.sig = sig; i.e = lw.expr(rhs);
+        portConn = portW;
         finishAssign(lw, i);
+        portConn = 0;
     }
 
     // Drive the parent's actual from the child's formal. `ext` is the
@@ -12557,7 +12574,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         Instr i; i.k = IK::Assign;
         lw.lhs(ext.left(), i);
         i.e = lw.expr(ext.right());
+        portConn = (int)ext.left().type->getBitWidth();
         finishAssign(lw, i);
+        portConn = 0;
     }
 
     // A port of an element of a multidimensional instance array (23.3.3.5).
@@ -12659,7 +12678,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             };
             if (ps.direction == ArgumentDirection::In) {
                 inLink(*ext);
-                driveSig(formal->sig, *ext);
+                driveSig(formal->sig, *ext, formal->w);
                 continue;
             }
             if (ps.direction != ArgumentDirection::Out && ps.direction != ArgumentDirection::InOut)
@@ -12687,7 +12706,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (!ps.isNetPort()) Lowerer::unsupported("inout port that is not a net");
             if ((int)asg.left().type->getBitWidth() != formal->w)
                 Lowerer::unsupported("inout width mismatch");
-            driveSig(formal->sig, asg.left());
+            driveSig(formal->sig, asg.left(), formal->w);
         }
     }
 
