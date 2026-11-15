@@ -166,7 +166,12 @@ public:
         for (auto& c : cycFns) chunkBytes += c.size();
         size_t nChunks = chunks.size() + cycFns.size();
         // files < 0: exactly that many (msim -cfiles), else only for a large design.
-        int nf = files < 0 ? (int)std::min<size_t>(-files, nChunks) : files > 1 ? (int)std::min<size_t>(files, chunkBytes / 65536) : 1;
+        // A large design gets more files than cores: the compiler takes about
+        // 0.25 GB per MB of generated code, so 1024 PicoRV32 cores in four
+        // 35 MB files ran a 16 GB machine out of memory. At most 4 MB a file.
+        size_t want = std::max<size_t>(files, (chunkBytes + (4u << 20) - 1) / (4u << 20));
+        int nf = files < 0 ? (int)std::min<size_t>(-files, nChunks)
+               : files > 1 ? (int)std::min({want, chunkBytes / 65536, nChunks}) : 1;
         nf = std::max(nf, 1);
         if (nf > 1) {
             for (auto& c : cycFns) chunks.push_back(std::move(c));
@@ -372,7 +377,7 @@ public:
         o << SV << "Instr AIA[" << std::max<size_t>(asrts_.size(), 1) << "];\n";
         for (size_t i = 0; i < asrts_.size(); i++) o << SV << "Instr& AI" << i << " = AIA[" << i << "];\n";
         o << SV << "std::shared_ptr<ProcCtl> CCA[" << ccMax_ + 1 << "];\n";
-        o << SV << "bool CIVA[" << ccMax_ + 1 << "];\n" << SV << "uint64_t* CIP[" << ccMax_ + 1 << "];\n";
+        o << SV << "uint8_t CIVA[" << ccMax_ + 1 << "];\n" << SV << "uint64_t* CIP[" << ccMax_ + 1 << "];\n";
         for (int i = 0; i < nAct; i++) o << SV << "Prog AP" << i << ";\n";
         for (int i = 0; i < nSlots; i++) o << SV << "E SL" << i << ";\n";
         if (nSlots) {
@@ -2729,8 +2734,19 @@ private:
                     }
                 }
                 auto asserts = [&](size_t j) { return !keepAll && asserts0(j); };
+                // A unit that reads or writes a signal outside its instance (a
+                // port bound to sum[i] of the top, say) moves by another
+                // distance than the rest: it goes to a group of its own, so
+                // that it does not keep the instance's other units from
+                // sharing one copy.
+                auto inst = [](const std::string& k) { return k.substr(0, k.find('\x01')); };
+                auto outside = [&](size_t j, const std::string& k) {
+                    for (long long n : refToks(text[j]).num) if (refCls(n, k) == -1) return true;
+                    return false;
+                };
                 for (size_t x = 0; x < L.size(); x++) {
                     std::string k = off || asserts(L[x]) ? "" : key(L[x]);
+                    if (!k.empty() && !asserts0(L[x]) && outside(L[x], k)) k += "\x01o";
                     if (!grp.count(k)) keys.push_back(k);
                     grp[k].push_back(L[x]);
                 }
@@ -2759,7 +2775,7 @@ private:
                         bool set[kRefCls] = {};
                         ok = g.size() == t.size();
                         size_t bad = 0;
-                        for (size_t x = 0; ok && x < g.size(); x++) { ok = refMatch(text[t[x]], text[g[x]], tk0, k, D.data(), set); bad = x; }
+                        for (size_t x = 0; ok && x < g.size(); x++) { ok = refMatch(text[t[x]], text[g[x]], inst(tk0), inst(k), D.data(), set); bad = x; }
                         static const char* dbgS = std::getenv("MSIM_WHYSHARE");
                         if (!ok && dbgS && *dbgS == '2' && g.size() == t.size()) {
                             {
@@ -2768,7 +2784,7 @@ private:
                                 for (size_t x = 0; x <= bad; x++) {
                                     std::array<long long, kRefCls> Dx{};
                                     bool sx[kRefCls] = {};
-                                    if (!refMatch(text[t[x]], text[g[x]], tk0, k, Dx.data(), sx)) { std::fprintf(stderr, "   unit %zu does not match alone\n", x); bad = x; break; }
+                                    if (!refMatch(text[t[x]], text[g[x]], inst(tk0), inst(k), Dx.data(), sx)) { std::fprintf(stderr, "   unit %zu does not match alone\n", x); bad = x; break; }
                                     for (int c = 0; c < kRefCls; c++)
                                         if (sx[c]) {
                                             if (!s0[c]) { s0[c] = true; D0[c] = Dx[c]; }
@@ -2779,8 +2795,8 @@ private:
                             RefToks ta = refToks(text[t[bad]]), tb = refToks(text[g[bad]]);
                             std::fprintf(stderr, "no share: %s vs %s (%zu/%zu refs)\n", sigName_[std::max(0, ksig(t[bad]))].c_str(), sigName_[std::max(0, ksig(g[bad]))].c_str(), ta.num.size(), tb.num.size());
                             for (size_t q = 0; q < std::min(ta.num.size(), tb.num.size()); q++)
-                                std::fprintf(stderr, "   %lld (%s, cls %d) vs %lld (%s, cls %d)\n", ta.num[q], ta.num[q] < (long long)sigName_.size() ? sigName_[ta.num[q]].c_str() : "?", refCls(ta.num[q], tk0),
-                                             tb.num[q], tb.num[q] < (long long)sigName_.size() ? sigName_[tb.num[q]].c_str() : "?", refCls(tb.num[q], k));
+                                std::fprintf(stderr, "   %lld (%s, cls %d) vs %lld (%s, cls %d)\n", ta.num[q], ta.num[q] < (long long)sigName_.size() ? sigName_[ta.num[q]].c_str() : "?", refCls(ta.num[q], inst(tk0)),
+                                             tb.num[q], tb.num[q] < (long long)sigName_.size() ? sigName_[tb.num[q]].c_str() : "?", refCls(tb.num[q], inst(k)));
                             if (ta.piece != tb.piece) for (size_t q = 0; q < std::min(ta.piece.size(), tb.piece.size()); q++) if (ta.piece[q] != tb.piece[q]) {
                                 size_t o = 0;
                                 while (o < ta.piece[q].size() && o < tb.piece[q].size() && ta.piece[q][o] == tb.piece[q][o]) o++;
@@ -2809,7 +2825,7 @@ private:
                         for (size_t c = 0; c < tg.size(); c += kChunk) {
                             std::string f = name + "T" + std::to_string(id) + "_" + std::to_string(c / kChunk);
                             o << "static void " << f << "(" << dParams() << ") {\n    const bool obs = S.observed; (void)obs;" << dUnused() << "\n";
-                            for (size_t x = c; x < tg.size() && x < c + (size_t)kChunk; x++) o << refParam(text[tg[x]], tk);
+                            for (size_t x = c; x < tg.size() && x < c + (size_t)kChunk; x++) o << refParam(text[tg[x]], inst(tk));
                             o << "}\n";
                             fnsOf[tk].push_back(f);
                         }
@@ -4049,32 +4065,38 @@ private:
                     if (w.events.size() > 1) for (auto& [sg, ed] : w.events) ins.push_back(sg);
                     else ins.push_back(w.sig);
                     // Reached through tables by process (CIVA, CIP), so that shared code moves them.
-                    std::string I_ = std::to_string(i), chk = "    { bool ch = !CIVA[" + I_ + "]; CIVA[" + I_ + "] = true;\n";
+                    // CIVA: 1 seen once, 2 every x / z word below is 0. In
+                    // 2-state mode (every input known) only the values compare.
+                    std::string I_ = std::to_string(i), chk = "    { bool ch = !CIVA[" + I_ + "]; CIVA[" + I_ + "] = 1;\n";
+                    std::string chk2 = "    { bool ch = !CIVA[" + I_ + "];\n", xz2;
                     size_t nw = 0;
                     auto CI = [&](size_t k) { return "CIP[" + I_ + "][" + std::to_string(k) + "]"; };
                     for (int sg : ins) {
                         std::string G_ = std::to_string(sg);
-                        if (isPriv(sg)) {
+                        if (isPriv(sg) || sigW_[sg] <= 64) {
+                            const std::string src = isPriv(sg) ? "P" + G_ : "S.sigs[" + G_ + "].val";
                             for (const char* f : {".v", ".x", ".z"})
-                                chk += "      ch |= UPD(" + CI(nw++) + ", P" + G_ + f + ");\n";
-                        } else if (sigW_[sg] <= 64) {
-                            for (const char* f : {".v", ".x", ".z"})
-                                chk += "      ch |= UPD(" + CI(nw++) + ", S.sigs[" + G_ + "].val" + f + ");\n";
+                                chk += "      ch |= UPD(" + CI(nw++) + ", " + src + f + ");\n";
+                            chk2 += "      ch |= UPD(" + CI(nw - 3) + ", " + src + ".v);\n";
+                            xz2 += " o |= " + CI(nw - 2) + " | " + CI(nw - 1) + "; " + CI(nw - 2) + " = 0; " + CI(nw - 1) + " = 0;";
                         } else {
                             o << "static Val CW" << I_ << "_" << G_ << ";\n";
                             chk += "      ch |= UPDV(CW" + I_ + "_" + G_ + ", S.sigs[" + G_ + "].val);\n";
+                            chk2 += "      ch |= UPDV(CW" + I_ + "_" + G_ + ", S.sigs[" + G_ + "].val);\n";
                         }
                         if (!isPriv(sg)) ext.insert(sg);   // a private one is in P, and S.sigs keeps its first X
                     }
                     o << "static uint64_t CI" << I_ << "[" << std::max<size_t>(nw, 1) << "]; static const bool CIR" << I_ << " = (CIP[" << I_
                       << "] = CI" << I_ << ", true);\n";
                     chk += "      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n";
+                    chk2 += "      if (__builtin_expect(CIVA[" + I_ + "] != 3, 0)) { uint64_t o = 0;" + xz2 + " ch |= o != 0; CIVA[" + I_ + "] = 3; }\n"
+                            "      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n";
                     auto withEnd = [&](std::string c, const std::string& lab) {
                         c.replace(c.find("@END@"), 5, lab);
                         return c;
                     };
                     c4 += withEnd(chk, L4(cp.code.size() - 2));
-                    c2 += withEnd(chk, L2(cp.code.size() - 2));
+                    c2 += withEnd(chk2, L2(cp.code.size() - 2));
                     serialOnly = true;
                 }
                 unitIns.emplace_back();
