@@ -1000,12 +1000,22 @@ struct Sim {
     // its strongest driver of that level (or of x). A variable, or a net
     // msim writes directly, is strong; supply nets are supply; an undriven
     // tri0 / tri1 adds its pull and an undriven trireg holds its charge (28.15).
-    uint8_t levelStrength(int s, int b, int lvl) const {
+    uint8_t levelStrength(int s, int b, int lvl) {
         const Sig& g = sigs[(size_t)s];
         if (g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1) return STR_SUPPLY;
-        if (g.drv.empty()) return STR_STRONG;
+        // A net joined by switches has the drivers of its whole group (28.8),
+        // as its value does.
+        vector<Drv> group;
+        const vector<Drv>* drv = &g.drv;
+        if (!tranOf.empty() && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) {
+            vector<int> seen;
+            uint8_t kind = 0;
+            group = tranDrivers(s, true, seen, kind);
+            drv = &group;
+        }
+        if (drv->empty()) return g.drv.empty() ? STR_STRONG : STR_HIZ;
         uint8_t best = STR_HIZ;
-        for (const Drv& dr : g.drv) {
+        for (const Drv& dr : *drv) {
             int v = bitAt(dr.v, b);
             if (v == 2 || v == lvl) best = std::max(best, lvl ? dr.s1 : dr.s0);
         }
@@ -1013,7 +1023,7 @@ struct Sim {
         if (best == STR_HIZ && g.kind == NR_TRIREG) return chargeOf(s);
         return best;
     }
-    void mosStrength(const MosLink& L, int& s0, int& s1) const {
+    void mosStrength(const MosLink& L, int& s0, int& s1) {
         if (L.port) { s0 = levelStrength(L.src, L.bit, 0); s1 = levelStrength(L.src, L.bit, 1); return; }
         if (L.part) s1 = tranReduce(levelStrength(L.src, L.bit, 1), L.resist);
         else s0 = tranReduce(levelStrength(L.src, L.bit, 0), L.resist);
@@ -1455,6 +1465,11 @@ struct Sim {
             vals.push_back({m, on});
         }
         for (auto& [m, val] : vals) set(m, val);
+        // Links that pass on a group member's strength (MOS data, ports) see
+        // the group's drivers: they may have changed with no new value.
+        if (!mosOf.empty())
+            for (int m : group)
+                if ((size_t)m < mosOf.size() && !mosOf[(size_t)m].empty()) mosAgain(m);
     }
     Val get(int s) const {
         return sigs[s].w <= 64 ? make(sigs[s].val.v, sigs[s].val.x, sigs[s].w, sigs[s].val.z)
@@ -2685,6 +2700,10 @@ struct Sim {
         if (h.parts.empty()) holds.erase(it);
         else applyHold(s);
         auto& g = sigs[s];
+        if (!tranOf.empty() && (size_t)s < tranOf.size() && !tranOf[(size_t)s].empty()) {   // a net joined by switches: its group resolves again (28.8)
+            tranResolve(s);
+            return;
+        }
         if (!g.drv.empty()) {   // a net (or a continuously assigned variable): its drivers take over
             Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)
                                       : resolveDrives(g.drv.data(), g.drv.size(), g.w);
