@@ -63,6 +63,7 @@ struct PathRec {
     // set them. Limits above the delay act as the delay (32.7).
     uint64_t rj[12] = {}, er[12] = {};
     uint64_t unit = 1;           // ticks per time unit of the module
+    uint64_t prec = 1;           // ticks per time precision step of the module (22.7): SDF delays round to it
     bool annotated = false;
     bool dstVar = false;         // the output is a variable: its port connection is delayed
     const void* sym = nullptr;   // its TimingPathSymbol (VPI: path type, polarity, condition)

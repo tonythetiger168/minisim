@@ -194,6 +194,12 @@ inline std::vector<std::string> targets(Ctx& c, const Op& op) {
     return r;
 }
 
+// A delay of the module is rounded to its time precision (22.7), as the
+// delays written in it are.
+inline void roundToPrec(PathRec& p) {
+    if (p.prec > 1)
+        for (uint64_t& v : p.d) v = (v + p.prec / 2) / p.prec * p.prec;
+}
 inline void iopath(Ctx& c, const Op& op, const std::string& inst) {
     int hits = 0;
     for (auto& p : pathRecs()) {
@@ -205,6 +211,7 @@ inline void iopath(Ctx& c, const Op& op, const std::string& inst) {
             if (e && p.edge != 3 && p.edge != e) continue;
         }
         if (!applyDel(c, op, p.d, p.rj, p.er)) return;
+        roundToPrec(p);
         p.annotated = true;
         hits++;
     }
@@ -249,6 +256,7 @@ inline void device(Ctx& c, const Op& op, const std::string& inst) {
     for (auto& p : pathRecs()) {
         if (p.inst != where || (!port.empty() && !sameName(p.out, port))) continue;
         if (!applyDel(c, op, p.d, p.rj, p.er)) return;
+        roundToPrec(p);
         p.annotated = true;
         hits++;
     }
