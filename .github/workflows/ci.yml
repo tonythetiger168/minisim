@@ -58,7 +58,7 @@ jobs:
           else echo "::warning::no apt mirror: mspice tests run without the ngspice comparison"; fi
 
       - name: Configure, build, and test
-        run: CXX=g++ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-failure
+        run: CXX=g++ cmake -B build && cmake --build build -j && ctest --test-dir build --output-on-failure -j4
 
   build-and-test-slang:
     runs-on: ubuntu-24.04
@@ -153,6 +153,40 @@ jobs:
         continue-on-error: true
         run: sudo timeout 300 apt-get install -y slurm-wlm munge && sudo timeout 120 sh tests/regress/slurm_up.sh
 
+      # ccache: slang, CaDiCaL and every file a PR does not touch come out of
+      # the cache instead of being recompiled. Only main saves it: PR runs can
+      # read main's caches, and dozens of branches saving their own would evict
+      # it from the repository's 10 GB cache limit.
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-slang-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-slang-${{ runner.os }}-
+
       # Unbounded -j was SIGTERM'd (exit 143) mid-compile on the hosted runner.
-      - name: Configure, build, and test with slang
-        run: (dpkg -s libffi-dev >/dev/null 2>&1 || sudo apt-get install -y libffi-dev) && CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON -DUVM_HOME=$HOME/uvm-core && cmake --build build -j2 && ctest --test-dir build --output-on-failure
+      # The runner has 4 cores and 16 GB; -j4 peaks at about 7.5 GB.
+      - name: Configure and build with slang
+        run: |
+          (dpkg -s libffi-dev >/dev/null 2>&1 || sudo apt-get install -y libffi-dev)
+          launcher=
+          if command -v ccache >/dev/null || { [ "$APT_OK" = 1 ] && sudo apt-get install -y ccache; }; then
+            ccache --max-size=2G && ccache --zero-stats
+            launcher="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+          CXX=g++ cmake -B build -DMINISIM_WITH_SLANG=ON -DUVM_HOME=$HOME/uvm-core $launcher
+          cmake --build build -j4
+          if [ -n "$launcher" ]; then ccache --show-stats; fi
+
+      - name: Save compiler cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/ccache
+          key: ccache-slang-${{ runner.os }}-${{ github.sha }}
+
+      # The suite (900+ tests) ran one test at a time and took about 23 of the
+      # job's 32 minutes. The longest single test is about 2.5 minutes.
+      - name: Test with slang
+        run: ctest --test-dir build --output-on-failure -j4
