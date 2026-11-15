@@ -3888,6 +3888,29 @@ private:
                         }
                         hasTmp = twoTmpOff_;
                         break;
+                    case IK::Display: {   // a testbench's clocked block (seqShape sys): printed where it runs
+                        sysArgs_.push_back(i.args);
+                        std::vector<int> rs;
+                        std::function<void(const E&)> col = [&](const E& e) {
+                            if (!e) return;
+                            if (e->op == Op::Ref && isPriv(e->sig)) rs.push_back(e->sig);
+                            for (auto& k : e->kids) col(k);
+                        };
+                        for (auto& a : i.args) col(a);
+                        std::string t;
+                        for (int r : rs) t += " S.sigs[" + std::to_string(r) + "].val = PR(P" + std::to_string(r) + ", " + std::to_string(sigW_[r]) + ", false);";
+                        t += " S.printSys(" + quote(i.fmt) + ", A" + std::to_string(sysArgs_.size() - 1) + (i.nonl ? ", false" : "") + ");\n";
+                        fns << t;
+                        fns2 << t;
+                        break;
+                    }
+                    case IK::Finish: {   // $fatal: its exit status
+                        std::string t = " S.finished = true;" + (i.hi > 0 ? " if (S.exitCode < " + std::to_string(i.hi) + ") S.exitCode = " + std::to_string(i.hi) + ";" : std::string()) +
+                                        " goto " + L(end) + ";\n";
+                        fns << t;
+                        fns2 << t;
+                        break;
+                    }
                     default: throw CodegenUnsupported("instruction in a clocked process");
                 }
             }

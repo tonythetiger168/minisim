@@ -52,6 +52,8 @@ set(CASES
   "examples/constprop.sv"
   "-x-assign 0 -x-initial 0 examples/constprop.sv"
   "examples/sliceoob.sv"
+  "examples/seqsys.sv"
+  "-x-assign 0 -x-initial 0 examples/seqsys.sv"
   "-x-assign 0 -x-initial 0 examples/xassign.sv"
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"
