@@ -1089,7 +1089,7 @@ inline Val v_insert(Val base, Val part, int hi, int lo) {
 inline Val v_slice(Val a, int hi, int lo) {
     int w = hi - lo + 1;
     if (w <= 0) return make(0, 0, 1);
-    if (a.hi.empty() && a.w <= 64 && lo >= 0 && lo < 64 && hi < 64)
+    if (a.hi.empty() && a.w <= 64 && lo >= 0 && hi < a.w)
         return make(a.v >> lo, a.x >> lo, w, a.z >> lo);
     // Bits outside the vector are X. In-range bits are copied over that.
     Val r = allx(w);

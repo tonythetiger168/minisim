@@ -171,6 +171,7 @@
 #include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
 #include "slang/diagnostics/LookupDiags.h"
+#include "slang/diagnostics/ExpressionsDiags.h"
 #include "slang/driver/Driver.h"
 #include "slang/text/SourceManager.h"
 #include "protect_front.hpp"
@@ -3131,6 +3132,20 @@ int main(int argc, char** argv) {
         bool userSet = false;
         for (auto& s : fwd) userSet |= s.find("duplicate-definition") != std::string::npos;
         if (!userSet) driver.diagEngine.setSeverity(slang::diag::DuplicateDefinition, slang::DiagnosticSeverity::Warning);
+    }
+    // 7.4.6, 11.5.1: a select outside the declared range reads x and a write
+    // to it does nothing (only the bits in range of a part select are
+    // written). A constant one is legal code, so a warning, as other
+    // simulators give; -Werror=range-oob / index-oob / range-width-oob keep
+    // the error. An indexed part select wider than its vector is the same.
+    {
+        bool rangeSet = false, indexSet = false;
+        for (auto& s : fwd) { rangeSet |= s.find("range-oob") != std::string::npos; indexSet |= s.find("index-oob") != std::string::npos; }
+        if (!rangeSet) driver.diagEngine.setSeverity(slang::diag::RangeOOB, slang::DiagnosticSeverity::Warning);
+        if (!indexSet) driver.diagEngine.setSeverity(slang::diag::IndexOOB, slang::DiagnosticSeverity::Warning);
+        bool widthSet = false;
+        for (auto& s : fwd) widthSet |= s.find("range-width-oob") != std::string::npos;
+        if (!widthSet) driver.diagEngine.setSeverity(slang::diag::RangeWidthOOB, slang::DiagnosticSeverity::Warning);
     }
 
     // Protected envelopes (34): decrypt before slang reads the files, and

@@ -330,6 +330,7 @@ struct Instr {
     std::vector<E> dlyE;   // assign #(expr) (10.3.3): the delays in ticks, read at each change
     int pw = 0;
     bool pdown = false;
+    bool armNow = false;   // Fork: start the branches now, before the parent goes on (a <= @(e) b arms its wait at once)
     bool hex = false;
     // Assign to a temporary only this process uses (msim -xprop): nothing
     // watches it, so the value is stored at once (Sim::poke).
