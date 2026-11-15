@@ -101,6 +101,13 @@ inline std::unordered_map<const slang::ast::Symbol*, int>& interconnectW() {
     static std::unordered_map<const slang::ast::Symbol*, int> m;
     return m;
 }
+// Output ports coerced to inout (23.3.3.1): an output net whose outside
+// net has another driver as well. It becomes the outside net, as an inout
+// port does, so the module sees what the other drivers put on it.
+inline std::unordered_set<const slang::ast::Symbol*>& coercedPorts() {
+    static std::unordered_set<const slang::ast::Symbol*> s;
+    return s;
+}
 inline std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*>& aliasOf() {
     static std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> m;
     return m;
@@ -11076,9 +11083,16 @@ inline const slang::ast::Symbol* nettypeCollapses(const slang::ast::PortSymbol& 
 // An inout port whose actual is a whole net of the same width and kind is
 // the same net as its internal net (23.3.3.1). Returns the internal net when
 // the two can share one signal.
+inline const slang::ast::Symbol* inoutCollapsesAny(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual);
 inline const slang::ast::Symbol* inoutCollapses(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual) {
+    if (ps.direction != slang::ast::ArgumentDirection::InOut) return nullptr;
+    return inoutCollapsesAny(ps, actual);
+}
+// Whether the port's net and the actual can be one net, whatever the
+// port's direction.
+inline const slang::ast::Symbol* inoutCollapsesAny(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual) {
     using namespace slang::ast;
-    if (ps.direction != ArgumentDirection::InOut || !ps.internalSymbol) return nullptr;
+    if (!ps.internalSymbol) return nullptr;
     if (ps.internalSymbol->kind != SymbolKind::Net || actual.kind != SymbolKind::Net) return nullptr;
     const auto& in = ps.internalSymbol->as<NetSymbol>();
     const auto& out = actual.as<NetSymbol>();
@@ -12857,6 +12871,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (ext->kind != ExpressionKind::Assignment)
                 Lowerer::unsupported("output port connection");
             const auto& asg = ext->as<AssignmentExpression>();
+            if (ps.direction == ArgumentDirection::Out && coercedPorts().count(&ps) && aliasOf().count(ps.internalSymbol))
+                continue;   // coerced to inout: the same net as its actual
             if (ps.direction == ArgumentDirection::InOut) {   // collapsed onto the net it connects to: nothing to drive
                 const Expression& act = Lowerer::peel(asg.left());
                 if (ValueExpressionBase::isKind(act.kind) && act.kind != ExpressionKind::ElementSelect &&
@@ -13623,12 +13639,93 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     fsmDefs().clear();
     {   // alias statements (10.11), before any signal is made
         aliasOf().clear();
+        coercedPorts().clear();
         interconnectW().clear();
+        // How many things drive each net from where it is declared or
+        // connected: continuous assignments, gate outputs, output and inout
+        // port connections. An output port on a net with another driver is
+        // coerced to inout (23.3.3.1).
+        struct DriverCount : slang::ast::ASTVisitor<DriverCount, slang::ast::VisitFlags::Symbols> {
+            std::unordered_map<const slang::ast::Symbol*, int> n;
+            void count(const slang::ast::Expression* e) {
+                using namespace slang::ast;
+                if (!e) return;
+                const Expression& x = Lowerer::peel(*e);
+                if (x.kind == ExpressionKind::Concatenation) {
+                    for (auto* op : x.as<ConcatenationExpression>().operands()) count(op);
+                    return;
+                }
+                if (const Symbol* sym = x.getSymbolReference(); sym && sym->kind == SymbolKind::Net) n[sym]++;
+            }
+            void handle(const slang::ast::ContinuousAssignSymbol& a) {
+                const auto& x = a.getAssignment();
+                if (x.kind == slang::ast::ExpressionKind::Assignment) count(&x.as<slang::ast::AssignmentExpression>().left());
+            }
+            void handle(const slang::ast::NetSymbol& net) {
+                if (net.getInitializer()) n[&net]++;
+            }
+            void handle(const slang::ast::PrimitiveInstanceSymbol& g) {
+                using namespace slang::ast;
+                auto ports = g.getPortConnections();
+                if (ports.empty()) return;
+                const auto& pt = g.primitiveType;
+                std::string_view nm = pt.name;
+                bool sw = nm == "tran" || nm == "rtran" || nm == "tranif0" || nm == "tranif1" || nm == "rtranif0" || nm == "rtranif1";
+                if (sw) { count(ports[0]); if (ports.size() > 1) count(ports[1]); return; }
+                size_t outs = 1;
+                if (nm == "buf" || nm == "not") outs = ports.size() > 1 ? ports.size() - 1 : 1;
+                for (size_t i = 0; i < outs; i++) count(ports[i]);
+            }
+            void handle(const slang::ast::InstanceSymbol& inst) {
+                using namespace slang::ast;
+                for (const PortConnection* c : inst.getPortConnections()) {
+                    if (!c || c->port.kind != SymbolKind::Port) continue;
+                    auto dir = c->port.as<PortSymbol>().direction;
+                    if (dir != ArgumentDirection::Out && dir != ArgumentDirection::InOut) continue;
+                    const Expression* x = c->getExpression();
+                    if (!x) continue;
+                    const Expression* y = &Lowerer::peel(*x);
+                    if (y->kind == ExpressionKind::Assignment) y = &y->as<AssignmentExpression>().left();
+                    count(y);
+                }
+                visitDefault(inst);
+            }
+        } drvCount;
+        comp.getRoot().visit(drvCount);
+        // How often each net is named at all: more names than drivers means
+        // something reads it.
+        struct RefCount : slang::ast::ASTVisitor<RefCount, slang::ast::VisitFlags::Symbols | slang::ast::VisitFlags::Statements |
+                                                               slang::ast::VisitFlags::Expressions> {
+            std::unordered_map<const slang::ast::Symbol*, int> n;
+            void handle(const slang::ast::NamedValueExpression& e) {
+                if (e.symbol.kind == slang::ast::SymbolKind::Net) n[&e.symbol]++;
+            }
+        } refCount;
+        comp.getRoot().visit(refCount);
         struct AliasFinder : slang::ast::ASTVisitor<AliasFinder> {
             std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> up;
             const slang::ast::Symbol* root(const slang::ast::Symbol* s) {
                 while (up.count(s) && up[s] != s) s = up[s];
                 return s;
+            }
+            // An output port coerced to inout (23.3.3.1): a whole net of the
+            // same width and kind as its actual, which something else drives
+            // too, in a module without specify paths (a path output keeps
+            // its own, delayed net).
+            const std::unordered_map<const slang::ast::Symbol*, int>* drivers = nullptr;
+            const std::unordered_map<const slang::ast::Symbol*, int>* refs = nullptr;
+            bool coerce(const slang::ast::PortSymbol& ps, const slang::ast::Symbol& actual, const slang::ast::InstanceSymbol& inst) {
+                using namespace slang::ast;
+                if (ps.direction != ArgumentDirection::Out || !ps.internalSymbol || !drivers) return false;
+                auto it = drivers->find(&actual);
+                if (it == drivers->end() || it->second < 2) return false;
+                for (const auto& m : inst.body.members())
+                    if (m.kind == SymbolKind::SpecifyBlock) return false;
+                // Only a port used as an input too: the module reads its net.
+                auto rd = refs->find(ps.internalSymbol);
+                auto dv = drivers->find(ps.internalSymbol);
+                if (rd == refs->end() || rd->second <= (dv == drivers->end() ? 0 : dv->second)) return false;
+                return inoutCollapsesAny(ps, actual) != nullptr;
             }
             void handle(const slang::ast::InstanceSymbol& inst) {
                 using namespace slang::ast;
@@ -13647,6 +13744,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     // one signal, as with alias. Two continuous assignments, one
                     // each way, would hold the last driven value for ever.
                     const Symbol* in = inoutCollapses(c->port.as<PortSymbol>(), ns);
+                    if (!in && coerce(c->port.as<PortSymbol>(), ns, inst)) {
+                        in = c->port.as<PortSymbol>().internalSymbol;
+                        coercedPorts().insert(&c->port);
+                    }
                     if (!in) in = sharedPortVar(c->port.as<PortSymbol>(), ns);
                     if (!in) in = nettypeCollapses(c->port.as<PortSymbol>(), ns);
                     if (in) {
@@ -13677,6 +13778,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 }
             }
         } af;
+        af.drivers = &drvCount.n;
+        af.refs = &refCount.n;
         comp.getRoot().visit(af);
         assignedEvents().clear();
         eventPtr().clear();
