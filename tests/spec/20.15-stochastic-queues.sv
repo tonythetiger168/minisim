@@ -1,7 +1,8 @@
 // IEEE 1800-2023 20.15: $q_initialize, $q_add, $q_remove, $q_full and
 // $q_exam manage FIFO (type 1) and LIFO (type 2) queues, with the status
-// codes of Table 20-11 and the statistics of Table 20-10.
-//! icarus-skip: the statistics of Icarus 13 differ in rounding
+// codes of Table 20-11 and the statistics of Table 20-10. A statistic with
+// nothing to measure yet is x; the average wait counts the jobs still
+// waiting; times are whole time units.
 module top;
   integer st, job, inf, v, full;
   initial begin
@@ -12,6 +13,8 @@ module top;
     $q_initialize(2, 2, 2, st); $display("lifo %0d", st);
     $q_add(9, 1, 1, st); $display("undef %0d", st);
     $q_remove(1, job, inf, st); $display("empty %0d", st);
+    $q_exam(1, 4, v, st); $display("no shortest %0d", v);
+    $q_exam(1, 6, v, st); $display("no average %0d", v);
     $q_add(1, 10, 100, st);
     #2 $q_add(1, 11, 101, st);
     #2 $q_add(1, 12, 102, st);
@@ -37,6 +40,8 @@ endmodule
 //> lifo 0
 //> undef 2
 //> empty 3
+//> no shortest x
+//> no average x
 //> full 1 0
 //> over 1
 //> length 3
@@ -46,6 +51,6 @@ endmodule
 //> fifo 10 100 0
 //> fifo 11 101 0
 //> shortest 10
-//> average 10
+//> average 9
 //> full 0
 //> lifo 2 6
