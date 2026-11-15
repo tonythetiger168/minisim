@@ -1835,17 +1835,29 @@ struct Sim {
     // net bit comes from its drivers, resolved as the net is (28.12); a
     // variable, or a net with no driver that still has a value (tri0, tri1,
     // supply, trireg), gets the strength its kind implies.
+    // A vector: each bit, the most significant first, joined by '_' (as
+    // other simulators print it; 21.2.1.4 defines scalars).
     static string strengthText(const E& a0, const Reader& rd) {
+        E a = a0;
+        while (a && a->op == Op::Resize && !a->kids.empty()) a = a->kids[0];
+        if (!(a && a->op == Op::Ref && !isRel(a->sig) && !a->at)) return strengthBit(a0, rd, 0);
+        int w = eval(a, rd).w;
+        if (w <= 1) return strengthBit(a0, rd, 0);
+        string r;
+        for (int k = w - 1; k >= 0; k--) r += strengthBit(a, rd, k) + (k ? "_" : "");
+        return r;
+    }
+    static string strengthBit(const E& a0, const Reader& rd, int k) {
         static const char* MN[8] = {"Hi", "Sm", "Me", "We", "La", "Pu", "St", "Su"};
         E a = a0;
         while (a && a->op == Op::Resize && !a->kids.empty()) a = a->kids[0];
         int sig = -1, bit = 0;
-        if (a && a->op == Op::Ref && !isRel(a->sig) && !a->at) sig = a->sig;
+        if (a && a->op == Op::Ref && !isRel(a->sig) && !a->at) { sig = a->sig; bit = k; }
         else if (a && a->op == Op::Slice && a->hi == a->lo && !a->kids.empty() && a->kids[0] &&
                  a->kids[0]->op == Op::Ref && !isRel(a->kids[0]->sig) && !a->kids[0]->at) {
             sig = a->kids[0]->sig; bit = a->lo;
         }
-        int v = bitAt(eval(a0, rd), 0);   // 0, 1, 2 = x, 3 = z
+        int v = bitAt(eval(a0, rd), k);   // 0, 1, 2 = x, 3 = z
         SBit sb;
         bool have = false;
         if (sig >= 0 && self) {
@@ -2042,6 +2054,7 @@ struct Sim {
             Val v = eval(args[ai++], rd);
             string out = (lc == 'f' || lc == 'e' || lc == 'g') ? fmtReal(lc, v_real(v), left ? 0 : minW, prec, zero)
                                                                : fmtVal(lc, v, left ? 1 : minW, zero);
+            if (c == 'E' || c == 'G') for (char& ch : out) ch = (char)toupper((unsigned char)ch);   // %E %G: as C's (21.2.1.3)
             if (left && (int)out.size() < minW) out += string(minW - out.size(), ' ');
             cout << out;
         }
