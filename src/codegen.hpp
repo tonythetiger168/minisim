@@ -3104,6 +3104,7 @@ private:
     // MSIM_NOTWOTMP=1: a process with temporaries runs its 4-state body in
     // 2-state mode too, and twoNow does not check its temporaries.
     const bool twoTmpOff_ = std::getenv("MSIM_NOTWOTMP") != nullptr;
+    const bool c0On_ = !std::getenv("MSIM_NOC0");   // MSIM_NOC0=1: 2-state private NBAs through their slots
     // scanP's back-off while a private signal holds X: at most this many
     // passes without a look. A 4-state comb pass costs far more than a scan,
     // so a long wait after the last X goes kept the design off its 2-state
@@ -3635,6 +3636,21 @@ private:
         // nobody can see the store before the commit would have made it.
         // (Comb units read it only after fcommit; see directNba_.)
         std::vector<char> direct(sigW_.size(), 0);
+        // partNba: a register the commit lists (C0L, C1L) must not take, as
+        // they are stored before the slots: some NBA to it writes a part or
+        // an element, has no 2-state value, or is in another process.
+        std::vector<char> partNba(sigW_.size(), 0);
+        {
+            std::vector<int> by(sigW_.size(), -1);
+            for (int n : dom)
+                for (auto& in : procs[n].prog->code) {
+                    if (in.k != IK::Nba || in.sig < 0 || (size_t)in.sig >= partNba.size()) continue;
+                    std::string g, u, sl;
+                    if (in.hi >= 0 || in.arr || in.bidx || !in.aidx.empty() || (by[in.sig] >= 0 && by[in.sig] != n) || !split(in.e, g, u, sl))
+                        partNba[in.sig] = 1;
+                    by[in.sig] = n;
+                }
+        }
         if (!std::getenv("MSIM_NODIRECT")) {
             const size_t ns = sigW_.size();
             std::vector<int> wproc(ns, -1), firstW(ns, -1);
@@ -3752,13 +3768,29 @@ private:
                         int k = (int)slots.size();
                         slots.push_back({i.sig, i.hi, i.lo});
                         slotProc.push_back(n);
-                        fns << " CLP(" << k << ");";
-                        fns2 << " CLP(" << k << ");";
                         std::string g, u, sl;
                         bool sp = (i.hi < 0 || (sigW_[i.sig] <= 64 && !sigNet_[i.sig])) && split(i.e, g, u, sl);   // a narrow part: see the commit
                         // Through the arrays (VA[k], not V<k>): shared code moves k.
                         const std::string K = std::to_string(k), V = " VA[" + K + "]", H = " HA[" + K + "]", F = " FA[" + K + "]";
-                        if (sp) fns2 << V << " = " << u << ";" << H << " = 1;\n";
+                        fns << " CLP(" << k << ");";
+                        // A private register's 2-state value: onto the C0 list (its
+                        // address and value), which fcommit stores in order (see C0L).
+                        // A register's 2-state value onto a commit list instead (its
+                        // address and value, stored in order by fcommit; see C0L):
+                        // a private one (C0), or a narrow S.sigs one (C1). Not for a
+                        // register some NBA writes a part of: the order would change.
+                        const bool c0 = sp && i.hi < 0 && c0On_ && !partNba[i.sig] && isPriv(i.sig);
+                        const bool c1 = sp && i.hi < 0 && c0On_ && !partNba[i.sig] && !isPriv(i.sig) && sigW_[i.sig] <= 64 &&
+                                        !sigNet_[i.sig] && !clock_[i.sig];
+                        if (c0)
+                            fns2 << " if (C0OK) { C0L[C0N].p = &P" << i.sig << "; C0L[C0N++].v = (" << u << ") & " << M(sigW_[i.sig])
+                                 << "; } else { CLP(" << k << ");" << V << " = " << u << ";" << H << " = 1; }\n";
+                        else if (c1)
+                            fns2 << " if (C1OK) { C1L[C1N].g = &S.sigs[" << i.sig << "]; C1L[C1N++].v = (" << u << ") & " << M(sigW_[i.sig])
+                                 << "; } else { CLP(" << k << ");" << V << " = " << u << ";" << H << " = 1; }\n";
+                        else fns2 << " CLP(" << k << ");";
+                        if (c0 || c1) {}
+                        else if (sp) fns2 << V << " = " << u << ";" << H << " = 1;\n";
                         else fns2 << F << " = " << fast(i.e) << ";" << H << " = 2;\n";   // no 2-state path: as it is
                         // H: 1 = the 2-state value in V<k>, 2 = the Val in F<k>.
                         if (sp) {
@@ -3837,6 +3869,13 @@ private:
         o << "static uint32_t CL[" << std::max<size_t>(slots.size(), 1) << "]; static const uint32_t CLCAP = " << std::max<size_t>(slots.size(), 1)
           << "; static uint32_t CN; static bool CLOVF; static bool CLON = true;\n"
              "#define CLP(k) do { if (CLON) { if (CN < CLCAP) CL[CN++] = (k); else CLOVF = true; } } while (0)\n";
+        // The 2-state NBAs to private registers, in the order they ran: one
+        // store each in fcommit, no slot (PicoRV32 x16 commits ~1300 a cycle).
+        // Off for the parallel path (CLON) and when full: the slot instead.
+        o << "struct C0E { PSig* p; uint64_t v; };\nstatic C0E C0L[" << std::max<size_t>(2 * slots.size(), 1) << "]; static uint32_t C0N;\n"
+             "#define C0OK (__builtin_expect(CLON && C0N < " << std::max<size_t>(2 * slots.size(), 1) << ", 1))\n"
+             "struct C1E { Sig* g; uint64_t v; };\nstatic C1E C1L[" << std::max<size_t>(2 * slots.size(), 1) << "]; static uint32_t C1N;\n"
+             "#define C1OK (__builtin_expect(CLON && C1N < " << std::max<size_t>(2 * slots.size(), 1) << ", 1))\n";
         std::vector<int> privs;
         for (size_t s = 0; s < priv_.size(); s++) if (priv_[s]) privs.push_back((int)s);
         // Only when something watches every change (a VCD opened at run time).
@@ -4044,8 +4083,21 @@ private:
                  "    static const uint64_t* TX[NT ? NT : 1];\n"
                  "    static bool init = false;\n"
                  "    if (!init) { for (size_t k = 0; k < NT; k++) TX[k] = &S.sigs[T[k + 1]].val.x; init = true; }\n"
-                 "    if (!pclean) return false;\n    uint64_t x = 0;\n"
-                 "    for (size_t k = 0; k < NT; k++) x |= *TX[k];\n"
+                 "    if (!pclean) return false;\n    uint64_t x = 0;\n";
+            // Up to a few thousand narrow signals: one load each at a constant
+            // offset from S.sigs.data(), unrolled (the pointer table took two
+            // loads and the loop: 7% of PicoRV32 x16). More: the table loop.
+            size_t nNarrow = 0;
+            for (int e : ext) if (!scratch(e) && sigW_[e] <= 64) nNarrow++;
+            if (nNarrow <= 4096) {
+                o << "    const Sig* const B = S.sigs.data();\n";
+                size_t c = 0;
+                for (int e : ext)
+                    if (!scratch(e) && sigW_[e] <= 64) o << (c++ % 8 ? " " : "    ") << "x |= B[" << e << "].val.x;" << (c % 8 ? "" : "\n");
+                if (c % 8) o << "\n";
+            } else
+                o << "    for (size_t k = 0; k < NT; k++) x |= *TX[k];\n";
+            o <<
                  "    for (size_t k = 1; k < sizeof TW / sizeof TW[0]; k++) { const Val& v = S.sigs[TW[k]].val; x |= v.x; for (auto& h : v.hi) x |= h.x; }\n"
                  "    return x == 0;\n";   // every limb: fx reads up to 64 bits of a wider signal
         } else
@@ -4416,6 +4468,9 @@ private:
             // known value, so the commits keep every private signal known.
             o << "static void fcommit() {\n"
                  "    const bool t = twoNow();\n"
+                 "    for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = C0L[j].v; p.x = 0; p.z = 0; }\n    C0N = 0;\n"                 "    { const bool obs = S.observed;" " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
+             " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { Val& q = g.val; q.v = C1L[j].v; q.x = 0; q.z = 0; q.real = false; q.str = false; }"
+             " else S.fwSlow(s, make(C1L[j].v, 0, g.w)); } C1N = 0;" " }\n"
                  "    const int use = S.domainTune[2].pick(S.threads);\n"
                  "    S.parallelFor(" << G << ", [t](size_t g) { CMG[g](t); }, use);\n"
                  "    S.domainTune[2].done(S.threads);\n"
@@ -4475,6 +4530,10 @@ private:
         o << "static void fcommit() {" << (multi ? " dpend = false;" : "");
         o << " const bool obs = S.observed;"
              // The common slot inline: a private signal given a known value.
+             " for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = C0L[j].v; p.x = 0; p.z = 0; } C0N = 0;"
+             " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
+             " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { Val& q = g.val; q.v = C1L[j].v; q.x = 0; q.z = 0; q.real = false; q.str = false; }"
+             " else S.fwSlow(s, make(C1L[j].v, 0, g.w)); } C1N = 0;"
              " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) { const uint32_t k = CL[j]; const uint8_t h = HA[k];"
              " if (h == 1) { const CTRow& t = CTAB[k]; if (t.kind == 0) { HA[k] = 0; PSig& p = *t.p; p.v = VA[k] & t.m; p.x = 0; p.z = 0; continue; } }"
              " if (h) commitOne(k, obs); } }"
