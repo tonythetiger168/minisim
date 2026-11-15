@@ -23,7 +23,7 @@ module xassign;
       default: c <= 4'd3;
     endcase
   end
-  always @* y = cnt === 8'bx ? 8'd99 : cnt + 8'd1;
+  always_comb y = cnt === 8'bx ? 8'd99 : cnt + 8'd1;
   initial begin
     repeat (5) @(negedge clk)
       $display("cnt=%h dc=%h w=%h a=%h r=%h c=%h y=%h wide=%h eqx=%b", cnt, dc, w, a, r, c, y, wide[99:96], dc === 8'bx);
