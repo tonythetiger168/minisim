@@ -1024,7 +1024,14 @@ struct Sim {
         return best;
     }
     void mosStrength(const MosLink& L, int& s0, int& s1) {
-        if (L.port) { s0 = levelStrength(L.src, L.bit, 0); s1 = levelStrength(L.src, L.bit, 1); return; }
+        if (L.port) {
+            // A net whose value arrives after a delay (a path output, wire #d)
+            // takes it at strong strength (30.4, 28.16), and its drivers can
+            // be ahead of its value: the port passes strong then too.
+            if ((!timedOut.empty() && (size_t)L.src < timedOut.size() && timedOut[(size_t)L.src]) ||
+                (!netDelay.empty() && netDelay.count(L.src))) { s0 = s1 = STR_STRONG; return; }
+            s0 = levelStrength(L.src, L.bit, 0); s1 = levelStrength(L.src, L.bit, 1); return;
+        }
         if (L.part) s1 = tranReduce(levelStrength(L.src, L.bit, 1), L.resist);
         else s0 = tranReduce(levelStrength(L.src, L.bit, 0), L.resist);
     }
