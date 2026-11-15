@@ -1640,6 +1640,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         c.combLevel = pl.level[i];
         c.seq = pl.seq[i];
         c.seqEv = pl.ev[i];
+        c.loops = lowered.procs[i].loops;
         procs.push_back(std::move(c));
     }
     CodegenParts parts;
