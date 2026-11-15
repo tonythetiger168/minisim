@@ -1370,20 +1370,26 @@ struct Sim {
             for (int id : tranOf[(size_t)m]) {
                 const TranSw& t = trans[(size_t)id];
                 if (t.state == 0 || t.state < 0 || (t.state == 2 && !unkOn && !lh)) continue;
-                int o = t.a == m ? t.b : t.a;
-                Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi, r.unk || t.state == 2};
-                if (t.w >= 0) {   // only the joined bits, moved to o's place
-                    int mLo = t.a == m ? t.aLo : t.bLo, oLo = t.a == m ? t.bLo : t.aLo;
-                    nb.lo = std::max(r.lo, mLo - r.delta);
-                    nb.hi = std::min(r.hi, mLo + t.w - r.delta);
-                    nb.delta = r.delta + oLo - mLo;
-                    if (nb.lo >= nb.hi) continue;
+                // From m across the switch: m is its a or its b terminal, or
+                // both when it joins two parts of one net (tran(a[0], a[1])).
+                for (int side = 0; side < 2; side++) {
+                    bool fromA = side == 0;
+                    if ((fromA ? t.a : t.b) != m) continue;
+                    int o = fromA ? t.b : t.a;
+                    Reach nb{r.k + (t.resist ? 1 : 0), true, r.delta, r.lo, r.hi, r.unk || t.state == 2};
+                    if (t.w >= 0) {   // only the joined bits, moved to o's place
+                        int mLo = fromA ? t.aLo : t.bLo, oLo = fromA ? t.bLo : t.aLo;
+                        nb.lo = std::max(r.lo, mLo - r.delta);
+                        nb.hi = std::min(r.hi, mLo + t.w - r.delta);
+                        nb.delta = r.delta + oLo - mLo;
+                        if (nb.lo >= nb.hi) continue;
+                    }
+                    std::tuple<int, int, int> ok{o, nb.delta, nb.lo};
+                    auto it = best.find(ok);
+                    if (it != best.end() && it->second.k <= nb.k) continue;
+                    best[ok] = nb;
+                    q.push_back(ok);
                 }
-                std::tuple<int, int, int> ok{o, nb.delta, nb.lo};
-                auto it = best.find(ok);
-                if (it != best.end() && it->second.k <= nb.k) continue;
-                best[ok] = nb;
-                q.push_back(ok);
             }
         }
         vector<Drv> all;

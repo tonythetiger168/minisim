@@ -12308,7 +12308,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         using namespace slang::ast;
         bool ctl = name.find("tranif") != std::string_view::npos;
         if (ports.size() != (ctl ? 3u : 2u)) Lowerer::unsupported("tran ports");
-        int t[2];
+        int t[2], lo[2] = {0, 0};
+        bool part = false;
+        Lowerer lw(sigmap);
+        prep(lw);
         for (int k = 0; k < 2; k++) {
             if (!ports[k]) Lowerer::unsupported("tran ports");
             const Expression* x = ports[k];
@@ -12316,15 +12319,25 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             x = &Lowerer::peel(*x);
             const Symbol* sym = ValueExpressionBase::isKind(x->kind) ? &x->as<ValueExpressionBase>().symbol : nullptr;
             auto it = sym ? sigmap.find(sym) : sigmap.end();
-            if (!sym || sym->kind != SymbolKind::Net || it == sigmap.end())
-                Lowerer::unsupported("a tran terminal that is not a whole net");
-            t[k] = it->second;
+            if (sym && sym->kind == SymbolKind::Net && it != sigmap.end()) { t[k] = it->second; continue; }
+            // A constant bit or part select of a net (28.8): only those bits are joined.
+            if (x->kind == ExpressionKind::ElementSelect || x->kind == ExpressionKind::RangeSelect) {
+                Instr li;
+                lw.lhs(*x, li);
+                if (li.sig >= 0 && li.hi >= 0 && !li.arr && !li.bidx && li.dyn < 0 && !isVarSig(li.sig)) {
+                    t[k] = li.sig;
+                    lo[k] = li.lo;
+                    part = true;
+                    continue;
+                }
+            }
+            Lowerer::unsupported("a tran terminal that is not a net or a constant select of one");
         }
-        if (ports[0]->type->getBitWidth() != ports[1]->type->getBitWidth()) Lowerer::unsupported("tran terminals of different widths");
+        int tw = (int)ports[0]->type->getBitWidth();
+        if (tw != (int)ports[1]->type->getBitWidth()) Lowerer::unsupported("tran terminals of different widths");
         int id = (int)out.trans.size();
-        out.trans.push_back({t[0], t[1], name[0] == 'r'});
-        Lowerer lw(sigmap);
-        prep(lw);
+        if (part) out.trans.push_back({t[0], t[1], name[0] == 'r', lo[0], lo[1], tw});
+        else out.trans.push_back({t[0], t[1], name[0] == 'r'});
         Instr i;
         i.k = IK::Tran;
         i.sig = id;
