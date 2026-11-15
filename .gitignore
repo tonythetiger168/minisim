@@ -14,3 +14,7 @@ tests/spec/spec_*.bin
 tests/spec/spec_*.txt
 *.mcovsave
 tests/spec/spec_*.cov.json
+# Scratch written by tests that do not use the spec_* prefix:
+# 21.3.7-ferror.sv, 21.3.4-unformatted-skip-width.sv, 21.3.4-unformatted-u-z.sv
+tests/spec/ferror_test.txt
+tests/spec/unformatted_*.bin
