@@ -12385,14 +12385,18 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                                                                : &root->as<RangeSelectExpression>().value();
         if (root->kind != ExpressionKind::NamedValue && root->kind != ExpressionKind::HierarchicalValue) return false;
         if (!simple(root->as<ValueExpressionBase>().symbol)) return false;
-        if ((int)act.type->getBitWidth() != f.w) return false;
+        // Of a port and a net of different widths only the low bits meet
+        // (23.3.3.8, as in an assignment): the extra bits of the wider one
+        // stay unconnected.
+        int jw = std::min((int)act.type->getBitWidth(), f.w);
+        if (jw <= 0) return false;
         Lowerer lw(sigmap);
         prep(lw);
         Instr i;
         lw.lhs(act, i);
         if (i.arr || i.bidx || i.dyn >= 0 || !lw.prog.code.empty()) return false;   // a variable index
         int id = (int)out.trans.size();
-        out.trans.push_back({f.sig, i.sig, false, 0, i.hi >= 0 ? i.lo : 0, f.w});
+        out.trans.push_back({f.sig, i.sig, false, 0, i.hi >= 0 ? i.lo : 0, jw});
         Instr t;
         t.k = IK::Tran;
         t.sig = id;
