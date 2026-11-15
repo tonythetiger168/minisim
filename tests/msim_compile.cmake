@@ -18,6 +18,8 @@ set(CASES
   "examples/strengths.sv"
   "examples/tasks.sv"
   "examples/autotask.sv"
+  "examples/nbatemp.sv"
+  "examples/tmppart.sv"
   "examples/breakcont.sv"
   "examples/hierarchy.sv"
   "examples/checks.sv"

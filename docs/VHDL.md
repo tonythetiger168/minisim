@@ -137,8 +137,14 @@ SystemVerilog drive strengths (`weak0`/`weak1`), as 16.7's resolution table.
 
 `msim -vhdl4` turns the companions off: std_logic then runs on the four
 values only (`'U'`, `'W'`, `'-'` are `'X'`, `'L'` is `'0'`, `'H'` is `'1'`).
-That is about twice as fast in the interpreter (NEORV32's processor test:
-55 s with `-vhdl4`, 103 s with nine values, for 300 µs).
+That is faster in the interpreter (NEORV32's processor test: 59 s with
+`-vhdl4`, 95 s with nine values, for 300 µs).
+
+A process with a sensitivity list becomes `always @(<sensitivity> or
+vhdl_rt::go) if (vhdl_rt::started) ...`: one `#0` per design starts every
+such process at once, where VHDL runs them for the first time (14.7.5.2).
+With no wait of its own, the process joins msim's static schedule like an
+`always @(posedge clk)` block, instead of staying a coroutine.
 
 Every VHDL test in `tests/vhdl` has a golden output made with GHDL, an
 independent open-source VHDL simulator. `ctest -R vhdl` runs msim against the
