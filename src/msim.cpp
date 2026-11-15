@@ -69,6 +69,8 @@
 //   -no-partition    apply every NBA on the main thread (no partition tasks)
 //   -no-2state       -compile without the 2-state fast path (codegen.hpp fast())
 //   -no-cycle        -compile without the cycle domain (codegen.hpp cycleDomain())
+//   -noassert, -nosva  leave concurrent assertions, assumptions and covers
+//                    out (xrun -noassert, vsim -nosva); immediate ones stay
 //   -threads <n>     worker threads (default: one per physical P core, at most
 //                    8; cpu.hpp). `-threads all` uses every logical CPU, SMT
 //                    siblings included. Results are the same for any n.
@@ -1804,6 +1806,32 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
     std::vector<std::pair<const Prog*, size_t>> covSlots;
+    // Every signal some process, final block or subroutine reads or waits on.
+    std::unordered_set<int> used;
+    {
+        std::vector<int> refs;
+        std::unordered_set<int> have;
+        std::vector<const Prog*> seen;
+        for (auto& p : lowered.procs) collectProgRefsInto(p.prog, refs, have, seen);
+        for (auto& p : lowered.finals) collectProgRefsInto(p.prog, refs, have, seen);
+        for (auto& p : lowered.subs) collectProgRefsInto(*p, refs, have, seen);
+        used.insert(refs.begin(), refs.end());
+        for (const Prog* q : seen)
+            for (auto& i : q->code) {
+                if (i.k == IK::CycleWait || i.k == IK::CbDrive) used.insert(-2);   // a clocking block in use
+                if (i.k == IK::WaitEdge && i.sig >= 0) used.insert(i.sig);
+                for (auto& [sg, ed] : i.events) used.insert(sg);
+            }
+    }
+    // A clocking block with no clockvars that nothing waits on or reads (a
+    // default clocking only for assertions, say, with -noassert) does
+    // nothing the design can see, and neither does a sampled copy of a
+    // signal that only such a block reads: both are left out.
+    bool liveClocking = used.count(-2) > 0;
+    for (auto& c : clockings())
+        liveClocking |= !c.ins.empty() || !c.outs.empty() || used.count(c.evSig) || used.count(c.evSig + 1);
+    bool liveShadow = !sampleClocks().empty();
+    for (auto [src, sh] : shadowPairs()) liveShadow |= used.count(sh) > 0;
     // Not compiled yet: final blocks, and a tick other than 1ns (`timescale).
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
@@ -1811,10 +1839,10 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                     : std::any_of(asserts().begin(), asserts().end(), [](const AssertInfo& a) {
                           return a.hidden || (a.type & (AT_CONCURRENT | AT_FINAL | AT_EXPECT));
                       }) ? "a concurrent, final or expect assertion"
-                    : !clockings().empty() ? "a clocking block"
+                    : liveClocking ? "a clocking block"
                     : !cgDefs().empty() ? "a covergroup"
                     : annexDUsed() ? "an Annex D system task"
-                    : !shadowPairs().empty() || !sampleClocks().empty() ? "a sampled value function" : nullptr;
+                    : liveShadow ? "a sampled value function" : nullptr;
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -2892,6 +2920,7 @@ int main(int argc, char** argv) {
             continue;
         }
         if (a == "-no-cycle") { cycle = false; continue; }
+        if (a == "-noassert" || a == "-nosva") { Lowerer::noConcAssert() = true; continue; }
         if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
         if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
         if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }

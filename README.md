@@ -119,6 +119,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-static-seq`, `-no-partition` | Turn off clocked-process functions / partition tasks |
 | `-no-2state` | `-compile` without the 2-state fast path |
 | `-x-assign 0`, `-x-initial 0` | As Verilator: X bits of literals become 0 (not in `===`, case items or `==?`), variables start at 0. A design that writes `'bx` as a don't-care then runs as a 2-state model, and `-compile` stays on its 2-state path |
+| `-noassert`, `-nosva` | Leave concurrent assertions, assumptions and covers out of the build (as `xrun -noassert`, `vsim -nosva`, or Verilator without `--assert`); immediate assertions stay |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `-xprop[=tmerge\|xmerge\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |

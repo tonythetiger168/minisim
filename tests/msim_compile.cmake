@@ -58,6 +58,8 @@ set(CASES
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
+  "examples/shareport.sv"
+  "-noassert examples/noassert.sv"
   "examples/manygroups.sv"
   "examples/islands.sv"
   "examples/combbranch.sv"
