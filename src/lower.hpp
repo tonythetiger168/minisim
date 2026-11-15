@@ -6156,6 +6156,77 @@ struct Lowerer {
         }
     }
 
+    // @(e) on an expression of automatic variables (@(arr[0]) in an automatic
+    // task, 9.4.2), or on any expression where no continuous assignment can
+    // follow it (in a subroutine): the process keeps each item's last value
+    // in its own frame and waits for any variable the items read, until one
+    // item changes (or its low bit has the edge, Table 9-2). An event list
+    // (9.4.2.1) is done when any item is.
+    bool dynEventWait(const slang::ast::TimingControl& t) {
+        using namespace slang::ast;
+        if (frames.empty() && eventExprHook()) return false;
+        std::vector<const SignalEventControl*> items;
+        if (t.kind == TimingControlKind::SignalEvent) items.push_back(&t.as<SignalEventControl>());
+        else if (t.kind == TimingControlKind::EventList) {
+            for (auto* sub : t.as<EventListControl>().events) {
+                if (sub->kind != TimingControlKind::SignalEvent) return false;
+                items.push_back(&sub->as<SignalEventControl>());
+            }
+        } else return false;
+        bool need = false;
+        for (auto* s : items) {
+            if (isGlobalClock(s->expr) || inferredClock(s->expr) || clockingRef(s->expr) ||
+                peel(s->expr).kind == ExpressionKind::AssertionInstance || classMember(s->expr) || vifAccess(s->expr) ||
+                !s->expr.type->isIntegral() || s->expr.type->isEvent())
+                return false;
+            if (!ValueExpressionBase::isKind(s->expr.kind)) need = true;
+        }
+        if (!need) return false;
+        size_t at = prog.here();
+        std::vector<E> xs;
+        for (auto* s : items) xs.push_back(expr(s->expr));
+        if (prog.here() != at) unsupported("event expression with a call");
+        bool rel = false;
+        for (auto& x : xs) rel = rel || hasRel(x);
+        if (!rel && eventExprHook()) return false;   // static: a signal kept equal to it (eventSignal)
+        auto put = [&](int sg, E v) { Instr a; a.k = IK::Assign; a.sig = sg; a.e = v; prog.emit(a); };
+        std::vector<int> olds, nws;
+        for (size_t k = 0; k < items.size(); k++) {
+            int w = (int)items[k]->expr.type->getBitWidth();
+            if (w <= 0) unsupported("event on an expression of this type");
+            olds.push_back(fresh(w));
+            nws.push_back(fresh(w));
+            put(olds[k], xs[k]);
+        }
+        size_t L = prog.here();
+        Instr wt; wt.k = IK::WaitEdge; wt.dynWait = true; wt.e = xs.size() == 1 ? xs[0] : node(Op::Concat, xs);
+        prog.emit(wt);
+        auto is = [](E v, uint64_t k) { return node(Op::CaseEq, {v, konst(make(k, 0, 1))}); };
+        auto unk = [&](E v) { return un(Op::LogNot, node(Op::LogOr, {is(v, 0), is(v, 1)})); };
+        E any;
+        for (size_t k = 0; k < items.size(); k++) {
+            const auto& s = *items[k];
+            put(nws[k], xs[k]);
+            E o = slice(::ref(olds[k]), 0, 0), n = slice(::ref(nws[k]), 0, 0);
+            E c;
+            if (s.edge == EdgeKind::None) c = un(Op::LogNot, node(Op::CaseEq, {::ref(olds[k]), ::ref(nws[k])}));
+            else {
+                E pos = node(Op::LogOr, {node(Op::LogAnd, {is(o, 0), un(Op::LogNot, is(n, 0))}), node(Op::LogAnd, {unk(o), is(n, 1)})});
+                E neg = node(Op::LogOr, {node(Op::LogAnd, {is(o, 1), un(Op::LogNot, is(n, 1))}), node(Op::LogAnd, {unk(o), is(n, 0)})});
+                c = s.edge == EdgeKind::PosEdge ? pos : s.edge == EdgeKind::NegEdge ? neg : node(Op::LogOr, {pos, neg});
+            }
+            if (s.iffCondition) c = node(Op::LogAnd, {c, expr(*s.iffCondition)});
+            any = any ? node(Op::LogOr, {any, c}) : c;
+        }
+        size_t jn = emitJmpIfNot(any);
+        size_t done = emitJmp();
+        prog.code[jn].target = prog.here();
+        for (size_t k = 0; k < items.size(); k++) put(olds[k], ::ref(nws[k]));
+        Instr back; back.k = IK::Jmp; back.target = L; prog.emit(back);
+        prog.code[done].target = prog.here();
+        return true;
+    }
+
     void timing(const slang::ast::TimingControl& t) {
         using namespace slang::ast;
         switch (t.kind) {
@@ -6175,6 +6246,7 @@ struct Lowerer {
                 break;
             }
             default: {  // SignalEvent or EventList: @(posedge a or negedge b ...)
+                if (dynEventWait(t)) break;
                 // @(ev iff c) (9.4.2.3): the event counts only when c is true
                 // as it happens, so wait again otherwise.
                 const Expression* iff = nullptr;
@@ -7632,7 +7704,12 @@ struct Lowerer {
             if (list[j]->kind == StatementKind::VariableDeclaration) {
                 const auto& v = list[j]->as<VariableDeclStatement>().symbol;
                 auto it = localMap().find(&v);
-                if (v.lifetime == VariableLifetime::Automatic && it != localMap().end() &&
+                // Only a one-slot variable is copied; an event (two slots), an
+                // array or a container stays shared with the block.
+                const Type& vt = v.getType().getCanonicalType();
+                bool oneSlot = !vt.isEvent() && !vt.isUnpackedArray() && !isDynType(vt) && !vt.isUnpackedStruct() &&
+                               !vt.isUnpackedUnion();
+                if (oneSlot && v.lifetime == VariableLifetime::Automatic && it != localMap().end() &&
                     std::find(frames.begin(), frames.end(), it->second.lay) != frames.end())
                     cand.insert(&v);
             }
