@@ -623,11 +623,12 @@ inline void collectRefs(const E& e, std::vector<int>& out) {
 // Signals read by this prog and by any prog it calls. @* / always_comb must see
 // a function body, or a call would hide the signals that should wake it.
 inline void collectProgRefsInto(const Prog& p, std::vector<int>& sigs, std::unordered_set<int>& have,
-                                std::vector<const Prog*>& seen) {
+                                std::vector<const Prog*>& seen, size_t from = 0, size_t to = SIZE_MAX) {
     for (const Prog* s : seen)
         if (s == &p) return;
     seen.push_back(&p);
-    for (auto& i : p.code) {
+    for (size_t pc = from; pc < std::min(to, p.code.size()); pc++) {
+        auto& i = p.code[pc];
         collectRefsInto(i.e, sigs, have);
         for (auto& a : i.args) collectRefsInto(a, sigs, have);  // $display / $strobe / $monitor
         for (auto& a : i.aidx) collectRefsInto(a, sigs, have);  // a[i] = ... reads i
@@ -648,10 +649,13 @@ inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, std::vector<c
 // a subroutine writes them itself, so two processes that call one function
 // would wake each other for ever.
 inline std::unordered_set<int>& subrLocalSigs() { static std::unordered_set<int> s; return s; }
-inline std::vector<std::pair<int, Edge>> readSet(const Prog& p) {
+// The signals read by code [from, to) of p: one statement, for the @* in
+// front of it (9.4.2.2).
+inline std::vector<std::pair<int, Edge>> readSet(const Prog& p, size_t from = 0, size_t to = SIZE_MAX) {
     std::vector<int> sigs;
     std::vector<const Prog*> seen;
-    collectProgRefs(p, sigs, seen);
+    std::unordered_set<int> have;
+    collectProgRefsInto(p, sigs, have, seen, from, to);
     std::unordered_set<int> own;
     for (const Prog* q : seen)
         if (q != &p) own.insert(q->locals.begin(), q->locals.end());
