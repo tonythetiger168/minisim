@@ -117,6 +117,7 @@ public:
     // false (msim -vhdl4, mlint): std_logic is four-valued.
     bool nine = false;
     bool firstRunWait = true;   // false for mlint: the #0 before a process's first run is a simulation detail
+    bool goStart = true;        // false with msim -upf: no design-wide first run (goProcess)
 
     void add(const std::vector<UP>& units) {
         for (auto& u : units) {
@@ -3425,6 +3426,7 @@ private:
 package vhdl_rt;
   timeunit )SV" + timeUnit + "; timeprecision " + timePrec + R"SV(;
   int errors = 0;
+  event go; bit started;   // the first run of the processes (Translator::goProcess)
   function automatic int imod(int a, int b);
     int r = a % b;
     if (r != 0 && ((r < 0) != (b < 0))) r += b;
@@ -6362,7 +6364,7 @@ endpackage
             curDrivers = &di;
             for (auto& s : stmts) conc << concStmt(*s, "");
             curDrivers = nullptr;
-            o << body.str() << helpers.str() << conc.str() << extra.str() << resolvedAux() << "endmodule\n";
+            o << body.str() << helpers.str() << conc.str() << extra.str() << resolvedAux() << goTrigger() << "endmodule\n";
         } catch (...) {
             cx = saved;
             throw;
@@ -6514,6 +6516,21 @@ endpackage
 
     std::string procName(const std::string& label) { return label.empty() ? "" : " : " + svId(label); }
 
+    // A process with a sensitivity list (14.7.5.2): `always @(<sensitivity> or vhdl_rt::go)` gated by
+    // vhdl_rt::started. One #0 per design (goTrigger) sets started and
+    // triggers go, so every such process runs its first time where its own
+    // #0 used to put it, and a change before that does nothing, as before.
+    // The process has no wait of its own, and its previous values for
+    // 'event and rising_edge are its own variables, so msim can schedule it
+    // statically (prog.hpp seqShape) instead of keeping it a coroutine.
+    bool goForm() const { return !synth && firstRunWait && goStart; }
+    std::string goProcess(const std::string& label, const std::string& decls, const std::string& body, const std::vector<std::string>& sens) {
+        return "  always @(" + eventList(sens) + " or vhdl_rt::go) if (vhdl_rt::started) begin" + procName(label) + "\n" + decls + body + "  end\n";
+    }
+    std::string goTrigger() const {
+        return goForm() ? "  initial begin #0; if (!vhdl_rt::started) begin vhdl_rt::started = 1; ->vhdl_rt::go; end end\n" : "";
+    }
+
     // an equivalent process: body once at time 0, then wait on the signals read
     std::string equivProcess(const std::string& label, const std::string& bodyText0, const std::vector<std::string>& sigs, bool postponed = false, const Proc* pr = nullptr) {
         std::string prevDecl, prevUpd, bodyText = bodyText0;
@@ -6526,6 +6543,8 @@ endpackage
         replaceAll(bodyText, "@@PREV@@", prevUpd);
         if (synth && prevDecl.empty() && !sigs.empty() && bodyText.find("@(") == std::string::npos && bodyText.find("wait") == std::string::npos)
             return "  always @* begin" + procName(label) + "\n" + bodyText + "  end\n";
+        if (goForm() && !sigs.empty() && bodyText.find("@(") == std::string::npos && bodyText.find("wait") == std::string::npos)
+            return goProcess(label, prevDecl, bodyText + (prevUpd.empty() ? "" : "    " + prevUpd + "\n"), sigs);
         std::string r = "  always begin" + procName(label) + "\n" + prevDecl + firstRun() + bodyText;
         if (sigs.empty()) r += "    " + prevUpd + "wait (0);\n";
         else r += "    " + prevUpd + "@(" + eventList(sigs) + ");\n";
@@ -6826,6 +6845,8 @@ endpackage
                 replaceAll(body, "@@PREV@@", prevUpd);
                 if (synth && s.hasSens && !sens.empty() && prevDecl.empty()) {
                     out = "  always @* begin" + procName(s.label) + "\n" + decls.str() + body + "  end\n";
+                } else if (goForm() && s.hasSens && !sens.empty()) {
+                    out = goProcess(s.label, decls.str() + prevDecl, body + (prevUpd.empty() ? "" : "    " + prevUpd + "\n"), sens);
                 } else {
                     out = "  always begin" + procName(s.label) + "\n" + decls.str() + prevDecl + firstRun() + body;
                     if (s.hasSens) {

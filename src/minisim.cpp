@@ -653,7 +653,9 @@ struct Sim {
     // wake-ups, safe from a clocked batch running in parallel.
     void poke(int s, Val nv, int hi, int lo) {
         Sig& g = sigs[s];
-        if (hi >= 0) nv = v_insert(g.val, nv, hi, lo);
+        // get(): the stored value's own width may not be the signal's yet
+        // (a variable never written whole keeps its 1-bit default).
+        if (hi >= 0) nv = v_insert(get(s), nv, hi, lo);
         nv = maskWidth(nv, g.w);
         nv.sgn = false;
         g.val = nv;
