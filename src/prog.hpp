@@ -953,7 +953,8 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::v
 // own (Instr::tmp, msim -xprop). Typical always @(posedge clk) RTL. It
 // reads signals and writes nothing until the NBA region, so all such
 // processes triggered in one slot can run at the same time.
-inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
+// sys (msim -compile only): $display and $finish too, run where they are.
+inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev, bool sys = false) {
     size_t n = p.code.size();
     if (n < 3) return false;
     const Instr& w = p.code[0];
@@ -968,6 +969,7 @@ inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev) {
             if (x.target < 1 || x.target > n - 1) return false;
             if (x.xt != Instr::NOX && (x.xt < 1 || x.xt > n - 1)) return false;
         } else if (x.k == IK::Assign && x.tmp) {
+        } else if (sys && ((x.k == IK::Display && x.fd == nullptr) || x.k == IK::Finish)) {
         } else
             return false;
     }
