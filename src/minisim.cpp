@@ -200,6 +200,8 @@ struct Pool {
     void work(int id, uint32_t b) {
         int T = active.load(memory_order_relaxed);
         if (id >= T) return;
+        static const bool noSteal = std::getenv("MSIM_NOSTEAL") != nullptr;   // debugging: each thread its own share only
+        if (noSteal) { drain(slots[id], b); return; }
         for (int k = 0; k < T; k++)
             if (!drain(slots[(id + k) % T], b)) return;
     }
@@ -483,6 +485,8 @@ struct Sim {
         std::chrono::steady_clock::time_point t0;
         int pick(int maxT) {
             if (maxT <= 1) return 1;
+            static const int fixed = [] { const char* e = std::getenv("MSIM_TUNE_FIXED"); return e ? std::atoi(e) : 0; }();   // debugging: no tuning
+            if (fixed > 0) return std::min(fixed, maxT);
             if (cand < 0) {
                 if (++n < kKeep) return best;
                 cand = 0; n = 0; sum = 0; bestNs = INT64_MAX;   // re-measure

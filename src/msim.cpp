@@ -1954,7 +1954,12 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             if (same && hdrSame && sameFlags && std::filesystem::exists(obj, ec)) continue;
             std::filesystem::remove(obj, ec);
             jobs.push_back(shq(cc) + cflags + " -c " + shq(path) + " -o " + shq(obj));
-            jobMB.push_back(300 + 600.0 * (text.size() + files[0].second.size()) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
+            // design.cpp of a split build is mostly tables: about 60 MB of
+            // compiler memory per MB (1024 PicoRV32 cores: 78 MB, 4.6 GB), not
+            // the 600 of code. Estimated as code, it ran alone for half an hour
+            // while every part waited.
+            const bool tables = name == "design.cpp" && files.size() > 2;
+            jobMB.push_back(300 + (tables ? 80.0 : 600.0) * (text.size() + files[0].second.size()) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
         }
         // Remove parts left from an earlier, larger split.
         for (int k = (int)files.size() - 2;; k++) {
