@@ -9855,7 +9855,10 @@ struct Lowerer {
     void finishImplicit() {
         if (implicitWaits.empty()) return;
         auto rs = readSet(prog);
-        if (rs.empty()) unsupported("@* in a block that reads no signals");
+        if (rs.empty()) {   // @* with nothing to wait on never triggers (9.4.2.2): a signal nothing writes
+            std::cerr << "msim: warning: " << whereStr() << "@* reads no signals, so it never triggers\n";
+            rs.push_back({freshStatic(1), ANY});
+        }
         for (size_t pc : implicitWaits) prog.code[pc] = waitInstr(rs);
     }
 
@@ -12234,10 +12237,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             dl.setScope(g.getParentScope());
             // Gates (logic, bufif/notif, MOS, UDP) drive like a continuous
             // assignment, so their delays may be expressions too, read at each
-            // output change (28.16). A tran's are not.
+            // output change (28.16); a tranif's delay its control.
             std::string_view pn = g.primitiveType.name;
-            bool driven = pn.find("tran") == std::string_view::npos;
-            gdly = dl.delays3(g.getDelay(), driven);
+            gdly = dl.delays3(g.getDelay(), true);
             gateDlyE = std::move(dl.dynDly);
         }
         gateDelay = &gdly;
@@ -12494,6 +12496,24 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             if (!ports[2]) Lowerer::unsupported("tran ports");
             i.e = resize(lw.expr(*ports[2]), 1, false, false);
             i.pdown = name.back() == '0';
+            // tranif #(on, off) (28.16): the switch turns on `on` after its
+            // control does, and off `off` after. The control goes through a
+            // delayed driver of a net of its own: for tranif1 turning on is
+            // the control's rise, for tranif0 its fall.
+            if (gateDelay && !gateDelay->empty()) {
+                std::vector<uint64_t> d = *gateDelay;
+                std::vector<E> dE = gateDlyE;
+                if (d.size() > 2) { d.resize(2); if (dE.size() > 2) dE.resize(2); }
+                if (i.pdown && d.size() == 2) { std::swap(d[0], d[1]); if (dE.size() == 2) std::swap(dE[0], dE[1]); }
+                int c = mkSig("_tranctl" + std::to_string((*tempSeq)++), 1, true);
+                Lowerer cl(sigmap);
+                prep(cl);
+                Instr a; a.k = IK::Assign; a.sig = c; a.e = i.e;
+                a.dly = d;
+                a.dlyE = dE;
+                finishAssign(cl, a);
+                i.e = ref(c);
+            }
         }
         lw.prog.emit(i);
         bool loops = false;
