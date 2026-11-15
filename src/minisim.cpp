@@ -825,6 +825,7 @@ struct Sim {
         for (size_t s = 0; s < sigs.size(); s++) {
             if (sigs[s].w > 64) quiet[s] = 0;   // (a net whose one continuous assign msim merged into a plain write has no driver and is stored like a variable)
             if (s < tranOf.size() && !tranOf[s].empty()) quiet[s] = 0;   // a tran net: drive() resolves its group
+            if (s < mosOf.size() && !mosOf[s].empty()) quiet[s] = 0;   // a MOS data input: drive() passes its strength on
             if (s < seqOf.size())
                 if (!seqOf[s].empty()) quiet[s] = 0;   // a clock: set() detects its edges
             if (s < combOf.size())
@@ -976,11 +977,69 @@ struct Sim {
         sigs[s].drv.push_back(Drv{allz(sigs[s].w), STR_STRONG, STR_STRONG});
         return (int)sigs[s].drv.size() - 1;
     }
+    // MOS switches pass the strength of their data input (28.13, 28.14).
+    // Each switch is two drivers of its output (one for the 0 strength, one
+    // for the 1); a link gives such a driver the strength its data bit has
+    // now, and a change of the data net's drivers that changes that strength
+    // drives the output again, even when the data value stays the same.
+    struct MosLink { int out, drv, src, bit; bool resist, part; };
+    vector<MosLink> mosLinks;
+    vector<vector<int>> mosOf;                // data signal -> its links
+    unordered_map<uint64_t, int> mosAt;       // (out, drv) -> link
+    int mosDepth = 0;
+    static uint64_t mosKey(int s, int d) { return (uint64_t)(uint32_t)s << 32 | (uint32_t)d; }
+    void addMos(int out, int drv, int src, int bit, bool resist, bool part) {
+        if (mosOf.size() < sigs.size()) mosOf.resize(sigs.size());
+        mosAt[mosKey(out, drv)] = (int)mosLinks.size();
+        mosOf[(size_t)src].push_back((int)mosLinks.size());
+        mosLinks.push_back({out, drv, src, bit, resist, part});
+    }
+    // The strength with which bit b of signal s is driven to level lvl (0 or 1):
+    // its strongest driver of that level (or of x). A variable, or a net
+    // msim writes directly, is strong; supply nets are supply; an undriven
+    // tri0 / tri1 is pull and an undriven trireg holds its charge (28.15).
+    uint8_t levelStrength(int s, int b, int lvl) const {
+        const Sig& g = sigs[(size_t)s];
+        if (g.kind == NR_SUPPLY0 || g.kind == NR_SUPPLY1) return STR_SUPPLY;
+        if (g.drv.empty()) return STR_STRONG;
+        uint8_t best = STR_HIZ;
+        for (const Drv& dr : g.drv) {
+            int v = bitAt(dr.v, b);
+            if (v == 2 || v == lvl) best = std::max(best, lvl ? dr.s1 : dr.s0);
+        }
+        if (best == STR_HIZ) {
+            if (g.kind == NR_TRI0 || g.kind == NR_TRI1) return STR_PULL;
+            if (g.kind == NR_TRIREG) return chargeOf(s);
+        }
+        return best;
+    }
+    void mosStrength(const MosLink& L, int& s0, int& s1) const {
+        if (L.part) s1 = tranReduce(levelStrength(L.src, L.bit, 1), L.resist);
+        else s0 = tranReduce(levelStrength(L.src, L.bit, 0), L.resist);
+    }
+    __attribute__((noinline)) void mosAgain(int src) {
+        if (mosDepth > 16) return;   // a ring of switches: stop rather than recurse forever
+        mosDepth++;
+        for (int id : mosOf[(size_t)src]) {
+            const MosLink& L = mosLinks[(size_t)id];
+            const Drv& dr = sigs[(size_t)L.out].drv[(size_t)L.drv];
+            int s0 = dr.s0, s1 = dr.s1;
+            mosStrength(L, s0, s1);
+            if (s0 != dr.s0 || s1 != dr.s1) drive(L.out, L.drv, dr.v, s0, s1);
+        }
+        mosDepth--;
+    }
+
     void drive(int s, int d, Val v, int s0 = STR_STRONG, int s1 = STR_STRONG) {
         auto& g = sigs[s];
+        if (__builtin_expect(!mosAt.empty(), 0)) {
+            auto it = mosAt.find(mosKey(s, d));
+            if (it != mosAt.end()) mosStrength(mosLinks[(size_t)it->second], s0, s1);
+        }
         g.drv[d].v = g.w <= 64 ? make(v.v, v.x, g.w, v.z) : clipRead(v, g.w);
         g.drv[d].s0 = (uint8_t)s0;
         g.drv[d].s1 = (uint8_t)s1;
+        if (__builtin_expect(!mosOf.empty(), 0) && (size_t)s < mosOf.size() && !mosOf[(size_t)s].empty()) mosAgain(s);
         if (__builtin_expect(!varPathDrv.empty(), 0) && !applyingVar) {   // a variable path output's port (30.4)
             auto vp = varPathDrv.find({s, d});
             if (vp != varPathDrv.end()) {
