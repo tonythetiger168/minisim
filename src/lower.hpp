@@ -12942,7 +12942,9 @@ inline void patchImplicit(Prog& prog) {
 // time and to completion, so it keeps static signals: that is the same
 // behavior (its locals are set again on every call) and -compile handles it.
 inline std::unordered_set<const slang::ast::SubroutineSymbol*>
-framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all) {
+framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all,
+                  const std::vector<const slang::ast::ProceduralBlockSymbol*>& procs = {},
+                  const std::vector<const slang::ast::SubroutineSymbol*>& exported = {}) {
     using namespace slang::ast;
     struct Scan : ASTVisitor<Scan, VisitFlags::Statements | VisitFlags::Expressions> {
         std::vector<const SubroutineSymbol*> callees;
@@ -12965,7 +12967,42 @@ framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all) {
         calls[s] = std::move(sc.callees);
         if (Lowerer::isDynType(s->getReturnType())) { out.insert(s); continue; }   // the result is a frame container
         if (!isAutomatic(*s)) continue;
-        if (s->subroutineKind == SubroutineKind::Task || isClassMethod(*s) || sc.forks) out.insert(s);
+        if (isClassMethod(*s) || sc.forks) out.insert(s);
+    }
+    // An automatic task needs frames only when two activations can overlap
+    // (13.3.2). One procedure that calls it, directly or through other
+    // subroutines, without a fork, runs one activation at a time: such a task
+    // lowers static like a function. `runs` counts the activations that may
+    // reach a subroutine; anything reached from a framed subroutine, a DPI
+    // export or a procedure with a fork counts as many.
+    std::unordered_map<const SubroutineSymbol*, int> runs;
+    auto spread = [&](const std::vector<const SubroutineSymbol*>& from, int n) {
+        std::unordered_set<const SubroutineSymbol*> seen;
+        std::vector<const SubroutineSymbol*> todo(from.begin(), from.end());
+        while (!todo.empty()) {
+            auto* c = todo.back();
+            todo.pop_back();
+            if (!seen.insert(c).second) continue;
+            runs[c] += n;
+            for (auto* d : calls[c]) todo.push_back(d);
+        }
+    };
+    for (auto* p : procs) {   // one entry per instance the procedure runs in
+        Scan sc;
+        p->getBody().visit(sc);
+        spread(sc.callees, sc.forks ? 2 : 1);
+    }
+    for (auto* s : exported) spread({s}, 2);
+    std::vector<const SubroutineSymbol*> framedNow(out.begin(), out.end());
+    for (auto* s : framedNow) spread(calls[s], 2);
+    for (bool more = true; more;) {
+        more = false;
+        for (auto* s : all)
+            if (isAutomatic(*s) && s->subroutineKind == SubroutineKind::Task && !out.count(s) && runs[s] != 1) {
+                out.insert(s);
+                spread(calls[s], 2);
+                more = true;
+            }
     }
     // Automatic functions on a call cycle (13.4.2).
     for (auto* s : all) {
@@ -13478,6 +13515,8 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             visitDefault(inst);
         }
         void handle(const slang::ast::SubroutineSymbol& s) { found.push_back(&s); }
+        std::vector<const slang::ast::ProceduralBlockSymbol*> procs;   // once per instance it runs in
+        void handle(const slang::ast::ProceduralBlockSymbol& p) { procs.push_back(&p); visitDefault(p); }
         std::vector<const slang::ast::ClassType*> classes;
         void handle(const slang::ast::ClassType& c) { classes.push_back(&c); visitDefault(c); }
         void handle(const slang::ast::CovergroupType&) {}   // its methods are built in (19.8)
@@ -13580,7 +13619,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         }
     };
     Lowerer setup(sigmap);
-    auto framed = framedSubroutines(finder.found);
+    std::vector<const slang::ast::SubroutineSymbol*> exported;
+    for (const auto& ex : comp.getDPIExports())
+        if (ex.subroutine) exported.push_back(ex.subroutine);
+    auto framed = framedSubroutines(finder.found, finder.procs, exported);
     for (const slang::ast::SubroutineSymbol* sym : finder.found) {
         if (!sym->flags.has(slang::ast::MethodFlags::DPIImport) || dpiMap().count(sym)) continue;
         using namespace slang::ast;
