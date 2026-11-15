@@ -1865,7 +1865,8 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     FrameP bf = bn < i.blays.size() && i.blays[bn] ? newFrame(i.blays[bn], ff, ff ? ff->self : 0) : ff;
                     Task t = startProc(b, c, std::move(bf));
                     S.all.push_back(t.h);
-                    S.active.push_back(t.h);
+                    if (i.armNow) t.h.resume();   // runs to its first wait now; the loop top sets this process's globals again
+                    else S.active.push_back(t.h);
                 }
                 pc++;
                 if (i.join != 2) { co_await JoinWait{js}; TO_REACTIVE; }

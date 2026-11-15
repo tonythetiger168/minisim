@@ -5345,8 +5345,7 @@ struct Lowerer {
         bool inner = i.hi >= 0 || i.bidx;
         if (inner) {
             auto K = [](int64_t v) { return konst(make((uint64_t)v, 0, 64, 0, true)); };
-            if (!i.bidx && ps.known) {
-                if (ps.cbit < 0 || ps.cbit + ps.bits > i.hi - i.lo + 1) unsupported("constant select outside the element");
+            if (!i.bidx && ps.known && ps.cbit >= 0 && ps.cbit + ps.bits <= i.hi - i.lo + 1) {
                 i.lo += (int)ps.cbit;
                 i.hi = i.lo + ps.bits - 1;
                 return;
@@ -5360,8 +5359,15 @@ struct Lowerer {
             i.lo = 0;
             return;
         }
+        if (ps.known && ps.cbit < 0) {   // partly below bit 0 (11.5.1): the run-time select writes only the bits in range
+            i.bidx = konst(make((uint64_t)ps.cbit, 0, 64, 0, true));
+            i.pw = ps.bits;
+            i.pdown = false;
+            i.hi = 0;
+            i.lo = 0;
+            return;
+        }
         if (ps.known) {
-            if (ps.cbit < 0) unsupported("constant select outside the vector");
             i.lo = (int)ps.cbit;
             i.hi = (int)(ps.cbit + ps.bits - 1);
             return;
@@ -9575,6 +9581,7 @@ struct Lowerer {
                     int w = storeW(*a.left().type);
                     needWidth(w);
                     Instr f; f.k = IK::Fork; f.join = 2;
+                    f.armNow = true;   // waiting for e from this statement on (9.4.5), not from when the parent next waits
                     FrameLayout* flay = newLayout("nba event");
                     int slot = flay->add(w, w > 64 ? allx(w) : Val{});
                     f.init.push_back({slot, resize(i.e, w, a.right().type->isSigned(), false)});
