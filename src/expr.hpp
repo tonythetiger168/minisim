@@ -2061,9 +2061,10 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
         if (i >= fmt.size()) break;
         char cv = (char)tolower((unsigned char)fmt[i]);
         if (cv == 'm') { if (!skip) { scanOut().push_back(mkstr("")); n++; } continue; }
-        if (cv == '\x01' || cv == '\x02') {   // %u / %z: `width` 32-bit words, LSB word first, 2- or 4-value (21.3.4.3)
+        if (cv == '\x01' || cv == '\x02') {   // %u / %z: `width` bits in whole 32-bit words, LSB word first, 2- or 4-value (21.3.4.3)
             bool four = cv == '\x02';
-            int words = std::max(1, width);
+            int bits = width > 0 ? width : 32;
+            int words = (bits + 31) / 32;
             std::vector<uint32_t> raw;
             bool full = true;
             for (int wd = 0; wd < words * (four ? 2 : 1) && full; wd++) {
@@ -2077,12 +2078,14 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
             }
             if (!full) { if (!any) eof = true; break; }
             any = true;
+            if (skip) continue;
             Val v = v_resize(make(0, 0, 32, 0), words * 32, false);
             for (int wd = 0; wd < words; wd++) {
                 uint32_t a = four ? raw[(size_t)wd * 2] : raw[(size_t)wd], bv = four ? raw[(size_t)wd * 2 + 1] : 0;
                 Val part = make(a & ~bv, bv, 32, ~a & bv);   // vecval: b=1 is x (a=1) or z (a=0)
                 v = v_insert(v, part, wd * 32 + 31, wd * 32);
             }
+            if (bits < words * 32) v = v_resize(v, bits, false);
             scanOut().push_back(v);
             n++;
             continue;
