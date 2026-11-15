@@ -40,8 +40,12 @@ timeouts, and exports `APT_OK` (`1` or `0`).
    miss. Check the license first (`third-party-code`).
 6. **Pin actions to a commit SHA** with the version in a comment, as the
    existing steps do.
-7. **Do not raise build parallelism** in the slang job above `-j2`: unbounded
-   `-j` was killed (exit 143) on the hosted runner.
+7. **Bound build parallelism** in the slang job to `-j4` (the runner's core
+   count): unbounded `-j` was killed (exit 143) on the hosted runner. `-j4`
+   peaked at about 10 GB of the runner's 16 GB (2026-11-15); if new tools push
+   it near the limit, drop back rather than letting the build be killed. Tests
+   run with `ctest -j4`, so a new test must not depend on running alone (no
+   fixed output paths shared with another test, no fixed ports).
 8. The two job names, `build-and-test` and `build-and-test-slang`, are the
    required checks on `main`. Renaming either blocks every merge.
 9. Apply the same change to `release.yml` when it has the same step.
