@@ -9328,6 +9328,113 @@ struct Lowerer {
         }
     }
 
+    // a <= @(e) b, a <= repeat (n) @(e) b (9.4.5): b (val) is taken now; a
+    // forked process waits for the event(s) and then schedules the update.
+    void nbaEvent(const slang::ast::AssignmentExpression& a, const slang::ast::TimingControl& tc0, E val) {
+        using namespace slang::ast;
+        const TimingControl* tc = &tc0;
+        if (!store) unsupported("nonblocking assignment with an intra-assignment event control here");
+        int w = storeW(*a.left().type);
+        needWidth(w);
+        Instr f; f.k = IK::Fork; f.join = 2;
+        f.armNow = true;   // waiting for e from this statement on (9.4.5), not from when the parent next waits
+        FrameLayout* flay = newLayout("nba event");
+        int slot = flay->add(w, w > 64 ? allx(w) : Val{});
+        f.init.push_back({slot, resize(val, w, a.right().type->isSigned(), false)});
+        int cslot = -1;
+        const TimingControl* ev = tc;
+        if (tc->kind == TimingControlKind::RepeatedEvent) {
+            const auto& re = tc->as<RepeatedEventControl>();
+            cslot = flay->add(32, Val{});
+            f.init.push_back({cslot, resize(expr(re.expr), 32, re.expr.type->isSigned(), true)});
+            ev = &re.event;
+        }
+        f.lay = flay;
+        Lowerer lw(sigmap);
+        lw.bind(subs, mkSig, tempSeq, store);
+        lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
+        lw.current = current;
+        lw.retSig = retSig;
+        lw.scope = scope;
+        lw.sampleEv = sampleEv;
+        lw.curClass = curClass;
+        FrameLayout* bl = newLayout("fork branch");
+        lw.frames = frames;
+        lw.frames.push_back(flay);
+        lw.frames.push_back(bl);
+        f.blays.push_back(bl);
+        // The target's index expressions are taken with the right-hand side
+        // (10.4.2), not when the event comes: a slot each in the fork's frame.
+        {
+            std::function<void(const Expression&)> walk = [&](const Expression& x0) {
+                const Expression& x = peel(x0);
+                auto pin = [&](const Expression& sel) {
+                    E v = expr(sel);
+                    if (v->op == Op::Const) return;
+                    int sw = std::max(1, (int)sel.type->getBitWidth());
+                    needWidth(sw);
+                    int so = flay->add(sw, sw > 64 ? allx(sw) : Val{});
+                    f.init.push_back({so, resize(v, sw, sel.type->isSigned(), sel.type->isSigned())});
+                    lw.exprOverride[&sel] = lw.relIn(flay, so);
+                };
+                switch (x.kind) {
+                case ExpressionKind::Concatenation:
+                    for (auto* op : x.as<ConcatenationExpression>().operands()) walk(*op);
+                    break;
+                case ExpressionKind::ElementSelect:
+                    walk(x.as<ElementSelectExpression>().value());
+                    pin(x.as<ElementSelectExpression>().selector());
+                    break;
+                case ExpressionKind::RangeSelect:
+                    walk(x.as<RangeSelectExpression>().value());
+                    pin(x.as<RangeSelectExpression>().left());
+                    pin(x.as<RangeSelectExpression>().right());
+                    break;
+                case ExpressionKind::MemberAccess: walk(x.as<MemberAccessExpression>().value()); break;
+                default: break;
+                }
+            };
+            const Expression* t0 = &a.left();
+            if (const Expression* c = modportConn(peel(*t0))) t0 = c;
+            walk(*t0);
+        }
+        if (cslot >= 0) {
+            int cnt = lw.relIn(flay, cslot);
+            size_t top = lw.prog.here();
+            Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(cnt, true), konst(make(0, 0, 32, 0, true)));
+            size_t jf = lw.prog.emit(j);
+            lw.timing(*ev);
+            Instr dec; dec.k = IK::Assign; dec.sig = cnt; dec.e = bin(Op::Sub, ref(cnt, true), konst(make(1, 0, 32, 0, true)));
+            lw.prog.emit(dec);
+            Instr back; back.k = IK::Jmp; back.target = top; lw.prog.emit(back);
+            lw.prog.code[jf].target = lw.prog.here();
+        } else {
+            lw.timing(*ev);
+        }
+        const Expression* tgt = &a.left();
+        if (const Expression* c = modportConn(peel(*tgt))) tgt = c;
+        if (peel(*tgt).kind == ExpressionKind::Concatenation) {   // {a, b} <= @e v: each part its slice (11.4.12)
+            std::vector<std::tuple<const Expression*, int, int>> parts;
+            concatParts(*tgt, w - 1, parts);
+            for (auto& [x, hi, lo] : parts) {
+                Instr n; n.k = IK::Nba;
+                lw.lhs(*x, n);
+                if (n.dyn >= 0) unsupported("nonblocking write to a container element");
+                n.e = slice(ref(lw.relIn(flay, slot)), hi, lo);
+                lw.prog.emit(n);
+            }
+        } else {
+            Instr n; n.k = IK::Nba;
+            lw.lhs(a.left(), n);
+            n.e = ref(lw.relIn(flay, slot), a.left().type->isSigned());
+            lw.prog.emit(n);
+        }
+        lw.finishImplicit();
+        store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
+        f.branches.push_back(store->back().get());
+        prog.emit(f);
+    }
+
     // {a, b} = v; {a, b} <= v; {a, b} = #d v: v is evaluated once, into a
     // temporary as wide as the target, and each part takes its slice.
     void concatAssign(const slang::ast::AssignmentExpression& a) {
@@ -9352,7 +9459,8 @@ struct Lowerer {
                 delayInto(tc->as<DelayControl>().expr, d);
                 later = true;
             } else if (a.isNonBlocking()) {
-                unsupported("nonblocking assignment with an intra-assignment event control");
+                nbaEvent(a, *tc, ref(tmp));
+                return;
             } else if (tc->kind == TimingControlKind::RepeatedEvent) {
                 unsupported("repeat event control on a concatenation assignment");
             } else {
@@ -9664,60 +9772,7 @@ struct Lowerer {
             if (const TimingControl* tc = a.timingControl; tc && tc->kind != TimingControlKind::Delay) {
                 // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
                 // written after the event (n events for repeat).
-                if (a.isNonBlocking()) {   // a <= @(e) b: a forked process waits and then schedules the update
-                    if (!store) unsupported("nonblocking assignment with an intra-assignment event control here");
-                    int w = storeW(*a.left().type);
-                    needWidth(w);
-                    Instr f; f.k = IK::Fork; f.join = 2;
-                    f.armNow = true;   // waiting for e from this statement on (9.4.5), not from when the parent next waits
-                    FrameLayout* flay = newLayout("nba event");
-                    int slot = flay->add(w, w > 64 ? allx(w) : Val{});
-                    f.init.push_back({slot, resize(i.e, w, a.right().type->isSigned(), false)});
-                    int cslot = -1;
-                    const TimingControl* ev = tc;
-                    if (tc->kind == TimingControlKind::RepeatedEvent) {
-                        const auto& re = tc->as<RepeatedEventControl>();
-                        cslot = flay->add(32, Val{});
-                        f.init.push_back({cslot, resize(expr(re.expr), 32, re.expr.type->isSigned(), true)});
-                        ev = &re.event;
-                    }
-                    f.lay = flay;
-                    Lowerer lw(sigmap);
-                    lw.bind(subs, mkSig, tempSeq, store);
-                    lw.tsUnit = tsUnit; lw.tsPrec = tsPrec;
-                    lw.current = current;
-                    lw.retSig = retSig;
-                    lw.scope = scope;
-                    lw.sampleEv = sampleEv;
-                    lw.curClass = curClass;
-                    FrameLayout* bl = newLayout("fork branch");
-                    lw.frames = frames;
-                    lw.frames.push_back(flay);
-                    lw.frames.push_back(bl);
-                    f.blays.push_back(bl);
-                    if (cslot >= 0) {
-                        int cnt = lw.relIn(flay, cslot);
-                        size_t top = lw.prog.here();
-                        Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Gt, ref(cnt, true), konst(make(0, 0, 32, 0, true)));
-                        size_t jf = lw.prog.emit(j);
-                        lw.timing(*ev);
-                        Instr dec; dec.k = IK::Assign; dec.sig = cnt; dec.e = bin(Op::Sub, ref(cnt, true), konst(make(1, 0, 32, 0, true)));
-                        lw.prog.emit(dec);
-                        Instr back; back.k = IK::Jmp; back.target = top; lw.prog.emit(back);
-                        lw.prog.code[jf].target = lw.prog.here();
-                    } else {
-                        lw.timing(*ev);
-                    }
-                    Instr n; n.k = IK::Nba;
-                    lw.lhs(a.left(), n);
-                    n.e = ref(lw.relIn(flay, slot), a.left().type->isSigned());
-                    lw.prog.emit(n);
-                    lw.finishImplicit();
-                    store->push_back(std::make_unique<Prog>(std::move(lw.prog)));
-                    f.branches.push_back(store->back().get());
-                    prog.emit(f);
-                    return;
-                }
+                if (a.isNonBlocking()) { nbaEvent(a, *tc, i.e); return; }   // a <= @(e) b
                 int w = (int)a.left().type->getBitWidth();
                 needWidth(w);
                 int tmp = fresh(w);
