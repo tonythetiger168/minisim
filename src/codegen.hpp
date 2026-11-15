@@ -54,6 +54,11 @@ struct CodegenSig {
     int w = 1;
     bool net = false;
     int drivers = 0;
+    // A narrow signal that is not all X before time 0 (an `always @*` arming
+    // flag, msim.cpp rotateAtStar): its value, set right after S.sig.
+    bool init = false;
+    uint64_t v = 0, x = 0, z = 0;
+    bool zeroWide = false;   // a wider one that is all 0 (-x-initial 0)
 };
 
 struct CodegenProc {
@@ -392,13 +397,20 @@ public:
             o << SV << "PSig PA[" << std::max<size_t>(np, 1) << "];\n";
             for (size_t x = 0; x < priv_.size(); x++)
                 if (priv_[x]) o << SV << "PSig& P" << x << " = PA[" << x << "];\n";
-            o << "struct PInitRow { uint32_t s; uint64_t m; bool net; };\nstatic const PInitRow PINIT[] = {";
+            // A variable known before time 0 (CodegenSig::init: -x-initial 0, an
+            // arming flag) starts with that value.
+            o << "struct PInitRow { uint32_t s; uint64_t v, x, z; };\nstatic const PInitRow PINIT[] = {";
             size_t c = 0;
             for (size_t x = 0; x < priv_.size(); x++)
-                if (priv_[x]) o << (c++ ? ", " : "") << "{" << x << ", " << M(sigW_[x]) << ", " << (sigNet_[x] ? "true" : "false") << "}";
-            if (!c) o << "{0, 0, false}";
+                if (priv_[x]) {
+                    const bool k = x < sigs.size() && sigs[x].init && !sigNet_[x];
+                    o << (c++ ? ", " : "") << "{" << x << ", " << (k ? std::to_string(sigs[x].v) + "ULL" : "0") << ", "
+                      << (k ? std::to_string(sigs[x].x) + "ULL" : M(sigW_[x])) << ", "
+                      << (k ? std::to_string(sigs[x].z) + "ULL" : sigNet_[x] ? M(sigW_[x]) : "0") << "}";
+                }
+            if (!c) o << "{0, 0, 0, 0}";
             o << "};\n";
-            if (c) privInit_ = "    for (auto& e : PINIT) { PA[e.s].x = e.m; PA[e.s].z = e.net ? e.m : 0; }\n";
+            if (c) privInit_ = "    for (auto& e : PINIT) { PA[e.s].v = e.v; PA[e.s].x = e.x; PA[e.s].z = e.z; }\n";
         }
         if (!armIns_.empty()) {   // armChk: the private inputs of each arming process, and their values when it began to wait
             std::string in, off = "0";
@@ -682,6 +694,18 @@ public:
                  "        S.sig(SIGS[s].n, SIGS[s].w, SIGS[s].net);\n"
                  "        for (int d = 0; d < SIGS[s].drv; d++) S.newDriver(s);\n"
                  "    }\n";
+            std::string iv;
+            for (size_t s = 0; s < sigs.size(); s++)
+                if (sigs[s].init) iv += "        {" + std::to_string(s) + ", " + std::to_string(sigs[s].v) + "ULL, " + std::to_string(sigs[s].x) + "ULL, " + std::to_string(sigs[s].z) + "ULL},\n";
+            std::string zw;
+            for (size_t s = 0; s < sigs.size(); s++)
+                if (sigs[s].zeroWide) zw += std::to_string(s) + ", ";
+            if (!zw.empty())
+                o << "    static const int SZW[] = {" << zw << "};\n"
+                     "    for (int s : SZW) { Val& g = S.sigs[s].val; g.v = g.x = g.z = 0; for (auto& h : g.hi) h.v = h.x = h.z = 0; }\n";
+            if (!iv.empty())
+                o << "    static const struct { int s; uint64_t v, x, z; } SIV[] = {\n" << iv << "    };\n"
+                     "    for (auto& e : SIV) { Val& g = S.sigs[e.s].val; g.v = e.v; g.x = e.x; g.z = e.z; }\n";
         }
         if (upf) {   // the power intent msim bound to the design (upf_rt.inc Rt::writeSnapshot)
             o << "    static Task (*const UPFPROC[])() = {";   // sim_replay_control runs these again
@@ -3068,6 +3092,9 @@ private:
     // the preamble): the statements that keep running the 4-state way.
     int colds_ = 0;
     std::vector<int> coneOuts_;
+    // MSIM_NOTWOTMP=1: a process with temporaries runs its 4-state body in
+    // 2-state mode too, and twoNow does not check its temporaries.
+    const bool twoTmpOff_ = std::getenv("MSIM_NOTWOTMP") != nullptr;
     std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
     // Of those, the clocks themselves, and their own smaller cone (combConeK):
@@ -3573,16 +3600,17 @@ private:
         // checks runs instead (dsN2, combQ). Only when every statement has one.
         bool two = twoState;
         std::set<int> ext;   // signals in S.sigs that the domain reads
-        // Temporaries of a domain process: only it reads them, and it runs
-        // its 4-state body (its 2-state copy calls that one), so an X they
-        // hold does not keep the rest of the domain off its 2-state path.
+        // Temporaries of a domain process: only it reads them. twoNow checks
+        // them like any other input, since a read before the first write of
+        // a pass sees the last pass's value (MSIM_NOTWOTMP: the old way, its
+        // 4-state body in both modes and the temporaries left out).
         std::set<int> tmpSig;
         for (int n : dom)
             for (auto& in : procs[n].prog->code) if (in.k == IK::Assign && in.tmp) tmpSig.insert(in.sig);
         auto noteRefs = [&](const E& e) {
             std::function<void(const E&)> f = [&](const E& x) {
                 if (!x) return;
-                if (x->op == Op::Ref && !isPriv(x->sig) && !tmpSig.count(x->sig)) ext.insert(x->sig);
+                if (x->op == Op::Ref && !isPriv(x->sig) && (!twoTmpOff_ || !tmpSig.count(x->sig))) ext.insert(x->sig);
                 for (auto& k : x->kids) f(k);
             };
             f(e);
@@ -3649,14 +3677,30 @@ private:
                     case IK::Assign:
                         if (!i.tmp) throw CodegenUnsupported("instruction in a clocked process");
                         for (auto& a : i.aidx) noteRefs(a);
-                        if (i.bidx) { noteRefs(i.bidx); fns << dynTarget(i, fast(i.e), " S.poke(s, v, hi, lo);", true); }
-                        else if (isPriv(i.sig) && i.hi < 0) {   // a private temporary (privateSigs): no write through the kernel
+                        // The 2-state copy writes the value alone: twoNow checks the
+                        // temporaries too (a read before the first write of a pass
+                        // sees the last pass's value), so every input is known.
+                        if (i.bidx) {
+                            noteRefs(i.bidx);
+                            std::string t = dynTarget(i, fast(i.e), " S.poke(s, v, hi, lo);", true);
+                            fns << t;
+                            fns2 << t;
+                        } else if (isPriv(i.sig) && i.hi < 0) {   // a private temporary (privateSigs): no write through the kernel
                             std::string g, u, sl;
-                            if (!split(i.e, g, u, sl)) fns << " " << pw(i.sig, sl) << "\n";
-                            else if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
-                            else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(pw(i.sig, sl)) << "\n";
-                        } else fns << assign(i);
-                        hasTmp = true;
+                            if (!split(i.e, g, u, sl)) {
+                                fns << " " << pw(i.sig, sl) << "\n";
+                                fns2 << " " << pw(i.sig, sl) << "\n";
+                            } else {
+                                if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
+                                else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(pw(i.sig, sl)) << "\n";
+                                fns2 << " " << pwv(i.sig, u) << "\n";
+                            }
+                        } else {
+                            std::string t = assign(i);
+                            fns << t;
+                            fns2 << t;
+                        }
+                        hasTmp = twoTmpOff_;
                         break;
                     default: throw CodegenUnsupported("instruction in a clocked process");
                 }
@@ -4183,10 +4227,22 @@ private:
                     coneUnits.push_back(j);
                     for (auto* in : unitIns[j]) privW |= isPriv(in->sig);
                 }
+                // After a cone pass: when every private signal was known before
+                // it, only the ones the cone writes can have changed that (a
+                // full scanP on every clock edge was 7% of PicoRV32 x16).
+                auto rescan = [&](const std::vector<size_t>& units) {
+                    std::set<int> w;
+                    for (size_t j : units)
+                        for (auto* in : unitIns[j])
+                            if (isPriv(in->sig) && !scratch(in->sig) && !deadSig[in->sig]) w.insert(in->sig);
+                    std::string r = "    if (pclean) { uint64_t x = 0;";
+                    for (int sg : w) r += " x |= P" + std::to_string(sg) + ".x;";
+                    return r + " if (x) pclean = false; } else scanP();\n";
+                };
                 std::vector<std::string> callsC = shareChunks(o, "combC", coneUnits, combStmts, unitProc, unitIns, procs, kChunk);
                 o << "static void combCone(const void*) {\n" << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
                 for (auto& c : callsC) o << "    " << c << ";\n";
-                if (privW) o << "    scanP();\n";
+                if (privW) o << rescan(coneUnits);
                 o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
                 // The clocks' own cone: when it is smaller, a clock edge runs
                 // only it (Ibex: the clock gate and the clock copies, not the
@@ -4204,7 +4260,7 @@ private:
                     std::vector<std::string> callsK = shareChunks(o, "combK", kUnits, combStmts, unitProc, unitIns, procs, kChunk);
                     o << "static void combConeK(const void*) {\n" << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
                     for (auto& c : callsK) o << "    " << c << ";\n";
-                    if (kPriv) o << "    scanP();\n";
+                    if (kPriv) o << rescan(kUnits);
                     o << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n") << "    if (S.observed) syncP();\n}\n";
                 } else coneClkIns_.clear();
             }
