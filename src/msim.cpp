@@ -3436,7 +3436,7 @@ int main(int argc, char** argv) {
     if (xAssign0) xAssignZero(lowered);
     if (xInitial0) xInitialZero();
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
-        gateRecs().empty() && !dumpPorts)
+        gateRecs().empty() && !dumpPorts && !annexDUsed())   // $countdrivers counts the drivers themselves (D.2)
         mergePartialDrivers(lowered);
     if (!vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOEMPTYCALL")) dropEmptyCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);

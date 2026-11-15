@@ -113,8 +113,8 @@ inline std::string str(const Val& v) { Val t = v; t.str = true; return v_str(t);
 inline Val countDrivers(int s, int bit) {
     const Sig& g = S.sigs[(size_t)s];
     int c01x = 0, c0 = 0, c1 = 0, cx = 0;
-    auto add = [&](const Val& v) {
-        Val b = v_index(v, mk((uint64_t)bit, 32));
+    auto add = [&](const Val& v, int at) {
+        Val b = v_index(v, mk((uint64_t)at, 32));
         if (b.x & 1) {
             if (b.z & 1) return;   // off
             cx++;
@@ -122,10 +122,24 @@ inline Val countDrivers(int s, int bit) {
         else c0++;
         c01x++;
     };
-    if (g.drv.empty()) add(g.val);   // a net with a single driver kept as its value
-    else
-        for (const Drv& d : g.drv)
-            if (!(d.s0 == STR_HIZ && d.s1 == STR_HIZ)) add(d.v);
+    // msim keeps every driver of a net when $countdrivers is used, so a net
+    // with none is undriven, whatever a force holds on it.
+    // A three-state gate or switch is two drivers in a row, one with only
+    // its 0 strength and one with only its 1 strength: one driver here.
+    const std::vector<Drv>& all = g.drv;
+    for (size_t i = 0; i < all.size(); i++) {
+        const Drv& d = all[i];
+        if (d.s0 == STR_HIZ && d.s1 == STR_HIZ) continue;
+        if (d.s1 == STR_HIZ && i + 1 < all.size() && all[i + 1].s0 == STR_HIZ && all[i + 1].s1 != STR_HIZ) {
+            int b0 = bitAt(d.v, bit), b1 = bitAt(all[i + 1].v, bit);
+            i++;
+            bool on0 = b0 == 0 || b0 == 2, on1 = b1 == 1 || b1 == 2;
+            if (!on0 && !on1) continue;   // off
+            add(make(on0 && !on1 && b0 == 0 ? 0 : on1 && !on0 && b1 == 1 ? 1 : 0, on0 && on1 ? 1 : (on0 ? b0 == 2 : b1 == 2), 1, 0), 0);
+            continue;
+        }
+        add(d.v, bit);
+    }
     counts[0] = c01x; counts[1] = c0; counts[2] = c1; counts[3] = cx;
     counts[4] = (g.fl & Sim::SF_HELD) ? 1 : 0;
     return make(c01x > 1 ? 1 : 0, 0, 1, 0);

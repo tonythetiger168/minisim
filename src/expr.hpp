@@ -1151,9 +1151,8 @@ inline Val v_mux(Val c, Val a, Val b) {
     int w = wmax(a, b);
     if (w <= 64 && a.hi.empty() && b.hi.empty()) {
         uint64_t m = mask(w);
-        uint64_t same = ~a.x & ~b.x & ~(a.v ^ b.v) & m; // both 0 or both 1
-        uint64_t bothz = a.z & b.z & m;
-        return make(a.v & same, m & ~same, w, bothz, a.sgn && b.sgn);
+        uint64_t same = ~a.x & ~b.x & ~(a.v ^ b.v) & m; // both 0 or both 1; anything else, z with z too, is x (Table 11-20)
+        return make(a.v & same, m & ~same, w, 0, a.sgn && b.sgn);
     }
     Val r;
     r.w = w;
@@ -1162,11 +1161,10 @@ inline Val v_mux(Val c, Val a, Val b) {
     if (n > 1) r.hi.resize(n - 1);
     for (int i = 0; i < n; i++) {
         uint64_t m = limbMask(w, i);
-        uint64_t av = limbV(a, i), ax = limbX(a, i), az = limbZ(a, i);
-        uint64_t bv = limbV(b, i), bx = limbX(b, i), bz = limbZ(b, i);
+        uint64_t av = limbV(a, i), ax = limbX(a, i);
+        uint64_t bv = limbV(b, i), bx = limbX(b, i);
         uint64_t same = ~ax & ~bx & ~(av ^ bv) & m;
-        uint64_t bothz = az & bz & m;
-        setLimb(r, i, av & same, m & ~same, bothz);
+        setLimb(r, i, av & same, m & ~same, 0);
     }
     return finish(r);
 }
