@@ -1363,7 +1363,7 @@ private:
                     return true;
                 }
                 if (!kid(0, A, fa)) return false;
-                if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64) return false;
+                if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64 || e->hi >= fa.w) return false;   // bits past the width read x: v_slice
                 out = "((" + A + " >> " + std::to_string(e->lo) + ") & " + M(w) + ")";
                 fi = {w, false};
                 return true;
@@ -1575,7 +1575,7 @@ private:
             case Op::Slice: {
                 if (!kid(0, A, AX, fa)) return false;
                 int w = e->hi - e->lo + 1;
-                if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64) return false;
+                if (e->lo < 0 || e->lo >= 64 || w < 1 || w > 64 || e->hi >= fa.w) return false;   // bits past the width read x: v_slice
                 std::string l = std::to_string(e->lo);
                 tmp("((" + A + " >> " + l + ") & " + M(w) + ")", "((" + AX + " >> " + l + ") & " + M(w) + ")");
                 fi = {w, false};
@@ -2970,7 +2970,7 @@ private:
         for (size_t i = 0; i < procs.size(); i++) {
             // A clock or reset stays in S.sigs when a process waits on it: the
             // domain waits on its wake signals only (wakeEvents).
-            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns && (!mine[i] || procs[i].combRank >= 0 || wakeSig(sg))) (bad[sg] = 1, whyL[sg] = __LINE__);
+            for (auto& [sg, ed] : procs[i].seqEv) if ((size_t)sg < ns && (!mine[i] || procs[i].combRank >= 0 || wakeSig(sg))) (bad[sg] = 1, whyL[sg] = __LINE__, whyP[sg] = (int)i);
             if (procs[i].combRank >= 0) {
                 for (auto& in : procs[i].prog->code) {
                     if (in.k == IK::WaitEdge) break;
