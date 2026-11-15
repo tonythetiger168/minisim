@@ -861,6 +861,7 @@ struct Lowerer {
         if (auto ts = sc->getTimeScale()) { tsUnit = tsExp(ts->base); tsPrec = tsExp(ts->precision); }
     }
     uint64_t ticksPerUnit() const { return pow10u(tsUnit - simPrecExp()); }
+    uint64_t ticksPerPrec() const { return pow10u(tsPrec - simPrecExp()); }
     // A delay in this module's units, as kernel ticks: rounded to the module's
     // precision first (22.7), then scaled to the simulation precision.
     uint64_t ticksOf(double units) const {
@@ -11768,6 +11769,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         PathRec base;
         base.inst = Lowerer::instPath(tp.getParentScope());
         base.unit = d.ticksPerUnit();
+        base.prec = d.ticksPerPrec();
         base.sym = &tp;
         if (const Expression* c = tp.getConditionExpr()) {
             base.hasCond = true;
@@ -12230,12 +12232,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             Lowerer dl(sigmap);
             prep(dl);
             dl.setScope(g.getParentScope());
-            // and/or/buf/not gates drive like a continuous assignment, so their
-            // delays may be expressions too, read at each output change.
+            // Gates (logic, bufif/notif, MOS, UDP) drive like a continuous
+            // assignment, so their delays may be expressions too, read at each
+            // output change (28.16). A tran's are not.
             std::string_view pn = g.primitiveType.name;
-            bool logic = pn == "and" || pn == "nand" || pn == "or" || pn == "nor" || pn == "xor" ||
-                         pn == "xnor" || pn == "buf" || pn == "not";
-            gdly = dl.delays3(g.getDelay(), logic);
+            bool driven = pn.find("tran") == std::string_view::npos;
+            gdly = dl.delays3(g.getDelay(), driven);
             gateDlyE = std::move(dl.dynDly);
         }
         gateDelay = &gdly;
