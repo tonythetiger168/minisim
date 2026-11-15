@@ -1652,7 +1652,15 @@ struct Sim {
                 pad = false;
                 break;
             }
-            case 's': body = bytesToStr(v); natural = (v.w + 7) / 8; break;   // leading zero bytes as spaces (21.2.1.7, 21.2.1.3)
+            case 's': {   // leading zero bytes as spaces (21.2.1.7, 21.2.1.3), a zero byte inside as one too
+                for (int b = (v.w + 7) / 8 - 1; b >= 0; b--) {
+                    unsigned char ch = 0;
+                    for (int k = 0; k < 8 && 8 * b + k < v.w; k++) if (bitAt(v, 8 * b + k) == 1) ch |= (unsigned char)(1u << k);
+                    if (ch || !body.empty()) body += ch ? (char)ch : ' ';
+                }
+                natural = (v.w + 7) / 8;
+                break;
+            }
             case 't':
             case 'd': {
                 int nx, nz;
@@ -1691,6 +1699,14 @@ struct Sim {
         if (v.str) {   // a string (6.16) prints its text with %s, and as bytes otherwise
             if (c == 's') {
                 string t = v_str(v);
+                // A literal can hold zero bytes ("\000a"): printed as for a
+                // vector, a space each, and the leading ones dropped by %0s.
+                if (t.find('\0') != string::npos) {
+                    size_t k = 0;
+                    if (zero) while (k < t.size() && !t[k]) k++;
+                    t = t.substr(k);
+                    for (char& ch : t) if (!ch) ch = ' ';
+                }
                 if (minW > 0 && (int)t.size() < minW) t = string(minW - t.size(), ' ') + t;
                 return t;
             }
@@ -1734,7 +1750,7 @@ struct Sim {
             case 's': {
                 for (int b = (v.w + 7) / 8 - 1; b >= 0; b--) {
                     char ch = char((v.v >> (8 * b)) & 0xff);
-                    if (ch || !body.empty()) body += ch;
+                    if (ch || !body.empty()) body += ch ? ch : ' ';
                 }
                 // A leading zero byte is not printed as a character, but the
                 // field keeps one column per byte, as for %d: %s pads with
