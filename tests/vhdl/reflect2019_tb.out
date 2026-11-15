@@ -1,0 +1,14 @@
+reflect2019.vhd:58:5:@0ms:(report note): color class_enumeration 3
+reflect2019.vhd:61:5:@0ms:(report note): rec 4 n c=blue n=7 x=2.5 t=3 ns
+reflect2019.vhd:66:5:@0ms:(report note): arr len=3 left=2 e2='1' e1='L' e0='0'
+reflect2019.vhd:71:5:@1ns:(report note): sig '0''1''Z''H'
+reflect2019.vhd:40:5:@1ns:(report note): class class_access of node_ptr
+reflect2019.vhd:74:5:@1ns:(report note): p.v=1 null? false next.v=2 end? true
+reflect2019.vhd:80:5:@1ns:(report note): dims=2 len2=3 m(2,1)=5
+reflect2019.vhd:83:5:@1ns:(report note): str(2)='b' len=3
+reflect2019.vhd:85:5:@1ns:(report note): b=done pos=2 low=run
+reflect2019.vhd:88:5:@1ns:(report note): i=-5 -5
+reflect2019.vhd:90:5:@1ns:(report note): integer high=2147483647
+reflect2019.vhd:92:5:@1ns:(report note): time units=8 us scale(ns)=1000000
+reflect2019.vhd:95:5:@1ns:(report note): prot class_protected counter
+reflect2019.vhd:97:5:@1ns:(report note): file class_file of integer

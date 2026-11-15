@@ -43,6 +43,7 @@ if(TARGET msim)
     "vhdl2019_env_tb|vhdl2019_env.vhd|"
     "dir2019_tb|dir2019.vhd|"
     "callpath2019_tb|callpath2019.vhd|"
+    "reflect2019_tb|reflect2019.vhd|"
     "mixed_sv_top|counter.vhd,mixed_sv_top.sv|"
     "mixed_vhdl_top|mixed_adder.sv,mixed_vhdl_top.vhd|"
     "mixed_uncon|uncon_ports.vhd,mixed_uncon.sv|")
