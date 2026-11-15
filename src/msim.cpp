@@ -3498,6 +3498,7 @@ int main(int argc, char** argv) {
         if (t.decays) S.decay[t.sig] = Sim::Decay{t.decay, 0, true};
     }
     for (auto& t : lowered.trans) S.addTran(t.a, t.b, t.resist, t.aLo, t.bLo, t.w);
+    for (auto& m : lowered.mos) S.addMos(m.out, m.drv, m.src, m.bit, m.resist, m.part);   // 28.13
     for (auto& [s, k] : lowered.netKinds) {   // tri0 starts at 0, supply1 at 1, trireg at x (6.6)
         auto& g = S.sigs[s];
         g.kind = k;
@@ -3562,7 +3563,8 @@ int main(int argc, char** argv) {
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
-    std::vector<Task> lateConst, lateRest;
+    std::vector<Task> lateConst;
+    bool constsOut = false;   // the constant assigns have started
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         // A process run as a function (static comb or clocked) still takes
         // its generator seed in start order (18.14.2), so every later
@@ -3591,19 +3593,21 @@ int main(int argc, char** argv) {
                      ? programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial")
                      : process(&lowered.procs[i].prog);
         if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
-        // Time 0 order: initial blocks start after the constant continuous
-        // assignments (assign tie = 1'b0), and those after every other
-        // process. So an always @(tie) or always @* reading a constant is
-        // already waiting and sees its change, and an initial block already
-        // reads it, as in other simulators. Everything else starts in
-        // declaration order, and each Task is still made in declaration
-        // order, which keeps the random seeds (18.14.2).
-        if (lowered.procs[i].kind == "assign" && !lowered.procs[i].loops) lateConst.push_back(t);
-        else if (lowered.procs[i].kind == "Initial") lateRest.push_back(t);
-        else S.spawn(t);
+        // Time 0 order: declaration order, except that constant continuous
+        // assignments (assign tie = 1'b0) start just before the first
+        // initial block. So an always @(tie) or always @* declared before it
+        // is already waiting and sees the change, and an initial block
+        // already reads the constant, as in other simulators. Each Task is
+        // still made in declaration order, which keeps the random seeds (18.14.2).
+        if (lowered.procs[i].kind == "assign" && !lowered.procs[i].loops && !constsOut) { lateConst.push_back(t); continue; }
+        if (lowered.procs[i].kind == "Initial" && !constsOut) {
+            constsOut = true;
+            for (auto& c : lateConst) S.spawn(c);
+            lateConst.clear();
+        }
+        S.spawn(t);
     }
     for (auto& t : lateConst) S.spawn(t);
-    for (auto& t : lateRest) S.spawn(t);
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
     S.freeVars = lowered.freeVars;   // free checker variables start random (17.7.2)

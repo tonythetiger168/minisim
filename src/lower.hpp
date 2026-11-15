@@ -719,6 +719,11 @@ struct LowerResult {
     std::vector<std::pair<int, bool>> freeVars;
     std::vector<std::unique_ptr<UdpTable>> udps;   // tables of the user-defined primitives (29)
     struct TranDecl { int a, b; bool resist; int aLo = 0, bLo = 0, w = -1; };
+    // MOS switches pass the strength of their data input (28.13, 28.14):
+    // driver drv of net out (part 0: its 0 strength, 1: its 1 strength)
+    // takes the strength bit `bit` of signal src has, reduced if resistive.
+    struct MosDecl { int out, drv, src, bit; bool resist, part; };
+    std::vector<MosDecl> mos;
     std::vector<TranDecl> trans;      // tran / tranif switches (28.8): the two nets, resistive; w >= 0: only bits [aLo, aLo+w) of a and [bLo, bLo+w) of b
     int precExp = -9;                 // one kernel tick = 10^precExp s
     // The tick as a VCD $timescale ("1ns", "100ps").
@@ -12184,6 +12189,15 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         auto is = [](E v, Val k) { return node(Op::CaseEq, {v, konst(k)}); };
         auto mux = [](E c, E a, E b) { return node(Op::Mux, {c, a, b}); };
         E d = bit(*ports[1]);
+        // The data input as one bit of a signal, when it is one: the
+        // switch then passes that signal's strength (28.13), not its own.
+        int dSrc = -1, dBit = 0;
+        {
+            E k = d;
+            if (k->op == Op::Resize && k->hi == 1 && k->kids.size() == 1) k = k->kids[0];   // the low bit
+            if (k->op == Op::Slice && k->hi == k->lo && k->kids.size() == 1) { dBit = k->lo; k = k->kids[0]; }
+            if (k->op == Op::Ref && !k->at && k->sig >= 0) dSrc = k->sig;
+        }
         E Z = konst(allz(1)), X = konst(allx(1));
         auto drive = [&](E ctl, bool activeHigh, bool invert, bool passZ) {
             E val = invert ? un(Op::Not, d) : passZ ? d : un(Op::Not, un(Op::Not, d));
@@ -12192,6 +12206,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 // With an unknown control this driver may drive unless the value is the other level or Z.
                 E unk = mux(is(val, make(part ? 0 : 1, 0, 1)), Z, mux(is(val, allz(1)), Z, X));
                 driveOut(*ports[0], mux(on, val, mux(off, Z, unk)), part ? STR_HIZ : s0, part ? s1 : STR_HIZ);
+                if (passZ && dSrc >= 0 && !out.procs.empty() && !out.procs.back().prog.code.empty()) {
+                    const Instr& di = out.procs.back().prog.code[0];
+                    if (di.k == IK::Assign && di.drv >= 0 && di.sig >= 0) out.mos.push_back({di.sig, di.drv, dSrc, dBit, resist, part == 1});
+                }
             }
         };
         if (name.starts_with("bufif") || name.starts_with("notif")) {
