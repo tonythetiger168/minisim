@@ -21,7 +21,7 @@ module top;
         #5 a = 0;
         #10 a = 1;
     end
-    always @(y) $display("%.3f y=%b", $realtime, y);
+    always @(y) if ($realtime > 0) $display("%.3f y=%b", $realtime, y);
 endmodule
 //> 2.300 y=0
 //> 6.100 y=1
