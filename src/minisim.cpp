@@ -1588,7 +1588,8 @@ struct Sim {
     //                Icarus does). A signed value prints with a minus sign.
     //                An all-X value is "x", all-Z is "z", partly unknown "X"/"Z".
     //   %c           the low 8 bits as a character
-    //   %s           the value as 8-bit characters, leading zero bytes dropped
+    //   %s           the value as 8-bit characters; leading zero bytes are
+    //                spaces, and %0s drops them
     //   %t           a time, right-justified to 20 columns
     //   %m           the scope name (minisim has one: the top module)
     //   %0<f>        no padding: %0d / %0t drop the spaces, %0b / %0h / %0o
@@ -1651,7 +1652,7 @@ struct Sim {
                 pad = false;
                 break;
             }
-            case 's': body = bytesToStr(v); pad = false; break;
+            case 's': body = bytesToStr(v); natural = (v.w + 7) / 8; break;   // leading zero bytes as spaces (21.2.1.7, 21.2.1.3)
             case 't':
             case 'd': {
                 int nx, nz;
@@ -1735,7 +1736,10 @@ struct Sim {
                     char ch = char((v.v >> (8 * b)) & 0xff);
                     if (ch || !body.empty()) body += ch;
                 }
-                pad = false;
+                // A leading zero byte is not printed as a character, but the
+                // field keeps one column per byte, as for %d: %s pads with
+                // spaces, %0s does not (21.2.1.3, 21.2.1.7).
+                natural = (v.w + 7) / 8;
                 break;
             }
             case 't':

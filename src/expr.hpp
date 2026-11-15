@@ -2246,9 +2246,10 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             static std::map<int32_t, Q> qs;
             static std::mutex mu;
             static thread_local int32_t lastJob = 0, lastInform = 0, lastExam = 0;
+            static thread_local bool lastExamX = false;   // the statistic has no value yet: x
             if (ctl == 3) return sint(lastJob);
             if (ctl == 4) return sint(lastInform);
-            if (ctl == 7) return sint(lastExam);
+            if (ctl == 7) return lastExamX ? make(0, 0xffffffffull, 32, 0, true) : sint(lastExam);
             std::lock_guard<std::mutex> lk(mu);
             int32_t qid = i32(a[0]);
             if (ctl == 0) {
@@ -2284,17 +2285,28 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
                 case 5: return make(((uint64_t)((int64_t)q.e.size() >= q.max ? 1 : 0) << 32), 0, 64, 0);
                 case 6: {
                     uint64_t tpu = a.size() > 2 && u64(a[2]) ? u64(a[2]) : 1;
+                    // A statistic with nothing to measure yet (no second
+                    // arrival, no job removed, an empty queue) is x. The
+                    // average wait counts the jobs still waiting, up to now.
+                    // Times are in the caller's time unit, truncated.
                     uint64_t v = 0;
+                    lastExamX = false;
                     switch (i32(a[1])) {
                         case 1: lastExam = (int32_t)q.e.size(); return sint(0);
-                        case 2: v = q.arrivals > 1 ? (q.lastAt - q.firstAt) / (q.arrivals - 1) : 0; break;
+                        case 2: lastExamX = q.arrivals < 2; if (!lastExamX) v = (q.lastAt - q.firstAt) / (q.arrivals - 1); break;
                         case 3: lastExam = (int32_t)q.maxLen; return sint(0);
-                        case 4: v = q.minWait; break;
-                        case 5: for (auto& en : q.e) v = std::max(v, g_simTime - en.at); break;
-                        case 6: v = q.removed ? q.waitSum / q.removed : 0; break;
+                        case 4: lastExamX = !q.removed; v = q.minWait; break;
+                        case 5: lastExamX = q.e.empty(); for (auto& en : q.e) v = std::max(v, g_simTime - en.at); break;
+                        case 6: {
+                            uint64_t sum = q.waitSum, n = q.removed + q.e.size();
+                            for (auto& en : q.e) sum += g_simTime - en.at;
+                            lastExamX = !n;
+                            if (n) v = sum / n;
+                            break;
+                        }
                         default: lastExam = 0; return sint(0);
                     }
-                    lastExam = (int32_t)((v + tpu / 2) / tpu);
+                    lastExam = (int32_t)(v / tpu);
                     return sint(0);
                 }
             }

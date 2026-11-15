@@ -31,4 +31,4 @@ module t;
   end
 endmodule
 //> fail=0 bad=0
-//> weights ok
+//> weights  ok

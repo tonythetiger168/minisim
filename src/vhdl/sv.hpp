@@ -3988,7 +3988,7 @@ package vhdl_rt;
               "sec": u = 64'd1000000000000000; "m", "min": u = 64'd60000000000000000; "hr": u = 64'd3600000000000000000;
               default: u = 1;
             endcase
-            val = u == 0 ? at_time() : $sformatf("%0d %s", fs / u, unit == "m" ? "min" : unit);
+            val = u == 0 ? at_time() : $sformatf("%0d %0s", fs / u, unit == "m" ? "min" : unit);
           end
         endcase
         if (align == 0) align = var_ == "t" ? ">" : "<";
@@ -4017,7 +4017,7 @@ package vhdl_rt;
       void'(fmt_apply(afmt[sev], sv, msg, inst_path(path, loc), o));
       $display("%s", o);
     end else
-      $display("%s:@%s:(%s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
+      $display("%s:@%s:(%0s %s): %s", loc, at_time(), is_assert ? "assertion" : "report", sv, msg);
     if (sev >= 2) errors++;
     if (sev >= 3) $fatal(0, "VHDL severity failure");
   endfunction
