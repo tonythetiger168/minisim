@@ -620,7 +620,13 @@ public:
             }
             o.str("");
             o << (kernelObj ? "#include \"design.hpp\"\n\n" : "#include \"design.hpp\"\n\nSim S;\n\n");
-            for (auto& h : hitems) o << h.decl;
+            // Macros for array elements (P<s> = PA[s]) only where design.cpp
+            // names them (dropped at the end): a million of them for 1024
+            // PicoRV32 cores were 30 MB of the file.
+            o << kMacroMark << "{\n";
+            for (auto& h : hitems) if (h.def.empty() && h.decl.compare(0, 8, "#define ") == 0) o << h.decl;
+            o << kMacroMark << "}\n";
+            for (auto& h : hitems) if (!(h.def.empty() && h.decl.compare(0, 8, "#define ") == 0)) o << h.decl;
             o << "\n";
             for (auto& h : hitems) o << h.def;
             o << "\n" << relocAsm() << "\n" << globalCode;
@@ -691,18 +697,65 @@ public:
         if (nSlots) o << "    XSL = SLT;\n";
         if (!arrs_.empty()) o << "    XAS = AST;\n";
         if (!sigs.empty()) {
-            o << "    static const struct { const char* n; int w; bool net; int drv; } SIGS[] = {\n";
-            for (size_t s = 0; s < sigs.size(); s++)
-                o << "        {" << quote(sigs[s].name) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ", "
-                  << sigs[s].drivers << "},\n";
+            // Runs of array elements (m[0], m[1], ...) are one row: 1024
+            // PicoRV32 cores have a quarter million memory words.
+            auto elem = [&](size_t s, std::string& base, long long& ix) {
+                const std::string& n = sigs[s].name;
+                if (n.empty() || n.back() != ']') return false;
+                size_t lb = n.rfind('[');
+                if (lb == std::string::npos || lb + 2 > n.size() - 1) return false;
+                for (size_t k = lb + 1; k + 1 < n.size(); k++) if (!std::isdigit((unsigned char)n[k])) return false;
+                if (n.size() - lb - 2 > 9) return false;
+                base = n.substr(0, lb);
+                ix = std::stoll(n.substr(lb + 1, n.size() - lb - 2));
+                return true;
+            };
+            o << "    static const struct { const char* n; int w; bool net; int drv; int cnt, lo, step; } SIGS[] = {\n";
+            for (size_t s = 0; s < sigs.size();) {
+                std::string b0, b1;
+                long long i0 = 0, i1 = 0;
+                size_t e = s + 1;
+                int step = 0;
+                if (elem(s, b0, i0) && s + 1 < sigs.size() && elem(s + 1, b1, i1) && b1 == b0 && (i1 == i0 + 1 || i1 == i0 - 1)) {
+                    step = (int)(i1 - i0);
+                    while (e < sigs.size() && sigs[e].w == sigs[s].w && sigs[e].net == sigs[s].net && sigs[e].drivers == sigs[s].drivers &&
+                           elem(e, b1, i1) && b1 == b0 && i1 == i0 + (long long)(e - s) * step)
+                        e++;
+                }
+                if (e - s >= 4)
+                    o << "        {" << quote(b0) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ", " << sigs[s].drivers
+                      << ", " << (e - s) << ", " << i0 << ", " << step << "},\n";
+                else {
+                    e = s + 1;
+                    o << "        {" << quote(sigs[s].name) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ", "
+                      << sigs[s].drivers << ", 0, 0, 0},\n";
+                }
+                s = e;
+            }
             o << "    };\n"
-                 "    for (int s = 0; s < (int)(sizeof SIGS / sizeof SIGS[0]); s++) {\n"
-                 "        S.sig(SIGS[s].n, SIGS[s].w, SIGS[s].net);\n"
-                 "        for (int d = 0; d < SIGS[s].drv; d++) S.newDriver(s);\n"
-                 "    }\n";
-            std::string iv;
-            for (size_t s = 0; s < sigs.size(); s++)
+                 "    for (auto& r : SIGS)\n"
+                 "        for (int k = 0; k < std::max(r.cnt, 1); k++) {\n"
+                 "            int s = r.cnt ? S.sig(std::string(r.n) + \"[\" + std::to_string(r.lo + k * r.step) + \"]\", r.w, r.net) : S.sig(r.n, r.w, r.net);\n"
+                 "            for (int d = 0; d < r.drv; d++) S.newDriver(s);\n"
+                 "        }\n";
+            // Initial values; runs of signals that start at 0 are one row
+            // {first, count}.
+            std::string iv, iz;
+            for (size_t s = 0; s < sigs.size();) {
+                auto zero = [&](size_t k) { return sigs[k].init && !sigs[k].v && !sigs[k].x && !sigs[k].z; };
+                if (zero(s)) {
+                    size_t e = s + 1;
+                    while (e < sigs.size() && zero(e)) e++;
+                    iz += "{" + std::to_string(s) + ", " + std::to_string(e - s) + "}, ";
+                    s = e;
+                    continue;
+                }
                 if (sigs[s].init) iv += "        {" + std::to_string(s) + ", " + std::to_string(sigs[s].v) + "ULL, " + std::to_string(sigs[s].x) + "ULL, " + std::to_string(sigs[s].z) + "ULL},\n";
+                s++;
+            }
+            if (!iz.empty())
+                o << "    static const struct { int s, n; } SIZ[] = {" << iz << "};\n"
+                     "    for (auto& e : SIZ) for (int s = e.s; s < e.s + e.n; s++) { Val& g = S.sigs[s].val; g.v = g.x = g.z = 0; }\n";
             std::string zw;
             for (size_t s = 0; s < sigs.size(); s++)
                 if (sigs[s].zeroWide) zw += std::to_string(s) + ", ";
@@ -864,8 +917,23 @@ public:
         if (outFiles.empty()) return o.str();
         // Files after one another, each after a marker line msim splits on.
         std::string all = std::string(kFileMark) + "design.hpp\n" + outFiles[0];
-        all += std::string(kFileMark) + "design.cpp\n" +
-               (rename.empty() ? o.str() : mapIdents(o.str(), [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; }));
+        std::string dcpp = rename.empty() ? o.str() : mapIdents(o.str(), [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; });
+        if (size_t a = dcpp.find(std::string(kMacroMark) + "{\n"), b = dcpp.find(std::string(kMacroMark) + "}\n"); a != std::string::npos && b != std::string::npos && a < b) {
+            size_t a2 = a + std::strlen(kMacroMark) + 2, b2 = b + std::strlen(kMacroMark) + 2;
+            std::unordered_set<std::string> used;
+            identsOf(dcpp.substr(0, a), [&](const std::string& x) { used.insert(x); });
+            identsOf(dcpp.substr(b2), [&](const std::string& x) { used.insert(x); });
+            std::string keep;
+            for (size_t i = a2; i < b;) {
+                size_t nl = dcpp.find('\n', i);
+                if (nl == std::string::npos || nl > b) nl = b;
+                size_t ne = dcpp.find(' ', i + 8);
+                if (ne != std::string::npos && ne < nl && used.count(dcpp.substr(i + 8, ne - i - 8))) keep.append(dcpp, i, nl + 1 - i);
+                i = nl + 1;
+            }
+            dcpp = dcpp.substr(0, a) + keep + dcpp.substr(b2);
+        }
+        all += std::string(kFileMark) + "design.cpp\n" + dcpp;
         for (size_t f = 1; f < outFiles.size(); f++) all += std::string(kFileMark) + "part" + std::to_string(f - 1) + ".cpp\n" + outFiles[f];
         return all;
     }
@@ -1970,6 +2038,7 @@ private:
         std::string def;                  // design.cpp only
         std::vector<int> deps;            // other items its declaration names
     };
+    static constexpr const char* kMacroMark = "// @macros";
     static void identsOf(const std::string& t, const std::function<void(const std::string&)>& f) {
         for (size_t i = 0; i < t.size();) {
             unsigned char c = (unsigned char)t[i];
@@ -4294,6 +4363,12 @@ private:
         int nIsl = (int)islandId.size();
         const int kGroups = 64;
         bool par = allPriv && nIsl >= 32 && !serialOnly && !multi && !dynArrNba;
+        if (std::getenv("MSIM_WHYPAR")) {
+            std::fprintf(stderr, "parallel domain: %s (all private %d, islands %d, serial %d, groups %d, dynamic array NBA %d)\n",
+                         par ? "yes" : "no", (int)allPriv, nIsl, (int)serialOnly, (int)multi, (int)dynArrNba);
+            for (auto& sl : slots) if (!isPriv(sl.sig)) { std::fprintf(stderr, "   public slot %s\n", sigName_[sl.sig].c_str()); break; }
+            for (auto* in : combIns) if (!isPriv(in->sig)) { std::fprintf(stderr, "   public comb %s\n", sigName_[in->sig].c_str()); break; }
+        }
         int G = par ? std::min(nIsl, kGroups) : 0;
         auto groupOf = [&](int sig) { return (int)((int64_t)islandOf(sig) * G / nIsl); };
         if (par) {
