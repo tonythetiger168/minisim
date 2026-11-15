@@ -41,6 +41,8 @@ set(CASES
   "examples/nbadelay.sv"
   "examples/conek.sv"
   "examples/xassign.sv"
+  "examples/directnba.sv"
+  "-x-assign 0 -x-initial 0 examples/directnba.sv"
   "-x-assign 0 -x-initial 0 examples/xassign.sv"
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"

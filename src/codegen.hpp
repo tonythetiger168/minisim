@@ -3095,6 +3095,11 @@ private:
     // MSIM_NOTWOTMP=1: a process with temporaries runs its 4-state body in
     // 2-state mode too, and twoNow does not check its temporaries.
     const bool twoTmpOff_ = std::getenv("MSIM_NOTWOTMP") != nullptr;
+    // scanP's back-off while a private signal holds X: at most this many
+    // passes without a look. A 4-state comb pass costs far more than a scan,
+    // so a long wait after the last X goes kept the design off its 2-state
+    // path for up to 255 passes (PicoRV32 x16: 4% of the run). MSIM_SCANCAP=<n>.
+    const int scanCap_ = std::getenv("MSIM_SCANCAP") ? std::atoi(std::getenv("MSIM_SCANCAP")) : 7;
     std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
     // Of those, the clocks themselves, and their own smaller cone (combConeK):
@@ -3615,6 +3620,88 @@ private:
             };
             f(e);
         };
+        // Direct NBAs: a narrow private register that only NBAs of one domain
+        // process write, that no other process reads, and that its writer
+        // does not read after the first write, is stored at the NBA itself:
+        // nobody can see the store before the commit would have made it.
+        // (Comb units read it only after fcommit; see directNba_.)
+        std::vector<char> direct(sigW_.size(), 0);
+        if (!std::getenv("MSIM_NODIRECT")) {
+            const size_t ns = sigW_.size();
+            std::vector<int> wproc(ns, -1), firstW(ns, -1);
+            std::vector<char> bad(ns, 0), inDom(procs.size(), 0);
+            for (int n : dom) inDom[n] = 1;
+            for (size_t p = 0; p < procs.size(); p++) {
+                if (!procs[p].prog) continue;
+                const auto& code = procs[p].prog->code;
+                for (size_t pc = 0; pc < code.size(); pc++) {
+                    const Instr& i = code[pc];
+                    if (i.sig < 0 || (size_t)i.sig >= ns) continue;
+                    const bool ok = inDom[p] && i.k == IK::Nba && i.hi < 0 && !i.arr && i.aidx.empty() && !i.bidx && !i.de &&
+                                    !i.delay && i.dly.empty();
+                    // A declaration initializer (logic a = 0) runs before any clock.
+                    if (!ok && procs[p].kind == "init" && procs[p].combRank < 0 && !procs[p].seq && i.k == IK::Assign) continue;
+                    if (!ok) { bad[i.sig] = 1; continue; }
+                    if (wproc[i.sig] < 0) { wproc[i.sig] = (int)p; firstW[i.sig] = (int)pc; }
+                    else if (wproc[i.sig] != (int)p) bad[i.sig] = 1;
+                }
+            }
+            // Reads. In the writer: bad only where some write can come before
+            // the read (the code is a DAG of forward jumps: one pass in pc
+            // order, the set of candidates written so far on some path).
+            auto cand = [&](int sg) { return sg >= 0 && (size_t)sg < ns && wproc[sg] >= 0 && !bad[sg]; };
+            std::vector<int> cidx(ns, -1);
+            for (size_t p = 0; p < procs.size(); p++) {
+                if (!procs[p].prog) continue;
+                const auto& code = procs[p].prog->code;
+                std::vector<int> mine;   // candidates this process writes
+                for (auto& i : code)
+                    if (i.k == IK::Nba && cand(i.sig) && wproc[i.sig] == (int)p && cidx[i.sig] < 0) { cidx[i.sig] = (int)mine.size(); mine.push_back(i.sig); }
+                const size_t nw = (mine.size() + 63) / 64;
+                bool fwd = true;
+                for (size_t pc = 0; pc < code.size(); pc++)
+                    if ((code[pc].k == IK::Jmp || code[pc].k == IK::JmpIfNot) && code[pc].target <= pc &&
+                        !(code[pc].k == IK::Jmp && pc + 1 == code.size()))   // the jump back to the wait ends an activation
+                        fwd = false;
+                std::vector<std::vector<uint64_t>> win(code.size() + 1, std::vector<uint64_t>(nw, 0));
+                for (size_t pc = 0; pc < code.size(); pc++) {
+                    const Instr& i = code[pc];
+                    auto rd = [&](int sg) {
+                        if (!cand(sg)) return;
+                        if (wproc[sg] != (int)p) { bad[sg] = 1; return; }
+                        const int c = cidx[sg];
+                        if (!fwd || (win[pc][(size_t)c / 64] >> (c % 64) & 1)) bad[sg] = 1;
+                    };
+                    std::function<void(const E&)> f = [&](const E& x) {
+                        if (!x) return;
+                        if (x->op == Op::Ref) rd(x->sig);
+                        if (x->sig >= 0 && x->op != Op::Ref && x->op != Op::Const) rd(x->sig);
+                        for (auto& k : x->kids) f(k);
+                        if (x->at) f(x->at);
+                    };
+                    f(i.e); f(i.de); f(i.bidx); f(i.fd);
+                    for (auto& a : i.aidx) f(a);
+                    for (auto& a : i.args) f(a);
+                    for (auto& ev : i.events) rd(ev.first);
+                    if (i.k == IK::WaitEdge) rd(i.sig);
+                    if (nw == 0 || !fwd) continue;
+                    std::vector<uint64_t> out = win[pc];
+                    if (i.k == IK::Nba && cand(i.sig) && cidx[i.sig] >= 0 && wproc[i.sig] == (int)p)
+                        out[(size_t)cidx[i.sig] / 64] |= 1ULL << (cidx[i.sig] % 64);
+                    auto join = [&](size_t t) { if (t < win.size()) for (size_t w = 0; w < nw; w++) win[t][w] |= out[w]; };
+                    if (i.k == IK::Jmp) { if (i.target > pc) join(i.target); }
+                    else {
+                        if (i.k == IK::JmpIfNot) { join(i.target); if (i.xt != Instr::NOX) join(i.xt); }
+                        join(pc + 1);
+                    }
+                }
+                for (int sg : mine) cidx[sg] = -1;
+            }
+            size_t nd = 0;
+            for (size_t sg = 0; sg < ns; sg++)
+                if (wproc[sg] >= 0 && !bad[sg] && isPriv((int)sg) && sigW_[sg] <= 64 && !clock_[sg] && !sigNet_[sg]) { direct[sg] = 1; nd++; }
+            if (std::getenv("MSIM_WHYDIRECT")) std::fprintf(stderr, "direct NBAs: %zu signals\n", nd);
+        }
         std::vector<std::string> dsB4(procs.size()), dsB2(procs.size());
         std::vector<char> dsTmp(procs.size());
         for (int n : dom) {
@@ -3639,13 +3726,27 @@ private:
                             break;
                         }
                         if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
+                        if (i.hi < 0 && direct[i.sig]) {   // stored here: nobody reads it before the commit (above)
+                            std::string g, u, sl;
+                            const std::string slow = pw(i.sig, "@V@") + " if (P" + std::to_string(i.sig) + ".x | P" + std::to_string(i.sig) + ".z) pclean = false;";
+                            auto at = [&](const std::string& v) { std::string t = slow; t.replace(t.find("@V@"), 3, v); return t; };
+                            if (i.hi < 0 && split(i.e, g, u, sl)) {
+                                fns2 << " " << pwv(i.sig, u) << "\n";
+                                if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
+                                else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(at(sl)) << "\n";
+                            } else {
+                                fns << " " << at(fast(i.e)) << "\n";
+                                fns2 << " " << at(fast(i.e)) << "\n";
+                            }
+                            break;
+                        }
                         int k = (int)slots.size();
                         slots.push_back({i.sig, i.hi, i.lo});
                         slotProc.push_back(n);
                         fns << " CLP(" << k << ");";
                         fns2 << " CLP(" << k << ");";
                         std::string g, u, sl;
-                        bool sp = i.hi < 0 && split(i.e, g, u, sl);
+                        bool sp = (i.hi < 0 || (sigW_[i.sig] <= 64 && !sigNet_[i.sig])) && split(i.e, g, u, sl);   // a narrow part: see the commit
                         // Through the arrays (VA[k], not V<k>): shared code moves k.
                         const std::string K = std::to_string(k), V = " VA[" + K + "]", H = " HA[" + K + "]", F = " FA[" + K + "]";
                         if (sp) fns2 << V << " = " << u << ";" << H << " = 1;\n";
@@ -3786,7 +3887,11 @@ private:
                 std::string S_ = std::to_string(in.sig);
                 std::string unk = isPriv(in.sig) ? "P" + S_ + ".x"
                                 : sigW_[in.sig] <= 64 ? "S.sigs[" + S_ + "].val.x" : "anyX(S.sigs[" + S_ + "].val)";
-                return "    {" + fassign(in) + "    if (__builtin_expect(" + unk + " != 0, 0)) @BAIL@ }\n";
+                // MSIM_WHYBAIL=1 at -compile: simv names the first statements that abandon a 2-state pass.
+                std::string why = std::getenv("MSIM_WHYBAIL") && (size_t)in.sig < sigName_.size()
+                                      ? "{ static int n = 0; if (n++ < 2) std::fprintf(stderr, \"2-state comb pass abandoned: %s\\n\", " + quote(sigName_[in.sig]) + "); } "
+                                      : "";
+                return "    {" + fassign(in) + "    if (__builtin_expect(" + unk + " != 0, 0)) { " + why + "@BAIL@ } }\n";
             }
             std::string S_ = std::to_string(in.sig);
             if (isPriv(in.sig))   // x and z are already 0 in 2-state mode
@@ -3956,7 +4061,7 @@ private:
         o << "static void scanP() {\n    static unsigned skip = 0, wait = 0;\n"
              "    if (wait) { wait--; pclean = false; return; }\n    uint64_t x = 0;\n";
         for (int s : privs) if (!scratch(s) && !deadSig[s]) o << "    x |= P" << s << ".x;\n";
-        o << "    pclean = x == 0;\n    skip = x ? (skip < 255 ? skip * 2 + 1 : 255) : 0;\n    wait = skip;\n}\n";
+        o << "    pclean = x == 0;\n    skip = x ? (skip < " << scanCap_ << " ? skip * 2 + 1 : " << scanCap_ << ") : 0;\n    wait = skip;\n}\n";
         o << "static void (*const DS[])() = {";
         for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j];
         o << "};\n";
@@ -4089,12 +4194,19 @@ private:
             const Slot& sl = slots[k];
             std::string K = std::to_string(k), sg = std::to_string(sl.sig);
             std::string w;
-            if (sl.hi >= 0)
+            if (sl.hi >= 0 && sigW_[sl.sig] <= 64 && !sigNet_[sl.sig]) {   // H 1: the part's 2-state value in V
+                const std::string m = "(" + M(sl.hi - sl.lo + 1) + " << " + std::to_string(sl.lo) + ")";
+                w = "    if (H" + K + " == 1) { H" + K + " = 0; const Val& c = S.sigs[" + sg + "].val; const uint64_t m = " + m +
+                    "; S.fw(" + sg + ", Val{(c.v & ~m) | (((uint64_t)V" + K + " << " + std::to_string(sl.lo) + ") & m), c.x & ~m, " +
+                    std::to_string(sigW_[sl.sig]) + ", c.z & ~m}); }\n"
+                    "    else if (H" + K + ") { H" + K + " = 0; S.fw(" + sg + ", v_insert(S.get(" + sg + "), F" + K + ", " +
+                    std::to_string(sl.hi) + ", " + std::to_string(sl.lo) + ")); }\n";
+            } else if (sl.hi >= 0)
                 w = "    if (H" + K + ") { H" + K + " = 0; S.fw(" + sg + ", v_insert(S.get(" + sg + "), F" + K + ", " +
                     std::to_string(sl.hi) + ", " + std::to_string(sl.lo) + ")); }\n";
             else if (isPriv(sl.sig))
                 w = "    if (H" + K + " == 1) " + pwv(sl.sig, "V" + K) + " else if (H" + K + ") { " + pw(sl.sig, "F" + K) +
-                    " pclean = false; } H" + K + " = 0;\n";
+                    " if (P" + std::to_string(sl.sig) + ".x | P" + std::to_string(sl.sig) + ".z) pclean = false; } H" + K + " = 0;\n";
             else
                 w = "    if (H" + K + " == 1) " + regWrite(sl.sig, "V" + K) + " else if (H" + K + ") S.fw(" + sg + ", F" + K +
                     "); H" + K + " = 0;\n";
@@ -4342,7 +4454,7 @@ private:
              "    const CTRow& t = CTAB[k];\n"
              "    if (t.kind == 0) {\n"
              "        HA[k] = 0;\n"
-             "        if (h == 1) { t.p->v = VA[k] & t.m; t.p->x = 0; t.p->z = 0; } else { PW(*t.p, t.w, FA[k]); pclean = false; }\n"
+             "        if (h == 1) { t.p->v = VA[k] & t.m; t.p->x = 0; t.p->z = 0; } else { PW(*t.p, t.w, FA[k]); if (t.p->x | t.p->z) pclean = false; }\n"
              "    } else if (t.kind == 1) {\n"
              "        HA[k] = 0;\n"
              "        if (h != 1) S.fw(t.sig, FA[k]);\n"
