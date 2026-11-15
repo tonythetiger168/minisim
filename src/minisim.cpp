@@ -891,7 +891,9 @@ struct Sim {
         // Most writes of a comb pass store what is already there.
         if (g.w <= 64 && g.val.hi.empty() && !g_cov) {
             uint64_t m = mask(g.w);
-            if ((in.v & m) == g.val.v && (in.x & m) == g.val.x && (in.z & m) == g.val.z && in.real == g.val.real && in.str == g.val.str) return;
+            // A variable's initial x fills the whole word, and value bits under x mean nothing: x to x is no change.
+            uint64_t ix = in.x & m, cx = g.val.x & m;
+            if ((in.v & m & ~ix) == (g.val.v & m & ~cx) && ix == cx && (in.z & m) == (g.val.z & m) && in.real == g.val.real && in.str == g.val.str) return;
         }
         bool waveOnly = !mon.on && !g.fl;
         if (!quiet[s] || !waiters[s].empty() || (observed && !waveOnly)) {
@@ -904,8 +906,8 @@ struct Sim {
 #endif
             set(s, in); return; }
         if (g.w <= 64 && g.val.hi.empty()) {   // the common case, without copying a Val
-            uint64_t m = mask(g.w), v = in.v & m, x = in.x & m, z = in.z & m;
-            if (v == g.val.v && x == g.val.x && z == g.val.z) return;
+            uint64_t m = mask(g.w), x = in.x & m, v = in.v & m & ~x, z = in.z & m;
+            if (v == (g.val.v & m & ~g.val.x) && x == (g.val.x & m) && z == (g.val.z & m)) return;
             if (g_cov) covToggle(s, g.val, Val{v, x, g.w, z});
             g.val.v = v; g.val.x = x; g.val.z = z;
             g.val.real = in.real; g.val.str = in.str; g.val.sgn = false;
@@ -2677,11 +2679,12 @@ struct Sim {
         int o, n;
         if (g.w <= 64) {
             uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
-            nv.v &= m; nv.x &= m; nv.z &= m; nv.sgn = false;
+            nv.x &= m; nv.z &= m; nv.v &= m & ~nv.x;   // value bits under x / z mean nothing: x to x is no change
+            nv.sgn = false;
             nv.hi.clear();
             if (tlPart) { setLocal(s, nv); return; }
             Val& cur = g.val;   // no limbs: compare and copy the words, as == and = would
-            if (cur.hi.empty() ? nv.v == cur.v && nv.x == cur.x && nv.z == cur.z : nv == cur) return;
+            if (cur.hi.empty() ? nv.v == (cur.v & m & ~cur.x) && nv.x == (cur.x & m) && nv.z == (cur.z & m) : nv == cur) return;   // the initial x fills the whole word
             o = bit0(cur); n = bit0(nv);
             if (g_cov) covToggle(s, cur, nv);
             if (cur.hi.empty()) {

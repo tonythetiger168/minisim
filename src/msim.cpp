@@ -3561,7 +3561,7 @@ int main(int argc, char** argv) {
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
-    std::vector<std::pair<size_t, int>> lateConst;
+    std::vector<Task> lateConst, lateRest;
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         // A process run as a function (static comb or clocked) still takes
         // its generator seed in start order (18.14.2), so every later
@@ -3586,22 +3586,23 @@ int main(int argc, char** argv) {
             S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
             continue;
         }
-        // A continuous assignment of a constant (assign tie = 1'b0) runs once.
-        // It starts after the other processes, so an always @(tie) or
-        // always @* that reads it is already waiting and sees the change,
-        // as in other simulators.
-        if (lowered.procs[i].kind == "assign" && !lowered.procs[i].loops) { lateConst.push_back({i, pe}); continue; }
         Task t = lowered.procs[i].program >= 0 || lowered.procs[i].reactive
                      ? programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial")
                      : process(&lowered.procs[i].prog);
         if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
-        S.spawn(t);
+        // Time 0 order: initial blocks start after the constant continuous
+        // assignments (assign tie = 1'b0), and those after every other
+        // process. So an always @(tie) or always @* reading a constant is
+        // already waiting and sees its change, and an initial block already
+        // reads it, as in other simulators. Everything else starts in
+        // declaration order, and each Task is still made in declaration
+        // order, which keeps the random seeds (18.14.2).
+        if (lowered.procs[i].kind == "assign" && !lowered.procs[i].loops) lateConst.push_back(t);
+        else if (lowered.procs[i].kind == "Initial") lateRest.push_back(t);
+        else S.spawn(t);
     }
-    for (auto [i, pe] : lateConst) {
-        Task t = process(&lowered.procs[i].prog);
-        if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
-        S.spawn(t);
-    }
+    for (auto& t : lateConst) S.spawn(t);
+    for (auto& t : lateRest) S.spawn(t);
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
     S.freeVars = lowered.freeVars;   // free checker variables start random (17.7.2)
