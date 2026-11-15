@@ -1546,7 +1546,11 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     if (i.hi >= 0) v = v_insert(allz(S.sigs[i.sig].w), v, i.hi, i.lo);
                     if (i.gate >= 0 && gateRecs()[(size_t)i.gate].annotated)   // SDF DEVICE delays (32.4.1)
                         S.driveGate(i.sig, i.drv, v, i.s0, i.s1, gateRecs()[(size_t)i.gate].d);
-                    else if (!i.dly.empty()) S.driveLater(i.sig, i.drv, v, i.s0, i.s1, i.dly);   // assign #d (10.3.3)
+                    else if (!i.dlyE.empty()) {   // assign #(expr): the delay as it is now
+                        std::vector<uint64_t> d;
+                        for (const E& de : i.dlyE) { Val dv = eval(de, rd); int64_t t = dv.x ? 0 : v_to_i64(dv); d.push_back(t < 0 ? 0 : (uint64_t)t); }
+                        S.driveLater(i.sig, i.drv, v, i.s0, i.s1, d);
+                    } else if (!i.dly.empty()) S.driveLater(i.sig, i.drv, v, i.s0, i.s1, i.dly);   // assign #d (10.3.3)
                     else S.drive(i.sig, i.drv, v, i.s0, i.s1);
                     pc++; break;
                 }
