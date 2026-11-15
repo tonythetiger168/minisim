@@ -844,7 +844,13 @@ static void localizeSeqBlocking(LowerResult& lowered) {
         if (q.code[0].k != IK::WaitEdge || q.code[n - 1].k != IK::Jmp || q.code[n - 1].target != 0) continue;
         bool edge = !q.code[0].events.empty() || q.code[0].edge != ANY;
         for (auto& [sg, ed] : q.code[0].events) edge &= ed != ANY;
-        if (!edge) continue;   // a clocked block only
+        // A block woken by any change that schedules nonblocking assignments
+        // (a VHDL process: `t = a & b; y <= t; y__9 <= f(t);`) is no
+        // combinational shape either, so its private working values may go
+        // silent the same way.
+        bool nba = false;
+        for (size_t pc = 1; pc + 1 < n; pc++) nba |= q.code[pc].k == IK::Nba;
+        if (!edge && !nba) continue;   // a clocked block, or one that only schedules
         std::vector<size_t> cand;
         bool ok = true;
         for (size_t pc = 1; ok && pc + 1 < n; pc++) {
@@ -3141,6 +3147,9 @@ int main(int argc, char** argv) {
     if (!vhdlFiles.empty()) {
         vhdl::Translator vtr;
         vtr.nine = !vhdl4;
+        // Power-aware simulation replays and holds processes per domain, and
+        // runs nothing in the static schedule: each process keeps its own #0.
+        vtr.goStart = upfPath.empty();
         if (!vhdl::addVhdl(driver, vhdlFiles, vhdlSv, "msim", vtr)) return 1;
     }
     if (parseOnly) return driver.reportParseDiags() ? 0 : 1;

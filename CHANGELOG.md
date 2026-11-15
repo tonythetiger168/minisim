@@ -249,6 +249,12 @@ Spec references are IEEE 1800-2023 clauses.
 - mlint: with `-sdc`, rules SDC001..SDC005 check the constraints against the design (inputs and outputs with no I/O delay, a clock on a port that clocks nothing or on a reset, objects the design does not have). STY016 (off by default) reports glue logic in a module that also instantiates submodules. The STARC table in docs/LINT.md now lists every topic of the guide as covered or not a lint check.
 
 ### Changed
+- msim: VHDL processes with a sensitivity list run in the static schedule
+  (one design-wide first run instead of a `#0` in each process), and a block
+  woken by any change that schedules nonblocking assignments may keep its
+  working values as silent temporaries. NEORV32's processor test runs 30%
+  faster with nine values (95 s for 300 µs, was 136 s) and 18% faster with
+  `-vhdl4` (59 s, was 72 s), with byte-identical traces.
 - mini45: cell widths, pin shapes and obstructions now come from the cells'
   generated layouts (`lib/mini45/mini45_abstract.json`). 67 of the 88 cells
   are wider (728 sites in all before, 1190 now), so their Liberty `area` and
@@ -260,6 +266,9 @@ Spec references are IEEE 1800-2023 clauses.
   off.
 
 ### Fixed
+- msim: a clocked block that writes its working variable only in parts
+  (struct fields, part selects), never whole, lost those writes in the
+  static schedule (`Sim::poke` merged into a 1-bit default value).
 - msim VHDL: a process's first run sees its input ports' initial values,
   not `Z` (14.7.5.2).
 - msim VHDL: `real'image` and `to_string` of a real print GHDL's form
