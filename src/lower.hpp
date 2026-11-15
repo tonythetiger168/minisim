@@ -6263,8 +6263,24 @@ struct Lowerer {
             while (i < fs.size() && isdigit((unsigned char)fs[i])) i++;
             if (i >= fs.size()) break;
             char c = (char)tolower((unsigned char)fs[i]);
-            if (std::string_view("dhxobcsfegtum").find(c) == std::string_view::npos)
+            if (std::string_view("dhxobcsfegtumz").find(c) == std::string_view::npos)
                 unsupported(("$fscanf / $sscanf format %" + std::string(1, fs[i])).c_str());
+            if (c == 'u' || c == 'z') {
+                // %u / %z read binary data (21.3.4.3): as many 32-bit words as
+                // the target holds, written into the format as a private
+                // conversion with that count.
+                if (skip) unsupported("$fscanf / $sscanf %*u or %*z");
+                size_t k = letters.size();
+                if (k + 2 >= args.size()) break;
+                int w = (int)outArg(*args[k + 2]).type->getBitWidth();
+                std::string rep = std::to_string(std::max(1, (w + 31) / 32)) + (c == 'u' ? '\x01' : '\x02');
+                size_t st = i;
+                while (st > 0 && fs[st - 1] != '%') st--;
+                fs.replace(st, i - st + 1, rep);
+                i = st + rep.size() - 1;
+                letters.push_back('h');
+                continue;
+            }
             if (!skip) letters.push_back(c);
         }
         if (letters.size() != args.size() - 2) unsupported("$fscanf / $sscanf with a different number of formats and outputs");
