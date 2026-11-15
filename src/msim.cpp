@@ -3647,8 +3647,16 @@ int main(int argc, char** argv) {
         size_t nk = propagateConstants(lowered, pl);
         if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constants: %zu signals\n", nk);
     }
+    // A testbench's clocked block with $display / $finish: a clocked
+    // process of the compiled model too (the interpreter keeps it a coroutine).
+    Plan plC = pl;
+    if (compiled && staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOSEQSYS"))
+        for (size_t i = 0; i < lowered.procs.size(); i++)
+            if (plC.rank[i] < 0 && !plC.seq[i] && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && !upfPinned(lowered.procs[i].prog) &&
+                seqShape(lowered.procs[i].prog, plC.ev[i], true))
+                plC.seq[i] = 1;
     if (compiled) {
-        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle,
+        int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, plC, threads, staticPart, twoState, cycle,
                              seed, covPath);
         if (st >= 0) {
             if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
