@@ -3116,6 +3116,7 @@ private:
     const int scanCap_ = std::getenv("MSIM_SCANCAP") ? std::atoi(std::getenv("MSIM_SCANCAP")) : 7;
     std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
+    bool dAhead_ = false;        // emitCycle: a direct NBA some comb process reads (DAHEAD, see directNba)
     // Of those, the clocks themselves, and their own smaller cone (combConeK):
     // a clock edge runs only that. The others (a debug request, an enable
     // feeding a clock gate) run the whole cone, rarely.
@@ -3488,6 +3489,7 @@ private:
     }
     void emitCycle(std::ostream& o, const std::vector<CodegenProc>& procs, const std::vector<int>& dom,
                    const std::vector<int>& byRank) {
+        dAhead_ = false;
         clock_.assign(sigW_.size(), 0);
         for (size_t i = 0; i < procs.size(); i++)
             for (auto& [sg, ed] : procs[i].seqEv)
@@ -3638,11 +3640,16 @@ private:
         // process write, that no other process reads, and that its writer
         // does not read after the first write, is stored at the NBA itself:
         // nobody can see the store before the commit would have made it.
-        // (Comb units read it only after fcommit; see directNba_.)
+        // A comb process of the domain may read it too: combAll runs after
+        // fcommit, and a pass that would run between the clocked processes
+        // and fcommit (an outside input changed in the same time step) waits
+        // for the one after it (DAHEAD), as it would see the stores early.
+        // Not a register that feeds a clock: combCone runs at any time.
         std::vector<char> direct(sigW_.size(), 0);
         // partNba: a register the commit lists (C0L, C1L) must not take, as
-        // they are stored before the slots: some NBA to it writes a part or
-        // an element, has no 2-state value, or is in another process.
+        // they are stored before the slots: some NBA to it writes an element,
+        // a part of a private or wide one, has no 2-state value, or is in
+        // another process.
         std::vector<char> partNba(sigW_.size(), 0);
         {
             std::vector<int> by(sigW_.size(), -1);
@@ -3650,7 +3657,8 @@ private:
                 for (auto& in : procs[n].prog->code) {
                     if (in.k != IK::Nba || in.sig < 0 || (size_t)in.sig >= partNba.size()) continue;
                     std::string g, u, sl;
-                    if (in.hi >= 0 || in.arr || in.bidx || !in.aidx.empty() || (by[in.sig] >= 0 && by[in.sig] != n) || !split(in.e, g, u, sl))
+                    const bool partOk = in.hi < 0 || (!isPriv(in.sig) && sigW_[in.sig] <= 64 && !sigNet_[in.sig]);   // C1L takes a mask
+                    if (!partOk || in.arr || in.bidx || !in.aidx.empty() || (by[in.sig] >= 0 && by[in.sig] != n) || !split(in.e, g, u, sl))
                         partNba[in.sig] = 1;
                     by[in.sig] = n;
                 }
@@ -3658,19 +3666,22 @@ private:
         if (!std::getenv("MSIM_NODIRECT")) {
             const size_t ns = sigW_.size();
             std::vector<int> wproc(ns, -1), firstW(ns, -1);
-            std::vector<char> bad(ns, 0), inDom(procs.size(), 0);
+            std::vector<char> bad(ns, 0), inDom(procs.size(), 0), inByRank(procs.size(), 0);
             for (int n : dom) inDom[n] = 1;
+            for (int r : byRank) if (r >= 0) inByRank[r] = 1;
+            const char* dbgW0 = std::getenv("MSIM_WHYDIRECT"); const bool dbgW = dbgW0 && *dbgW0 == '2';
             for (size_t p = 0; p < procs.size(); p++) {
                 if (!procs[p].prog) continue;
                 const auto& code = procs[p].prog->code;
                 for (size_t pc = 0; pc < code.size(); pc++) {
                     const Instr& i = code[pc];
                     if (i.sig < 0 || (size_t)i.sig >= ns) continue;
+                    if (i.k == IK::WaitEdge) continue;   // a read (its edge signal): below
                     const bool ok = inDom[p] && i.k == IK::Nba && i.hi < 0 && !i.arr && i.aidx.empty() && !i.bidx && !i.de &&
                                     !i.delay && i.dly.empty();
                     // A declaration initializer (logic a = 0) runs before any clock.
                     if (!ok && procs[p].kind == "init" && procs[p].combRank < 0 && !procs[p].seq && i.k == IK::Assign) continue;
-                    if (!ok) { bad[i.sig] = 1; continue; }
+                    if (!ok) { if (dbgW && !bad[i.sig]) std::fprintf(stderr, "WD write %s k=%d proc=%zu %s dom=%d\n", sigName_[i.sig].c_str(), (int)i.k, p, procs[p].kind.c_str(), (int)inDom[p]); bad[i.sig] = 1; continue; }
                     if (wproc[i.sig] < 0) { wproc[i.sig] = (int)p; firstW[i.sig] = (int)pc; }
                     else if (wproc[i.sig] != (int)p) bad[i.sig] = 1;
                 }
@@ -3678,6 +3689,24 @@ private:
             // Reads. In the writer: bad only where some write can come before
             // the read (the code is a DAG of forward jumps: one pass in pc
             // order, the set of candidates written so far on some path).
+            const char* dbgD0 = std::getenv("MSIM_WHYDIRECT"); const bool dbgD = dbgD0 && *dbgD0 == '2';
+            // The signals some comb process turns into a clock, at any depth.
+            std::vector<char> feedsClk(ns, 0), combRead(ns, 0);
+            for (size_t x = 0; x < ns && x < clock_.size(); x++) feedsClk[x] = clock_[x];
+            for (bool again = true; again;) {
+                again = false;
+                for (int r : byRank) {
+                    if (r < 0) continue;
+                    bool feeds = false;
+                    for (auto& in : procs[r].prog->code) {
+                        if (in.k == IK::WaitEdge) break;
+                        if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) feeds |= feedsClk[in.sig] != 0;
+                    }
+                    if (!feeds) continue;
+                    for (int x : procs[r].combIns)
+                        if (x >= 0 && (size_t)x < ns && !feedsClk[x]) { feedsClk[x] = 1; again = true; }
+                }
+            }
             auto cand = [&](int sg) { return sg >= 0 && (size_t)sg < ns && wproc[sg] >= 0 && !bad[sg]; };
             std::vector<int> cidx(ns, -1);
             for (size_t p = 0; p < procs.size(); p++) {
@@ -3697,9 +3726,13 @@ private:
                     const Instr& i = code[pc];
                     auto rd = [&](int sg) {
                         if (!cand(sg)) return;
-                        if (wproc[sg] != (int)p) { bad[sg] = 1; return; }
+                        if (wproc[sg] != (int)p && procs[p].combRank >= 0 && inByRank[p] && !feedsClk[sg]) { combRead[sg] = 1; return; }
+                        // An @* arming process (armChk compares the inputs; it arms
+                        // its block once, which runs in combAll after fcommit either way).
+                        if (wproc[sg] != (int)p && p < armK_.size() && armK_[p] >= 0) return;
+                        if (wproc[sg] != (int)p) { if (!bad[sg] && dbgD) std::fprintf(stderr, "WD other %s w=%d r=%zu %s rank=%d seq=%d dom=%d line=%d\n", sigName_[sg].c_str(), wproc[sg], p, procs[p].kind.c_str(), procs[p].combRank, (int)procs[p].seq, (int)inDom[p], procs[p].prog->code.empty() ? 0 : procs[p].prog->code[0].line); bad[sg] = 1; return; }
                         const int c = cidx[sg];
-                        if (!fwd || (win[pc][(size_t)c / 64] >> (c % 64) & 1)) bad[sg] = 1;
+                        if (!fwd || (win[pc][(size_t)c / 64] >> (c % 64) & 1)) { if (!bad[sg] && dbgD) std::fprintf(stderr, "WD self %s fwd=%d\n", sigName_[sg].c_str(), (int)fwd); bad[sg] = 1; }
                     };
                     std::function<void(const E&)> f = [&](const E& x) {
                         if (!x) return;
@@ -3726,10 +3759,14 @@ private:
                 }
                 for (int sg : mine) cidx[sg] = -1;
             }
-            size_t nd = 0;
+            size_t nd = 0, nc = 0;
             for (size_t sg = 0; sg < ns; sg++)
-                if (wproc[sg] >= 0 && !bad[sg] && isPriv((int)sg) && sigW_[sg] <= 64 && !clock_[sg] && !sigNet_[sg]) { direct[sg] = 1; nd++; }
-            if (std::getenv("MSIM_WHYDIRECT")) std::fprintf(stderr, "direct NBAs: %zu signals\n", nd);
+                if (wproc[sg] >= 0 && !bad[sg] && isPriv((int)sg) && sigW_[sg] <= 64 && !clock_[sg] && !sigNet_[sg]) {
+                    direct[sg] = 1;
+                    nd++;
+                    if (combRead[sg]) { dAhead_ = true; nc++; }
+                }
+            if (std::getenv("MSIM_WHYDIRECT")) std::fprintf(stderr, "direct NBAs: %zu signals, %zu read by comb\n", nd, nc);
         }
         std::vector<std::string> dsB4(procs.size()), dsB2(procs.size());
         std::vector<char> dsTmp(procs.size());
@@ -3784,13 +3821,16 @@ private:
                         // a private one (C0), or a narrow S.sigs one (C1). Not for a
                         // register some NBA writes a part of: the order would change.
                         const bool c0 = sp && i.hi < 0 && c0On_ && !partNba[i.sig] && isPriv(i.sig);
-                        const bool c1 = sp && i.hi < 0 && c0On_ && !partNba[i.sig] && !isPriv(i.sig) && sigW_[i.sig] <= 64 &&
+                        const bool c1 = sp && c0On_ && !partNba[i.sig] && !isPriv(i.sig) && sigW_[i.sig] <= 64 &&
                                         !sigNet_[i.sig] && !clock_[i.sig];
+                        // C1L: the bits written (all, or the part's) and their value there.
+                        const std::string c1m = i.hi < 0 ? M(sigW_[i.sig]) : "(" + M(i.hi - i.lo + 1) + " << " + std::to_string(i.lo) + ")";
+                        const std::string c1v = i.hi < 0 ? "(" + u + ")" : "((uint64_t)(" + u + ") << " + std::to_string(i.lo) + ")";
                         if (c0)
                             fns2 << " if (C0OK) { C0L[C0N].p = &P" << i.sig << "; C0L[C0N++].v = (" << u << ") & " << M(sigW_[i.sig])
                                  << "; } else { CLP(" << k << ");" << V << " = " << u << ";" << H << " = 1; }\n";
                         else if (c1)
-                            fns2 << " if (C1OK) { C1L[C1N].g = &S.sigs[" << i.sig << "]; C1L[C1N++].v = (" << u << ") & " << M(sigW_[i.sig])
+                            fns2 << " if (C1OK) { C1L[C1N].g = &S.sigs[" << i.sig << "]; C1L[C1N].m = " << c1m << "; C1L[C1N++].v = " << c1v << " & " << c1m
                                  << "; } else { CLP(" << k << ");" << V << " = " << u << ";" << H << " = 1; }\n";
                         else fns2 << " CLP(" << k << ");";
                         if (c0 || c1) {}
@@ -3872,13 +3912,14 @@ private:
         // idle in any one cycle). CLON is off for the parallel path.
         o << "static uint32_t CL[" << std::max<size_t>(slots.size(), 1) << "]; static const uint32_t CLCAP = " << std::max<size_t>(slots.size(), 1)
           << "; static uint32_t CN; static bool CLOVF; static bool CLON = true;\n"
+             "static bool DAHEAD;   // the clocked processes ran, fcommit has not (see directNba)\n"
              "#define CLP(k) do { if (CLON) { if (CN < CLCAP) CL[CN++] = (k); else CLOVF = true; } } while (0)\n";
         // The 2-state NBAs to private registers, in the order they ran: one
         // store each in fcommit, no slot (PicoRV32 x16 commits ~1300 a cycle).
         // Off for the parallel path (CLON) and when full: the slot instead.
         // (No sizes in the macros: they go to every part, and a part must not
         // change when a process elsewhere adds slots.)
-        o << "struct C0E { PSig* p; uint64_t v; };\nstruct C1E { Sig* g; uint64_t v; };\n"
+        o << "struct C0E { PSig* p; uint64_t v; };\nstruct C1E { Sig* g; uint64_t v, m; };\n"
              "static C0E C0L[" << std::max<size_t>(2 * slots.size(), 1) << "]; static C1E C1L[" << std::max<size_t>(2 * slots.size(), 1)
           << "]; static const uint32_t C0CAP = " << std::max<size_t>(2 * slots.size(), 1) << "; static uint32_t C0N, C1N;\n"
              "#define C0OK (__builtin_expect(CLON && C0N < C0CAP, 1))\n"
@@ -4229,6 +4270,7 @@ private:
             o << "};\n";
         }
         o << "static void dseq(const void* ctx, std::vector<Sim::NbaItem>& nb) {\n    (void)ctx;\n    DNB = &nb;\n";
+        if (dAhead_) o << "    DAHEAD = true;\n";
         if (par) o << "    CLON = false;\n";
         if (par)
             // Nothing else runs before the NBA region (S.fuseOk()): each group
@@ -4239,6 +4281,7 @@ private:
                  "        S.parallelFor(" << G << ", [t](size_t g) { DSG[g](t); CMG[g](t); }, use);\n"
                  "        S.domainTune[0].done(S.threads);\n"
                  "        if (!t || cdirty.exchange(false)) scanP();\n"
+                 "        DAHEAD = false;\n"
                  "        if (S.observed) syncP();\n"
                  "        return;\n    }\n"
                  "    { const bool t = twoNow(); const int use = S.domainTune[1].pick(S.threads);\n"
@@ -4447,7 +4490,8 @@ private:
         }
         // armChk before the pass (a testbench write to a private input) and
         // after it (a private comb output read by a later @* block).
-        o << "static void combAll(const void*) {\n" << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
+        o << "static void combAll(const void*) {\n" << (dAhead_ ? "    if (DAHEAD) return;   // fcommit queues the pass after it\n" : "")
+          << (armIns_.empty() ? "" : "    if (ARMLEFT) armChk();\n");
         if (two) {
             o << "    if (twoNow()) {\n        cdirty = false;\n";
             for (auto& c : callsQ) o << "        " << c << "; if (cdirty) goto slow;\n";
@@ -4474,10 +4518,12 @@ private:
             // twoNow() before the commits: in 2-state mode every slot holds a
             // known value, so the commits keep every private signal known.
             o << "static void fcommit() {\n"
+                 "    DAHEAD = false;\n"
                  "    const bool t = twoNow();\n"
                  "    for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = C0L[j].v; p.x = 0; p.z = 0; }\n    C0N = 0;\n"                 "    { const bool obs = S.observed;" " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
-             " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { Val& q = g.val; q.v = C1L[j].v; q.x = 0; q.z = 0; q.real = false; q.str = false; }"
-             " else S.fwSlow(s, make(C1L[j].v, 0, g.w)); } C1N = 0;" " }\n"
+             " const uint64_t m = C1L[j].m; Val& q = g.val;"
+             " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { q.v = (q.v & ~m) | C1L[j].v; q.x &= ~m; q.z &= ~m; q.real = false; q.str = false; }"
+             " else S.fwSlow(s, Val{(q.v & ~m) | C1L[j].v, q.x & ~m, g.w, q.z & ~m}); } C1N = 0;" " }\n"
                  "    const int use = S.domainTune[2].pick(S.threads);\n"
                  "    S.parallelFor(" << G << ", [t](size_t g) { CMG[g](t); }, use);\n"
                  "    S.domainTune[2].done(S.threads);\n"
@@ -4534,13 +4580,14 @@ private:
              "        } else S.fwSlow(t.sig, make(VA[k] & t.m, 0, t.w));\n"
              "    } else CMS[k / " << kChunk << "](k);\n"
              "}\n";
-        o << "static void fcommit() {" << (multi ? " dpend = false;" : "");
+        o << "static void fcommit() { DAHEAD = false;" << (multi ? " dpend = false;" : "");
         o << " const bool obs = S.observed;"
              // The common slot inline: a private signal given a known value.
              " for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = C0L[j].v; p.x = 0; p.z = 0; } C0N = 0;"
              " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
-             " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { Val& q = g.val; q.v = C1L[j].v; q.x = 0; q.z = 0; q.real = false; q.str = false; }"
-             " else S.fwSlow(s, make(C1L[j].v, 0, g.w)); } C1N = 0;"
+             " const uint64_t m = C1L[j].m; Val& q = g.val;"
+             " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { q.v = (q.v & ~m) | C1L[j].v; q.x &= ~m; q.z &= ~m; q.real = false; q.str = false; }"
+             " else S.fwSlow(s, Val{(q.v & ~m) | C1L[j].v, q.x & ~m, g.w, q.z & ~m}); } C1N = 0;"
              " if (!CLOVF) { for (uint32_t j = 0; j < CN; j++) { const uint32_t k = CL[j]; const uint8_t h = HA[k];"
              " if (h == 1) { const CTRow& t = CTAB[k]; if (t.kind == 0) { HA[k] = 0; PSig& p = *t.p; p.v = VA[k] & t.m; p.x = 0; p.z = 0; continue; } }"
              " if (h) commitOne(k, obs); } }"
