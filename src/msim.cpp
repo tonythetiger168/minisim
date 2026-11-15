@@ -175,6 +175,8 @@
 #include "slang/diagnostics/LookupDiags.h"
 #include "slang/diagnostics/ExpressionsDiags.h"
 #include "slang/driver/Driver.h"
+#include "slang/analysis/AnalysisManager.h"
+#include "slang/diagnostics/AnalysisDiags.h"
 #include "slang/text/SourceManager.h"
 #include "protect_front.hpp"
 #include "slang/syntax/AllSyntax.h"
@@ -3399,6 +3401,40 @@ int main(int argc, char** argv) {
     vendor::declare(*comp);   // $fsdbDumpvars, $vcdpluson, $shm_probe, ... (after VPI: a real PLI library wins)
     driver.reportCompilation(*comp, /*quiet*/ true);
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
+    // Illegal drivers of a net: a uwire with several drivers (6.6.2), a net
+    // of a user-defined nettype without a resolution function with several
+    // (6.6.7). slang finds them in its data-flow analysis; they are errors.
+    // (Its checks of variable drivers, 6.5 and 9.2.2, are left out: they
+    // also flag the slices an instance array drives, 23.3.3.5.)
+    bool singleDriverNets = false;   // only then is the analysis worth its time
+    {
+        struct Find : slang::ast::ASTVisitor<Find, slang::ast::VisitFlags::Symbols> {
+            bool any = false;
+            void handle(const slang::ast::NetSymbol& n) {
+                const auto& nt = n.netType;
+                if (nt.netKind == slang::ast::NetType::UWire ||
+                    (nt.netKind == slang::ast::NetType::UserDefined && !nt.getResolutionFunction()))
+                    any = true;
+            }
+        } f;
+        comp->getRoot().visit(f);
+        singleDriverNets = f.any;
+    }
+    if (singleDriverNets) {
+        using namespace slang;
+        comp->freeze();
+        analysis::AnalysisOptions ao;
+        analysis::AnalysisManager am(ao);
+        am.analyze(*comp);
+        comp->unfreeze();
+        bool bad = false;
+        for (const Diagnostic& d : am.getDiagnostics()) {
+            if (d.code != diag::MultipleUWireDrivers && d.code != diag::MultipleUDNTDrivers) continue;
+            driver.diagEngine.issue(d);
+            bad = true;
+        }
+        if (bad) { driver.reportDiagnostics(/*quiet*/ true); return 1; }
+    }
 
     // The VCD's root scope is the top module (several tops: "top").
     if (auto tops = comp->getRoot().topInstances; tops.size() == 1) S.vcdTop = std::string(tops[0]->name);
