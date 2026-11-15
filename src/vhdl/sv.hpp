@@ -959,6 +959,9 @@ private:
                 // packed vectors are declared [hi:lo]; unpacked dynamic arrays count up from 0
                 g = mkRng("$left(" + v.s + ")", "$right(" + v.s + ")", isScalarBit(t->elem));
                 if (t->elem && t->elem->k == Type::Char) g = mkRng("1", v.s + ".len()", false);
+            } else if (t && (t->k == Type::String || t->k == Type::Line)) {
+                // a string object without known bounds: 1 to its length
+                g = mkRng("1", ex(r->a, nullptr).s + ".len()", false);
             } else if (t && t->range) g = *t->range;
             else if (t && t->k == Type::Enum) g = mkRng(t->litSv.front(), t->litSv.back(), false);
             else if (t && t->k == Type::Int) g = mkRng("-2147483648", "2147483647", false);
@@ -2294,6 +2297,13 @@ private:
             Val x = ex(e->b, pt);
             return attrImage(pt, x);
         }
+        if (a == "reflect") {   // 16.2.2 (VHDL-2019): a mirror of the subtype or of the value
+            const Sym* m = lookup(isType ? "subtype_mirror" : "value_mirror");
+            if (!m || m->k != Sym::TypeK) fail(e->line, "'REFLECT needs std.reflection (use std.reflection.all)");
+            v.t = m->type;
+            v.s = isType ? reflectSm(pt, nullptr, e->line) : reflectVm(pt, e->a, e->line);
+            return v;
+        }
         if (a == "value") {
             Val x = ex(e->b, bt["string"]);
             if (bt0->k == Type::Int) { v.s = "vhdl_rt::int_value(" + x.s + ")"; v.t = pt; return v; }
@@ -2311,7 +2321,7 @@ private:
         if (a == "pos") {
             Val x = ex(e->b, pt);
             v.t = bt["integer"];
-            if (bt0->k == Type::Logic) v.s = "vhdl_rt::sl_pos(" + x.s + ")";
+            if (bt0->k == Type::Logic) v.s = x.a.empty() ? "vhdl_rt::sl_pos(" + x.s + ")" : "vhdl_rt::sl_pos9(" + x.s + ", " + x.a + ")";
             else v.s = "int'(" + x.s + ")";
             return v;
         }
@@ -2388,6 +2398,313 @@ private:
         }
         (void)want;
         fail(e->line, "unsupported attribute '" + e->text + "'");
+    }
+
+    // ------------------------------------------------------------ 'REFLECT
+    // VHDL-2019 16.2.2 / 16.12: T'REFLECT is a subtype_mirror of T, O'REFLECT
+    // a value_mirror of the object's value. Both are built by calls of the
+    // msim_* constructors of std.reflection (reflection.hpp), nested as
+    // expressions; an array's elements are filled by a function of this
+    // module (one per use, the array passed in). An access type designating
+    // a type already being mirrored gets a function of its own that calls
+    // itself (a linked list); without a module to hold it (in a package),
+    // the inner mirror is null.
+    std::vector<const Type*> reflStack;
+    std::map<const Type*, std::string> reflAccFns;   // per module (cleared with the helpers)
+    std::string reflFn(const std::string& n, int line) {
+        const Sym* y = lookup(n);
+        if (!y || y->k != Sym::Sub) fail(line, "'REFLECT needs std.reflection (use std.reflection.all)");
+        return qualSub(*y);
+    }
+    static std::string reflQ(const std::string& s) {
+        std::string r = "\"";
+        for (char c : s) {
+            if (c == '\\' || c == '"') r += '\\';
+            if (c == '\n') { r += "\\n"; continue; }
+            if ((unsigned char)c >= 0x80) {   // a Latin-1 character (character'reflect)
+                char b[8];
+                std::snprintf(b, sizeof b, "\\x%02x", (unsigned char)c);
+                r += b;
+                continue;
+            }
+            r += c;
+        }
+        return r + "\"";
+    }
+    static std::string reflReal(double d) {
+        char b[64];
+        std::snprintf(b, sizeof b, "%.17g", d);
+        std::string r = b;
+        if (r.find_first_of(".eEn") == std::string::npos) r += ".0";
+        return r;
+    }
+    EP reflName(const std::string& n, int line) { auto e = std::make_shared<Expr>(EK::Name, line); e->name = n; e->text = n; return e; }
+    EP reflAttr(const EP& pre, const std::string& a, int dim, int line) {
+        auto e = std::make_shared<Expr>(EK::Attr, line);
+        e->a = pre; e->name = a; e->text = a;
+        if (dim > 0) { e->b = std::make_shared<Expr>(EK::Int, line); e->b->ival = dim; e->b->text = std::to_string(dim); }
+        return e;
+    }
+    std::vector<std::string> reflLits(const TP& b) {
+        if (b->k == Type::Logic) return {"'U'", "'X'", "'0'", "'1'", "'Z'", "'W'", "'L'", "'H'", "'-'"};
+        if (b->k == Type::Bool) return {"false", "true"};
+        if (b->k == Type::Bit) return {"'0'", "'1'"};
+        if (b->k == Type::Char) {
+            static const char* ctl[] = {"nul", "soh", "stx", "etx", "eot", "enq", "ack", "bel", "bs", "ht", "lf", "vt", "ff", "cr", "so", "si",
+                                        "dle", "dc1", "dc2", "dc3", "dc4", "nak", "syn", "etb", "can", "em", "sub", "esc", "fsp", "gsp", "rsp", "usp"};
+            std::vector<std::string> r;
+            for (int c = 0; c < 256; c++) {
+                if (c < 32) r.push_back(ctl[c]);
+                else if (c == 127) r.push_back("del");
+                else if (c >= 128 && c < 160) r.push_back("c" + std::to_string(c));
+                else r.push_back(std::string("'") + (char)c + "'");
+            }
+            return r;
+        }
+        return b->lits;
+    }
+    // the position of a scalar range bound given as SystemVerilog text
+    std::string reflPos(const TP& b, const std::string& sv) {
+        if (b->k == Type::Logic) return "vhdl_rt::sl_pos(" + sv + ")";
+        return "int'(" + sv + ")";
+    }
+    std::string reflName0(const TP& t) { return t && !t->text.empty() ? t->text : t && !t->name.empty() ? t->name : ""; }
+    // SV text of a subtype_mirror of t; pre: an object of that subtype (for
+    // an unconstrained array's bounds), or null
+    std::string reflectSm(const TP& t, const EP& pre, int line) {
+        TP b = baseOf(t);
+        if (!b) fail(line, "'REFLECT of an object without a type");
+        std::string n = reflQ(reflName0(t));
+        auto rangeOf = [&](std::string& l, std::string& r, bool& asc, const char* dl, const char* dr) {
+            std::optional<Rng> rg = t->range;
+            if (!rg && b->range) rg = b->range;
+            if (rg) { l = rg->l; r = rg->r; asc = !rg->downto; }
+            else { l = dl; r = dr; asc = true; }
+        };
+        switch (b->k) {
+        case Type::Logic: case Type::Bool: case Type::Bit: case Type::Char: case Type::Enum: {
+            auto lits = reflLits(b);
+            std::string ls;
+            for (size_t i = 0; i < lits.size(); i++) ls += (i ? "\n" : "") + lits[i];
+            std::string l, r; bool asc;
+            std::optional<Rng> rg = t->range;
+            if (rg) { l = reflPos(b, rg->l); r = reflPos(b, rg->r); asc = !rg->downto; }
+            else { l = "0"; r = std::to_string(lits.size() - 1); asc = true; }
+            return reflFn("msim_enum_sm", line) + "(" + n + ", " + reflQ(ls) + ", " + l + ", " + r + ", " + (asc ? "1'b1" : "1'b0") + ")";
+        }
+        case Type::Int: {
+            std::string l, r; bool asc;
+            rangeOf(l, r, asc, "(-2147483647-1)", "2147483647");
+            return reflFn("msim_int_sm", line) + "(" + n + ", " + l + ", " + r + ", " + (asc ? "1'b1" : "1'b0") + ")";
+        }
+        case Type::Real: {
+            std::string l, r; bool asc;
+            rangeOf(l, r, asc, "-1.7976931348623157e308", "1.7976931348623157e308");
+            return reflFn("msim_float_sm", line) + "(" + n + ", real'(" + l + "), real'(" + r + "), " + (asc ? "1'b1" : "1'b0") + ")";
+        }
+        case Type::Time: {
+            std::string l, r; bool asc;
+            rangeOf(l, r, asc, "(-9223372036854775807.0*1fs)", "(9223372036854775807.0*1fs)");
+            return reflFn("msim_phys_sm", line) + "(" + n + ", " + reflQ("fs\nps\nns\nus\nms\nsec\nmin\nhr") + ", " +
+                   reflQ("1.0\n1.0e3\n1.0e6\n1.0e9\n1.0e12\n1.0e15\n6.0e16\n3.6e18") + ", (" + l + ") / 1fs, (" + r + ") / 1fs, " +
+                   (asc ? "1'b1" : "1'b0") + ")";
+        }
+        case Type::Record: {
+            std::string names;
+            for (size_t i = 0; i < b->fnames.size(); i++) names += (i ? "\n" : "") + b->fnames[i];
+            std::string r = reflFn("msim_rec_sm", line) + "(" + n + ", " + reflQ(names) + ", " + std::to_string(b->fnames.size()) + ")";
+            const TP& rt = t->k == Type::Record ? t : b;
+            for (size_t i = 0; i < b->fnames.size(); i++) {
+                EP sub;
+                if (pre) { sub = std::make_shared<Expr>(EK::Sel, line); sub->a = pre; sub->name = b->fnames[i]; sub->text = b->fnames[i]; }
+                r = reflFn("msim_rec_set", line) + "(" + r + ", " + std::to_string(i) + ", " + reflectSm(rt->ftypes[i], sub, line) + ")";
+            }
+            return r;
+        }
+        case Type::String: case Type::Array: {
+            TP at = t->k == Type::Array || t->k == Type::String ? t : b;
+            size_t nd = b->k == Type::String ? 1 : std::max<size_t>(1, at->dims.size());
+            TP et = b->k == Type::String ? bt["character"] : at->elem;
+            // the element subtype: of the first element when the element is unconstrained
+            EP epre;
+            if (pre && isUnconstrained(et)) {
+                epre = std::make_shared<Expr>(EK::Call, line);
+                epre->a = pre;
+                for (size_t d = 0; d < nd; d++) epre->args.push_back(Assoc{nullptr, reflAttr(pre, "left", nd > 1 ? (int)d + 1 : 0, line)});
+            }
+            std::string r = reflFn("msim_arr_sm", line) + "(" + n + ", " + std::to_string(nd) + ", " + reflectSm(et, epre, line) + ")";
+            for (size_t d = 0; d < nd; d++) {
+                std::string l, rr, asc;
+                TP it = b->k != Type::String && d < at->dims.size() && at->dims[d].idx ? at->dims[d].idx : bt["integer"];
+                bool box = b->k == Type::String || (d < at->dims.size() && at->dims[d].box);
+                if (box && !pre) { l = "1"; rr = "0"; asc = "1'b1"; }
+                else if (box) {
+                    l = attribute(reflAttr(pre, "left", nd > 1 ? (int)d + 1 : 0, line), nullptr).s;
+                    rr = attribute(reflAttr(pre, "right", nd > 1 ? (int)d + 1 : 0, line), nullptr).s;
+                    asc = attribute(reflAttr(pre, "ascending", nd > 1 ? (int)d + 1 : 0, line), nullptr).s;
+                } else {
+                    const Rng& g = at->dims[d];
+                    l = g.l; rr = g.r; asc = g.downto ? "1'b0" : "1'b1";
+                }
+                TP ib = baseOf(it);
+                if (ib && ib->k != Type::Int) { l = reflPos(ib, l); rr = reflPos(ib, rr); }
+                r = reflFn("msim_arr_dim", line) + "(" + r + ", " + std::to_string(d + 1) + ", " + reflectSm(it, nullptr, line) + ", " + l + ", " + rr + ", " + asc + ")";
+            }
+            return r;
+        }
+        case Type::Line: case Type::Access: {
+            TP d = b->k == Type::Line ? bt["string"] : b->target;
+            bool rec = std::find(reflStack.begin(), reflStack.end(), b.get()) != reflStack.end();
+            std::string ds = "null";
+            if (d && !rec) {
+                reflStack.push_back(b.get());
+                ds = reflectSm(d, nullptr, line);
+                reflStack.pop_back();
+            }
+            return reflFn("msim_acc_sm", line) + "(" + n + ", " + ds + ")";
+        }
+        case Type::File: {
+            std::string ds = b->target ? reflectSm(b->target, nullptr, line) : "null";
+            return reflFn("msim_file_sm", line) + "(" + n + ", " + ds + ")";
+        }
+        case Type::Protected: return reflFn("msim_prot_sm", line) + "(" + n + ")";
+        default: fail(line, "'REFLECT of this type is not supported");
+        }
+        return "";
+    }
+    // SV text of a value_mirror of the object or value `pre` of subtype t
+    std::string reflectVm(const TP& t, const EP& pre, int line, const std::string& smGiven = "") {
+        TP b = baseOf(t);
+        std::string sm = smGiven.empty() ? reflectSm(t, pre, line) : smGiven;
+        switch (b->k) {
+        case Type::Logic: {
+            Val x = ex(pre, t);
+            std::string pos = x.a.empty() ? "vhdl_rt::sl_pos(" + x.s + ")" : "vhdl_rt::sl_pos9(" + x.s + ", " + x.a + ")";
+            return reflFn("msim_enum_vm", line) + "(" + sm + ", " + pos + ")";
+        }
+        case Type::Bool: case Type::Bit: case Type::Char: case Type::Enum:
+            return reflFn("msim_enum_vm", line) + "(" + sm + ", int'(" + ex(pre, t).s + "))";
+        case Type::Int: return reflFn("msim_int_vm", line) + "(" + sm + ", " + ex(pre, t).s + ")";
+        case Type::Real: return reflFn("msim_float_vm", line) + "(" + sm + ", " + ex(pre, t).s + ")";
+        case Type::Time: return reflFn("msim_phys_vm", line) + "(" + sm + ", (" + ex(pre, t).s + ") / 1fs)";
+        case Type::Record: {
+            std::string r = reflFn("msim_rec_vm", line) + "(" + sm + ")";
+            const TP& rt = t->k == Type::Record ? t : b;
+            for (size_t i = 0; i < b->fnames.size(); i++) {
+                EP sub = std::make_shared<Expr>(EK::Sel, line);
+                sub->a = pre; sub->name = b->fnames[i]; sub->text = b->fnames[i];
+                r = reflFn("msim_rec_vset", line) + "(" + r + ", " + std::to_string(i) + ", " + reflectVm(rt->ftypes[i], sub, line) + ")";
+            }
+            return r;
+        }
+        case Type::String: case Type::Array: {
+            // a function of this module fills the elements, in row-major order
+            if (!cx->helpers) fail(line, "'REFLECT of an array value is supported in a design unit's statements and processes only");
+            Val x = ex(pre, t);
+            TP at = x.t ? x.t : t;
+            size_t nd = baseOf(at)->k == Type::String ? 1 : std::max<size_t>(1, at->dims.size());
+            TP et = baseOf(at)->k == Type::String ? bt["character"] : at->elem;
+            int id = ++uniq;
+            std::string xn = "msim_rx" + std::to_string(id), mn = "msim_rm" + std::to_string(id);
+            const Sym* vmS = lookup("value_mirror");
+            if (!vmS || vmS->k != Sym::TypeK) fail(line, "'REFLECT needs std.reflection (use std.reflection.all)");
+            cx->scopes.push_back(Scope());
+            Sym xs; xs.k = Sym::Obj; xs.cls = "constant"; xs.name = xn; xs.text = xn; xs.sv = xn; xs.type = at;
+            xs.aux = !x.a.empty();   // nine-value std_logic elements: the companion goes along
+            declare(xs);
+            EP xe = reflName(xn, line);
+            std::ostringstream f;
+            f << "  function automatic " << svDecl(vmS->type, "") << " msim_reflect" << id << "(input " << svDecl(at, xn)
+              << (x.a.empty() ? "" : ", input " + svDecl(at, xn + "__9")) << ");\n";
+            const Sym* smS = lookup("subtype_mirror");
+            f << "    " << svDecl(vmS->type, mn) << ";\n    int o = 0;\n";
+            // one subtype mirror for every element when the element subtype is constrained
+            std::string se;
+            if (smS && smS->k == Sym::TypeK && !isUnconstrained(et)) {
+                se = "msim_rs" + std::to_string(id);
+                f << "    " << svDecl(smS->type, se) << " = " << reflectSm(et, nullptr, line) << ";\n";
+            }
+            std::string count = "1";
+            std::vector<std::string> lens(nd), lefts(nd), ascs(nd);
+            for (size_t d = 0; d < nd; d++) {
+                int dd = nd > 1 ? (int)d + 1 : 0;
+                lens[d] = attribute(reflAttr(xe, "length", dd, line), nullptr).s;
+                lefts[d] = attribute(reflAttr(xe, "left", dd, line), nullptr).s;
+                ascs[d] = attribute(reflAttr(xe, "ascending", dd, line), nullptr).s;
+                count += " * (" + lens[d] + ")";
+            }
+            f << "    " << mn << " = " << reflFn("msim_arr_vm", line) << "(" << reflectSm(at, xe, line) << ", " << count << ");\n";
+            EP el = std::make_shared<Expr>(EK::Call, line);
+            el->a = xe;
+            std::string ind = "    ";
+            for (size_t d = 0; d < nd; d++) {
+                std::string k = "k" + std::to_string(d), in = "msim_ri" + std::to_string(id) + "_" + std::to_string(d);
+                TP it = baseOf(at)->k != Type::String && d < at->dims.size() && at->dims[d].idx ? at->dims[d].idx : bt["integer"];
+                TP ib = baseOf(it);
+                std::string idx = "(" + ascs[d] + " ? " + reflPos(ib ? ib : bt["integer"], lefts[d]) + " + " + k + " : " +
+                                  reflPos(ib ? ib : bt["integer"], lefts[d]) + " - " + k + ")";
+                if (ib && ib->k == Type::Enum) idx = typeName(ib) + "'(" + idx + ")";
+                else if (ib && (ib->k == Type::Char)) idx = "8'(" + idx + ")";
+                else if (ib && (ib->k == Type::Bool || ib->k == Type::Bit)) idx = "1'(" + idx + ")";
+                Sym is; is.k = Sym::Obj; is.cls = "constant"; is.name = in; is.text = in; is.sv = idx; is.type = it;
+                declare(is);
+                el->args.push_back(Assoc{nullptr, reflName(in, line)});
+                f << ind << "for (int " << k << " = 0; " << k << " < (" << lens[d] << "); " << k << "++) begin\n";
+                ind += "  ";
+            }
+            f << ind << "void'(" << reflFn("msim_arr_vset", line) << "(" << mn << ", o, " << reflectVm(et, el, line, se) << "));\n";
+            f << ind << "o++;\n";
+            for (size_t d = 0; d < nd; d++) { ind.resize(ind.size() - 2); f << ind << "end\n"; }
+            f << "    return " << mn << ";\n  endfunction\n";
+            cx->scopes.pop_back();
+            *cx->helpers << f.str();
+            return "msim_reflect" + std::to_string(id) + "(" + x.s + (x.a.empty() ? "" : ", " + x.a) + ")";
+        }
+        case Type::Line: case Type::Access: {
+            Val x = ex(pre, t);
+            TP d = b->k == Type::Line ? bt["string"] : b->target;
+            if (!d) return reflFn("msim_acc_vm", line) + "(" + sm + ", null)";
+            // A function of this module per access type, which calls itself
+            // for an access value of the same type inside the designated
+            // value (a linked list).
+            if (cx->helpers) {
+                auto it = reflAccFns.find(b.get());
+                if (it != reflAccFns.end()) return it->second + "(" + x.s + ")";
+                const Sym* vmS = lookup("value_mirror");
+                if (!vmS || vmS->k != Sym::TypeK) fail(line, "'REFLECT needs std.reflection (use std.reflection.all)");
+                int id = ++uniq;
+                std::string fn = "msim_reflect_acc" + std::to_string(id), xn = "msim_rx" + std::to_string(id);
+                reflAccFns[b.get()] = fn;
+                cx->scopes.push_back(Scope());
+                Sym xs; xs.k = Sym::Obj; xs.cls = "variable"; xs.name = xn; xs.text = xn; xs.sv = xn; xs.type = t;
+                declare(xs);
+                EP xe = reflName(xn, line), all = std::make_shared<Expr>(EK::Sel, line);
+                all->a = xe; all->name = "all"; all->text = "all";
+                std::string body = reflectVm(d, all, line);
+                cx->scopes.pop_back();
+                std::ostringstream f;
+                f << "  function automatic " << svDecl(vmS->type, "") << " " << fn << "(input " << svDecl(t, xn) << ");\n"
+                  << "    return " << reflFn("msim_acc_vm", line) << "(" << sm << ", " << xn << " == null ? null : " << body << ");\n"
+                  << "  endfunction\n";
+                *cx->helpers << f.str();
+                return fn + "(" + x.s + ")";
+            }
+            bool rec = std::find(reflStack.begin(), reflStack.end(), b.get()) != reflStack.end();
+            std::string dv = "null";
+            if (!rec) {
+                EP all = std::make_shared<Expr>(EK::Sel, line);
+                all->a = pre; all->name = "all"; all->text = "all";
+                reflStack.push_back(b.get());
+                dv = "(" + x.s + " == null ? null : " + reflectVm(d, all, line) + ")";
+                reflStack.pop_back();
+            }
+            return reflFn("msim_acc_vm", line) + "(" + sm + ", " + dv + ")";
+        }
+        case Type::File: return reflFn("msim_file_vm", line) + "(" + sm + ")";
+        case Type::Protected: return reflFn("msim_prot_vm", line) + "(" + sm + ")";
+        default: fail(line, "'REFLECT of this value is not supported");
+        }
+        return "";
     }
 
     // T'IMAGE (16.2.2): VHDL-2019 also takes a composite type. A one-dimensional array of
@@ -3519,6 +3836,11 @@ package vhdl_rt;
   function automatic int sl_pos(logic v);
     case (v) 1'b0: return 2; 1'b1: return 3; 1'bz: return 4; default: return 1; endcase
   endfunction
+  function automatic int sl_pos9(logic v, logic a);   // nine-value 'POS: U X 0 1 Z W L H -
+    if (a === 1'b1) return v === 1'b0 ? 6 : v === 1'b1 ? 7 : v === 1'bz ? 8 : 5;
+    if (a !== 1'b0 && v === 1'bx) return 0;
+    return sl_pos(v);
+  endfunction
   function automatic logic sl_val(int p);
     case (p) 2, 6: return 1'b0; 3, 7: return 1'b1; 4: return 1'bz; default: return 1'bx; endcase
   endfunction
@@ -4265,7 +4587,10 @@ endpackage
             t->k = Type::Access;
             t->target = subtype(td.elem);
             if (t->target->k == Type::String) t->k = Type::Line;
-            else {
+            else if (t->target->k == Type::Protected) {
+                // an access to a protected type (VHDL-2019, 5.4.1): the class handle itself
+                t->sv = t->target->sv;
+            } else {
                 t->sv = svId(t->text + (hoist ? "__" + std::to_string(++uniq) : ""));
                 out << pre << "typedef class " << t->sv << ";\n";
                 if (t->target->k == Type::Unknown && t->target->flavor == "incomplete") pendingAcc[t->target.get()].push_back(t);
@@ -4399,7 +4724,8 @@ endpackage
                 throw;
             }
             cx = saved;
-            out << pre << "class " << pt->sv << ";\n" << cls.str() << pre << "endclass\n";
+            // `new PT` of an access to the protected type (VHDL-2019)
+            out << pre << "class " << pt->sv << ";\n" << cls.str() << pre << "  static function " << pt->sv << " make__(); " << pt->sv << " p = new(); return p; endfunction\n" << pre << "endclass\n";
             return;
         }
         }
@@ -4492,6 +4818,7 @@ endpackage
         return v;
     }
     Val deref(const Val& p) {
+        if (p.t && p.t->target && p.t->target->k == Type::Protected) { Val v = p; v.t = p.t->target; return v; }
         if (accArray(p.t)) return derefArray(p);
         Val v;
         if (p.t->target && baseOf(p.t->target)->k == Type::Record) {
@@ -4508,6 +4835,7 @@ endpackage
         std::string c = typeName(at);
         Val v;
         v.t = at;
+        if (d && d->k == Type::Protected) { v.s = d->sv + "::make__()"; return v; }
         EP x = e->a;
         if (x && x->k == EK::Qual) {
             // new T'(value)
@@ -4589,6 +4917,7 @@ endpackage
         }
         Val p = ex(sel->a, nullptr);
         TP t = p.t;
+        if (t && t->k == Type::Access && t->target && t->target->k == Type::Protected) t = t->target;   // implicit .all
         while (t && t->k != Type::Protected && t->base) t = t->base;
         if (!t || t->k != Type::Protected) return nullptr;
         auto it = protMembers.find(t.get());
@@ -6359,6 +6688,7 @@ endpackage
             // concurrent statements
             std::ostringstream conc, helpers;
             c.helpers = &helpers;
+            reflAccFns.clear();
             trNames.clear();
             scanTrStmts(stmts);
             curDrivers = &di;

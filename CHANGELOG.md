@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- msim: VHDL-2019 reflection (IEEE 1076-2019 16.2.2 `'reflect`, 16.12
+  std.reflection): subtype and value mirrors of every type class, from
+  enumerations and nine-value std_logic to multidimensional arrays, linked
+  lists, files and protected types. `tests/vhdl/reflect2019.vhd`.
 - msim: VHDL-2019 std.env `get_call_path` and `to_string` of
   `call_path_element`, `call_path_vector` and `call_path_vector_ptr`
   (IEEE 1076-2019 16.5.7). Only a design that calls it pays for the frames.
@@ -266,6 +270,8 @@ Spec references are IEEE 1800-2023 clauses.
   off.
 
 ### Fixed
+- msim VHDL: `std_logic'pos` with nine values gives the positions of `'U'`
+  and of `'W'`, `'L'`, `'H'`, `'-'` (was the four-value position).
 - msim: a clocked block that writes its working variable only in parts
   (struct fields, part selects), never whole, lost those writes in the
   static schedule (`Sim::poke` merged into a 1-bit default value).
