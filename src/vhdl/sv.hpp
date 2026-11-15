@@ -958,6 +958,9 @@ private:
                 // packed vectors are declared [hi:lo]; unpacked dynamic arrays count up from 0
                 g = mkRng("$left(" + v.s + ")", "$right(" + v.s + ")", isScalarBit(t->elem));
                 if (t->elem && t->elem->k == Type::Char) g = mkRng("1", v.s + ".len()", false);
+            } else if (t && (t->k == Type::String || t->k == Type::Line)) {
+                // a string object without known bounds: 1 to its length
+                g = mkRng("1", ex(r->a, nullptr).s + ".len()", false);
             } else if (t && t->range) g = *t->range;
             else if (t && t->k == Type::Enum) g = mkRng(t->litSv.front(), t->litSv.back(), false);
             else if (t && t->k == Type::Int) g = mkRng("-2147483648", "2147483647", false);
@@ -4263,7 +4266,10 @@ endpackage
             t->k = Type::Access;
             t->target = subtype(td.elem);
             if (t->target->k == Type::String) t->k = Type::Line;
-            else {
+            else if (t->target->k == Type::Protected) {
+                // an access to a protected type (VHDL-2019, 5.4.1): the class handle itself
+                t->sv = t->target->sv;
+            } else {
                 t->sv = svId(t->text + (hoist ? "__" + std::to_string(++uniq) : ""));
                 out << pre << "typedef class " << t->sv << ";\n";
                 if (t->target->k == Type::Unknown && t->target->flavor == "incomplete") pendingAcc[t->target.get()].push_back(t);
@@ -4397,7 +4403,8 @@ endpackage
                 throw;
             }
             cx = saved;
-            out << pre << "class " << pt->sv << ";\n" << cls.str() << pre << "endclass\n";
+            // `new PT` of an access to the protected type (VHDL-2019)
+            out << pre << "class " << pt->sv << ";\n" << cls.str() << pre << "  static function " << pt->sv << " make__(); " << pt->sv << " p = new(); return p; endfunction\n" << pre << "endclass\n";
             return;
         }
         }
@@ -4490,6 +4497,7 @@ endpackage
         return v;
     }
     Val deref(const Val& p) {
+        if (p.t && p.t->target && p.t->target->k == Type::Protected) { Val v = p; v.t = p.t->target; return v; }
         if (accArray(p.t)) return derefArray(p);
         Val v;
         if (p.t->target && baseOf(p.t->target)->k == Type::Record) {
@@ -4506,6 +4514,7 @@ endpackage
         std::string c = typeName(at);
         Val v;
         v.t = at;
+        if (d && d->k == Type::Protected) { v.s = d->sv + "::make__()"; return v; }
         EP x = e->a;
         if (x && x->k == EK::Qual) {
             // new T'(value)
@@ -4587,6 +4596,7 @@ endpackage
         }
         Val p = ex(sel->a, nullptr);
         TP t = p.t;
+        if (t && t->k == Type::Access && t->target && t->target->k == Type::Protected) t = t->target;   // implicit .all
         while (t && t->k != Type::Protected && t->base) t = t->base;
         if (!t || t->k != Type::Protected) return nullptr;
         auto it = protMembers.find(t.get());
