@@ -74,6 +74,7 @@ struct CodegenProc {
     // returns its NBAs, registered with Sim::addSeq on these events.
     bool seq = false;
     std::vector<std::pair<int, Edge>> seqEv;
+    bool loops = true;   // LoweredProc::loops (false: a constant continuous assign)
 };
 
 // Arguments of Sim::buildPartitions (by rank; fixed NBA targets).
@@ -798,18 +799,26 @@ public:
                 if (procs[i].seq) {
                     for (auto& [sg, ed] : procs[i].seqEv) evs += "{" + std::to_string(sg) + ", " + edge(ed) + "},";
                     tab += "        {seq" + std::to_string(i) + ", nullptr, " + std::to_string(off) + ", " +
-                           std::to_string(procs[i].seqEv.size()) + "},\n";
+                           std::to_string(procs[i].seqEv.size()) + ", 0},\n";
                     off += procs[i].seqEv.size();
-                } else
-                    tab += "        {nullptr, proc" + std::to_string(i) + ", 0, 0},\n";
+                } else {
+                    // Time 0 order as the interpreter's (msim.cpp): constant
+                    // continuous assigns after the other processes, initial
+                    // blocks last; each Task is still made in declaration order.
+                    const int late = procs[i].kind == "assign" && !procs[i].loops ? 1 : procs[i].kind == "Initial" ? 2 : 0;
+                    tab += "        {nullptr, proc" + std::to_string(i) + ", 0, 0, " + std::to_string(late) + "},\n";
+                }
             }
             if (n) {
                 o << "    static const std::pair<int, Edge> SEV[] = {" << evs << "{0, ANY}};\n"
-                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n; } PROCS[] = {\n"
+                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; } PROCS[] = {\n"
                   << tab << "    };\n"
+                     "    std::vector<Task> late[2];\n"
                      "    for (auto& p : PROCS)\n"
                      "        if (p.s) S.addSeq(p.s, nullptr, std::vector<std::pair<int, Edge>>(SEV + p.at, SEV + p.at + p.n));\n"
-                     "        else S.spawn(p.p());\n";
+                     "        else if (p.late) late[p.late - 1].push_back(p.p());\n"
+                     "        else S.spawn(p.p());\n"
+                     "    for (auto& v : late) for (auto& t : v) S.spawn(t);\n";
             }
         }
         if (!dom.empty()) o << "    S.fastInit();\n";
