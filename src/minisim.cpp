@@ -2708,6 +2708,9 @@ struct Sim {
             Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), g.drv.size(), g.w, g.val)
                                       : resolveDrives(g.drv.data(), g.drv.size(), g.w);
             set(s, r);
+        } else if (g.net) {   // a net with no drivers: z again (10.6.2), or its pull / charge (6.6)
+            Val r = g.kind != NR_WIRE ? resolveNet(g.kind, g.drv.data(), 0, g.w, g.val) : allz(g.w);
+            set(s, r);
         }
     }
     void heldInputChanged(int s) {
