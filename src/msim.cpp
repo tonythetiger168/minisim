@@ -3412,12 +3412,12 @@ int main(int argc, char** argv) {
     // Illegal drivers, from slang's data-flow analysis. Of a net: a uwire
     // with several drivers (6.6.2), a net of a user-defined nettype without
     // a resolution function with several (6.6.7): errors. Of a variable:
-    // several continuous assignments, or continuous and procedural ones
-    // (6.5), a variable an always_comb / always_ff / always_latch writes
-    // written by another process too (9.2.2.2, 9.2.2.3, 9.2.2.4): warnings,
-    // since much existing code does it (an initial reset of an always_ff
-    // register) and other simulators run it; -strict-drivers makes them
-    // errors. The slices of a variable that the instances of an instance
+    // continuous and procedural assignments (6.5), a variable an
+    // always_comb / always_ff / always_latch writes written by another
+    // process too (9.2.2.2, 9.2.2.3, 9.2.2.4): warnings, since much existing
+    // code does it (an initial reset of an always_ff register) and other
+    // simulators run it; -strict-drivers makes them errors, and adds several
+    // continuous assignments to one variable (6.5). The slices of a variable that the instances of an instance
     // array drive are one driver each (23.3.3.5), not several.
     {
         using namespace slang;
@@ -3454,6 +3454,10 @@ int main(int argc, char** argv) {
             bool net = d.code == diag::MultipleUWireDrivers || d.code == diag::MultipleUDNTDrivers;
             bool var = d.code == diag::MultipleContAssigns || d.code == diag::MixedVarAssigns || d.code == diag::MultipleAlwaysAssigns;
             if (!net && !var) continue;
+            // Several continuous assignments to a variable are common for a
+            // tristate bus declared logic, which msim resolves like a wire:
+            // reported only with -strict-drivers.
+            if (d.code == diag::MultipleContAssigns && !strictDrivers) continue;
             if (d.code == diag::MultipleContAssigns && inArr(d.location)) {
                 bool all = true;   // every other driver an instance of an array, too
                 for (auto& n : d.notes) if (n.location != SourceLocation::NoLocation && !inArr(n.location)) all = false;
