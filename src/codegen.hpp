@@ -3876,10 +3876,13 @@ private:
         // The 2-state NBAs to private registers, in the order they ran: one
         // store each in fcommit, no slot (PicoRV32 x16 commits ~1300 a cycle).
         // Off for the parallel path (CLON) and when full: the slot instead.
-        o << "struct C0E { PSig* p; uint64_t v; };\nstatic C0E C0L[" << std::max<size_t>(2 * slots.size(), 1) << "]; static uint32_t C0N;\n"
-             "#define C0OK (__builtin_expect(CLON && C0N < " << std::max<size_t>(2 * slots.size(), 1) << ", 1))\n"
-             "struct C1E { Sig* g; uint64_t v; };\nstatic C1E C1L[" << std::max<size_t>(2 * slots.size(), 1) << "]; static uint32_t C1N;\n"
-             "#define C1OK (__builtin_expect(CLON && C1N < " << std::max<size_t>(2 * slots.size(), 1) << ", 1))\n";
+        // (No sizes in the macros: they go to every part, and a part must not
+        // change when a process elsewhere adds slots.)
+        o << "struct C0E { PSig* p; uint64_t v; };\nstruct C1E { Sig* g; uint64_t v; };\n"
+             "static C0E C0L[" << std::max<size_t>(2 * slots.size(), 1) << "]; static C1E C1L[" << std::max<size_t>(2 * slots.size(), 1)
+          << "]; static const uint32_t C0CAP = " << std::max<size_t>(2 * slots.size(), 1) << "; static uint32_t C0N, C1N;\n"
+             "#define C0OK (__builtin_expect(CLON && C0N < C0CAP, 1))\n"
+             "#define C1OK (__builtin_expect(CLON && C1N < C0CAP, 1))\n";
         std::vector<int> privs;
         for (size_t s = 0; s < priv_.size(); s++) if (priv_[s]) privs.push_back((int)s);
         // Only when something watches every change (a VCD opened at run time).
