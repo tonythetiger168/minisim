@@ -6271,7 +6271,8 @@ struct Lowerer {
             if (fs[i] == '%') continue;
             bool skip = fs[i] == '*';
             if (skip) i++;
-            while (i < fs.size() && isdigit((unsigned char)fs[i])) i++;
+            int given = 0;   // a width written in the format
+            while (i < fs.size() && isdigit((unsigned char)fs[i])) given = given * 10 + (fs[i++] - '0');
             if (i >= fs.size()) break;
             char c = (char)tolower((unsigned char)fs[i]);
             if (std::string_view("dhxobcsfegtumz").find(c) == std::string_view::npos)
@@ -6280,11 +6281,16 @@ struct Lowerer {
                 // %u / %z read binary data (21.3.4.3): as many 32-bit words as
                 // the target holds, written into the format as a private
                 // conversion with that count.
-                if (skip) unsupported("$fscanf / $sscanf %*u or %*z");
+                if (skip) {   // %*u / %*z: read and drop one 32-bit word (or the bits written as a width)
+                    fs[i] = c == 'u' ? '\x01' : '\x02';
+                    continue;
+                }
                 size_t k = letters.size();
                 if (k + 2 >= args.size()) break;
-                int w = (int)outArg(*args[k + 2]).type->getBitWidth();
-                std::string rep = std::to_string(std::max(1, (w + 31) / 32)) + (c == 'u' ? '\x01' : '\x02');
+                // A width in the format is the number of bits (read as whole
+                // 32-bit words, the value cut to that many bits), as in Icarus.
+                int w = given > 0 ? given : (int)outArg(*args[k + 2]).type->getBitWidth();
+                std::string rep = std::to_string(std::max(1, w)) + (c == 'u' ? '\x01' : '\x02');
                 size_t st = i;
                 while (st > 0 && fs[st - 1] != '%') st--;
                 fs.replace(st, i - st + 1, rep);
