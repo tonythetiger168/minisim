@@ -17,6 +17,7 @@ set(CASES
   "examples/signed.sv"
   "examples/strengths.sv"
   "examples/tasks.sv"
+  "examples/autotask.sv"
   "examples/breakcont.sv"
   "examples/hierarchy.sv"
   "examples/checks.sv"
