@@ -862,15 +862,24 @@ struct Lowerer {
     // evaluated when the statement runs (9.4.1). x or z waits zero time.
     // The rise / fall / turn-off delays of a continuous assign, gate or net
     // (10.3.3, 28.16), in ticks. They must be constant.
-    std::vector<uint64_t> delays3(const slang::ast::TimingControl* tc) {
+    // A continuous assignment's delay may be an expression such as
+    // #(period/3) (10.3.3): with dyn, dynDly gets each delay as ticks,
+    // evaluated each time the right-hand side changes, and the result holds
+    // placeholders.
+    std::vector<E> dynDly;
+    std::vector<uint64_t> delays3(const slang::ast::TimingControl* tc, bool dyn = false) {
         using namespace slang::ast;
         std::vector<uint64_t> out;
+        dynDly.clear();
         if (!tc) return out;
+        bool anyDyn = false;
         auto one = [&](const Expression& e) {
             Instr t;
             delayInto(e, t);
-            if (t.de) unsupported("a delay on a continuous assignment, gate or net that is not constant");
-            out.push_back(t.delay);
+            if (t.de && !dyn) unsupported("a delay on a gate or net that is not constant");
+            anyDyn |= (bool)t.de;
+            dynDly.push_back(t.de ? t.de : konst(mk(t.delay, 64)));
+            out.push_back(t.de ? 1 : t.delay);
         };
         if (tc->kind == TimingControlKind::Delay) one(tc->as<DelayControl>().expr);
         else if (tc->kind == TimingControlKind::Delay3) {
@@ -886,6 +895,7 @@ struct Lowerer {
         if (mode == DelayDirectives::ZERO || mode == DelayDirectives::PATH) out.clear();
         else if (mode == DelayDirectives::UNIT)
             for (auto& v : out) if (v) v = pow10u(tsPrec - simPrecExp());
+        if (!anyDyn || mode == DelayDirectives::ZERO || mode == DelayDirectives::PATH || mode == DelayDirectives::UNIT) dynDly.clear();
         bool any = false;
         for (auto v : out) any |= v != 0;
         if (!any) out.clear();   // #0 is no delay
@@ -992,6 +1002,13 @@ struct Lowerer {
         if (x.kind == ExpressionKind::IntegerLiteral && !x.as<IntegerLiteral>().getValue().hasUnknown()) {
             i.delay = ticksOf((double)*x.as<IntegerLiteral>().getValue().as<uint64_t>());
             return;
+        }
+        if (slang::ConstantValue cf = tryConst(d)) {   // #(tdelay) with a parameter slang has not folded yet
+            if (cf.isReal()) { i.delay = ticksOf(cf.real()); return; }
+            if (cf.isInteger() && !cf.integer().hasUnknown()) {
+                auto v = cf.integer().as<int64_t>();
+                if (v && *v > 0) { i.delay = ticksOf((double)*v); return; }
+            }
         }
         if (d.type->isFloating()) {   // #(hb) with a real variable: scaled to ticks, rounded (10.3.3, 11.11)
             // rounded to the module's precision first, as a constant delay is
@@ -3349,6 +3366,44 @@ struct Lowerer {
     void unpin(const std::vector<const slang::ast::Expression*>& sels) {
         for (auto* x : sels) exprOverride.erase(x);
     }
+    // Does the low part of x depend on its high bits? Only >>, / and % (in
+    // the context-determined part of x) bring high bits down; +, -, * and
+    // the bitwise operators can be worked out at a narrower target width.
+    static bool carriesDown(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        switch (x.kind) {
+            case ExpressionKind::BinaryOp: {
+                const auto& b = x.as<BinaryExpression>();
+                switch (b.op) {
+                    case BinaryOperator::LogicalShiftRight: case BinaryOperator::ArithmeticShiftRight:
+                    case BinaryOperator::Divide: case BinaryOperator::Mod:
+                        return true;
+                    case BinaryOperator::Add: case BinaryOperator::Subtract: case BinaryOperator::Multiply:
+                    case BinaryOperator::BinaryAnd: case BinaryOperator::BinaryOr: case BinaryOperator::BinaryXor:
+                    case BinaryOperator::BinaryXnor:
+                        return carriesDown(b.left()) || carriesDown(b.right());
+                    case BinaryOperator::LogicalShiftLeft: case BinaryOperator::ArithmeticShiftLeft:
+                    case BinaryOperator::Power:
+                        return carriesDown(b.left());
+                    default: return false;
+                }
+            }
+            case ExpressionKind::UnaryOp: {
+                const auto& u = x.as<UnaryExpression>();
+                if (u.op == UnaryOperator::BitwiseNot || u.op == UnaryOperator::Minus || u.op == UnaryOperator::Plus)
+                    return carriesDown(u.operand());
+                return false;
+            }
+            case ExpressionKind::ConditionalOp: {
+                const auto& c = x.as<ConditionalExpression>();
+                return carriesDown(c.left()) || carriesDown(c.right());
+            }
+            case ExpressionKind::Conversion:
+                return x.as<ConversionExpression>().conversionKind != ConversionKind::Explicit &&
+                       carriesDown(x.as<ConversionExpression>().operand());
+            default: return false;
+        }
+    }
     // The value of e as a new temporary, by its type.
     E asType(const slang::ast::Type& t, int sig, bool sgn) {
         if (t.isFloating()) return un(Op::AsReal, ref(sig));
@@ -5455,6 +5510,20 @@ struct Lowerer {
                     bool os = c.operand().type->isSigned();
                     E v = resize(expr(c.operand(), ExprCtx{ow, os, os, true}), dst, false, c.type->isSigned());
                     return sized(std::move(v), dst, c.type->isSigned(), ctx);
+                }
+                if (c.type->isIntegral() && c.operand().type->isIntegral()) {
+                    // An implicit narrowing ((a + b + 0) >> 1 into 16 bits, 11.8.2):
+                    // the operand is worked out at its own width, so a carry
+                    // that a shift or divide brings down is kept, then cut.
+                    int ow = (int)c.operand().type->getBitWidth();
+                    int to = ctx.live && ctx.w > 0 ? ctx.w : dst;
+                    if (ow > to && to > 0 && carriesDown(c.operand())) {
+                        bool os = c.operand().type->isSigned();
+                        needWidth(ow);
+                        bool tg = ctx.live && ctx.w > 0 ? ctx.tag : c.type->isSigned();
+                        E v = resize(expr(c.operand(), ExprCtx{ow, os, os, true}), to, false, tg);
+                        return sized(std::move(v), to, tg, ctx);
+                    }
                 }
                 bool fill, tag;
                 if (ctx.live && ctx.w > 0) {
@@ -11764,6 +11833,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::NetSymbol& n) {
         const slang::ast::Expression* e = n.getInitializer();
         std::vector<uint64_t> dl;
+        std::vector<E> dlE;
         bool trireg = n.netType.netKind == slang::ast::NetType::TriReg && !e;
         std::optional<uint64_t> decay;   // a trireg's charge decay time (28.16.2), ticks
         if (n.getDelay() || trireg) {
@@ -11782,7 +11852,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 if (rf.size() == 3) rf.pop_back();
                 if (std::all_of(rf.begin(), rf.end(), [](uint64_t v) { return v == 0; })) rf.clear();
                 dl = rf;
-            } else if (tc) dl = d.delays3(tc);
+            } else if (tc) {
+                dl = d.delays3(tc, e != nullptr);   // wire #(expr) w = a: a delayed assignment (10.3.3)
+                dlE = std::move(d.dynDly);
+            }
             if (trireg && !decay) {   // `default_decay_time (E.2)
                 DelayDirectives dd = delayDirectives(n.getParentScope());
                 if (dd.decaySet && !dd.decayInfinite) decay = d.ticksOf(dd.decay);
@@ -11804,6 +11877,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         lw.setScope(n.getParentScope());
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&n); i.e = lw.expr(*e);
         i.dly = dl;
+        i.dlyE = std::move(dlE);
         finishAssign(lw, i);
     }
     // Moves the initializer process to the front of `out.procs`.
@@ -11835,8 +11909,13 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
 
     const std::vector<uint64_t>* gateDelay = nullptr;   // the delays of the gate being lowered
+    std::vector<E> gateDlyE;   // and its delay expressions, if any is not constant
+    // An element of a gate array (28.3.6): the bit of each port it takes when a
+    // terminal is as wide as the array, and the array's size; -1 otherwise.
+    int gateBit = -1, gateArrN = 0;
     int curGate = -1;                                    // its gateRecs() entry
     int linkFormal = -1;                                 // the output port being connected (outLinks)
+    int outBit = -1;   // driveOut drives only this bit of the terminal (a gate array element)
     void driveOut(const slang::ast::Expression& out, E rhs, uint8_t s0, uint8_t s1) {
         Lowerer lw(sigmap);
         prep(lw);
@@ -11844,12 +11923,16 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         i.k = IK::Assign;
         i.s0 = s0;
         i.s1 = s1;
-        if (gateDelay) i.dly = *gateDelay;
+        if (gateDelay) { i.dly = *gateDelay; i.dlyE = gateDlyE; }
         // A gate output port is sometimes an assignment whose left side is the net.
         const slang::ast::Expression* tgt = &out;
         if (tgt->kind == slang::ast::ExpressionKind::Assignment)
             tgt = &tgt->as<slang::ast::AssignmentExpression>().left();
         lw.lhs(*tgt, i);
+        if (outBit >= 0 && i.hi < 0) {   // one bit of a gate array's output terminal (slang may have selected it already)
+            if (i.arr || i.bidx || i.dyn >= 0) Lowerer::unsupported("a gate array output of this kind");
+            i.lo = i.hi = outBit;
+        }
         if (curGate >= 0) {
             i.gate = curGate;
             auto& o = gateRecs()[(size_t)curGate].outs;
@@ -11895,7 +11978,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 i.sig = it->second->base + k;
                 i.e = els[(size_t)k];
                 L.setScope(ca.getParentScope());
-                i.dly = L.delays3(ca.getDelay());
+                i.dly = L.delays3(ca.getDelay(), true);
+                i.dlyE = std::move(L.dynDly);
                 assignGate(ca, i);
                 finishAssign(L, i);
             }
@@ -11919,7 +12003,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 L.lhs(*x, i);
                 i.e = slice(resize(L.expr(a.right()), w, false, false), hi, lo);
                 L.setScope(ca.getParentScope());
-                i.dly = L.delays3(ca.getDelay());
+                i.dly = L.delays3(ca.getDelay(), true);
+                i.dlyE = std::move(L.dynDly);
                 assignGate(ca, i);
                 finishAssign(L, i);
             }
@@ -11931,7 +12016,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         lw.lhs(a.left(), i);
         i.e = lw.expr(a.right());
         lw.setScope(ca.getParentScope());
-        i.dly = lw.delays3(ca.getDelay());
+        i.dly = lw.delays3(ca.getDelay(), true);
+        i.dlyE = std::move(lw.dynDly);
         assignGate(ca, i);
         finishAssign(lw, i);
         g_emitLoc = {};
@@ -11963,10 +12049,21 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             Lowerer dl(sigmap);
             prep(dl);
             dl.setScope(g.getParentScope());
-            gdly = dl.delays3(g.getDelay());
+            // and/or/buf/not gates drive like a continuous assignment, so their
+            // delays may be expressions too, read at each output change.
+            std::string_view pn = g.primitiveType.name;
+            bool logic = pn == "and" || pn == "nand" || pn == "or" || pn == "nor" || pn == "xor" ||
+                         pn == "xnor" || pn == "buf" || pn == "not";
+            gdly = dl.delays3(g.getDelay(), logic);
+            gateDlyE = std::move(dl.dynDly);
         }
         gateDelay = &gdly;
-        struct Reset { const std::vector<uint64_t>*& p; int& g; ~Reset() { p = nullptr; g = -1; } } reset{gateDelay, curGate};
+        struct Reset { const std::vector<uint64_t>*& p; int& g; std::vector<E>& e; int& b; ~Reset() { p = nullptr; g = -1; e.clear(); b = -1; } } reset{gateDelay, curGate, gateDlyE, gateBit};
+        if (const Scope* ps = g.getParentScope(); ps && ps->asSymbol().kind == SymbolKind::InstanceArray && g.arrayPath.size() == 1) {
+            gateArrN = (int)ps->asSymbol().as<InstanceArraySymbol>().elements.size();
+            const slang::ConstantRange r = ps->asSymbol().as<InstanceArraySymbol>().range;   // the leftmost instance takes the leftmost bits
+            gateBit = r.left >= r.right ? (int)g.arrayPath[0] : gateArrN - 1 - (int)g.arrayPath[0];
+        }
         {
             GateRec gr;
             gr.inst = Lowerer::instPath(g.getParentScope());
@@ -12055,13 +12152,19 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         Lowerer lw(sigmap);
         prep(lw);
         int w = (int)ports[0]->type->getBitWidth();
-        if (w != 1) Lowerer::unsupported("a three-state gate or switch wider than one bit");
+        bool split = w != 1 && gateBit >= 0 && w == gateArrN;
+        if (w != 1 && !split) Lowerer::unsupported("a three-state gate or switch wider than one bit");
+        struct OB { int& b; ~OB() { b = -1; } } obReset{outBit};
+        if (split) outBit = gateBit;
         bool resist = name[0] == 'r';
         if (resist) {
             s0 = std::min<uint8_t>(s0, STR_PULL);
             s1 = std::min<uint8_t>(s1, STR_PULL);
         }
-        auto bit = [&](const slang::ast::Expression& x) { return resize(lw.expr(x), 1, false, false); };
+        auto bit = [&](const slang::ast::Expression& x) {
+            if (split && (int)x.type->getBitWidth() == gateArrN) return slice(lw.expr(x), gateBit, gateBit);
+            return resize(lw.expr(x), 1, false, false);
+        };
         auto is = [](E v, Val k) { return node(Op::CaseEq, {v, konst(k)}); };
         auto mux = [](E c, E a, E b) { return node(Op::Mux, {c, a, b}); };
         E d = bit(*ports[1]);

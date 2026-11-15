@@ -1,0 +1,9 @@
+dir2019.vhd:19:5:@0ms:(report note): status=status_ok count=3
+dir2019.vhd:21:7:@0ms:(report note): 0: a.txt
+dir2019.vhd:21:7:@0ms:(report note): 1: b.txt
+dir2019.vhd:21:7:@0ms:(report note): 2: sub
+dir2019.vhd:23:5:@0ms:(report note): name ends with dtest: true
+dir2019.vhd:25:5:@0ms:(report note): closed items null: true
+dir2019.vhd:27:5:@0ms:(report note): missing: status_not_found
+dir2019.vhd:29:5:@0ms:(report note): file: status_no_directory
+dir2019.vhd:32:5:@0ms:(report note): line_vector xyz

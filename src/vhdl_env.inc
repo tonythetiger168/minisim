@@ -10,6 +10,8 @@
 #include <ctime>
 #include <filesystem>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 extern "C" {
 
@@ -115,5 +117,28 @@ int msim_vhdl_unlink(const char* p) {
     std::filesystem::remove(p, ec);
     return ec ? msim_vhdl_errStatus(ec, 1, 2, 3) : 0;
 }
+
+// DIR_OPEN: reads the directory into msim_vhdl_dir; DIR_OPEN_STATUS as msim_vhdl_chdir
+static std::string msim_vhdl_dirName;
+static std::vector<std::string> msim_vhdl_dirItems;
+int msim_vhdl_diropen(const char* p) {
+    std::error_code ec;
+    msim_vhdl_dirName.clear();
+    msim_vhdl_dirItems.clear();
+    if (!std::filesystem::exists(p, ec)) return ec ? msim_vhdl_errStatus(ec, 1, 3, 4) : 1;
+    if (!std::filesystem::is_directory(p, ec)) return 2;
+    std::filesystem::directory_iterator it(p, ec);
+    if (ec) return msim_vhdl_errStatus(ec, 1, 3, 4);
+    for (; it != std::filesystem::directory_iterator(); it.increment(ec)) {
+        if (ec) return msim_vhdl_errStatus(ec, 1, 3, 4);
+        msim_vhdl_dirItems.push_back(it->path().filename().string());
+    }
+    std::sort(msim_vhdl_dirItems.begin(), msim_vhdl_dirItems.end());
+    msim_vhdl_dirName = std::filesystem::canonical(p, ec).string();
+    return 0;
+}
+const char* msim_vhdl_dirname() { return msim_vhdl_dirName.c_str(); }
+int msim_vhdl_dircount() { return (int)msim_vhdl_dirItems.size(); }
+const char* msim_vhdl_diritem(int i) { return i >= 0 && i < (int)msim_vhdl_dirItems.size() ? msim_vhdl_dirItems[i].c_str() : ""; }
 
 }  // extern "C"

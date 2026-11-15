@@ -29,6 +29,11 @@ inline void readFiles(Translator& tr, const std::vector<std::string>& files) {
             src = ca.run(src);
             tr.warnings.insert(tr.warnings.end(), ca.warnings.begin(), ca.warnings.end());
         }
+        {   // std.env's GET_CALL_PATH needs a frame in every subprogram
+            std::string l = src;
+            for (auto& c : l) c = (char)std::tolower((unsigned char)c);
+            if (l.find("get_call_path") != std::string::npos) tr.callPath = true;
+        }
         Lexer lx(src, f);
         Parser p(lx.run(), f);
         tr.add(p.designFile());

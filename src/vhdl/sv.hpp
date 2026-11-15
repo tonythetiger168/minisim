@@ -98,6 +98,9 @@ public:
     std::map<std::string, SvModule> svModules;   // lower-case name -> module
     std::string timeUnit = "1ns", timePrec = "1fs";
     bool useEnv = false;   // the design calls std.env's calendar, directory or environment functions
+    // the design calls std.env's GET_CALL_PATH (16.5.7): every subprogram keeps a frame on
+    // vhdl_env's call stack, and every call passes its line and the caller's frame
+    bool callPath = false;
     std::vector<std::string> warnings;
     std::map<std::string, std::string> condIds;   // conditional analysis identifiers from the command line (upper case)
     // For synthesis tools: a combinational process (a sensitivity list or an
@@ -265,6 +268,7 @@ private:
         Proc* proc = nullptr;
         std::vector<Loop>* loops = nullptr;
         bool inFunc = false;
+        bool cpFrame = false;   // inside a subprogram that keeps a call-path frame (`callPath`)
         TP retType;      // function return type (null: procedure)
         TP retSeen;      // type of the first return expression (specialization)
         std::string file;
@@ -424,6 +428,24 @@ private:
         line->target = str;
         TP text = mkType(Type::File, "text");
         text->target = str;
+        // std.textio's LINE_VECTOR and std.env's DIRECTORY (VHDL-2019, 16.4, 16.5.5)
+        TP lvec = mkArray("line_vector", line, natural, "");
+        TP ditems = mkType(Type::Access, "directory_items");
+        ditems->target = lvec;
+        ditems->sv = "vhdl_env::directory_items";
+        TP dir = mkType(Type::Record, "directory");
+        dir->sv = "vhdl_env::directory";
+        dir->fnames = {"name", "items"};
+        dir->ftext = {"name", "items"};
+        dir->ftypes = {line, ditems};
+        TP cpe = mkType(Type::Record, "call_path_element");   // GET_CALL_PATH (16.5.7)
+        cpe->sv = "vhdl_env::call_path_element";
+        cpe->fnames = cpe->ftext = {"name", "file_name", "file_path", "file_line"};
+        cpe->ftypes = {line, line, line, positive};
+        TP cpv = mkArray("call_path_vector", cpe, natural, "");
+        TP cpp = mkType(Type::Access, "call_path_vector_ptr");
+        cpp->target = cpv;
+        cpp->sv = "vhdl_env::call_path_vector_ptr";
         TP bv = mkArray("bit_vector", bit, natural, "bv");
         TP bov = mkArray("boolean_vector", boolean, natural, "");
         TP iv = mkArray("integer_vector", integer, natural, "");
@@ -538,7 +560,7 @@ private:
                        "getvhdlassertenable", "setvhdlassertformat", "getvhdlassertformat", "setvhdlreadseverity",
                        "getvhdlreadseverity", "epoch", "localtime", "gmtime", "time_to_seconds", "seconds_to_time",
                        "getenv", "dir_workingdir", "dir_itemexists", "dir_itemisdir", "dir_itemisfile", "dir_createdir",
-                       "dir_deletedir", "dir_deletefile", "pslassertfailed", "psliscovered", "pslisassertcovered",
+                       "dir_deletedir", "dir_deletefile", "dir_open", "dir_close", "get_call_path", "pslassertfailed", "psliscovered", "pslisassertcovered",
                        "getpslcoverassert", "setpslcoverassert", "clearpslstate"})
             addBuiltinFn(n);
     }
@@ -976,6 +998,7 @@ private:
 
     TP subtype(const SubInd& si, const EP& initForWidth = nullptr) {
         TP t = typeOfMark(si.mark);
+        if (t && (t == bt["directory"] || t == bt["directory_items"])) useEnv = true;
         if (si.range) {
             TP n = std::make_shared<Type>(*t);
             n->base = t->base ? t->base : t;
@@ -2758,6 +2781,7 @@ private:
             if (pt && isScalarBit(pt) && av[i].t && av[i].t->k == Type::Array) a = av[i].s;
             r += (i ? ", " : "") + a;
         }
+        if (std::string cp = cpArgs(line); !cp.empty()) r += (av.empty() ? "" : ", ") + cp;
         v.s = r + ")";
         v.t = retType(&s);
         return v;
@@ -2886,6 +2910,15 @@ private:
             Val x = arg(0);
             v.t = bt["string"];
             TP b = baseOf(x.t);
+            if (id == "to_string" && callPath && b && (b == bt["call_path_element"] || b == bt["call_path_vector"] || b == bt["call_path_vector_ptr"])) {
+                // (16.5.7) path/name:line:subprogram, elements joined by the separator (LF by default)
+                std::string sep = args.size() > 1 ? arg(1, bt["string"]).s : std::string("\"\\n\"");
+                if (EP n = named("separator")) sep = ex(n, bt["string"]).s;
+                v.s = b == bt["call_path_element"] ? "vhdl_env::cp_str(" + x.s + ")"
+                    : b == bt["call_path_vector"] ? "vhdl_env::cp_vec_str(" + x.s + ", " + sep + ")" : "vhdl_env::cp_ptr_str(" + x.s + ", " + sep + ")";
+                v.t = bt["string"];
+                return v;
+            }
             if (id == "to_string" && b && b == bt["time_record"]) {   // ISO 8601 (16.5.5)
                 useEnv = true;
                 v.s = "vhdl_env::tm_str(" + x.s + ", " + (args.size() > 1 ? arg(1, bt["integer"]).s : std::string("0")) + ")";
@@ -2982,6 +3015,14 @@ private:
             v.t = bt["string"];
             return v;
         }
+        if (id == "get_call_path") {   // (16.5.7)
+            if (!callPath) fail(line, "GET_CALL_PATH: internal: call path not enabled");
+            useEnv = true;
+            std::string a = cpArgs(line);
+            v.s = "vhdl_env::get_call_path(" + a + ")";
+            v.t = bt["call_path_vector_ptr"];
+            return v;
+        }
         if (id == "file_name" || id == "file_path") {
             std::string f = cx->file;
             size_t sl = f.find_last_of('/');
@@ -3025,8 +3066,15 @@ private:
         if (id == "getpslcoverassert") { v.s = "vhdl_rt::psl_cover_assert"; v.t = bt["boolean"]; return v; }
         // std.env calendar time, environment and directories (VHDL-2019, 16.5.5 - 16.5.7)
         if (id == "epoch" || id == "localtime" || id == "gmtime" || id == "getenv" || id == "dir_workingdir" || id == "dir_itemexists" ||
-            id == "dir_itemisdir" || id == "dir_itemisfile" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
+            id == "dir_itemisdir" || id == "dir_itemisfile" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile" ||
+            id == "dir_open") {
             useEnv = true;
+            if (id == "dir_open") {   // DIR_OPEN(Dir, Path) return DIR_OPEN_STATUS (16.5.5)
+                if (args.size() != 2) fail(line, "DIR_OPEN: needs Dir and Path");
+                v.s = "vhdl_env::dir_open(" + target(args[0].actual, false) + ", " + arg(1, bt["string"]).s + ")";
+                v.t = bt["dir_open_status"];
+                return v;
+            }
             TP trec = bt["time_record"];
             if (id == "epoch" || id == "localtime" || id == "gmtime") {
                 std::string loc = id == "gmtime" ? "0" : "1";
@@ -3089,6 +3137,27 @@ private:
   import "DPI-C" function int msim_vhdl_mkdir(string path, int parents);
   import "DPI-C" function int msim_vhdl_rmdir(string path, int recursive);
   import "DPI-C" function int msim_vhdl_unlink(string path);
+  import "DPI-C" function int msim_vhdl_diropen(string path);
+  import "DPI-C" function string msim_vhdl_dirname();
+  import "DPI-C" function int msim_vhdl_dircount();
+  import "DPI-C" function string msim_vhdl_diritem(int i);
+  // DIRECTORY_ITEMS: an access to LINE_VECTOR, laid out like every access-to-array class
+)SV" + accClassText("directory_items", "string") + R"SV(  typedef struct { string name; directory_items items; } directory;
+  // DIR_OPEN: the canonical path and the items' simple names, sorted; null values on failure
+  function automatic int dir_open(output directory d, input string path);
+    int st = msim_vhdl_diropen(path);
+    d.name = "";
+    d.items = null;
+    if (st != 0) return st;
+    d.name = msim_vhdl_dirname();
+    d.items = directory_items::alloc(0, msim_vhdl_dircount() - 1, 1'b0);
+    foreach (d.items.a[i]) d.items.a[i] = msim_vhdl_diritem(i);
+    return 0;
+  endfunction
+  function automatic void dir_close(inout directory d);
+    d.name = "";
+    d.items = null;
+  endfunction
   typedef struct { int microsecond, second, minute, hour, day, month, year, weekday, dayofyear; } time_record;
   function automatic time_record tm(real t, int loc);
     time_record r;
@@ -3110,8 +3179,85 @@ private:
     if (frac > 0) s = {s, ".", pad0(r.microsecond, 6).substr(0, frac - 1)};
     return s;
   endfunction
-endpackage
+)SV" + (callPath ? callPathText() : std::string()) + "endpackage\n";
+    }
+    // An access-to-array class as emitAccClass makes it, for std.env's predefined access types
+    static std::string accClassText(const std::string& c, const std::string& ep) {
+        return "  class " + c + ";\n"
+               "    typedef " + ep + " arr_t[];\n"
+               "    arr_t a;\n"
+               "    int l; bit dn;\n"
+               "    static function " + c + " alloc(int l, int r, bit dn);\n"
+               "      " + c + " p = new(); p.l = l; p.dn = dn;\n"
+               "      p.a = new[(dn ? l - r : r - l) >= 0 ? (dn ? l - r : r - l) + 1 : 0];\n"
+               "      return p;\n"
+               "    endfunction\n"
+               "    static function " + c + " from(int l, bit dn, " + ep + " x[]);\n"
+               "      " + c + " p = new(); p.l = l; p.dn = dn; p.a = x; return p;\n"
+               "    endfunction\n"
+               "    function int right(); return dn ? l - a.size() + 1 : l + a.size() - 1; endfunction\n"
+               "    function int idx(int i); return dn ? l - i : i - l; endfunction\n"
+               "    function arr_t slice(int i, int j);\n"
+               "      arr_t r = new[j >= i ? j - i + 1 : 0];\n"
+               "      foreach (r[k]) r[k] = a[i + k];\n"
+               "      return r;\n"
+               "    endfunction\n"
+               "    function void set_slice(int i, arr_t x);\n"
+               "      foreach (x[k]) a[i + k] = x[k];\n"
+               "    endfunction\n"
+               "  endclass\n";
+    }
+    // GET_CALL_PATH (16.5.7): a stack of frames, the root (process or architecture) first.
+    // A frame knows its depth; a call names the caller's depth, so a frame left by a
+    // return is dropped at the next call or GET_CALL_PATH of its caller.
+    static std::string callPathText() {
+        return R"SV(  typedef struct { string name, file_name, file_path; int file_line; } call_path_element;
+)SV" + accClassText("call_path_vector_ptr", "call_path_element") + R"SV(  call_path_element cp_stack[$];
+  function automatic void cp_at(string rn, string rfn, string rfp, int l, int c);
+    if (c < 0) begin
+      cp_stack.delete();
+      cp_stack.push_back('{rn, rfn, rfp, l});
+    end else begin
+      while (cp_stack.size() > c + 1) void'(cp_stack.pop_back());
+      if (c < cp_stack.size()) cp_stack[c].file_line = l;
+    end
+  endfunction
+  function automatic int cp_enter(string n, string fn, string fp, string rn, string rfn, string rfp, int l, int c);
+    cp_at(rn, rfn, rfp, l, c);
+    cp_stack.push_back('{n, fn, fp, 0});
+    return cp_stack.size() - 1;
+  endfunction
+  function automatic call_path_vector_ptr get_call_path(string rn, string rfn, string rfp, int l, int c);
+    call_path_vector_ptr p;
+    cp_at(rn, rfn, rfp, l, c);
+    p = call_path_vector_ptr::alloc(0, cp_stack.size() - 1, 1'b0);
+    foreach (p.a[i]) p.a[i] = cp_stack[cp_stack.size() - 1 - i];
+    return p;
+  endfunction
+  function automatic string cp_str(call_path_element e);
+    return {e.file_path, "/", e.file_name, ":", $sformatf("%0d", e.file_line), ":", e.name};
+  endfunction
+  function automatic string cp_vec_str(call_path_element v[], string sep);
+    string s = "";
+    foreach (v[i]) s = {s, i ? sep : "", cp_str(v[i])};
+    return s;
+  endfunction
+  function automatic string cp_ptr_str(call_path_vector_ptr p, string sep);
+    return p == null ? "" : cp_vec_str(p.a, sep);
+  endfunction
 )SV";
+    }
+    // The call-path arguments a call passes (see `callPath`): the root's name and file, the
+    // call's line and the caller's frame (-1 outside a subprogram)
+    std::string cpArgs(int line) {
+        if (!callPath) return "";
+        if (cx->cpFrame) return "\"\", \"\", \"\", " + std::to_string(line) + ", cp__d";
+        std::string f = cx->file;
+        size_t sl = f.find_last_of('/');
+        std::string fn = sl == std::string::npos ? f : f.substr(sl + 1), fp = sl == std::string::npos ? "." : f.substr(0, sl);
+        std::string root = cx->proc && !cx->proc->label.empty() ? cx->proc->label : cx->container;
+        if (!root.empty() && root[0] == '\\') root = root.substr(1, root.size() - 2);
+        return "\"" + root + "\", \"" + fn + "\", \"" + fp + "\", " + std::to_string(line) + ", -1";
     }
 
     // seconds per unit of `timeUnit`, the unit of a VHDL time value in SystemVerilog
@@ -3137,6 +3283,15 @@ endpackage
         if (id == "setpslcoverassert") { EP e = by("enable", 0); return "vhdl_rt::psl_cover_assert = " + (e ? ex(e, bt["boolean"]).s : std::string("1'b1")) + ";"; }
         if (id == "clearpslstate") return ";";
         // std.env directory procedures: the last argument is the status (16.5.6)
+        if (id == "dir_open" || id == "dir_close") {   // (16.5.5)
+            useEnv = true;
+            EP d = by("dir", 0), p = by("path", 1), st = by("status", 2);
+            if (!d) fail(line, id + ": missing argument");
+            if (id == "dir_close") return "vhdl_env::dir_close(" + target(d, false) + ");";
+            if (!p) fail(line, "DIR_OPEN: missing Path");
+            std::string c = "vhdl_env::dir_open(" + target(d, false) + ", " + ex(p, bt["string"]).s + ")";
+            return st ? target(st, false) + " = " + c + ";" : "void'(" + c + ");";
+        }
         if (id == "dir_workingdir" || id == "dir_createdir" || id == "dir_deletedir" || id == "dir_deletefile") {
             useEnv = true;
             EP p = by("path", 0), st = by("status", args.size() - 1), flag = by(id == "dir_createdir" ? "parents" : "recursive", 99);
@@ -4844,6 +4999,17 @@ endpackage
             TP rt = sp.isFunc ? (spec && !retTypes[s.sub.get()] ? nullptr : retTypes[s.sub.get()]) : nullptr;
             cx->retType = rt;
             std::ostringstream decls;
+            if (callPath) {
+                // this call's frame on the call path (see `callPath`)
+                for (const char* f : {"input string cp__n = \"\"", "input string cp__fn = \"\"", "input string cp__fp = \"\"", "input int cp__l = 0", "input int cp__c = -1"})
+                    formals.push_back(f);
+                std::string f = cx->file;
+                size_t sl = f.find_last_of('/');
+                std::string fn = sl == std::string::npos ? f : f.substr(sl + 1), fp = sl == std::string::npos ? "." : f.substr(0, sl);
+                decls << "    int cp__d = vhdl_env::cp_enter(\"" << sp.text << "\", \"" << fn << "\", \"" << fp << "\", cp__n, cp__fn, cp__fp, cp__l, cp__c);\n";
+                cx->cpFrame = true;
+                useEnv = true;
+            }
             emitDecls(decls, sp.decls, "function");
             std::string stmts = seqStmts(sp.body);
             body << decls.str() << stmts;
@@ -4925,7 +5091,6 @@ endpackage
 
     std::map<std::string, TP> specRetTypes;
     Val specializedCall(const Sym& s, const std::vector<EP>& ord, const std::vector<Val>& av, int line, const std::string& recv = "") {
-        (void)line;
         const Subprog& sp = *s.sub;
         Spec spec;
         std::string key = s.sv + "|" + std::to_string((uintptr_t)s.sub.get());
@@ -4998,6 +5163,7 @@ endpackage
             r += (first ? "" : ", ") + av[i].s;
             first = false;
         }
+        if (std::string cp = cpArgs(line); !cp.empty()) r += (first ? "" : ", ") + cp;
         v.s = r + ")";
         v.t = specRetTypes[key];
         (void)ord;
