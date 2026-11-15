@@ -757,6 +757,7 @@ struct Lowerer {
     std::unordered_map<const slang::ast::Symbol*, int>& sigmap;
     Prog prog;
     std::vector<size_t> implicitWaits;  // WaitEdge slots for @*, filled by finishImplicit()
+    std::unordered_map<size_t, size_t> implicitEnd;   // @* slot -> end of the statement it controls
     // Set while lowering a compound assignment. slang's right-hand side is the
     // binary operator, and its left operand is an LValueReference: the target's
     // type, and no symbol. The read is the assignment's left expression.
@@ -9854,12 +9855,15 @@ struct Lowerer {
     // @* waits on every signal the block reads (known only after lowering).
     void finishImplicit() {
         if (implicitWaits.empty()) return;
-        auto rs = readSet(prog);
-        if (rs.empty()) {   // @* with nothing to wait on never triggers (9.4.2.2): a signal nothing writes
-            std::cerr << "msim: warning: " << whereStr() << "@* reads no signals, so it never triggers\n";
-            rs.push_back({freshStatic(1), ANY});
+        for (size_t pc : implicitWaits) {
+            auto e = implicitEnd.find(pc);
+            auto rs = e != implicitEnd.end() ? readSet(prog, pc + 1, e->second) : readSet(prog);
+            if (rs.empty()) {   // @* with nothing to wait on never triggers (9.4.2.2): a signal nothing writes
+                std::cerr << "msim: warning: " << whereStr() << "@* reads no signals, so it never triggers\n";
+                rs.push_back({freshStatic(1), ANY});
+            }
+            prog.code[pc] = waitInstr(rs);
         }
-        for (size_t pc : implicitWaits) prog.code[pc] = waitInstr(rs);
     }
 
     // foreach over a dynamic array or queue: index 0 up to size() - 1, read
@@ -10142,7 +10146,11 @@ struct Lowerer {
             case StatementKind::Timed: {
                 const auto& t = s.as<TimedStatement>();
                 timing(t.timing);
+                size_t at = prog.here();
                 stmt(t.stmt);
+                // @* waits on what its own statement reads, not the rest of
+                // the process (9.4.2.2): a nested @* sees only its statement.
+                if (t.timing.kind == TimingControlKind::ImplicitEvent && at > 0) implicitEnd[at - 1] = prog.here();
                 break;
             }
             case StatementKind::Conditional: {
