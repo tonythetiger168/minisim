@@ -139,10 +139,10 @@ foreach(c IN LISTS CASES)
     endif()
   endif()
   # Public registers and run-time array NBAs still run the cycle domain
-  # in parallel groups (codegen.hpp DEFG, gnbApply).
+  # in parallel groups (codegen.hpp GSt, gnbApply).
   if(c MATCHES "examples/parpub")
     file(READ ${OUT}/c${n}/design.cpp gen)
-    if(NOT gen MATCHES "gnbApply\\(GNB")
+    if(NOT gen MATCHES "gnbApply\\(GS")
       message(FATAL_ERROR "${c}: the cycle domain does not run in parallel groups")
     endif()
   endif()
