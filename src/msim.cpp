@@ -389,6 +389,148 @@ static void mergePartialDrivers(LowerResult& lowered) {
     }
 }
 
+// msim -compile: a signal whose only writer is a comb process `s = <constant>`
+// (a tied-off port, a parameter-driven select: test_en_i = 0, Ibex's
+// cheriot_enable_i) is a constant. Its reads in the comb and clocked
+// processes become that constant, and an operator whose operands are all
+// constants is folded, so the C++ compiler drops the logic that hangs on
+// it, as Verilator does. Its process still writes it (a waveform, other
+// readers). Only 64-bit 2-state values; never a signal anything else names
+// as a target (an NBA, force, array element, ref argument, task output).
+static size_t propagateConstants(LowerResult& lowered, const Plan& pl) {
+    const size_t ns = S.sigs.size();
+    std::vector<int> writes(ns, 0);
+    std::vector<char> noConst(ns, 0);
+    std::unordered_set<const Prog*> seen;
+    auto range = [&](const ArrShape* a) {
+        if (!a) return;
+        for (int64_t k = 0; k < a->count; k++)
+            if (a->base + k >= 0 && (size_t)(a->base + k) < ns) noConst[(size_t)(a->base + k)] = 1;
+    };
+    std::function<void(const E&)> ex = [&](const E& e) {
+        if (!e) return;
+        range(e->arr.get());
+        if ((e->op == Op::AddrOf || e->op == Op::Addr || e->op == Op::ArrAddr) && e->sig >= 0 && (size_t)e->sig < ns) noConst[e->sig] = 1;
+        if (e->op != Op::Ref && e->op != Op::Const && e->sig >= 0 && (size_t)e->sig < ns) noConst[e->sig] = 1;   // a container, a handle
+        ex(e->at);
+        for (auto& k : e->kids) ex(k);
+    };
+    std::function<void(const Prog*)> walk = [&](const Prog* p) {
+        if (!p || !seen.insert(p).second) return;
+        for (auto& in : p->code) {
+            if (in.k != IK::WaitEdge && in.sig >= 0 && (size_t)in.sig < ns) writes[in.sig]++;
+            range(in.arr.get());
+            ex(in.e); ex(in.bidx); ex(in.de); ex(in.fd); ex(in.self);
+            for (auto& a : in.args) ex(a);
+            for (auto& a : in.aidx) ex(a);
+            walk(in.callee);
+            for (auto* b : in.branches) walk(b);
+        }
+    };
+    for (auto& lp : lowered.procs) walk(&lp.prog);
+    for (auto& f : lowered.finals) walk(&f.prog);
+    // Candidates: the one Assign of a ranked comb process, whole, the only write.
+    std::vector<const Instr*> unit(ns, nullptr);
+    // Or a process that only assigns, once, at time 0 (an assign of a
+    // constant: nothing to wait on; a declaration's initializer).
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        const auto& c = lowered.procs[i].prog.code;
+        const bool comb = pl.rank[i] >= 0 && c.size() >= 2 && c[0].k == IK::Assign && c[1].k == IK::WaitEdge;
+        bool once = pl.rank[i] < 0 && !pl.seq[i] && !c.empty() && !lowered.procs[i].reactive && lowered.procs[i].program < 0;
+        for (auto& in : c) once &= in.k == IK::Assign;
+        if (!comb && !once) continue;
+        for (const Instr& a : c) {
+            if (a.sig < 0 || (size_t)a.sig >= ns || a.hi >= 0 || a.arr || a.bidx || !a.aidx.empty() || a.tmp || writes[a.sig] != 1 || noConst[a.sig]) continue;
+            const Sig& g = S.sigs[a.sig];
+            if (g.w < 1 || g.w > 64 || g.val.real || g.val.str || g.fl) continue;
+            if (a.drv >= 0 ? g.drv.size() != 1 || a.s0 == STR_HIZ || a.s1 == STR_HIZ : !g.drv.empty()) continue;
+            unit[a.sig] = &a;
+            if (comb) break;
+        }
+    }
+    std::vector<char> known(ns, 0);
+    std::vector<uint64_t> kv(ns, 0);
+    auto pure = [](Op o) {
+        switch (o) {
+            case Op::Not: case Op::And: case Op::Or: case Op::Xor: case Op::Add: case Op::Sub: case Op::Mul:
+            case Op::Eq: case Op::Ne: case Op::CaseEq: case Op::CaseZEq: case Op::CaseXEq: case Op::WildEq:
+            case Op::Lt: case Op::Le: case Op::Gt: case Op::Ge: case Op::Shl: case Op::Shr: case Op::Asr: case Op::Resize:
+            case Op::LogNot: case Op::LogAnd: case Op::LogOr: case Op::RedAnd: case Op::RedOr: case Op::RedXor:
+            case Op::Slice: case Op::Index: case Op::Concat: case Op::Mux:
+                return true;
+            default: return false;
+        }
+    };
+    // The expression with the known signals as constants, folded; the same
+    // pointer when nothing changed (expressions may be shared).
+    std::function<E(const E&)> fold = [&](const E& e) -> E {
+        if (!e) return e;
+        if (e->op == Op::Ref) {
+            if (e->at || e->sig < 0 || (size_t)e->sig >= ns || !known[e->sig]) return e;
+            Val k = make(kv[e->sig], 0, S.sigs[e->sig].w);
+            k.sgn = e->sgn;
+            return konst(k);
+        }
+        if (e->op == Op::Const || e->at) return e;
+        std::vector<E> kids;
+        bool changed = false, allConst = !e->kids.empty();
+        kids.reserve(e->kids.size());
+        for (auto& k : e->kids) {
+            E f = fold(k);
+            changed |= f != k;
+            allConst &= f && f->op == Op::Const && f->k.hi.empty() && !f->k.real && !f->k.str;
+            kids.push_back(std::move(f));
+        }
+        if (!pure(e->op)) {
+            if (!changed) return e;
+            auto n = std::make_shared<Expr>(*e);
+            n->kids = std::move(kids);
+            return n;
+        }
+        if (e->op == Op::Mux && kids.size() == 3 && kids[0] && kids[0]->op == Op::Const) {
+            int t = truth(kids[0]->k);
+            if (t == 1) return kids[1];
+            if (t == 0) return kids[2];
+        }
+        if (allConst) {
+            auto n = std::make_shared<Expr>(*e);
+            n->kids = kids;
+            Val v = eval(n, [](int) -> Val { return Val{}; });
+            if (!v.real && !v.str && v.hi.empty() && v.w >= 1 && v.w <= 64) return konst(v);
+        }
+        if (!changed) return e;
+        auto n = std::make_shared<Expr>(*e);
+        n->kids = std::move(kids);
+        return n;
+    };
+    size_t nk = 0;
+    for (bool again = true; again;) {
+        again = false;
+        for (size_t s = 0; s < ns; s++) {
+            if (!unit[s] || known[s]) continue;
+            E f = fold(unit[s]->e);
+            if (!f || f->op != Op::Const || f->k.x || f->k.z || f->k.real || f->k.str || !f->k.hi.empty()) continue;
+            Val v = f->k;
+            uint64_t m = S.sigs[s].w >= 64 ? ~0ULL : (1ULL << S.sigs[s].w) - 1;
+            if (v.w < S.sigs[s].w && v.sgn && v.w < 64 && ((v.v >> (v.w - 1)) & 1)) v.v |= ~0ULL << v.w;   // sign-extended to the target
+            kv[s] = v.v & m;
+            known[s] = 1;
+            nk++;
+            again = true;
+        }
+    }
+    if (!nk) return 0;
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        if (pl.rank[i] < 0 && !pl.seq[i]) continue;
+        for (auto& in : lowered.procs[i].prog.code) {
+            in.e = fold(in.e);
+            in.bidx = fold(in.bidx);
+            for (auto& a : in.aidx) a = fold(a);
+        }
+    }
+    return nk;
+}
+
 // -x-assign 0 / -x-initial 0 (Verilator's options of the same names): the
 // design runs as a 2-state model would. Every X bit of a literal becomes 0
 // (picorv32 writes 'bx as a don't-care into a dozen registers every cycle,
@@ -3500,6 +3642,10 @@ int main(int argc, char** argv) {
     if (compiled && (vcdSva || vcdPower)) {
         std::cerr << "msim: -compile: " << (vcdSva ? "assertions" : "power states") << " in the waveform need the interpreter; using it\n";
         compiled = false;
+    }
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCONST")) {
+        size_t nk = propagateConstants(lowered, pl);
+        if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constants: %zu signals\n", nk);
     }
     if (compiled) {
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, pl, threads, staticPart, twoState, cycle,
