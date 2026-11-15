@@ -3639,6 +3639,8 @@ private:
                     if (i.sig < 0 || (size_t)i.sig >= ns) continue;
                     const bool ok = inDom[p] && i.k == IK::Nba && i.hi < 0 && !i.arr && i.aidx.empty() && !i.bidx && !i.de &&
                                     !i.delay && i.dly.empty();
+                    // A declaration initializer (logic a = 0) runs before any clock.
+                    if (!ok && procs[p].kind == "init" && procs[p].combRank < 0 && !procs[p].seq && i.k == IK::Assign) continue;
                     if (!ok) { bad[i.sig] = 1; continue; }
                     if (wproc[i.sig] < 0) { wproc[i.sig] = (int)p; firstW[i.sig] = (int)pc; }
                     else if (wproc[i.sig] != (int)p) bad[i.sig] = 1;
