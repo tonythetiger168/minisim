@@ -1856,6 +1856,23 @@ struct Sim {
                 cout << strengthText(args[ai++], rd);
                 continue;
             }
+            if ((lc == 'u' || lc == 'z') && ai < args.size()) {   // %u / %z: binary, 32-bit words, LSB word first (21.2.1.1)
+                Val v = eval(args[ai++], rd);
+                int words = std::max(1, (v.w + 31) / 32);
+                auto put = [&](uint32_t u) { for (int b = 0; b < 4; b++) cout << (char)((u >> (8 * b)) & 0xff); };
+                for (int wd = 0; wd < words; wd++) {
+                    uint32_t a = 0, bv = 0;
+                    for (int b = 0; b < 32 && wd * 32 + b < v.w; b++) {
+                        int t = bitAt(v, wd * 32 + b);   // 0, 1, 2 = x, 3 = z
+                        if (lc == 'u') { if (t == 1) a |= 1u << b; continue; }   // x and z write 0
+                        if (t == 1 || t == 2) a |= 1u << b;
+                        if (t >= 2) bv |= 1u << b;
+                    }
+                    put(a);
+                    if (lc == 'z') put(bv);
+                }
+                continue;
+            }
             bool known = string_view("bohxdcstfeg").find(lc) != string_view::npos;
             if (!known || ai >= args.size()) { cout << fmt.substr(start, i - start + 1); continue; }
             Val v = eval(args[ai++], rd);

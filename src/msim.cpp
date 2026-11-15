@@ -3477,6 +3477,7 @@ int main(int argc, char** argv) {
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
+    std::vector<std::pair<size_t, int>> lateConst;
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         // A process run as a function (static comb or clocked) still takes
         // its generator seed in start order (18.14.2), so every later
@@ -3501,9 +3502,19 @@ int main(int argc, char** argv) {
             S.addSeq(execSeq, &lowered.procs[i].prog, pl.ev[i]);
             continue;
         }
+        // A continuous assignment of a constant (assign tie = 1'b0) runs once.
+        // It starts after the other processes, so an always @(tie) or
+        // always @* that reads it is already waiting and sees the change,
+        // as in other simulators.
+        if (lowered.procs[i].kind == "assign" && !lowered.procs[i].loops) { lateConst.push_back({i, pe}); continue; }
         Task t = lowered.procs[i].program >= 0 || lowered.procs[i].reactive
                      ? programProc(&lowered.procs[i].prog, lowered.procs[i].program, lowered.procs[i].kind == "Initial")
                      : process(&lowered.procs[i].prog);
+        if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
+        S.spawn(t);
+    }
+    for (auto [i, pe] : lateConst) {
+        Task t = process(&lowered.procs[i].prog);
         if (pe >= 0) prof::P().byHandle[t.h.address()] = pe;
         S.spawn(t);
     }

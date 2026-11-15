@@ -2054,6 +2054,32 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
         if (i >= fmt.size()) break;
         char cv = (char)tolower((unsigned char)fmt[i]);
         if (cv == 'm') { if (!skip) { scanOut().push_back(mkstr("")); n++; } continue; }
+        if (cv == '\x01' || cv == '\x02') {   // %u / %z: `width` 32-bit words, LSB word first, 2- or 4-value (21.3.4.3)
+            bool four = cv == '\x02';
+            int words = std::max(1, width);
+            std::vector<uint32_t> raw;
+            bool full = true;
+            for (int wd = 0; wd < words * (four ? 2 : 1) && full; wd++) {
+                uint32_t u = 0;
+                for (int b = 0; b < 4; b++) {
+                    int c = next();
+                    if (c == EOF) { full = false; break; }
+                    u |= (uint32_t)(unsigned char)c << (8 * b);
+                }
+                raw.push_back(u);
+            }
+            if (!full) { if (!any) eof = true; break; }
+            any = true;
+            Val v = v_resize(make(0, 0, 32, 0), words * 32, false);
+            for (int wd = 0; wd < words; wd++) {
+                uint32_t a = four ? raw[(size_t)wd * 2] : raw[(size_t)wd], bv = four ? raw[(size_t)wd * 2 + 1] : 0;
+                Val part = make(a & ~bv, bv, 32, ~a & bv);   // vecval: b=1 is x (a=1) or z (a=0)
+                v = v_insert(v, part, wd * 32 + 31, wd * 32);
+            }
+            scanOut().push_back(v);
+            n++;
+            continue;
+        }
         if (cv != 'c') skipWs();
         if (eof) break;
         std::string tok;
@@ -2729,6 +2755,16 @@ inline Val eval(const E& e, const Reader& rd) {
         case Op::IntToStr: { Val v = k(0); return v.str ? v : mkstr(bytesToStr(v)); }
         case Op::StrToInt: {
             const std::string& s = v_str(k(0));
+            if (e->hi > 64) {   // a string into a wide vector: the last character in the low byte (5.9, 21.3.3)
+                Val r = make(0, 0, e->hi);
+                int nl = limbCount(e->hi);
+                std::vector<uint64_t> limbs((size_t)nl, 0);
+                size_t n = s.size();
+                for (size_t j = 0; j < n && (int)(j * 8) < e->hi; j++)
+                    limbs[j / 8] |= (uint64_t)(unsigned char)s[n - 1 - j] << (8 * (j % 8));
+                for (int i = 0; i < nl; i++) setLimb(r, i, limbs[(size_t)i], 0, 0);
+                return r;
+            }
             uint64_t v = 0;
             for (size_t i = 0; i < s.size(); i++) v = (v << 8) | (unsigned char)s[i];
             return make(v, 0, e->hi);
