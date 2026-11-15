@@ -7629,7 +7629,11 @@ struct Lowerer {
                     continue;
                 }
                 if (sp.c == 's' && pe.kind == ExpressionKind::StringLiteral) {   // a literal of any length (5.9)
-                    out.push_back(strOf(*a));
+                    // Its zero bytes stay, for %s to print as spaces; "" is
+                    // one zero byte (11.10.3).
+                    std::string t(pe.as<StringLiteral>().getValue());
+                    if (t.empty()) t.assign(1, '\0');
+                    out.push_back(konst(mkstr(t)));
                     continue;
                 }
                 if (sp.c == 'p') {
