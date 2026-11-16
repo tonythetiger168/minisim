@@ -374,10 +374,37 @@ emit, and checks that msim:
 
 What this cannot show is opening an envelope encrypted **only** for a
 commercial tool: that needs that vendor's private key, which minisim does not
-have and does not try to obtain. Nor can it show a vendor's own tool opening
-a minisim envelope. Those two need the tools themselves; the cryptography and
-the envelope syntax on both sides of the exchange are what is checked here
-and in `tests/protect_openssl.cmake`.
+have and does not try to obtain.
+
+### AMD Vivado (checked 2026-11-16)
+
+A vendor's own tool opening a minisim envelope was checked with AMD Vivado
+2026.1 (free tier, Windows). `secret_core.v` was encrypted by minisim's
+encryptor for AMD's public key, the `xilinxt_2026.1-2030.x` key that ships in
+the install under `data/pubkey/`, with `key_keyowner="Xilinx"`. Vivado's
+xsim ran each file under a plain testbench, and an out-of-context
+`synth_design` ran on each one. Of 17 variants, these opened in both:
+
+- clause 34 envelopes, with or without `version = 1`, with `aes128-cbc` or
+  `aes256-cbc`, a PKCS#1 `key_block`, and **no** `key_public_key` and **no**
+  `digest_block`. xsim's output matched the plain run, and synthesis passed.
+
+Vivado refused the rest:
+
+- any `digest_block`. Vivado expects `end_protected` after the `data_block`.
+- a `key_public_key` beside the `key_block`. Vivado reads it as a second
+  vendor block without `key_keyowner`.
+- version 3. Vivado 2026.1 does not take the `end_protected="..."`
+  signature.
+
+So to encrypt for Vivado, write a clause 34 envelope with no digest and no
+`key_public_key`: `EncryptOptions` with `digestMethod = ""` and
+`publicKey = false`. That envelope carries no integrity check, so msim warns
+when it opens one (see the clause 34 section below).
+
+The other direction was not checked. The free tier refuses Vivado's
+`encrypt` command ("Your current selected license is BASIC"), so no
+Vivado-made envelope was available.
 
 ## IEEE 1735-2023 coverage
 

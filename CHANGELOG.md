@@ -251,6 +251,10 @@ Spec references are IEEE 1800-2023 clauses.
   `mdebug -lint` use too.
 - mlint: VHDL-only rules VHD001..VHD009 on the VHDL text (vendor arithmetic packages, 'event clock edges, buffer ports, initial values, shared variables, positional port maps, unlabeled processes, integers with no range, bit ports). A process starting with `wait until rising_edge(clk)` is a flop, not an implicit state machine, and `COMB001` on VHDL suggests `process (all)`.
 - mlint: with `-sdc`, rules SDC001..SDC005 check the constraints against the design (inputs and outputs with no I/O delay, a clock on a port that clocks nothing or on a reset, objects the design does not have). STY016 (off by default) reports glue logic in a module that also instantiates submodules. The STARC table in docs/LINT.md now lists every topic of the guide as covered or not a lint check.
+- protect: `EncryptOptions::publicKey` (default on) can leave
+  `key_public_key` out of a clause 34 envelope. AMD Vivado 2026.1 xsim and
+  synthesis opened minisim envelopes for AMD's public key that had no
+  `key_public_key` and no digest. docs/PROTECT.md lists what it refused.
 
 ### Changed
 - msim: VHDL processes with a sensitivity list run in the static schedule
