@@ -431,6 +431,64 @@ inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::
     }
     return {after, fw};
 }
+// The enum fields of a packed value (an enum, or packed structs of them at
+// any depth): their low bit (lo for the value's bit 0), width and type.
+// Each takes only its named values when randomized (18.4).
+inline void packedEnums(const slang::ast::Type& t0, int lo, std::vector<std::tuple<int, int, const slang::ast::Type*>>& out) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (t.isEnum()) { out.push_back({lo, (int)t.getBitWidth(), &t}); return; }
+    if (t.kind != SymbolKind::PackedStructType) return;
+    for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>())
+        packedEnums(f.getType(), lo + (int)f.bitOffset, out);
+}
+// The rand members of an unpacked struct (7.2, 18.4) as parts of its bits,
+// top first: a rand integral member (or each element of a rand fixed-size
+// array member) is solved, a rand unpacked struct member is split the same
+// way, anything else keeps its bits. enums: the low bit, width and type of
+// each rand enum part. False when a rand member cannot be solved this way.
+inline bool randParts(const slang::ast::Type& t0, std::vector<RandVar::Part>& out,
+                      std::vector<std::tuple<int, int, const slang::ast::Type*>>& enums, int top) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (!t.isUnpackedStruct()) return false;
+    for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+        const Type& ft = f.getType().getCanonicalType();
+        int fw = uMemberW(ft);
+        if (fw <= 0) return false;
+        bool rnd = f.randMode != RandMode::None;
+        auto leaf = [&](const Type& lt, int w, int at) {   // one solved part; at: its top bit + 1
+            if (!lt.isIntegral() || lt.isUnpackedStruct()) return false;
+            packedEnums(lt, at - w, enums);
+            if (w > 64) {   // a wide member (a packed struct, a long vector): chunks of 64 bits, top first
+                if (f.randMode == RandMode::RandC || lt.isEnum()) return false;
+                for (int left = w; left > 0;) {
+                    int cw = left % 64 ? left % 64 : 64;
+                    out.push_back({cw, true, false, false});
+                    left -= cw;
+                }
+                return true;
+            }
+            out.push_back({w, true, lt.isSigned(), f.randMode == RandMode::RandC});
+            return true;
+        };
+        if (!rnd) out.push_back({fw, false, false, false});
+        else if (ft.isUnpackedStruct()) { if (!randParts(ft, out, enums, top)) return false; }
+        else if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            const Type* et = &ft;
+            int n = 1;
+            while (et->kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                n *= (int)et->as<FixedSizeUnpackedArrayType>().range.width();
+                et = &et->getArrayElementType()->getCanonicalType();
+            }
+            int ew = fw / n;
+            for (int k = 0; k < n; k++)
+                if (!leaf(*et, ew, top - k * ew)) return false;
+        } else if (!leaf(ft, fw, top)) return false;
+        top -= fw;
+    }
+    return true;
+}
 inline Val structDefaultVal(const slang::ast::Type& t0);
 inline bool memberInitVal(const slang::ast::FieldSymbol& f, int w, Val& out);
 inline bool unpackedConstVal(const slang::ast::Type& t, const slang::ConstantValue& cv, Val& out);
@@ -466,6 +524,39 @@ inline int vifMember(const slang::ast::Symbol& m) {
 inline bool isClassMethod(const slang::ast::SubroutineSymbol& s) {
     const slang::ast::Scope* p = s.getParentScope();
     return p && p->asSymbol().kind == slang::ast::SymbolKind::ClassType;
+}
+// A static variable declared in a block of an initial, always or final
+// procedure (not in a task or function): its initializer runs once before
+// time 0 (6.21), whether or not the block is ever entered.
+inline bool staticOfProcedure(const slang::ast::VariableSymbol& v) {
+    using namespace slang::ast;
+    if (v.lifetime != VariableLifetime::Static || !v.getInitializer()) return false;
+    // only a constant initializer: one with calls (process::self()) or that
+    // reads other variables keeps running in the process that reaches the
+    // declaration, where those have their values
+    struct Calls : public ASTVisitor<Calls, VisitFlags::Expressions> {
+        bool found = false;
+        void handle(const CallExpression&) { found = true; }
+        void handle(const NewClassExpression&) { found = true; }
+        void handle(const NamedValueExpression& n) { look(n.symbol); }
+        void handle(const HierarchicalValueExpression& n) { look(n.symbol); }
+        void look(const Symbol& s) {
+            if (s.kind != SymbolKind::Parameter && s.kind != SymbolKind::EnumValue && s.kind != SymbolKind::Specparam) found = true;
+        }
+    } c;
+    v.getInitializer()->visit(c);
+    if (c.found) return false;
+    const Scope* sc = v.getParentScope();
+    if (!sc || sc->asSymbol().kind != SymbolKind::StatementBlock) return false;
+    for (; sc; sc = sc->asSymbol().getParentScope()) {
+        auto k = sc->asSymbol().kind;
+        if (k == SymbolKind::Subroutine || k == SymbolKind::ClassType || k == SymbolKind::CheckerInstanceBody ||
+            k == SymbolKind::RandSeqProduction)
+            return false;
+        if (k == SymbolKind::InstanceBody || k == SymbolKind::GenerateBlock) return true;
+        if (k != SymbolKind::StatementBlock) return false;
+    }
+    return false;
 }
 inline bool isAutomatic(const slang::ast::SubroutineSymbol& s) {
     return s.defaultLifetime == slang::ast::VariableLifetime::Automatic || isClassMethod(s);
@@ -6696,10 +6787,24 @@ struct Lowerer {
                 items.push_back(&sub->as<SignalEventControl>());
             }
         } else return false;
+        // A bit or part select of a virtual interface or class member
+        // (@(posedge vif.state[0]), 9.4.2, 25.9) has no signal of its own
+        // and no continuous assignment can follow it: it is waited on here,
+        // and so is every other item of its event list.
+        auto memberSel = [&](const Expression& x) {
+            const Expression* b = &x;
+            while (b->kind == ExpressionKind::ElementSelect || b->kind == ExpressionKind::RangeSelect)
+                b = b->kind == ExpressionKind::ElementSelect ? &b->as<ElementSelectExpression>().value()
+                                                             : &b->as<RangeSelectExpression>().value();
+            return b != &x && (vifAccess(*b) || classMember(*b));
+        };
+        bool sel = false;
+        for (auto* s : items) sel = sel || memberSel(s->expr);
         bool need = false;
         for (auto* s : items) {
             if (isGlobalClock(s->expr) || inferredClock(s->expr) || clockingRef(s->expr) ||
-                peel(s->expr).kind == ExpressionKind::AssertionInstance || classMember(s->expr) || vifAccess(s->expr) ||
+                peel(s->expr).kind == ExpressionKind::AssertionInstance ||
+                (!sel && (classMember(s->expr) || vifAccess(s->expr))) ||
                 !s->expr.type->isIntegral() || s->expr.type->isEvent())
                 return false;
             if (!ValueExpressionBase::isKind(s->expr.kind)) need = true;
@@ -6711,7 +6816,7 @@ struct Lowerer {
         if (prog.here() != at) unsupported("event expression with a call");
         bool rel = false;
         for (auto& x : xs) rel = rel || hasRel(x);
-        if (!rel && eventExprHook()) return false;   // static: a signal kept equal to it (eventSignal)
+        if (!rel && !sel && eventExprHook()) return false;   // static: a signal kept equal to it (eventSignal)
         auto put = [&](int sg, E v) { Instr a; a.k = IK::Assign; a.sig = sg; a.e = v; prog.emit(a); };
         std::vector<int> olds, nws;
         for (size_t k = 0; k < items.size(); k++) {
@@ -10837,7 +10942,8 @@ struct Lowerer {
                 // An array with an initializer in a function that keeps static
                 // signals: assigned at each entry, as an automatic one is.
                 if (init && vd.symbol.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType &&
-                    !(current && vd.symbol.lifetime == VariableLifetime::Static) && arrFind(&vd.symbol) &&
+                    !(current && vd.symbol.lifetime == VariableLifetime::Static) && !(!current && staticOfProcedure(vd.symbol)) &&
+                    arrFind(&vd.symbol) &&
                     assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false))
                     break;
                 if (localMap().count(&vd.symbol)) {   // an automatic variable starts over at each entry (6.21)
@@ -10895,6 +11001,9 @@ struct Lowerer {
                 // The flag starts as X, so the first entry fails the "already
                 // done" test and takes the init.
                 bool once = vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
+                if (once && !current && staticOfProcedure(vd.symbol) && !dynMap().count(&vd.symbol) &&
+                    (sigmap.count(&vd.symbol) || arrFind(&vd.symbol)))
+                    break;   // initialized before time 0 (ProcCollector, initStatic)
                 auto initVar = [&] {   // a fixed-size array takes its value element by element
                     if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = cloneConts(vd.symbol.getType(), expr(*init));
@@ -12411,6 +12520,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             // (6.8, 6.21). One with an initializer takes it on the first call.
             if (v.lifetime == slang::ast::VariableLifetime::Static && !e && (sigmap.count(&v) || arrMap().count(&v)) && !dynMap().count(&v))
                 initStatic(v);
+            // in a block of a procedure: before time 0, even if the block never runs
+            else if (staticOfProcedure(v) && (sigmap.count(&v) || arrMap().count(&v)) && !dynMap().count(&v))
+                initStatic(v);
             return;
         }
         if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
@@ -12853,6 +12965,27 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (!e) {
             if (!dl.empty()) out.netDelays.push_back({sigmap.at(&n), dl});
+            return;
+        }
+        if (n.getType().getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+            // wire [2:0] w [1:0] = '{...} (10.3.1): a continuous assignment to each element
+            auto it = arrMap().find(&n);
+            if (it == arrMap().end()) Lowerer::unsupported("net array with an initializer");
+            Lowerer lw(sigmap);
+            prep(lw);
+            lw.setScope(n.getParentScope());
+            std::vector<E> els;
+            lw.arrayElems(n.getType(), *e, els);
+            if ((int)els.size() != it->second->count || !lw.prog.code.empty())
+                Lowerer::unsupported("net array initializer of this kind");
+            for (size_t k = 0; k < els.size(); k++) {
+                Lowerer L(sigmap);
+                prep(L);
+                L.setScope(n.getParentScope());
+                Instr i; i.k = IK::Assign; i.sig = it->second->base + (int)k; i.e = els[k];
+                i.dly = dl;
+                finishAssign(L, i);
+            }
             return;
         }
         Lowerer lw(sigmap);
@@ -15086,6 +15219,30 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             }
                             if (et->isUnpackedArray()) Lowerer::unsupported("rand container of fixed-size arrays");
                         }
+                        if (et->isUnpackedStruct() && !rv.dyn) {   // rand members of an unpacked struct (18.4)
+                            std::vector<std::tuple<int, int, const Type*>> enums;
+                            rv.w = uWidth(*et);
+                            if (rv.w <= 0 || !randParts(*et, rv.parts, enums, rv.w))
+                                Lowerer::unsupported("rand unpacked struct with a member of this kind");
+                            bool any = false;
+                            for (auto& pt : rv.parts) any |= pt.rand;
+                            if (!any) rv.parts.clear();   // nothing in it is rand: left alone
+                            for (int k = 0; k < rv.count && any; k++)
+                                for (auto& [lo, w, en] : enums) {   // an enum member takes only its named values
+                                    E any2;
+                                    for (const auto& ev : en->as<EnumType>().values()) {
+                                        const auto& cv = ev.getValue();
+                                        if (!cv.isInteger()) continue;
+                                        auto u = cv.integer().as<uint64_t>();
+                                        E eq = bin(Op::Eq, slice(ref(lw.thisRel(rv.off + k), false), lo + w - 1, lo),
+                                                   konst(mk(u ? *u : 0, w)));
+                                        any2 = any2 ? bin(Op::LogOr, any2, eq) : eq;
+                                    }
+                                    if (any2) { RandItem it; it.e = any2; enumBlock->items.push_back(std::move(it)); }
+                                }
+                            if (any) sp->vars.push_back(std::move(rv));
+                            continue;
+                        }
                         if (isHandleType(*et)) {
                             rv.obj = true; rv.w = 64;   // a dynamic array or queue of them too: each object
                         }
@@ -15141,6 +15298,21 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                                 }
                                 if (any) { RandItem it; it.e = any; enumBlock->items.push_back(std::move(it)); }
                             }
+                        } else if (et->kind == SymbolKind::PackedStructType && !rv.dyn) {   // its enum fields: named values only (18.4)
+                            std::vector<std::tuple<int, int, const Type*>> enums;
+                            packedEnums(*et, 0, enums);
+                            for (int k = 0; k < rv.count; k++)
+                                for (auto& [lo, w, en] : enums) {
+                                    E any;
+                                    for (const auto& ev : en->as<EnumType>().values()) {
+                                        const auto& cv = ev.getValue();
+                                        if (!cv.isInteger()) continue;
+                                        auto u = cv.integer().as<uint64_t>();
+                                        E eq = bin(Op::Eq, slice(ref(lw.thisRel(rv.off + k), false), lo + w - 1, lo), konst(mk(u ? *u : 0, w)));
+                                        any = any ? bin(Op::LogOr, any, eq) : eq;
+                                    }
+                                    if (any) { RandItem it; it.e = any; enumBlock->items.push_back(std::move(it)); }
+                                }
                         }
                         sp->vars.push_back(std::move(rv));
                         continue;
