@@ -118,6 +118,33 @@ inline std::unordered_map<const slang::ast::Symbol*, int>& eventPtr() {
     static std::unordered_map<const slang::ast::Symbol*, int> m;
     return m;
 }
+// Fixed-size arrays of events (15.5): each element is two consecutive
+// signals or slots (trigger count, last trigger + 1), so element k starts at
+// base + 2k. The layout is null for a static array (base is a signal id),
+// else the frame the slots live in.
+inline std::unordered_map<const slang::ast::Symbol*, std::pair<FrameLayout*, std::shared_ptr<ArrShape>>>& evArrs() {
+    static std::unordered_map<const slang::ast::Symbol*, std::pair<FrameLayout*, std::shared_ptr<ArrShape>>> m;
+    return m;
+}
+// The dimensions of a fixed-size unpacked array of events, or null.
+inline std::shared_ptr<ArrShape> eventArrayShape(const slang::ast::Type& t0) {
+    using namespace slang::ast;
+    const Type* t = &t0.getCanonicalType();
+    if (t->kind != SymbolKind::FixedSizeUnpackedArrayType) return nullptr;
+    auto sh = std::make_shared<ArrShape>();
+    int64_t total = 1;
+    while (t->kind == SymbolKind::FixedSizeUnpackedArrayType) {
+        const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+        sh->dims.push_back({ft.range.left, ft.range.right});
+        total *= (int64_t)ft.range.width();
+        if (total > (1 << 16)) return nullptr;
+        t = &ft.elementType.getCanonicalType();
+    }
+    if (!t->isEvent()) return nullptr;
+    sh->count = (int)total;
+    sh->elemW = 0;
+    return sh;
+}
 inline std::unordered_set<const slang::ast::Symbol*>& assignedEvents() {
     static std::unordered_set<const slang::ast::Symbol*> m;
     return m;
@@ -811,6 +838,7 @@ struct Lowerer {
     // The event signal an event expression names (e, sub.e).
     int eventSig(const slang::ast::Expression& x) {
         using namespace slang::ast;
+        if (x.kind == ExpressionKind::ElementSelect) return eventElemSig(x);
         if (vifAccess(x)) {   // v.e, v.x (25.9): an event is two signals
             const auto& m = x.as<MemberAccessExpression>();
             bool two = m.member.kind == slang::ast::SymbolKind::ClockingBlock ||
@@ -841,6 +869,92 @@ struct Lowerer {
         if (s < 0) unsupported("event expression");
         return s;
     }
+    // e[i], h.e[i][j] (15.5): an element of a fixed-size array of events.
+    // Element k is the two signals (or slots) at base + 2k. A constant index
+    // into a static array names them directly; otherwise their address is
+    // worked out here and the wait or trigger goes through it. An index
+    // outside the array names a spare event that nothing else triggers.
+    int eventElemSig(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        std::vector<const Expression*> idx;
+        const Expression* cur = &x;
+        while (cur->kind == ExpressionKind::ElementSelect &&
+               cur->as<ElementSelectExpression>().value().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            idx.push_back(&cur->as<ElementSelectExpression>().selector());
+            cur = &cur->as<ElementSelectExpression>().value();
+        }
+        std::reverse(idx.begin(), idx.end());
+        std::shared_ptr<const ArrShape> A;
+        int staticBase = -1;
+        E baseAddr;
+        auto at = [](int sig) { auto n = node(Op::AddrOf); n->sig = sig; return n; };
+        if (classMember(*cur)) {
+            const auto& m = cur->as<MemberAccessExpression>();
+            const PropSlot* ps = memberSlot(m);
+            if (ps && ps->kind == 3) {
+                A = ps->arr;
+                baseAddr = node(Op::Addr, {exprH(m.value())});
+                baseAddr->sig = ps->off;
+            } else if (auto ea = evArrs().find(&m.member); !ps && ea != evArrs().end() && !ea->second.first) {   // a static property
+                A = ea->second.second;
+                staticBase = A->base;
+            }
+        } else if (ValueExpressionBase::isKind(cur->kind)) {
+            const Symbol* sym = &cur->as<ValueExpressionBase>().symbol;
+            if (auto it = propMap().find(sym); it != propMap().end() && it->second.kind == 3) {   // e[i] in a method of its class
+                A = it->second.arr;
+                baseAddr = at(thisRel(it->second.off));
+            } else if (auto ea = evArrs().find(sym); ea != evArrs().end()) {
+                A = ea->second.second;
+                if (!ea->second.first) staticBase = A->base;
+                else baseAddr = at(relIn(ea->second.first, A->base));
+            }
+        }
+        if (!A) unsupported("event expression");
+        if (idx.size() != A->dims.size()) unsupported("a slice of an event array as an event");
+        bool constant = true;
+        for (auto* i : idx)
+            if (!(i->kind == ExpressionKind::IntegerLiteral || i->getConstant())) constant = false;
+        auto spare = [&] {
+            int c = fresh(32);
+            if (fresh(64) != c + 1) unsupported("event signals that are not consecutive");
+            return c;
+        };
+        if (constant && staticBase >= 0) {
+            std::vector<int64_t> v;
+            for (auto* i : idx) v.push_back(constInt(*i));
+            int64_t off = A->offset(v);
+            return off >= 0 ? staticBase + 2 * (int)off : spare();
+        }
+        if (staticBase >= 0) baseAddr = at(staticBase);
+        auto k64 = [](int64_t v) { return konst(make((uint64_t)v, 0, 64, 0, true)); };
+        E off = k64(0), ok;
+        for (size_t d = 0; d < A->dims.size(); d++) {
+            auto [l, r] = A->dims[d];
+            E i = resize(expr(*idx[d]), 64, idx[d]->type->isSigned(), true);
+            E o = l <= r ? bin(Op::Sub, i, k64(l)) : bin(Op::Sub, k64(l), i);
+            E in = bin(Op::LogAnd, bin(Op::Ge, o, k64(0)), bin(Op::Lt, o, k64(A->size(d))));
+            ok = ok ? bin(Op::LogAnd, ok, in) : in;
+            off = bin(Op::Add, bin(Op::Mul, off, k64(A->size(d))), o);
+        }
+        int b = fresh(64);
+        {   // the base address once: 0 for a null handle, which the wait or trigger reports
+            Instr i; i.k = IK::Assign; i.sig = b; i.e = baseAddr;
+            prog.emit(i);
+        }
+        E addr = mux(bin(Op::Ne, ref(b), k64(0)), bin(Op::Add, ref(b), bin(Op::Mul, off, k64(2))), k64(0));
+        addr = mux(ok, addr, at(spare()));
+        int first = -1, t0 = -1;
+        for (int k = 0; k < 2; k++) {
+            int tmp = fresh(64);
+            Instr i; i.k = IK::Assign; i.sig = tmp;
+            i.e = k ? bin(Op::Add, ref(t0), k64(1)) : addr;
+            prog.emit(i);
+            int id = indThrough(tmp);
+            if (!k) { first = id; t0 = tmp; }
+        }
+        return first;
+    }
     // The (signal id + 1) of the event an expression names now: e, an alias, or null.
     E eventAddr(const slang::ast::Expression& x0) {
         using namespace slang::ast;
@@ -855,7 +969,9 @@ struct Lowerer {
             if (auto p = eventPtr().find(&x.as<ValueExpressionBase>().symbol); p != eventPtr().end())
                 return ref(p->second);
         if (classMember(x)) unsupported("assignment of an event property");
-        auto n = node(Op::AddrOf); n->sig = eventSig(x);
+        int es = eventSig(x);
+        if (isInd(es)) unsupported("assignment of an event array element through an index or handle");
+        auto n = node(Op::AddrOf); n->sig = es;
         return n;
     }
     std::unordered_map<const slang::ast::SubroutineSymbol*, Subr*>* subs = nullptr;
@@ -1184,6 +1300,17 @@ struct Lowerer {
             L->add(64, make(0, 0, 64));
             return ps;
         }
+        if (auto sh = eventArrayShape(t)) {   // event e[4] (15.5): two slots per element, in a row
+            for (int k = 0; k < 2 * sh->count; k++) {
+                int off = L->add(k & 1 ? 64 : 32, make(0, 0, k & 1 ? 64 : 32));
+                if (!k) sh->base = off;
+                else if (off != sh->base + k) unsupported("event array slots not laid out in a row");
+            }
+            ps.kind = 3;
+            ps.off = sh->base;
+            ps.arr = sh;
+            return ps;
+        }
         if (t.isUnpackedArray()) {
             auto shape = std::make_shared<ArrShape>();
             const Type* et = &t;
@@ -1237,6 +1364,7 @@ struct Lowerer {
         PropSlot ps = declSlot(v.getType(), L);
         if (ps.kind == 2) localDyn()[&v] = {L, ps.off};
         else if (ps.kind == 1) localArr()[&v] = {L, ps.arr};
+        else if (ps.kind == 3) evArrs()[&v] = {L, ps.arr};
         else localMap()[&v] = {L, ps.off};
     }
     // Every automatic variable that `st` declares, outside nested fork
@@ -6165,6 +6293,7 @@ struct Lowerer {
             }
             int sig;
             if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
+            else if (s.expr.kind == ExpressionKind::ElementSelect && s.expr.type->isEvent()) sig = eventSig(s.expr);   // @(e[i])
             else if (ValueExpressionBase::isKind(s.expr.kind) && eventPtr().count(&s.expr.as<ValueExpressionBase>().symbol))
                 sig = eventSig(s.expr);   // an event that may be an alias (6.17)
             else if (ValueExpressionBase::isKind(s.expr.kind) && !modportConn(s.expr)) {
@@ -9765,6 +9894,8 @@ struct Lowerer {
                 prog.emit(i);
                 return;
             }
+            if (a.left().type->isEvent() && peel(a.left()).kind == ExpressionKind::ElementSelect)
+                unsupported("assignment to an element of an event array");
             if (const Expression& l = peel(a.left()); l.kind == ExpressionKind::ElementSelect &&
                 l.as<ElementSelectExpression>().value().type->isString()) {   // s[i] = c (6.16): s.putc(i, c)
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this write to a string character");
@@ -11151,6 +11282,18 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     template <typename T> void reg(const T& s, bool net) {
         if (auto a = aliasOf().find(&s); a != aliasOf().end() && a->second != &s) { aliased.push_back(&s); return; }
         if (Lowerer::isDynType(s.getType())) { regDyn(s); return; }
+        if (auto sh = eventArrayShape(s.getType())) {   // event e[4] (15.5): two signals per element
+            std::string base = prefix + std::string(s.name);
+            for (int k = 0; k < sh->count; k++) {
+                int id = mkSig(base + "[" + std::to_string(k) + "]", 32, false);
+                if (mkSig(base + "[" + std::to_string(k) + "]$trig", 64, false) != id + 1 || (k && id != sh->base + 2 * k))
+                    Lowerer::unsupported("event signals that are not consecutive");
+                if (!k) sh->base = id;
+            }
+            evArrs()[&s] = {nullptr, sh};
+            noteHidden(s, sh->base, 2 * sh->count);
+            return;
+        }
         if (s.getType().isUnpackedArray()) {
             const slang::ast::Type* t = &s.getType().getCanonicalType();
             while (t->kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) t = &t->getArrayElementType()->getCanonicalType();
@@ -11655,6 +11798,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     std::unique_ptr<Lowerer> init0;   // default values (no initializer): run before every initializer
     void handle(const slang::ast::VariableSymbol& v) {
         const slang::ast::Expression* e = v.getInitializer();
+        if (initEventArray(v)) return;
         if (v.getType().isEvent()) {   // both counters start at 0: not triggered
             if (!sigmap.count(&v)) return;   // an automatic one lives in a frame
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
@@ -11708,8 +11852,22 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) initStatic(p);
     }
+    // An event array (15.5): every counter starts at 0 (not triggered).
+    bool initEventArray(const slang::ast::VariableSymbol& v) {
+        auto ea = evArrs().find(&v);
+        if (ea == evArrs().end()) return false;
+        if (ea->second.first) return true;   // an automatic one lives in a frame
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        for (int k = 0; k < 2 * ea->second.second->count; k++) {
+            Instr i; i.k = IK::Assign; i.sig = ea->second.second->base + k;
+            i.e = konst(mk(0, k & 1 ? 64 : 32));
+            init->prog.emit(i);
+        }
+        return true;
+    }
     void initStatic(const slang::ast::VariableSymbol& v) {
         const slang::ast::Expression* e = v.getInitializer();
+        if (initEventArray(v)) return;
         if (auto it = dynMap().find(&v); it != dynMap().end()) {   // int q[$] = '{1, 2};
             if (!e) return;
             if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
