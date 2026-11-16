@@ -285,7 +285,8 @@ whatever the rights (IEEE 1735 9.5):
 - `interface_viewport [mod]`: the ports of the next (or named) module.
 
 The pragmas are encrypted with the source; msim blanks their lines before
-the compiler sees them.
+the compiler sees them. This holds in version 3 envelopes and in clause 34
+(`-v1`) ones.
 
 ## What the tools hide
 
