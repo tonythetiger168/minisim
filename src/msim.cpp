@@ -37,6 +37,7 @@
 //                    for power analysis with mpower (docs/POWER.md)
 //   -restore <file> [+args]  go back to a $save checkpoint and go on (docs/CHECKPOINT.md)
 //   -elab            stop after elaboration, before the run (xrun -elaborate / -c)
+//   -strict-drivers  illegal variable drivers (6.5, 9.2.2) are errors, not warnings
 //   -parse           stop after parsing: syntax errors only (vlog / vlogan, mstep.inc)
 //   -vlog, -vcom, -vopt, -vsim, -vlib, -vmap, -vlogan, -vhdlan, -vcs
 //                    the rest is that Siemens / Synopsys step (also when msim
@@ -2877,6 +2878,7 @@ int main(int argc, char** argv) {
     bool interactiveMode = false;   // -i / -do FILE
     std::string doPath;
     bool elabOnly = false;   // -elab: stop after elaboration (xrun -elaborate)
+    bool strictDrivers = false;   // -strict-drivers: illegal variable drivers are errors
     bool parseOnly = false;  // -parse: stop after parsing (the analysis steps of mstep.inc)
     bool compiled = false, staticComb = true, staticSeq = true, staticPart = true, twoState = true, cycle = true;
     bool xAssign0 = false, xInitial0 = false;   // -x-assign 0, -x-initial 0
@@ -2912,6 +2914,7 @@ int main(int argc, char** argv) {
         if (a == "-sv" || a == "-sverilog") continue;
         if (a == "-compile") { compiled = true; continue; }
         if (a == "-elab") { elabOnly = true; continue; }
+        if (a == "-strict-drivers") { strictDrivers = true; continue; }
         if (a == "-parse") { parseOnly = true; continue; }
         if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
         if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
@@ -3406,39 +3409,65 @@ int main(int argc, char** argv) {
     vendor::declare(*comp);   // $fsdbDumpvars, $vcdpluson, $shm_probe, ... (after VPI: a real PLI library wins)
     driver.reportCompilation(*comp, /*quiet*/ true);
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
-    // Illegal drivers of a net: a uwire with several drivers (6.6.2), a net
-    // of a user-defined nettype without a resolution function with several
-    // (6.6.7). slang finds them in its data-flow analysis; they are errors.
-    // (Its checks of variable drivers, 6.5 and 9.2.2, are left out: they
-    // also flag the slices an instance array drives, 23.3.3.5.)
-    bool singleDriverNets = false;   // only then is the analysis worth its time
+    // Illegal drivers, from slang's data-flow analysis. Of a net: a uwire
+    // with several drivers (6.6.2), a net of a user-defined nettype without
+    // a resolution function with several (6.6.7): errors. Of a variable:
+    // continuous and procedural assignments (6.5), a variable an
+    // always_comb / always_ff / always_latch writes written by another
+    // process too (9.2.2.2, 9.2.2.3, 9.2.2.4): warnings, since much existing
+    // code does it (an initial reset of an always_ff register) and other
+    // simulators run it; -strict-drivers makes them errors, and adds several
+    // continuous assignments to one variable (6.5). The slices of a variable that the instances of an instance
+    // array drive are one driver each (23.3.3.5), not several.
     {
-        struct Find : slang::ast::ASTVisitor<Find, slang::ast::VisitFlags::Symbols> {
-            bool any = false;
-            void handle(const slang::ast::NetSymbol& n) {
-                const auto& nt = n.netType;
-                if (nt.netKind == slang::ast::NetType::UWire ||
-                    (nt.netKind == slang::ast::NetType::UserDefined && !nt.getResolutionFunction()))
-                    any = true;
-            }
-        } f;
-        comp->getRoot().visit(f);
-        singleDriverNets = f.any;
-    }
-    if (singleDriverNets) {
         using namespace slang;
         comp->freeze();
         analysis::AnalysisOptions ao;
         analysis::AnalysisManager am(ao);
         am.analyze(*comp);
         comp->unfreeze();
+        // Where the instances of instance arrays connect their ports.
+        struct ArrConns : ast::ASTVisitor<ArrConns, ast::VisitFlags::Symbols> {
+            std::vector<SourceRange> r;
+            void add(const ast::InstanceArraySymbol& a) {
+                if (const auto* sx = a.getSyntax()) r.push_back(sx->sourceRange());
+                for (const ast::Symbol* e : a.elements) {
+                    if (e->kind == ast::SymbolKind::InstanceArray) add(e->as<ast::InstanceArraySymbol>());
+                    if (e->kind != ast::SymbolKind::Instance) continue;
+                    for (const ast::PortConnection* c : e->as<ast::InstanceSymbol>().getPortConnections())
+                        if (c) if (const ast::Expression* x = c->getExpression()) r.push_back(x->sourceRange);
+                }
+            }
+            void handle(const ast::InstanceArraySymbol& a) { add(a); visitDefault(a); }
+        } arr;
+        bool anyVar = false;
+        for (const Diagnostic& d : am.getDiagnostics())
+            if (d.code == diag::MultipleContAssigns) { anyVar = true; break; }
+        if (anyVar) comp->getRoot().visit(arr);
+        auto inArr = [&](SourceLocation l) {
+            for (auto& sr : arr.r)
+                if (sr.start().buffer() == l.buffer() && sr.start() <= l && l <= sr.end()) return true;
+            return false;
+        };
         bool bad = false;
         for (const Diagnostic& d : am.getDiagnostics()) {
-            if (d.code != diag::MultipleUWireDrivers && d.code != diag::MultipleUDNTDrivers) continue;
+            bool net = d.code == diag::MultipleUWireDrivers || d.code == diag::MultipleUDNTDrivers;
+            bool var = d.code == diag::MultipleContAssigns || d.code == diag::MixedVarAssigns || d.code == diag::MultipleAlwaysAssigns;
+            if (!net && !var) continue;
+            // Several continuous assignments to a variable are common for a
+            // tristate bus declared logic, which msim resolves like a wire:
+            // reported only with -strict-drivers.
+            if (d.code == diag::MultipleContAssigns && !strictDrivers) continue;
+            if (d.code == diag::MultipleContAssigns && inArr(d.location)) {
+                bool all = true;   // every other driver an instance of an array, too
+                for (auto& n : d.notes) if (n.location != SourceLocation::NoLocation && !inArr(n.location)) all = false;
+                if (all) continue;
+            }
+            if (var) driver.diagEngine.setSeverity(d.code, strictDrivers ? DiagnosticSeverity::Error : DiagnosticSeverity::Warning);
             driver.diagEngine.issue(d);
-            bad = true;
+            if (net || strictDrivers) bad = true;
         }
-        if (bad) { driver.reportDiagnostics(/*quiet*/ true); return 1; }
+        if (!driver.reportDiagnostics(/*quiet*/ true) || bad) return 1;
     }
 
     // The VCD's root scope is the top module (several tops: "top").
