@@ -864,6 +864,11 @@ struct Sim {
             g.val.str = false;
             return;
         }
+        // A watched signal that keeps its value (a reset or an enable the
+        // clock cone rewrites at every edge): fwSlow's first test, without the call.
+        if (g.w <= 64 && !g_cov && g.val.hi.empty() && (g.val.v & mask(g.w)) == (v & mask(g.w)) && !(g.val.x & mask(g.w)) &&
+            !(g.val.z & mask(g.w)) && !g.val.real && !g.val.str)
+            return;
         fwSlow(s, make(v & mask(g.w), 0, g.w));
     }
     __attribute__((always_inline)) void fwdv(int s, int d, uint64_t v, int s0, int s1) {
