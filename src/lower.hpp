@@ -2589,6 +2589,31 @@ struct Lowerer {
             if (auto ar = arrFind(sym)) return at(ar->base);
             return at(sigAt(sym));
         }
+        // An element of a fixed-size unpacked array (13.5.2): its elements
+        // are consecutive signals (or frame slots), so the address is the
+        // first one's plus the element's offset, worked out at the call.
+        // An index outside the array refers to a spare element nothing reads.
+        if (a.kind == ExpressionKind::ElementSelect) {
+            if (auto sel = arraySel(a); sel && !isInd(sel->a->base) && sel->idx.size() == sel->a->dims.size()) {
+                const ArrShape& A = *sel->a;
+                if (sel->constant) {
+                    int64_t off = constOffset(*sel);
+                    return at(off >= 0 ? A.base + (int)off : freshStatic(A.elemW));
+                }
+                auto k64 = [](int64_t v) { return konst(make((uint64_t)v, 0, 64, 0, true)); };
+                E off = k64(0), ok;
+                for (size_t d = 0; d < A.dims.size(); d++) {
+                    auto [l, r] = A.dims[d];
+                    E i = resize(expr(*sel->idx[d]), 64, sel->idx[d]->type->isSigned(), true);
+                    E o = l <= r ? bin(Op::Sub, i, k64(l)) : bin(Op::Sub, k64(l), i);
+                    E in = bin(Op::LogAnd, bin(Op::Ge, o, k64(0)), bin(Op::Lt, o, k64(A.size(d))));
+                    ok = ok ? bin(Op::LogAnd, ok, in) : in;
+                    off = bin(Op::Add, bin(Op::Mul, off, k64(A.size(d))), o);
+                }
+                E addr = bin(Op::Add, at(A.base), off);
+                return mux(ok, addr, at(freshStatic(A.elemW)));
+            }
+        }
         unsupported("ref argument that is not a whole variable or property");
     }
     // A ref formal's kind and shape, from its type.
