@@ -1030,5 +1030,6 @@ inline bool seqShape(const Prog& p, std::vector<std::pair<int, Edge>>& ev, bool 
 // The NBA targets of a seqShape process that are fixed at compile time.
 inline void seqTargets(const Prog& p, std::vector<int>& out) {
     for (const Instr& i : p.code)
-        if (i.k == IK::Nba && !i.arr && i.aidx.empty() && !i.bidx) out.push_back(i.sig);
+        if (i.k == IK::Nba && !i.arr && i.aidx.empty() && !i.bidx && i.sig >= 0 && i.sig < kRel)   // vif.x <= v: resolved at run time
+            out.push_back(i.sig);
 }
