@@ -4228,12 +4228,69 @@ struct Lowerer {
                 return;
             case ExpressionKind::ConditionalOp: {   // c ? a : b on unpacked arrays (11.4.11): element by element
                 const auto& c = x.as<ConditionalExpression>();
+                const Type* leaf = &et.getCanonicalType();
+                while (leaf->isUnpackedArray()) leaf = &leaf->getArrayElementType()->getCanonicalType();
+                if (stmtDepth && (sideEffects(c.left()) || sideEffects(c.right()))) {
+                    // An arm with a call: only the chosen one runs, into
+                    // temporaries (both for an x or z condition, then merged).
+                    int w = leaf->isIntegral() ? (int)leaf->getBitWidth() : storeW(*leaf);
+                    if (w <= 0) unsupported("conditional on arrays of this element type");
+                    needWidth(w);
+                    bool sg = leaf->isSigned();
+                    int cs = fresh(1);
+                    { Instr i; i.k = IK::Assign; i.sig = cs; i.e = un(Op::LogNot, un(Op::LogNot, condOf(c))); prog.emit(i); }
+                    auto arm = [&](const Expression& a) {
+                        std::vector<E> v;
+                        arrayElems(t, a, v);
+                        std::vector<int> tmps;
+                        for (auto& e : v) {
+                            int tt = fresh(w);
+                            Instr i; i.k = IK::Assign; i.sig = tt; i.e = e; prog.emit(i);
+                            tmps.push_back(tt);
+                        }
+                        return tmps;
+                    };
+                    std::vector<int> res;
+                    auto copy = [&](const std::vector<int>& from) {
+                        if (res.empty()) for (size_t k = 0; k < from.size(); k++) res.push_back(fresh(w));
+                        if (from.size() != res.size()) unsupported("conditional on arrays of different sizes");
+                        for (size_t k = 0; k < from.size(); k++) {
+                            Instr i; i.k = IK::Assign; i.sig = res[k]; i.e = ref(from[k], sg); prog.emit(i);
+                        }
+                    };
+                    bool merge = leaf->isIntegral() && !leaf->isUnpackedStruct() && !leaf->isUnpackedUnion();
+                    std::vector<size_t> ends;
+                    if (merge) {
+                        Instr jk; jk.k = IK::JmpIfNot; jk.e = bin(Op::CaseEq, ref(cs), konst(make(0, 1, 1)));
+                        size_t known = prog.emit(jk);
+                        auto a = arm(c.left()), b = arm(c.right());
+                        if (a.size() != b.size()) unsupported("conditional on arrays of different sizes");
+                        std::vector<int> m;
+                        for (size_t k = 0; k < a.size(); k++) {
+                            int tt = fresh(w);
+                            Instr i; i.k = IK::Assign; i.sig = tt;
+                            i.e = mux(bin(Op::CaseEq, ref(a[k], sg), ref(b[k], sg)), ref(a[k], sg), konst(initOf(*leaf)));
+                            prog.emit(i);
+                            m.push_back(tt);
+                        }
+                        copy(m);
+                        ends.push_back(emitJmp());
+                        prog.code[known].target = prog.here();
+                    }
+                    Instr jf; jf.k = IK::JmpIfNot; jf.e = ref(cs);
+                    size_t toFalse = prog.emit(jf);
+                    copy(arm(c.left()));
+                    ends.push_back(emitJmp());
+                    prog.code[toFalse].target = prog.here();
+                    copy(arm(c.right()));
+                    for (size_t e : ends) prog.code[e].target = prog.here();
+                    for (int r : res) out.push_back(asType(*leaf, r, sg));
+                    return;
+                }
                 std::vector<E> l, r;
                 arrayElems(t, c.left(), l);
                 arrayElems(t, c.right(), r);
                 if (l.size() != r.size()) unsupported("conditional on arrays of different sizes");
-                const Type* leaf = &et.getCanonicalType();
-                while (leaf->isUnpackedArray()) leaf = &leaf->getArrayElementType()->getCanonicalType();
                 E cond = un(Op::LogNot, un(Op::LogNot, condOf(c)));
                 // An x or z condition: an element both arms agree on, else the
                 // element type's default (Table 7-1).
@@ -4887,8 +4944,20 @@ struct Lowerer {
         int d = indThrough(tmp);
         indShape[d] = shape;
         if (consDepth) { consRefs.push_back({d, std::move(n)}); return d; }
+        bool arr = n->op == Op::ArrAddr;
         Instr i; i.k = IK::Assign; i.sig = tmp; i.e = std::move(n);
         prog.emit(i);
+        if (arr && mkSig) {
+            // An index outside the array (7.4.6): a spare container, emptied
+            // first, so a read finds nothing and a write is dropped.
+            int spare = freshStatic(64);
+            dynStore()[spare] = shape;
+            Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Eq, ref(tmp), konst(mk(0, 64)));
+            size_t jf = prog.emit(j);
+            Instr s; s.k = IK::Assign; s.sig = tmp; s.e = konst(mk((uint64_t)spare + 1, 64)); prog.emit(s);
+            prog.emit(dynCmd(spare, D_DELETE));
+            prog.code[jf].target = prog.here();
+        }
         return d;
     }
     // The indirect id of the element container that `ref` (a DynElemRef of
@@ -13726,6 +13795,10 @@ framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all,
         void handle(const BlockStatement& b) {
             if (b.blockKind != StatementBlockKind::Sequential) forks = true;
             visitDefault(b);
+        }
+        void handle(const VariableDeclStatement& d) {   // int r = f(...): a call in an initializer
+            if (auto* i = d.symbol.getInitializer()) i->visit(*this);
+            visitDefault(d);
         }
     };
     std::unordered_map<const SubroutineSymbol*, std::vector<const SubroutineSymbol*>> calls;
