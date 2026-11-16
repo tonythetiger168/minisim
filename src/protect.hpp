@@ -1100,6 +1100,38 @@ struct ToolBlock {
     int line = 0;
 };
 
+// A viewport or interface_viewport directive in decrypted text: record it
+// in info and blank its line so the compiler does not see it. Annex A:
+// viewport [scoped_identifier {, scoped_identifier}], the parts of a scoped
+// name joined by '.' (9.6.1) or ':'.
+inline void takeViewport(std::string& plain, const Directive& d, const std::string& key, Envelope& info) {
+    std::vector<std::string> names;
+    std::string one;
+    std::string_view args = d.args;
+    while (!args.empty() && (args.front() == ' ' || args.front() == '\t')) args.remove_prefix(1);
+    if (!args.empty() && args.front() == '=') args.remove_prefix(1);   // tolerate "viewport = name"
+    for (char c : std::string(args) + ",") {
+        if (c == ' ' || c == '\t') continue;
+        if (c == ',') { if (!one.empty()) names.push_back(one); one.clear(); continue; }
+        one += c == ':' ? '.' : c;
+    }
+    if (names.empty()) names.emplace_back();
+    size_t at = d.start, next = d.next;
+    for (size_t i = d.start; i < d.lineEnd; i++) plain[i] = ' ';
+    for (auto& nm : names) {
+        Viewport v;
+        v.iface = key == "interface_viewport";
+        v.name = nm;
+        v.at = at;
+        if (v.name.empty()) {
+            auto [b, en] = nextDeclaration(plain, next);
+            v.targetBegin = b;
+            v.targetEnd = en;
+        }
+        info.viewports.push_back(std::move(v));
+    }
+}
+
 // The envelope whose begin_protected line starts at lineStart; sc is just past
 // that line. Returns the cleartext; info gets the tool block, rights and
 // viewports (viewport offsets relative to the cleartext).
@@ -1326,32 +1358,7 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
                 OPENSSL_cleanse(plain->data(), plain->size());
                 throw Error(where(beginLine) + "a version 3 envelope may not hold another envelope (5.1.2)");
             }
-            if (e.key == "viewport" || e.key == "interface_viewport") {
-                // Annex A: viewport [scoped_identifier {, scoped_identifier}],
-                // the parts of a scoped name joined by '.' (9.6.1) or ':'.
-                std::vector<std::string> names;
-                std::string one;
-                for (char c : std::string(d->args) + ",") {
-                    if (c == ' ' || c == '\t') continue;
-                    if (c == ',') { if (!one.empty()) names.push_back(one); one.clear(); continue; }
-                    one += c == ':' ? '.' : c;
-                }
-                if (names.empty()) names.emplace_back();
-                size_t at = d->start, next = d->next;
-                for (size_t i = d->start; i < d->lineEnd; i++) (*plain)[i] = ' ';
-                for (auto& nm : names) {
-                    Viewport v;
-                    v.iface = e.key == "interface_viewport";
-                    v.name = nm;
-                    v.at = at;
-                    if (v.name.empty()) {
-                        auto [b, en] = nextDeclaration(*plain, next);
-                        v.targetBegin = b;
-                        v.targetEnd = en;
-                    }
-                    info.viewports.push_back(std::move(v));
-                }
-            }
+            if (e.key == "viewport" || e.key == "interface_viewport") takeViewport(*plain, *d, e.key, info);
         }
     }
     return std::move(*plain);
@@ -1562,12 +1569,27 @@ inline void decryptInto(std::string_view text, const Keyring& ring, const Decryp
         Decrypted inner;
         decryptInto(plain, ring, opt, file, depth + 1, inner, false);
         OPENSSL_cleanse(plain.data(), plain.size());
+        // IEEE 1735 viewports work in a clause 34 envelope too (msimprotect
+        // -v1 keeps them). The IEEE 1800 viewport=(object=..., access=...)
+        // form is not read, as before.
+        Envelope info;
+        {
+            Scanner ps(inner.text);
+            while (auto d = ps.next()) {
+                if (d->kind != Directive::Protect || d->exprs.empty()) continue;
+                const std::string& k = d->exprs[0].key;
+                if (k != "viewport" && k != "interface_viewport") continue;
+                size_t i = d->args.find_first_not_of(" \t=");
+                if (i != std::string_view::npos && d->args[i] == '(') continue;
+                v3::takeViewport(inner.text, *d, k, info);
+            }
+        }
         size_t b = out.text.size();
         out.text += inner.text;
         OPENSSL_cleanse(inner.text.data(), inner.text.size());
         if (!out.text.empty() && out.text.back() != '\n') out.text += '\n';
         out.ranges.push_back({b, out.text.size()});
-        Envelope info;
+        for (auto& v : info.viewports) { v.at += b; v.targetBegin += b; v.targetEnd += b; }
         info.begin = b;
         info.end = out.text.size();
         out.envs.push_back(std::move(info));
