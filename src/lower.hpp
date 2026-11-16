@@ -467,6 +467,24 @@ inline bool isClassMethod(const slang::ast::SubroutineSymbol& s) {
     const slang::ast::Scope* p = s.getParentScope();
     return p && p->asSymbol().kind == slang::ast::SymbolKind::ClassType;
 }
+// A static variable declared in a block of an initial, always or final
+// procedure (not in a task or function): its initializer runs once before
+// time 0 (6.21), whether or not the block is ever entered.
+inline bool staticOfProcedure(const slang::ast::VariableSymbol& v) {
+    using namespace slang::ast;
+    if (v.lifetime != VariableLifetime::Static || !v.getInitializer()) return false;
+    const Scope* sc = v.getParentScope();
+    if (!sc || sc->asSymbol().kind != SymbolKind::StatementBlock) return false;
+    for (; sc; sc = sc->asSymbol().getParentScope()) {
+        auto k = sc->asSymbol().kind;
+        if (k == SymbolKind::Subroutine || k == SymbolKind::ClassType || k == SymbolKind::CheckerInstanceBody ||
+            k == SymbolKind::RandSeqProduction)
+            return false;
+        if (k == SymbolKind::InstanceBody || k == SymbolKind::GenerateBlock) return true;
+        if (k != SymbolKind::StatementBlock) return false;
+    }
+    return false;
+}
 inline bool isAutomatic(const slang::ast::SubroutineSymbol& s) {
     return s.defaultLifetime == slang::ast::VariableLifetime::Automatic || isClassMethod(s);
 }
@@ -10837,7 +10855,8 @@ struct Lowerer {
                 // An array with an initializer in a function that keeps static
                 // signals: assigned at each entry, as an automatic one is.
                 if (init && vd.symbol.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType &&
-                    !(current && vd.symbol.lifetime == VariableLifetime::Static) && arrFind(&vd.symbol) &&
+                    !(current && vd.symbol.lifetime == VariableLifetime::Static) && !(!current && staticOfProcedure(vd.symbol)) &&
+                    arrFind(&vd.symbol) &&
                     assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false))
                     break;
                 if (localMap().count(&vd.symbol)) {   // an automatic variable starts over at each entry (6.21)
@@ -10895,6 +10914,9 @@ struct Lowerer {
                 // The flag starts as X, so the first entry fails the "already
                 // done" test and takes the init.
                 bool once = vd.symbol.lifetime == slang::ast::VariableLifetime::Static;
+                if (once && !current && staticOfProcedure(vd.symbol) && !dynMap().count(&vd.symbol) &&
+                    (sigmap.count(&vd.symbol) || arrFind(&vd.symbol)))
+                    break;   // initialized before time 0 (ProcCollector, initStatic)
                 auto initVar = [&] {   // a fixed-size array takes its value element by element
                     if (arrFind(&vd.symbol) && assignWholeArray(vd.symbol, vd.symbol.getType(), *init, false)) return;
                     Instr i; i.k = IK::Assign; i.sig = sigAt(&vd.symbol); i.e = cloneConts(vd.symbol.getType(), expr(*init));
@@ -12411,6 +12433,9 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             // (6.8, 6.21). One with an initializer takes it on the first call.
             if (v.lifetime == slang::ast::VariableLifetime::Static && !e && (sigmap.count(&v) || arrMap().count(&v)) && !dynMap().count(&v))
                 initStatic(v);
+            // in a block of a procedure: before time 0, even if the block never runs
+            else if (staticOfProcedure(v) && (sigmap.count(&v) || arrMap().count(&v)) && !dynMap().count(&v))
+                initStatic(v);
             return;
         }
         if (v.flags.has(slang::ast::VariableFlags::CheckerFreeVariable) && !e) { freeVar(v); return; }
@@ -12853,6 +12878,27 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         }
         if (!e) {
             if (!dl.empty()) out.netDelays.push_back({sigmap.at(&n), dl});
+            return;
+        }
+        if (n.getType().getCanonicalType().kind == slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+            // wire [2:0] w [1:0] = '{...} (10.3.1): a continuous assignment to each element
+            auto it = arrMap().find(&n);
+            if (it == arrMap().end()) Lowerer::unsupported("net array with an initializer");
+            Lowerer lw(sigmap);
+            prep(lw);
+            lw.setScope(n.getParentScope());
+            std::vector<E> els;
+            lw.arrayElems(n.getType(), *e, els);
+            if ((int)els.size() != it->second->count || !lw.prog.code.empty())
+                Lowerer::unsupported("net array initializer of this kind");
+            for (size_t k = 0; k < els.size(); k++) {
+                Lowerer L(sigmap);
+                prep(L);
+                L.setScope(n.getParentScope());
+                Instr i; i.k = IK::Assign; i.sig = it->second->base + (int)k; i.e = els[k];
+                i.dly = dl;
+                finishAssign(L, i);
+            }
             return;
         }
         Lowerer lw(sigmap);

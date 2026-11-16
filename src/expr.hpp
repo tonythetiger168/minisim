@@ -695,7 +695,15 @@ inline Val v_rtoi(const Val& a, int w, bool sgn, bool trunc) {
     if (std::isnan(d)) return allx(w);
     double r = trunc ? std::trunc(d) : std::round(d);
     if (w <= 64) {
-        uint64_t bits = r < 0 ? (uint64_t)(int64_t)r : (r >= 18446744073709551616.0 ? ~0ULL : (uint64_t)r);
+        // the low w bits of the rounded value, also when it does not fit in
+        // 64 bits (6.12.2: the integer is truncated to the target's size)
+        uint64_t bits;
+        if (std::fabs(r) < 9223372036854775808.0) bits = (uint64_t)(int64_t)r;
+        else if (!std::isfinite(r)) bits = 0;
+        else {
+            bits = (uint64_t)std::fmod(std::fabs(r), 18446744073709551616.0);
+            if (r < 0) bits = ~bits + 1;
+        }
         Val v = make(bits, 0, w);
         v.sgn = sgn;
         return v;
