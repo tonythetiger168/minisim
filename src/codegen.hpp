@@ -3171,9 +3171,13 @@ private:
         }
         for (int s : noPriv) if (s >= 0 && (size_t)s < ns) bad[(size_t)s] = 1;
         priv_.assign(ns, 0);
+        // An element of an unpacked array or a signal in a generate loop
+        // (a name with '[') is private too, unless a run-time index reaches
+        // it (above). MSIM_NOPRIVBR: the old rule, never private.
+        const char* notPriv = std::getenv("MSIM_NOPRIVBR") ? "[$" : "$";
         for (size_t s = 0; s < ns; s++)
             priv_[s] = cand[s] && !bad[s] && sigs[s].w >= 1 && sigs[s].w <= 64 &&
-                       sigs[s].name.find_first_of("[$") == std::string::npos;
+                       sigs[s].name.find_first_of(notPriv) == std::string::npos;
         armK_.assign(procs.size(), -1);
         armIns_.clear();
         armSet_.clear();
