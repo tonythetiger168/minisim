@@ -1260,6 +1260,17 @@ struct Rewrite {
             r->sgn = sg;
             return r;
         }
+        if (e->op == Op::DynHas && !e->kids.empty())   // x inside {q} with q being randomized (11.4.13, 18.5.6)
+            if (RCont* c = contOf(e->sig); c && !c->assoc) {
+                if (pass == 1) { dropped = true; return e; }
+                E x = (*this)(e->kids[0]);
+                E acc;
+                for (int64_t k = 0; k < c->n; k++) {
+                    E m = bin(Op::Eq, x, elem(*c, k));
+                    acc = acc ? bin(Op::LogOr, acc, m) : m;
+                }
+                return acc ? acc : konst(mk(0, 1));
+            }
         if (e->op == Op::DynSize)
             if (RCont* c = contOf(e->sig)) {
                 if (pass == 2 || c->assoc || c->sized) return konst(make((uint64_t)c->n, 0, 32));   // an associative array keeps its keys
