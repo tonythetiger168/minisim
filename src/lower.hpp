@@ -4110,6 +4110,64 @@ struct Lowerer {
         std::vector<const slang::ast::Expression*> idx;
         bool constant = true;
     };
+    // h.a[i][j] in a constraint (18.5): a fixed-size array property of another
+    // object. Each element is a slot read through the handle when the solver
+    // runs; a constant index names one, an index that varies (a foreach
+    // variable, a random variable) picks among them. nullptr when e is not
+    // such a select.
+    E consMemberElem(const slang::ast::Expression& e) {
+        using namespace slang::ast;
+        std::vector<const Expression*> idx;
+        const Expression* cur = &e;
+        while (cur->kind == ExpressionKind::ElementSelect &&
+               cur->as<ElementSelectExpression>().value().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            idx.push_back(&cur->as<ElementSelectExpression>().selector());
+            cur = &cur->as<ElementSelectExpression>().value();
+        }
+        if (idx.empty() || !classMember(*cur) || vifAccess(*cur)) return nullptr;
+        const auto& m = cur->as<MemberAccessExpression>();
+        const PropSlot* ps = memberSlot(m);
+        if (!ps || ps->kind != 1 || ps->arr->dynElem || ps->arr->elemW > 64) return nullptr;
+        const ArrShape& A = *ps->arr;
+        std::reverse(idx.begin(), idx.end());
+        if (idx.size() != A.dims.size()) return nullptr;   // a sub-array: not a value here
+        E h = exprH(m.value());
+        auto elem = [&](int64_t off) {
+            E r = ref(A.base + (int)off, A.sgn);
+            r->at = h;
+            return r;
+        };
+        std::vector<int64_t> cidx;
+        for (auto* x : idx) {
+            if (x->kind == ExpressionKind::IntegerLiteral || x->getConstant()) cidx.push_back(constInt(*x));
+            else break;
+        }
+        if (cidx.size() == idx.size()) {   // all constant: one element, or the default when out of range (7.4.6)
+            int64_t off = A.offset(cidx);
+            return off < 0 ? konst(make(0, A.twoState ? 0 : ~0ULL, A.elemW, 0, A.sgn)) : elem(off);
+        }
+        if (A.count > 4096) unsupported("a run-time index into a large array property in a constraint");
+        std::vector<E> ix;
+        for (auto* x : idx) ix.push_back(resize(expr(*x), 64, x->type->isSigned(), true));
+        E acc = konst(make(0, A.twoState ? 0 : ~0ULL, A.elemW, 0, A.sgn));
+        for (int64_t k = A.count; k-- > 0;) {
+            int64_t rest = k;
+            std::vector<int64_t> at(A.dims.size());
+            for (size_t d = A.dims.size(); d-- > 0;) {
+                auto [l, r] = A.dims[d];
+                int64_t n = (l > r ? l - r : r - l) + 1, o = rest % n;
+                rest /= n;
+                at[d] = l <= r ? l + o : l - o;
+            }
+            E c;
+            for (size_t d = 0; d < at.size(); d++) {
+                E eq = bin(Op::Eq, ix[d], konst(make((uint64_t)at[d], 0, 64, 0, true)));
+                c = c ? bin(Op::LogAnd, c, eq) : eq;
+            }
+            acc = mux(c, elem(k), acc);
+        }
+        return acc;
+    }
     std::optional<ArrSel> arraySel(const slang::ast::Expression& e, bool partial = false) {
         using namespace slang::ast;
         std::vector<const Expression*> idx;
@@ -4441,6 +4499,16 @@ struct Lowerer {
                     else if (!ps) A = arrFind(&m.member);
                     else {
                         if (ps->kind != 1 || ps->arr->dynElem) unsupported("array value of this property");
+                        if (consDepth && ps->arr->elemW <= 64) {   // h.a in a constraint: each element read through the handle at solve time
+                            E h = exprH(m.value());
+                            for (int k = 0; k < ps->arr->count; k++) {
+                                E r = ref(ps->arr->base + k, ps->arr->sgn);
+                                r->at = h;
+                                out.push_back(sized(r, ps->arr->elemW, ps->arr->sgn,
+                                                    ExprCtx{ps->arr->elemW, ps->arr->sgn, ps->arr->sgn, true}));
+                            }
+                            return;
+                        }
                         auto c = std::make_shared<ArrShape>(*ps->arr);
                         c->base = indSlot(exprH(m.value()), ps->arr->base);
                         A = c;
@@ -6365,6 +6433,8 @@ struct Lowerer {
                     needWidth(w);
                     return sized(dynGet(d, e.as<ElementSelectExpression>().selector()), w, e.type->isSigned(), ctx);
                 }
+                if (consDepth)   // h.a[i] in a constraint: the element read through the handle at solve time
+                    if (E r = consMemberElem(e)) return sized(r, bitsOf(*e.type), e.type->isSigned(), ctx);
                 if (auto as = arraySel(e))
                     return sized(arrayRead(*as), as->a->elemW, as->a->sgn, ctx);
                 const auto& sel = e.as<ElementSelectExpression>();
@@ -7253,7 +7323,10 @@ struct Lowerer {
             // an unpacked array as an item: any of its elements (11.4.13)
             std::vector<E> els;
             arrayElems(*it.type, it, els);
-            const Type& et = *it.type->getCanonicalType().getArrayElementType();
+            const Type* ep = &it.type->getCanonicalType().getArrayElementType()->getCanonicalType();
+            while (ep->kind == SymbolKind::FixedSizeUnpackedArrayType)   // an array of arrays: its singular elements
+                ep = &ep->getArrayElementType()->getCanonicalType();
+            const Type& et = *ep;
             if (!et.isIntegral() || !l.type->isIntegral()) unsupported("inside an array of non-integral elements");
             int w = std::max((int)l.type->getBitWidth(), (int)et.getBitWidth());
             bool sg = l.type->isSigned() && et.isSigned();
