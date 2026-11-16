@@ -4293,9 +4293,29 @@ struct Lowerer {
                     }
                     return;
                 }
+                if (ValueExpressionBase::isKind(base.kind) && base.as<ValueExpressionBase>().symbol.kind == SymbolKind::Parameter) {
+                    if (auto cv = tryConst(x, &base.as<ValueExpressionBase>().symbol); cv && cv.isUnpacked()) {   // P[3:1] (6.20.2)
+                        constElems(t, cv, out);
+                        return;
+                    }
+                }
                 if (base.kind != ExpressionKind::NamedValue && base.kind != ExpressionKind::HierarchicalValue)
                     unsupported("slice of an array expression");
                 auto it = arrMap().find(&base.as<ValueExpressionBase>().symbol);
+                if (it != arrMap().end() && it->second->dims.size() > 1 && rs.getSelectionKind() == RangeSelectionKind::Simple) {
+                    // m[1:0] of a multidimensional array (7.4.5): the sub-arrays, each in a row
+                    const ArrShape& A = *it->second;
+                    auto [dl, dr] = A.dims[0];
+                    int per = A.count / (int)A.size(0);
+                    int64_t a0 = constInt(rs.left()), a1 = constInt(rs.right());
+                    for (int64_t k = a0;; k += a0 <= a1 ? 1 : -1) {
+                        int64_t o = dl <= dr ? k - dl : dl - k;
+                        if (o < 0 || o >= A.size(0)) unsupported("array slice outside the array");
+                        for (int e = 0; e < per; e++) out.push_back(ref(A.base + (int)o * per + e, A.sgn));
+                        if (k == a1) break;
+                    }
+                    return;
+                }
                 if (it == arrMap().end() || it->second->dims.size() != 1) unsupported("slice of a multidimensional array");
                 const ArrShape& A = *it->second;
                 int64_t l, r;
@@ -4394,6 +4414,36 @@ struct Lowerer {
             const Expression& base = peel(r.value());
             if (ValueExpressionBase::isKind(base.kind) && base.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
                 auto A = arrFind(&base.as<ValueExpressionBase>().symbol);
+                if (A && A->dims.size() > 1 && !A->dynElem && !isInd(A->base) && r.getSelectionKind() == RangeSelectionKind::Simple) {
+                    // m[3:1] = ... on a multidimensional array (7.4.5): each index of the
+                    // first dimension names a sub-array, its elements in a row
+                    auto [dl, dr] = A->dims[0];
+                    int per = A->count / (int)A->size(0);
+                    int64_t a0 = constInt(r.left()), a1 = constInt(r.right());
+                    std::vector<int> sigs;
+                    for (int64_t x = a0;; x += a0 <= a1 ? 1 : -1) {
+                        int64_t o = dl <= dr ? x - dl : dl - x;
+                        if (o < 0 || o >= A->size(0)) unsupported("array slice outside the array");
+                        for (int e = 0; e < per; e++) sigs.push_back(A->base + (int)o * per + e);
+                        if (x == a1) break;
+                    }
+                    std::vector<E> vals;
+                    arrayElems(*l.type, rhs, vals);
+                    if (vals.size() != sigs.size()) unsupported("array value with the wrong number of elements");
+                    for (auto& v : vals) {   // every value first
+                        if (v->op == Op::Const && !nba) continue;
+                        int tmp = fresh(A->elemW);
+                        Instr h; h.k = IK::Assign; h.sig = tmp; h.e = v;
+                        prog.emit(h);
+                        v = ref(tmp, A->sgn);
+                    }
+                    for (size_t k = 0; k < sigs.size(); k++) {
+                        Instr i; i.k = nba ? IK::Nba : IK::Assign;
+                        i.sig = sigs[k]; i.e = vals[k];
+                        xpDirect(i);
+                    }
+                    return true;
+                }
                 if (A && A->dims.size() == 1 && !A->dynElem) {
                     auto [dl, dr] = A->dims[0];
                     bool desc = dl >= dr;
@@ -6335,6 +6385,13 @@ struct Lowerer {
                 collectEvents(globalClocking()->getEvent(), ev);
                 return;
             }
+            if (!s.expr.type->isEvent() && peel(s.expr).kind != ExpressionKind::AssertionInstance &&
+                peel(s.expr).kind != ExpressionKind::ArbitrarySymbol && (s.expr.getConstant() || paramsOnly(s.expr))) {
+                // @(1'b0), @(PARAM), @(ENUM_NAME): a constant never changes, so it never
+                // triggers; a signal nothing drives stands for it
+                ev.push_back({freshStatic(1), ANY});
+                return;
+            }
             if (const auto* cb = inferredClock(s.expr)) {   // @($inferred_clock) (16.14.7)
                 if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $inferred_clock");
                 collectEvents(cb->getEvent(), ev);
@@ -6456,6 +6513,12 @@ struct Lowerer {
                 const auto& d = t.as<DelayControl>();
                 Instr i; i.k = IK::WaitDelay;
                 delayInto(d.expr, i);
+                prog.emit(i);
+                break;
+            }
+            case TimingControlKind::OneStepDelay: {   // #1step (A.2.2.3): one unit of the global time precision
+                Instr i; i.k = IK::WaitDelay;
+                i.delay = 1;
                 prog.emit(i);
                 break;
             }
@@ -12497,30 +12560,77 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         auto [ds0, ds1] = ca.getDriveStrength();
         if (a.left().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
             // assign arr = other_arr / '{...}: one assign per element (10.3, 7.6)
+            // assign arr[2:5] = ..., assign m[1] = ... (a sub-array of the first
+            // dimension, 7.4.5): the elements it covers, in order, with constant bounds.
             const Expression& l = Lowerer::peel(a.left());
-            if (l.kind != ExpressionKind::NamedValue && l.kind != ExpressionKind::HierarchicalValue)
+            const Expression* whole = &l;
+            std::vector<int> targets;   // element offsets, leftmost first; empty: the whole array
+            auto constOf = [&](const Expression& x) -> std::optional<int64_t> {
+                auto cv = lw.tryConst(x);
+                if (!cv.isInteger() || cv.integer().hasUnknown()) return std::nullopt;
+                return cv.integer().as<int64_t>();
+            };
+            if (l.kind == ExpressionKind::RangeSelect || l.kind == ExpressionKind::ElementSelect) {
+                lw.setScope(ca.getParentScope());
+                const Expression& v = Lowerer::peel(l.kind == ExpressionKind::RangeSelect ? l.as<RangeSelectExpression>().value()
+                                                                                          : l.as<ElementSelectExpression>().value());
+                if (v.kind != ExpressionKind::NamedValue && v.kind != ExpressionKind::HierarchicalValue)
+                    Lowerer::unsupported("continuous assign to part of an unpacked array");
+                auto at = arrMap().find(&v.as<ValueExpressionBase>().symbol);
+                if (at == arrMap().end()) Lowerer::unsupported("continuous assign to this array");
+                const ArrShape& A = *at->second;
+                auto [dl, dr] = A.dims[0];
+                int per = A.count / (int)A.size(0);
+                std::vector<int64_t> idx;   // first-dimension indexes, left to right
+                if (l.kind == ExpressionKind::ElementSelect) {
+                    auto k = constOf(l.as<ElementSelectExpression>().selector());
+                    if (!k) Lowerer::unsupported("continuous assign to an array element with an index that is not constant");
+                    idx.push_back(*k);
+                } else {
+                    const auto& rs = l.as<RangeSelectExpression>();
+                    auto x0 = constOf(rs.left()), x1 = constOf(rs.right());
+                    if (!x0 || !x1) Lowerer::unsupported("continuous assign to an array slice with bounds that are not constant");
+                    int64_t lft = *x0, rgt = *x1;
+                    if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                        bool up = rs.getSelectionKind() == RangeSelectionKind::IndexedUp;
+                        int64_t lo = up ? *x0 : *x0 - *x1 + 1, hi = up ? *x0 + *x1 - 1 : *x0;
+                        bool asc = dl <= dr;
+                        lft = asc ? lo : hi; rgt = asc ? hi : lo;
+                    }
+                    for (int64_t k = lft;; k += lft <= rgt ? 1 : -1) { idx.push_back(k); if (k == rgt) break; }
+                }
+                for (int64_t k : idx) {
+                    int64_t o = dl <= dr ? k - dl : dl - k;
+                    if (o < 0 || o >= A.size(0)) Lowerer::unsupported("continuous assign to an array slice outside the array");
+                    for (int e = 0; e < per; e++) targets.push_back((int)o * per + e);
+                }
+                whole = &v;
+            }
+            if (whole->kind != ExpressionKind::NamedValue && whole->kind != ExpressionKind::HierarchicalValue)
                 Lowerer::unsupported("continuous assign to part of an unpacked array");
-            auto it = arrMap().find(&l.as<ValueExpressionBase>().symbol);
+            auto it = arrMap().find(&whole->as<ValueExpressionBase>().symbol);
             if (it == arrMap().end()) Lowerer::unsupported("continuous assign to this array");
+            if (targets.empty()) for (int k = 0; k < it->second->count; k++) targets.push_back(k);
             std::vector<E> els;
             lw.setScope(ca.getParentScope());
             lw.arrayElems(*a.left().type, a.right(), els);
-            if ((int)els.size() != it->second->count || !lw.prog.code.empty())
+            if (els.size() != targets.size() || !lw.prog.code.empty())
                 Lowerer::unsupported("continuous assign of an unpacked array from this value");
             if (auto un = userNet(it->second->base); un && un->arr) {   // a driver of an array nettype net (6.6.7): one packed value
+                if ((int)targets.size() != it->second->count) Lowerer::unsupported("continuous assign to part of an array nettype net");
                 Instr i; i.k = IK::Assign; i.sig = it->second->base;
                 i.e = els.size() == 1 ? els[0] : node(Op::Concat, std::move(els));
                 finishAssign(lw, i);
                 g_emitLoc = {};
                 return;
             }
-            for (int k = 0; k < it->second->count; k++) {
+            for (size_t k = 0; k < targets.size(); k++) {
                 Lowerer L(sigmap);
                 prep(L);
                 Instr i; i.k = IK::Assign;
                 applyStrength(i, ds0, ds1, STR_STRONG, STR_STRONG);
-                i.sig = it->second->base + k;
-                i.e = els[(size_t)k];
+                i.sig = it->second->base + targets[k];
+                i.e = els[k];
                 L.setScope(ca.getParentScope());
                 i.dly = L.delays3(ca.getDelay(), true);
                 i.dlyE = std::move(L.dynDly);
