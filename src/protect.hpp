@@ -1385,6 +1385,10 @@ inline std::string where(std::string_view file, int line) {
     return std::string(file) + ":" + std::to_string(line) + ": ";
 }
 
+// The one message for a clause 34 data_block that a held key opens but that
+// does not decrypt to text with a matching digest.
+constexpr const char* kModified = "protected envelope does not decrypt: it was modified or damaged";
+
 inline bool digestMatches(const Block& b, const std::string& sessionKey, std::string_view dataMethod,
                           std::string_view plain) {
     if (!b.digest) return true;
@@ -1401,7 +1405,8 @@ inline void decryptInto(std::string_view text, const Keyring& ring, const Decryp
 
 // The envelope that starts after a begin_protected directive; sc.pos is just
 // past that directive's line. Returns the cleartext.
-inline std::string envelope(Scanner& sc, State st, const Keyring& ring, std::string_view file, int beginLine) {
+inline std::string envelope(Scanner& sc, State st, const Keyring& ring, std::string_view file, int beginLine,
+                            bool& digested) {
     std::vector<Block> keys;
     std::optional<Block> data;
     Block* last = nullptr;
@@ -1451,6 +1456,7 @@ inline std::string envelope(Scanner& sc, State st, const Keyring& ring, std::str
     // Each key_block a held key can open, in order; the first session key that
     // passes the digests and the padding check wins.
     std::string tried;
+    bool modified = false;
     for (auto& kb : keys) {
         std::string owner = kb.st.str("key_keyowner"), name = kb.st.str("key_keyname");
         std::string method = kb.st.str("key_method", "rsa");
@@ -1467,17 +1473,21 @@ inline std::string envelope(Scanner& sc, State st, const Keyring& ring, std::str
             auto sk = rsaDecrypt(k.key.get(), kb.bin);
             if (!sk || sk->size() != keyLen) continue;
             if (!digestMatches(kb, *sk, dataMethod, *sk)) continue;
+            // A clause 34 data_block has no MAC before decryption, so a
+            // changed one must not tell bad padding from a bad digest from
+            // bad text (padding oracle, Chhotaray et al., CCS 2017; CERT
+            // VU#739007): every failure past this point takes the same work
+            // and gives the same message.
             auto plain = cbcDecrypt(dataMethod, *sk, data->bin);
-            if (!plain) { OPENSSL_cleanse(sk->data(), sk->size()); continue; }
-            bool dataOk = digestMatches(*data, *sk, dataMethod, *plain);
+            bool dataOk = plain && digestMatches(*data, *sk, dataMethod, *plain);
+            if (!plain) (void)digestMatches(*data, *sk, dataMethod, data->bin);
             OPENSSL_cleanse(sk->data(), sk->size());
-            if (!dataOk) {
-                OPENSSL_cleanse(plain->data(), plain->size());
-                throw Error(where(file, beginLine) + "data_block digest does not match: the envelope was modified");
-            }
-            return std::move(*plain);
+            if (dataOk) { digested = data->digest.has_value(); return std::move(*plain); }
+            if (plain) OPENSSL_cleanse(plain->data(), plain->size());
+            modified = true;
         }
     }
+    if (modified) throw Error(where(file, beginLine) + kModified);
     throw Error(where(file, beginLine) + "no key for this protected envelope (" +
                 (tried.empty() ? std::string("it has no key_block") : tried) + "); pass the private key with -keyfile");
 }
@@ -1544,7 +1554,11 @@ inline void decryptInto(std::string_view text, const Keyring& ring, const Decryp
         if (version > 0 && version != 3)
             throw Error(where(file, d->line) + "IEEE 1735 version " + std::to_string(version) +
                         " envelopes are not supported (version 3, or IEEE 1800-2023 clause 34 envelopes without a version)");
-        std::string plain = envelope(sc, env, ring, file, d->line);
+        bool digested = false;
+        std::string plain = envelope(sc, env, ring, file, d->line, digested);
+        if (!digested && opt.warn)
+            opt.warn(where(file, d->line) + "this clause 34 envelope has no digest_block on its data_block, so a change to it "
+                     "cannot be detected (CERT VU#739007); re-encrypt it with a digest or as IEEE 1735 version 3");
         Decrypted inner;
         decryptInto(plain, ring, opt, file, depth + 1, inner, false);
         OPENSSL_cleanse(plain.data(), plain.size());

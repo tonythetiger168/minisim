@@ -415,3 +415,15 @@ envelopes nested in decrypted text and envelopes made with the `openssl` tool
 alone. Not supported there: `decrypt_license`, `runtime_license`, the 1800
 `viewport = (object=..., access=...)` form, `key_method` other than `rsa`,
 and `data_decrypt_key` / `digest_decrypt_key`.
+
+A clause 34 `data_block` has no MAC that is checked before it is decrypted,
+which is what the padding oracle attack on IEEE 1735 uses (Chhotaray et al.,
+CCS 2017; CERT VU#739007): the attacker changes the ciphertext and watches
+whether the tool reports bad padding or something else. msim gives one
+message, `protected envelope does not decrypt: it was modified or damaged`,
+for bad padding and for a digest that does not match, after the same work,
+and syntax errors in decrypted text are reported only as "in protected code
+(details hidden)". An envelope whose `data_block` has no `digest_block`
+cannot be checked at all, so msim warns when it opens one. Version 3
+envelopes are not affected: their HMAC-SHA512 signature is checked before
+anything is decrypted.
