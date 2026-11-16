@@ -73,4 +73,6 @@ are always on in msim; coverage files and snapshot names have no counterpart.
 
 The exit status is msim's: 0 after a normal end or `$finish`, 1 when the
 design does not compile or elaborate or `$fatal` ends it, 2 for a bad
-command line.
+command line, 3 with `-uvm-error-status` when UVM reported an error, and 4 with
+`-maxtime-status` when `-maxtime` stopped a run with events pending (see the README, "Exit
+status and run verdict").
