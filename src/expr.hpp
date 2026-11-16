@@ -829,6 +829,33 @@ struct DynKey {
     std::string s;     // string key
     bool operator<(const DynKey& o) const { return s != o.s ? s < o.s : i < o.i; }
 };
+// str.atoreal() (6.16.10): the longest prefix that reads as a real constant
+// (5.7.2), whose digits may have underscores after the first; 0 when there
+// are no digits. Leading white space and a sign are accepted.
+inline double atorealOf(const std::string& s) {
+    size_t i = 0;
+    std::string t;
+    while (i < s.size() && std::isspace((unsigned char)s[i])) i++;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) t += s[i++];
+    auto digits = [&] {   // digits, then digits or underscores
+        size_t n = 0;
+        while (i < s.size() && (std::isdigit((unsigned char)s[i]) || (n && s[i] == '_'))) {
+            if (s[i] != '_') t += s[i];
+            i++, n++;
+        }
+        return n;
+    };
+    if (!digits()) return 0;
+    if (i + 1 < s.size() && s[i] == '.' && std::isdigit((unsigned char)s[i + 1])) { t += s[i++]; digits(); }
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+        size_t save = i, len = t.size();
+        t += 'e';
+        i++;
+        if (i < s.size() && (s[i] == '+' || s[i] == '-')) t += s[i++];
+        if (!digits()) { i = save; t.resize(len); }
+    }
+    return std::strtod(t.c_str(), nullptr);
+}
 struct DynObj {
     int kind = 0;               // 0 dynamic array, 1 queue, 2 associative array
     std::vector<Val> vec;
@@ -2090,6 +2117,13 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
             n++;
             continue;
         }
+        int tUnit = 0, tPrec = 0;   // %t: the calling module's time unit and precision, written after it by the lowering
+        if (cv == '\x03') {
+            if (i + 2 >= fmt.size()) break;
+            tUnit = fmt[i + 1] - 64;
+            tPrec = fmt[i + 2] - 64;
+            i += 2;
+        }
         if (cv != 'c') skipWs();
         if (eof) break;
         std::string tok;
@@ -2103,7 +2137,7 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
                 case 'h': case 'x': return isxdigit(c) || c == '_' || strchr("xXzZ?", c) != nullptr;
                 case 'o': return (c >= '0' && c <= '7') || c == '_' || strchr("xXzZ?", c) != nullptr;
                 case 'b': return c == '0' || c == '1' || c == '_' || strchr("xXzZ?", c) != nullptr;
-                case 'f': case 'e': case 'g': return isdigit(c) || strchr("+-.eE", c) != nullptr;
+                case 'f': case 'e': case 'g': case '\x03': return isdigit(c) || strchr("+-.eE", c) != nullptr;
                 default: return false;
             }
         };
@@ -2113,12 +2147,26 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
             tok += (char)c;
         }
         if (tok.empty()) { if (!any && c == EOF) eof = true; break; }
+        // A number needs a digit (or x / z): "_" or a lone sign is a matching failure.
+        if (cv != 's' && cv != 'c' && tok.find_first_not_of("_+-") == std::string::npos) break;
         any = true;
         if (skip) continue;
         Val v;
         if (cv == 's') v = mkstr(tok);
         else if (cv == 'c') v = make((unsigned char)tok[0], 0, 8, 0);
         else if (cv == 'f' || cv == 'e' || cv == 'g') v = mkreal(atof(tok.c_str()));
+        else if (cv == '\x03') {   // %t (21.3.4.3): a number in $timeformat units, rounded to its
+                                    // precision, then in the module's units, rounded to its precision
+            const TimeFmt& tf = timeFmt();
+            auto roundTo = [](double d, int digits) {
+                double p = std::pow(10.0, digits);
+                double x = d * p;
+                return std::round(x + (x < 0 ? -1 : 1) * std::fabs(x) * 1e-12) / p;
+            };
+            double d = roundTo(atof(tok.c_str()), std::max(0, tf.prec));
+            d *= std::pow(10.0, tf.units - tUnit);
+            v = mkreal(roundTo(d, tUnit - tPrec));
+        }
         else {
             int bits = cv == 'h' || cv == 'x' ? 4 : cv == 'o' ? 3 : cv == 'b' ? 1 : 0;
             uint64_t val = 0, x = 0, z = 0;
@@ -2862,7 +2910,7 @@ inline Val eval(const E& e, const Reader& rd) {
                 case S_ATOHEX: return parse(16);
                 case S_ATOOCT: return parse(8);
                 case S_ATOBIN: return parse(2);
-                case S_ATOREAL: return mkreal(std::strtod(s.c_str(), nullptr));
+                case S_ATOREAL: return mkreal(atorealOf(s));
                 case S_PUTC: {   // a new string; the statement writes it back
                     int64_t i = ival(1);
                     Val c = k(2);
