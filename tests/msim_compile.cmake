@@ -69,6 +69,8 @@ set(CASES
   "-x-assign 0 -x-initial 0 examples/snapnba.sv"
   "examples/privarr.sv"
   "-x-assign 0 -x-initial 0 examples/privarr.sv"
+  "examples/caseswitch.sv"
+  "-x-assign 0 -x-initial 0 examples/caseswitch.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
   "examples/islands.sv"
