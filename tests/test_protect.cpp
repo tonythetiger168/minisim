@@ -186,6 +186,25 @@ int main() {
         assert(decryptSource(e, ra, "s").text.find("  always @(a) b = ~a;\n") != std::string::npos);
     }
 
+    // The shape AMD Vivado 2026.1 opens (docs/PROTECT.md): no key_public_key,
+    // no digest_block. msim still opens it, with a warning.
+    {
+        EncryptOptions ov = o;
+        ov.dataMethod = "aes128-cbc";
+        ov.digestMethod = "";
+        ov.publicKey = false;
+        std::string e = encryptSource(SRC, ov, "s");
+        assert(e.find("key_public_key") == std::string::npos);
+        assert(e.find("digest") == std::string::npos);
+        size_t kb = e.find("`pragma protect key_block\n"), db = e.find("`pragma protect data_block\n");
+        assert(kb != std::string::npos && db != std::string::npos && kb < db);
+        int warned = 0;
+        DecryptOptions dw;
+        dw.warn = [&](const std::string&) { warned++; };
+        assert(decryptSource(e, ra, "s", dw).text.find("  always @(a) b = ~a;\n") != std::string::npos);
+        assert(warned == 1);
+    }
+
     // Keywords in the source: data_method / encoding before begin, and a
     // key_public_key recipient given in the source itself.
     {
