@@ -1594,6 +1594,18 @@ static int doRandomize(int obj, const RandCall* rc) {
             if (it.it->isDist && !it.it->guard && de && de->op == Op::Ref && it.vars.size() == 1 && !it.it->soft) {
                 Var& v = ctx.vars[(size_t)it.vars[0]];
                 if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
+            } else if (it.it->isDist && !it.it->guard && de && de->op == Op::ArrRead && de->arr && !it.it->soft &&
+                       std::all_of(de->kids.begin(), de->kids.end(), [](const E& x) { return x && x->op == Op::Const; })) {
+                // a[2] dist {...} (a foreach over a fixed-size array names each
+                // element so): the weights belong to that element.
+                std::vector<int64_t> ix;
+                for (const E& x : de->kids) ix.push_back(v_to_i64(x->k));
+                int64_t off = de->arr->offset(ix);
+                if (off >= 0)
+                    if (auto f = ctx.idx.find(R(de->arr->base) + (int)off); f != ctx.idx.end()) {
+                        Var& v = ctx.vars[(size_t)f->second];
+                        if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
+                    }
             }
         }
         // disable soft x: soft constraints on x of lower priority are dropped.
