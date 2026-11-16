@@ -569,6 +569,7 @@ struct Subr {
     };
     std::vector<Arg> args;
     std::vector<Subr*> calls;
+    bool root = false;            // called from a process, a class's code or C (not only from other subroutines)
 };
 
 // DPI imports by symbol (35); filled before any process is lowered.
@@ -1950,7 +1951,13 @@ struct Lowerer {
     static bool superCall(const slang::ast::CallExpression& call) {
         if (!call.syntax) return false;
         // the first token (its leading comments and spaces are trivia, not text)
-        return call.syntax->getFirstToken().rawText() == "super";
+        if (call.syntax->getFirstToken().rawText() == "super") return true;
+        // Class::f() (8.23) names one class's body, so it is not dispatched virtually either
+        const slang::syntax::SyntaxNode* n = call.syntax;
+        if (n->kind == slang::syntax::SyntaxKind::InvocationExpression)
+            n = n->as<slang::syntax::InvocationExpressionSyntax>().left.get();
+        return n->kind == slang::syntax::SyntaxKind::ScopedName &&
+               n->as<slang::syntax::ScopedNameSyntax>().separator.kind == slang::parsing::TokenKind::DoubleColon;
     }
     // Package UPF (IEEE 1801-2024 11.2.4), added by msim -upf: the functions
     // that change or read supplies run in the power-aware runtime
@@ -2187,6 +2194,7 @@ struct Lowerer {
         }
         Subr* sub = it->second;
         if (current) current->calls.push_back(sub);
+        else sub->root = true;
 
         auto args = call.arguments();
         if (args.size() != sub->args.size()) unsupported("subroutine argument count");
@@ -6383,6 +6391,22 @@ struct Lowerer {
             }
             case ExpressionKind::Inside: {          // x inside {a, [lo:hi]} (11.4.13)
                 const auto& in = e.as<InsideExpression>();
+                // f() inside {[a:b], c}: the left operand is evaluated once, into a temporary
+                struct Unpin {
+                    std::unordered_map<const Expression*, int>* m = nullptr;
+                    const Expression* x = nullptr;
+                    ~Unpin() { if (m) m->erase(x); }
+                } unpin;
+                if (stmtDepth && in.left().type->isIntegral() && !exprOverride.count(&in.left()) && sideEffects(in.left())) {
+                    int w = (int)in.left().type->getBitWidth();
+                    needWidth(w);
+                    int t = fresh(w);
+                    Instr i; i.k = IK::Assign; i.sig = t; i.e = expr(in.left());
+                    prog.emit(i);
+                    exprOverride[&in.left()] = t;
+                    unpin.m = &exprOverride;
+                    unpin.x = &in.left();
+                }
                 E acc;
                 for (const Expression* it : in.rangeList()) {
                     E m = insideItem(in.left(), *it);
@@ -7194,8 +7218,23 @@ struct Lowerer {
         if (it.kind == ExpressionKind::ValueRange) {
             const auto& vr = it.as<ValueRangeExpression>();
             if (vr.rangeKind == ValueRangeKind::Simple) {
-                if (isReal(l) || isReal(vr.left()) || isReal(vr.right()))
+                // [$:hi] and [lo:$] (11.4.13): $ is the lowest or highest value, so that
+                // side always holds and only the other bound is compared
+                auto dollar = [](const Expression* x) {   // $ under the implicit conversions slang adds
+                    while (x->kind == ExpressionKind::Conversion) x = &x->as<ConversionExpression>().operand();
+                    return x->kind == ExpressionKind::UnboundedLiteral;
+                };
+                bool noLo = dollar(&vr.left());
+                bool noHi = dollar(&vr.right());
+                if (noLo && noHi) return konst(mk(1, 1));
+                bool re = isReal(l) || (!noLo && isReal(vr.left())) || (!noHi && isReal(vr.right()));
+                if (re) {
+                    if (noLo) return fcmp(1, realOf(l), realOf(vr.right()));
+                    if (noHi) return fcmp(3, realOf(l), realOf(vr.left()));
                     return bin(Op::LogAnd, fcmp(3, realOf(l), realOf(vr.left())), fcmp(1, realOf(l), realOf(vr.right())));
+                }
+                if (noLo) { auto [l2, hi] = pair(l, vr.right()); return bin(Op::Le, l2, hi); }
+                if (noHi) { auto [l1, lo] = pair(l, vr.left()); return bin(Op::Ge, l1, lo); }
                 auto [l1, lo] = pair(l, vr.left());
                 auto [l2, hi] = pair(l, vr.right());
                 return bin(Op::LogAnd, bin(Op::Ge, l1, lo), bin(Op::Le, l2, hi));
@@ -13975,8 +14014,16 @@ inline void rejectRecursive(const std::vector<Subr*>& subs) {
         }
         color[s] = Color::Black;
     };
+    // Only cycles that can run matter: a static task that calls itself only
+    // through subroutines nothing calls is never entered. Class methods may be
+    // reached through a virtual method table, so they count as called.
+    auto entered = [](const Subr* s) {
+        if (s->root || s->cls) return true;
+        const auto* sc = s->sym ? s->sym->getParentScope() : nullptr;
+        return !s->sym || (sc && sc->asSymbol().kind == slang::ast::SymbolKind::ClassType);
+    };
     for (Subr* s : subs)
-        if (color[s] == Color::White) dfs(dfs, s);
+        if (color[s] == Color::White && entered(s)) dfs(dfs, s);
 }
 
 // Object shape, constructor and virtual method table of every class,
@@ -14854,6 +14901,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         if (it == subMap.end()) Lowerer::unsupported("DPI export of this subroutine");
         Subr* sub = it->second;
         if (sub->lay) Lowerer::unsupported("DPI export of an automatic task, or of a function that recurses");
+        sub->root = true;
         auto f = std::make_unique<DpiFunc>();
         f->isExport = true;
         f->svName = std::string(ex.subroutine->name);
