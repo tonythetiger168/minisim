@@ -8454,6 +8454,7 @@ struct Lowerer {
             case ConstraintKind::DisableSoft: {   // 18.5.13.2
                 RandItem it;
                 it.disableSoft = true;
+                it.guard = guard;   // under an implication or if (18.5.13.2)
                 it.e = expr(c.as<DisableSoftConstraint>().target);
                 items.push_back(std::move(it));
                 break;
