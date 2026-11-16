@@ -2412,6 +2412,95 @@ private:
         return p.code.size() >= 2 && p.code[0].k == IK::Assign && p.code[1].k == IK::WaitEdge;
     }
     // A static combinational process with if / case (prog.hpp: combShape).
+    // A case statement as the 2-state code sees it: a chain of tests
+    // "if (!(sel == K1 || sel == K2)) goto next", each failing to the next
+    // test, on one selector of at most 64 bits and constant keys. The tests
+    // have no effect, so the first one that holds is found by one switch on
+    // the selector; the chain stays for the 4-state code. caseDispatch
+    // returns that switch for the chain starting at pc (empty: no chain of
+    // at least 4 keys), and marks the later tests of the chain in `in`.
+    // MSIM_NOCASESWITCH: off. MSIM_WHYCASE=1: the first tests that are not a chain.
+    // A selector: signals, constant selects of them and concatenations (at most 64 bits).
+    bool caseSel(const E& e) const {
+        if (!e || e->at || e->arr) return false;
+        switch (e->op) {
+            case Op::Ref: return e->sig >= 0 && (size_t)e->sig < sigW_.size() && sigW_[e->sig] <= 64;
+            case Op::Slice: return e->kids.size() == 1 && caseSel(e->kids[0]);
+            case Op::Resize: return !e->lo && e->kids.size() == 1 && caseSel(e->kids[0]);
+            case Op::Concat: for (auto& k : e->kids) if (!caseSel(k)) return false; return !e->kids.empty();
+            default: return false;
+        }
+    }
+    static bool sameExpr(const E& a, const E& b) {
+        if (a == b) return true;
+        if (!a || !b || a->op != b->op || a->sig != b->sig || a->hi != b->hi || a->lo != b->lo || a->kids.size() != b->kids.size() || a->at || b->at) return false;
+        if (a->op == Op::Const && !(a->k == b->k)) return false;
+        for (size_t j = 0; j < a->kids.size(); j++) if (!sameExpr(a->kids[j], b->kids[j])) return false;
+        return true;
+    }
+    bool caseKeys(const E& e, E& sel, std::vector<uint64_t>& keys) const {
+        if (!e || e->at) return false;
+        if ((e->op == Op::Or || e->op == Op::LogOr) && e->kids.size() == 2)
+            return caseKeys(e->kids[0], sel, keys) && caseKeys(e->kids[1], sel, keys);
+        // ==, ===, casez / casex and ==? (inside) all mean == for a key without x or z bits.
+        bool wild = e->op == Op::CaseZEq || e->op == Op::CaseXEq || e->op == Op::WildEq;
+        if ((e->op != Op::Eq && e->op != Op::CaseEq && !wild) || e->kids.size() != 2) return false;
+        E a = e->kids[0], b = e->kids[1];
+        if (a && a->op == Op::Const && e->op != Op::WildEq) std::swap(a, b);   // ==? : the pattern is the right one
+        if (!a || !b || b->op != Op::Const || b->k.x || b->k.z || !b->k.hi.empty() || b->k.real || b->k.str) return false;
+        if (a->op == Op::Resize && !a->lo && a->kids.size() == 1) a = a->kids[0];
+        int w = widthOf(a);
+        if (w < 1 || w > 64 || !caseSel(a)) return false;
+        if (sel && !sameExpr(sel, a)) return false;
+        sel = a;
+        uint64_t k = b->k.v;
+        if (w < 64 && (k >> w)) return true;   // wider than the selector: never matches
+        keys.push_back(k);
+        return true;
+    }
+    template <class Lab>
+    std::string caseDispatch(const Prog& cp, size_t pc, std::vector<char>& in, const Lab& lab) {
+        if (std::getenv("MSIM_NOCASESWITCH")) return "";
+        E sel;
+        std::vector<std::pair<uint64_t, size_t>> arms;   // key, the body it selects
+        std::set<uint64_t> seen;
+        std::vector<size_t> tests;
+        size_t k = pc, nTests = 0;
+        while (k < cp.code.size() && cp.code[k].k == IK::JmpIfNot && cp.code[k].xt == Instr::NOX) {
+            std::vector<uint64_t> keys;
+            E s = sel;
+            if (!caseKeys(cp.code[k].e, s, keys)) {
+                if (std::getenv("MSIM_WHYCASE") && k == pc) {
+                    std::function<std::string(const E&)> pr = [&](const E& e) -> std::string {
+                        if (!e) return "null";
+                        std::string r = "op" + std::to_string((int)e->op);
+                        if (e->op == Op::Ref) r += "[s" + std::to_string(e->sig) + "]";
+                        if (e->op == Op::Const) r += "[w" + std::to_string(e->k.w) + "]";
+                        if (e->op == Op::Resize || e->op == Op::Slice) r += "[" + std::to_string(e->hi) + "," + std::to_string(e->lo) + "]";
+                        if (e->kids.empty()) return r;
+                        r += "(";
+                        for (size_t j = 0; j < e->kids.size() && j < 3; j++) r += (j ? "," : "") + pr(e->kids[j]);
+                        return r + ")";
+                    };
+                    std::fprintf(stderr, "case? %s\n", pr(cp.code[k].e).substr(0, 300).c_str());
+                }
+                break;
+            }
+            sel = s;
+            for (uint64_t x : keys) if (seen.insert(x).second) arms.push_back({x, k + 1});   // the first test that holds wins
+            tests.push_back(k);
+            nTests++;
+            if (cp.code[k].target <= k) { k = cp.code[k].target; break; }
+            k = cp.code[k].target;
+        }
+        if (!sel || nTests < 1 || arms.size() < 4 || k > cp.code.size()) return "";
+        std::string g, u, sl;
+        if (!split(sel, g, u, sl)) return "";
+        for (size_t t : tests) if (t != pc) in[t] = 1;
+        std::string r = " switch ((uint64_t)(" + u + ") & " + M(widthOf(sel)) + ") {";
+        for (auto& [key, body] : arms) r += " case " + std::to_string(key) + "ULL: goto " + lab(body) + ";";
+        return r + " default: goto " + lab(k) + "; }\n";
+    }
     static bool combBranches(const Prog& p) {
         for (auto& i : p.code) {
             if (i.k == IK::WaitEdge) return false;
@@ -3925,6 +4014,7 @@ private:
                     allF2 << " const PSig LS_" << ks << "{" << ps << ".v, 0, 0};";   // the 2-state body: known bits
                 }
             if (sn) { allF << "\n"; allF2 << "\n"; }
+            std::vector<char> inChainD(p.code.size() + 1, 0);
             for (size_t pc = 1; pc < end; pc++) {
                 const Instr& i = p.code[pc];
                 std::ostringstream fns, fns2;
@@ -4002,6 +4092,7 @@ private:
                     }
                     case IK::JmpIfNot: {
                         if (i.xt != Instr::NOX) throw CodegenUnsupported("three-way jump in the cycle domain");
+                        if (!inChainD[pc]) fns2 << caseDispatch(p, pc, inChainD, L);   // a case: one switch (see caseDispatch)
                         std::string g, u, sl;
                         if (split(i.e, g, u, sl)) {
                             fns2 << " if (!(" << u << ")) goto " << L(i.target) << ";\n";
@@ -4248,9 +4339,12 @@ private:
                 unitProc.push_back(i);
                 unitConds.emplace_back();
                 size_t pc = 0;
+                std::vector<char> inChain(cp.code.size() + 1, 0);
                 for (; pc < cp.code.size(); pc++) {
                     const Instr& in = cp.code[pc];
                     if (in.k == IK::JmpIfNot) {
+                        // A case chain: one switch, then its tests as they were (not reached).
+                        const std::string pre2 = L2(pc) + ":" + (inChain[pc] ? "" : caseDispatch(cp, pc, inChain, L2));
                         noteRefs(in.e);
                         unitConds.back().push_back(in.e);
                         std::string g, u, sl;
@@ -4261,8 +4355,8 @@ private:
                         else if (sp) c4 += L4(pc) + ": if (__builtin_expect(" + g + ", 1)) { if (!(" + u + ")) goto " + L4(in.target) + "; } else {" + slow4 + " }\n";
                         else c4 += L4(pc) + ":" + slow4;
                         // Every signal read is known here (twoNow, and no bail so far).
-                        if (sp) c2 += L2(pc) + ": if (!(" + u + ")) goto " + L2(in.target) + ";\n";
-                        else c2 += L2(pc) + ":" + jmpIfNot(in, sl, "goto " + L2(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L2(in.xt) + ";");
+                        if (sp) c2 += pre2 + " if (!(" + u + ")) goto " + L2(in.target) + ";\n";
+                        else c2 += pre2 + jmpIfNot(in, sl, "goto " + L2(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L2(in.xt) + ";");
                         continue;
                     }
                     if (in.k == IK::Jmp) {
