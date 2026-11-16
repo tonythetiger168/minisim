@@ -4850,6 +4850,14 @@ struct Lowerer {
             const DynObj* shape = nullptr;
             for (auto& [off, o] : ci->lay->dyn) if (off == ps->off) shape = &o;
             if (!shape) unsupported("container property shape");
+            if (consDepth) {   // h.q in a constraint: resolved at solve time (RandItem::refs)
+                auto a = node(Op::Addr, {exprH(m.value())});
+                a->sig = ps->off;
+                int d = indThrough(fresh(64));
+                indShape[d] = *shape;
+                consRefs.push_back({d, std::move(a)});
+                return d;
+            }
             int d = indSlot(exprH(m.value()), ps->off);
             indShape[d] = *shape;
             return d;
