@@ -270,6 +270,10 @@ Spec references are IEEE 1800-2023 clauses.
   off.
 
 ### Fixed
+- msim: an event control in a class on a bit or part select of a virtual
+  interface or class member (`@(posedge vif.state[0])`), mixed with other
+  items, failed with "unsupported event on non-signal". It now waits on
+  that bit's edges (`tests/spec/25.9-vif-bit-select-event.sv`).
 - msim `-uvm` with the Accellera UVM 1.2 release: the DPI build included
   `uvm_hdl_polling.c`, which only uvm-core 2020 has, so it did not compile.
   It is left out when missing; `uvm12/*` tests run with `-DUVM12_HOME`.

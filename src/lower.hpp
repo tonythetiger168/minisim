@@ -6696,10 +6696,24 @@ struct Lowerer {
                 items.push_back(&sub->as<SignalEventControl>());
             }
         } else return false;
+        // A bit or part select of a virtual interface or class member
+        // (@(posedge vif.state[0]), 9.4.2, 25.9) has no signal of its own
+        // and no continuous assignment can follow it: it is waited on here,
+        // and so is every other item of its event list.
+        auto memberSel = [&](const Expression& x) {
+            const Expression* b = &x;
+            while (b->kind == ExpressionKind::ElementSelect || b->kind == ExpressionKind::RangeSelect)
+                b = b->kind == ExpressionKind::ElementSelect ? &b->as<ElementSelectExpression>().value()
+                                                             : &b->as<RangeSelectExpression>().value();
+            return b != &x && (vifAccess(*b) || classMember(*b));
+        };
+        bool sel = false;
+        for (auto* s : items) sel = sel || memberSel(s->expr);
         bool need = false;
         for (auto* s : items) {
             if (isGlobalClock(s->expr) || inferredClock(s->expr) || clockingRef(s->expr) ||
-                peel(s->expr).kind == ExpressionKind::AssertionInstance || classMember(s->expr) || vifAccess(s->expr) ||
+                peel(s->expr).kind == ExpressionKind::AssertionInstance ||
+                (!sel && (classMember(s->expr) || vifAccess(s->expr))) ||
                 !s->expr.type->isIntegral() || s->expr.type->isEvent())
                 return false;
             if (!ValueExpressionBase::isKind(s->expr.kind)) need = true;
@@ -6711,7 +6725,7 @@ struct Lowerer {
         if (prog.here() != at) unsupported("event expression with a call");
         bool rel = false;
         for (auto& x : xs) rel = rel || hasRel(x);
-        if (!rel && eventExprHook()) return false;   // static: a signal kept equal to it (eventSignal)
+        if (!rel && !sel && eventExprHook()) return false;   // static: a signal kept equal to it (eventSignal)
         auto put = [&](int sg, E v) { Instr a; a.k = IK::Assign; a.sig = sg; a.e = v; prog.emit(a); };
         std::vector<int> olds, nws;
         for (size_t k = 0; k < items.size(); k++) {
