@@ -433,6 +433,7 @@ inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::
 }
 inline Val structDefaultVal(const slang::ast::Type& t0);
 inline bool memberInitVal(const slang::ast::FieldSymbol& f, int w, Val& out);
+inline bool unpackedConstVal(const slang::ast::Type& t, const slang::ConstantValue& cv, Val& out);
 // A class handle (8), chandle, or null: a 64-bit signal holding an object's
 // first signal id (0 is null).
 inline bool isHandleType(const slang::ast::Type& t) {
@@ -3993,6 +3994,10 @@ struct Lowerer {
         }
         if (cv.isReal()) { out.push_back(konst(mkreal(cv.real()))); return; }
         if (cv.isString() && t.isString()) { out.push_back(konst(mkstr(cv.str()))); return; }
+        if (t.isUnpackedStruct() || t.isUnpackedUnion()) {   // a struct element: its bits (7.2)
+            Val v;
+            if (unpackedConstVal(t, cv, v)) { out.push_back(konst(v)); return; }
+        }
         unsupported("constant array element of this kind");
     }
 
@@ -4003,6 +4008,10 @@ struct Lowerer {
         const Symbol* b = selectBase(e);
         if (!b || b->kind != SymbolKind::Parameter || !b->as<ParameterSymbol>().getType().isUnpackedArray()) return nullptr;
         auto cv = tryConst(e, b);
+        if (cv && (cv.isUnpacked() || cv.isUnion()) && (e.type->isUnpackedStruct() || e.type->isUnpackedUnion())) {
+            Val v;   // P[1], a struct element: its bits (7.2)
+            if (unpackedConstVal(*e.type, cv, v)) return konst(v);
+        }
         if (!cv || !cv.isInteger()) {
             if (E rom = paramRom(e, *b, ctx)) return rom;
             if (paramArray(*b)) return nullptr;   // an ordinary array read of its signals
@@ -4027,7 +4036,8 @@ struct Lowerer {
             if (total > (1 << 16)) return false;
             t = &ft.elementType.getCanonicalType();
         }
-        if (t->isUnpackedArray() || !(t->isIntegral() || t->isFloating() || t->isString())) return false;
+        bool st = (t->isUnpackedStruct() || t->isUnpackedUnion()) && uWidth(*t) > 0;   // structs as their bits (7.2)
+        if (t->isUnpackedArray() || !(t->isIntegral() || t->isFloating() || t->isString() || st)) return false;
         const auto& cv = b.as<ParameterSymbol>().getValue();
         if (!cv.isUnpacked()) return false;
         std::vector<E> elems;
@@ -5827,7 +5837,11 @@ struct Lowerer {
             std::memcpy(&bits, &d, 8);
             return konst(mk(bits, 64));
         }
-        if (!cv || !cv->isInteger()) unsupported("reference to non-signal symbol");
+        if (cv && (cv->isUnpacked() || cv->isUnion()) && (e.type->isUnpackedStruct() || e.type->isUnpackedUnion())) {
+            Val v;   // an unpacked struct parameter (6.20.2): its bits
+            if (unpackedConstVal(*e.type, *cv, v)) return konst(v);
+        }
+        if (!cv || !cv->isInteger()) unsupported(("reference to non-signal symbol " + std::string(sym.name)).c_str());
         return svLit(cv->integer(), e.type->isSigned(), ctx);
     }
 
@@ -11405,6 +11419,83 @@ struct Lowerer {
 // A member's initial value in the struct type (7.2.2: `bit [3:0] lo = c;`),
 // a constant expression, as w bits. False when the member has none or it is
 // not an integral or real constant.
+// A constant of an unpacked struct, union or fixed-size array type (an
+// unpacked struct parameter, 6.20.2) as the bits it is held in (uWidth):
+// the first member, or the left element, highest. False for a member this
+// layout cannot hold as a constant (a container).
+inline bool unpackedConstVal(const slang::ast::Type& t0, const slang::ConstantValue& cv, Val& out) {
+    using namespace slang::ast;
+    const Type& t = t0.getCanonicalType();
+    int W = uWidth(t);
+    if (W <= 0) return false;
+    auto leaf = [&](const Type& ft, const slang::ConstantValue& v, int w, Val& o) -> bool {
+        if (ft.isUnpackedStruct() || ft.isUnpackedUnion() || ft.kind == SymbolKind::FixedSizeUnpackedArrayType)
+            return unpackedConstVal(ft, v, o);
+        if (v.isReal() || v.isShortReal()) {
+            double d = v.isReal() ? (double)v.real() : (double)(float)v.shortReal();
+            uint64_t bits;
+            std::memcpy(&bits, &d, 8);
+            o = make(bits, 0, w);
+            return true;
+        }
+        if (v.isString() && ft.isString()) { o = make(strPool().of(v.str()), 0, w); return true; }   // its pool id
+        if (!v.isInteger() || !ft.isIntegral()) return false;
+        const slang::SVInt& sv = v.integer();
+        int sw = (int)sv.getBitWidth();
+        Val x = make(0, 0, sw, 0, sv.isSigned());
+        if (!sv.hasUnknown()) x = wordsToVal(sw, sv.isSigned(), sv.getRawPtr(), (sw + 63) / 64);
+        else
+            for (int b = 0; b < sw; b++) {
+                auto bit = sv[b];
+                Val one = make(bit.isUnknown() ? 0 : bit.value ? 1 : 0, bit.isUnknown() ? 1 : 0, 1,
+                               bit.value == slang::logic_t::Z_VALUE ? 1 : 0);
+                copyBits(x, b, one, 0, 1);
+            }
+        o = v_resize(x, w, sv.isSigned() && w > sw);
+        return true;
+    };
+    Val r = make(0, 0, W);
+    if (t.isUnpackedUnion()) {   // the active member, in the low bits as a write to it leaves them
+        if (!cv.isUnion() || !cv.unionVal()->activeMember) return false;
+        size_t k = *cv.unionVal()->activeMember, i = 0;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+            if (i++ != k) continue;
+            const Type& ft = f.getType().getCanonicalType();
+            Val p;
+            if (!leaf(ft, cv.unionVal()->value, uMemberW(ft), p)) return false;
+            copyBits(r, 0, p, 0, uMemberW(ft));
+        }
+        out = finish(r);
+        return true;
+    }
+    if (!cv.isUnpacked()) return false;
+    auto els = cv.elements();
+    if (t.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+        const Type& et = t.as<FixedSizeUnpackedArrayType>().elementType.getCanonicalType();
+        int ew = uMemberW(et), top = W;
+        for (const auto& v : els) {
+            top -= ew;
+            Val p;
+            if (top < 0 || !leaf(et, v, ew, p)) return false;
+            copyBits(r, top, p, 0, ew);
+        }
+        out = finish(r);
+        return true;
+    }
+    int top = W;
+    size_t i = 0;
+    for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+        if (i >= els.size()) return false;
+        const Type& ft = f.getType().getCanonicalType();
+        int w = uMemberW(ft);
+        top -= w;
+        Val p;
+        if (!leaf(ft, els[i++], w, p)) return false;
+        copyBits(r, top, p, 0, w);
+    }
+    out = finish(r);
+    return true;
+}
 inline bool memberInitVal(const slang::ast::FieldSymbol& f, int w, Val& out) {
     using namespace slang::ast;
     const Expression* init = f.getInitializer();
