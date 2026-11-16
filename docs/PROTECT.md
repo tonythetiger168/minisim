@@ -397,6 +397,19 @@ Vivado refused the rest:
 - version 3. Vivado 2026.1 does not take the `end_protected="..."`
   signature.
 
+A second round of nine hand-built envelopes showed:
+
+- `AES128-CBC` and `BASE64` in upper case are accepted, and so is a
+  version 1 envelope whose key sits in a `begin_toolblock` /
+  `end_toolblock = ""`.
+- Vivado's version 1 parser lists `digest_method` as an unknown keyword, and
+  it wants `end_protected` straight after the `data_block`. It has no
+  clause 34 digest at all, so this is not a layout we could change.
+- Version 2 needs `rights_digest_method` and a value on `end_toolblock`. The
+  value is computed as IEEE 1735-2014 defines it, and Vivado reports the
+  envelope as modified when the value is left empty. minisim does not write
+  version 2.
+
 So to encrypt for Vivado, write a clause 34 envelope with no digest and no
 `key_public_key`: `EncryptOptions` with `digestMethod = ""` and
 `publicKey = false`. That envelope carries no integrity check, so msim warns
