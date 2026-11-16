@@ -119,5 +119,6 @@ cat iv1.bin ct1.bin > data1.bin
 } > v1.svp
 "$MSIM" -keyfile Acme:acme-1=acme.pem v1.svp "$T/interop_tb.sv" > log 2>&1 || fail "the clause 34 envelope did not run"
 want "tb: y=55"
+grep -qF "no digest_block" log || fail "no warning for a clause 34 data_block without a digest"
 
 echo "ok    msim opens IEEE 1735 and clause 34 envelopes it did not make"

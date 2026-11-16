@@ -433,6 +433,10 @@ Spec references are IEEE 1800-2023 clauses.
   by default, `-traverse_macros`, `-expand_to_bits`, transitive searches that
   stop at leaf cells and macros, `-leaf_only` / `-non_leaf` for every object
   type, and the glob forms of 6.33.2 (`[a-z]`, `\x`, `{a,b,c}`).
+- msim: a changed IEEE 1800 clause 34 `data_block` gives one message,
+  whether its padding or its digest fails, after the same work, so msim
+  cannot serve as a padding oracle (CCS 2017, CERT VU#739007). An envelope
+  whose data has no digest opens with a warning.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
