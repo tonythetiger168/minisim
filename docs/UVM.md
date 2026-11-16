@@ -41,6 +41,16 @@ register layer has no backdoor. It is the same as
 msim +incdir+$UVM_HOME/src $UVM_HOME/src/uvm_pkg.sv my_tb.sv -top top +define+UVM_NO_DPI
 ```
 
+## UVM 1.2
+
+The Accellera UVM 1.2 release (before IEEE 1800.2) works the same way:
+point `-uvmhome` (or `$UVM_HOME`) at it. Its C code has no HDL polling
+interface, which minisim's DPI build leaves out when the file is missing.
+`hello`, `hello_nodpi`, `agent`, `dpi` and `reg_sequences` run against it
+as the `uvm12/*` tests when CMake is configured with
+`-DUVM12_HOME=<UVM 1.2 release>`. Tests that use 1800.2-2020 additions
+(`uvm_time`, `uvm_reg_file::type_id`, `get_core_state`) need uvm-core.
+
 ## What is covered
 
 `tests/uvm` holds the UVM regression, run in CI against uvm-core 2020.3.1

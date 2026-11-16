@@ -463,6 +463,20 @@ if(MINISIM_WITH_SLANG)
     set_tests_properties(mdebug_uvm_tr PROPERTIES LABELS "uvm")
   endif()
 
+  # The same tests against Accellera UVM 1.2 when -DUVM12_HOME=<UVM 1.2
+  # release> is given. Only the tests that use no 1800.2-2020 API, and whose
+  # expected output does not depend on the library's print format.
+  set(UVM12_HOME "$ENV{UVM12_HOME}" CACHE PATH "Accellera UVM 1.2 release for the UVM 1.2 tests")
+  if(UVM12_HOME AND EXISTS ${UVM12_HOME}/src/uvm_pkg.sv)
+    foreach(name hello hello_nodpi agent dpi reg_sequences)
+      add_test(NAME uvm12/${name}
+               COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DUVM_HOME=${UVM12_HOME}
+                       -DSV=${CMAKE_SOURCE_DIR}/tests/uvm/${name}.sv
+                       -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
+      set_tests_properties(uvm12/${name} PROPERTIES LABELS "uvm")
+    endforeach()
+  endif()
+
   # mini45's Verilog models against the functions in its Liberty files.
   add_test(NAME mini45_models
            COMMAND msim ${CMAKE_SOURCE_DIR}/lib/mini45/mini45.v ${CMAKE_SOURCE_DIR}/lib/mini45/mini45_tb.sv
