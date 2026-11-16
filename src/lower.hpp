@@ -10952,7 +10952,11 @@ inline DynObj Lowerer::dynShapeOf(const slang::ast::Type& t0) {
                 o.keyW = (int)kt.getBitWidth();
                 o.keySgn = kt.isSigned();
             } else if (kt.isIntegral()) { o.wideKey = true; o.keyW = (int)kt.getBitWidth(); o.keySgn = false; } else if (isHandleType(kt)) { o.keyW = 64; o.keySgn = false; }   // class key: by handle
-            else throw std::runtime_error("lower: unsupported associative array index type " + kt.toString());
+            else if ((kt.isUnpackedStruct() || kt.isUnpackedArray()) && uWidth(kt) > 0) {   // an unpacked struct or array key (7.8.5): its members as one vector
+                int w = uWidth(kt);
+                if (w <= 64) o.keyW = w; else { o.wideKey = true; o.keyW = w; }
+                o.keySgn = false;
+            } else throw std::runtime_error("lower: unsupported associative array index type " + kt.toString());
         } else { o.keyW = 64; o.keySgn = false; }   // [*]: integral keys, unsigned order
     } else {
         et = &t.as<DynamicArrayType>().elementType;
