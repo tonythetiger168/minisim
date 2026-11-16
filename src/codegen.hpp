@@ -3216,6 +3216,7 @@ private:
     const int scanCap_ = std::getenv("MSIM_SCANCAP") ? std::atoi(std::getenv("MSIM_SCANCAP")) : 7;
     std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
+    std::map<int, std::vector<int>> snap_;   // emitCycle: per domain process, the registers it reads from a snapshot (sorted)
     bool dAhead_ = false;        // emitCycle: a direct NBA some comb process reads (DAHEAD, see directNba)
     // Of those, the clocks themselves, and their own smaller cone (combConeK):
     // a clock edge runs only that. The others (a debug request, an enable
@@ -3767,7 +3768,7 @@ private:
         if (!std::getenv("MSIM_NODIRECT")) {
             const size_t ns = sigW_.size();
             std::vector<int> wproc(ns, -1), firstW(ns, -1);
-            std::vector<char> bad(ns, 0), inDom(procs.size(), 0), inByRank(procs.size(), 0);
+            std::vector<char> bad(ns, 0), inDom(procs.size(), 0), inByRank(procs.size(), 0), selfRd(ns, 0);
             for (int n : dom) inDom[n] = 1;
             for (int r : byRank) if (r >= 0) inByRank[r] = 1;
             const char* dbgW0 = std::getenv("MSIM_WHYDIRECT"); const bool dbgW = dbgW0 && *dbgW0 == '2';
@@ -3833,7 +3834,10 @@ private:
                         if (wproc[sg] != (int)p && p < armK_.size() && armK_[p] >= 0) return;
                         if (wproc[sg] != (int)p) { if (!bad[sg] && dbgD) std::fprintf(stderr, "WD other %s w=%d r=%zu %s rank=%d seq=%d dom=%d line=%d\n", sigName_[sg].c_str(), wproc[sg], p, procs[p].kind.c_str(), procs[p].combRank, (int)procs[p].seq, (int)inDom[p], procs[p].prog->code.empty() ? 0 : procs[p].prog->code[0].line); bad[sg] = 1; return; }
                         const int c = cidx[sg];
-                        if (!fwd || (win[pc][(size_t)c / 64] >> (c % 64) & 1)) { if (!bad[sg] && dbgD) std::fprintf(stderr, "WD self %s fwd=%d\n", sigName_[sg].c_str(), (int)fwd); bad[sg] = 1; }
+                        if (!fwd || (win[pc][(size_t)c / 64] >> (c % 64) & 1)) {
+                            if (!bad[sg] && !selfRd[sg] && dbgD) std::fprintf(stderr, "WD self %s fwd=%d\n", sigName_[sg].c_str(), (int)fwd);
+                            selfRd[sg] = 1;   // read after a write of its own: a snapshot (below), or the commit list
+                        }
                     };
                     std::function<void(const E&)> f = [&](const E& x) {
                         if (!x) return;
@@ -3860,14 +3864,29 @@ private:
                 }
                 for (int sg : mine) cidx[sg] = -1;
             }
-            size_t nd = 0, nc = 0;
+            // A register its writer reads after writing it is stored at the
+            // NBA too, when every read of it in that process can take a copy
+            // made as the process starts (snap_): the process sees the old
+            // value, as it would through the commit. Only in a process whose
+            // reads are all in its generated text (NBAs, jumps, temporaries).
+            static const bool noSnap = std::getenv("MSIM_NOSNAP") != nullptr;
+            std::vector<char> plain(procs.size(), 0);
+            for (int n : dom) {
+                bool ok = true;
+                for (auto& in : procs[n].prog->code)
+                    ok &= in.k == IK::Nba || in.k == IK::Jmp || in.k == IK::JmpIfNot || in.k == IK::WaitEdge || (in.k == IK::Assign && in.tmp);
+                plain[n] = ok;
+            }
+            size_t nd = 0, nc = 0, nsnap = 0;
             for (size_t sg = 0; sg < ns; sg++)
-                if (wproc[sg] >= 0 && !bad[sg] && isPriv((int)sg) && sigW_[sg] <= 64 && !clock_[sg] && !sigNet_[sg]) {
+                if (wproc[sg] >= 0 && !bad[sg] && isPriv((int)sg) && sigW_[sg] <= 64 && !clock_[sg] && !sigNet_[sg] &&
+                    (!selfRd[sg] || (!noSnap && plain[wproc[sg]]))) {
                     direct[sg] = 1;
                     nd++;
+                    if (selfRd[sg]) { snap_[wproc[sg]].push_back((int)sg); nsnap++; }
                     if (combRead[sg]) { dAhead_ = true; nc++; }
                 }
-            if (std::getenv("MSIM_WHYDIRECT")) std::fprintf(stderr, "direct NBAs: %zu signals, %zu read by comb\n", nd, nc);
+            if (std::getenv("MSIM_WHYDIRECT")) std::fprintf(stderr, "direct NBAs: %zu signals, %zu read by comb, %zu through a snapshot\n", nd, nc, nsnap);
         }
         std::vector<std::string> dsB4(procs.size()), dsB2(procs.size());
         std::vector<char> dsTmp(procs.size());
@@ -3875,10 +3894,37 @@ private:
             const Prog& p = *procs[n].prog;
             size_t end = p.code.size() - 1;
             auto L = [](size_t pc) { return "d_" + std::to_string(pc); };
-            std::ostringstream fns, fns2;   // the bodies; shared or emitted below
+            std::ostringstream allF, allF2;   // the bodies; shared or emitted below
             bool hasTmp = false;
+            // Snapshots (snap_): the process reads LS_<k>, a copy of the
+            // register made as it starts; its NBAs store the register itself.
+            const std::vector<int>* sn = snap_.count(n) ? &snap_[n] : nullptr;
+            auto snapRen = [&](const std::string& t) {
+                if (!sn) return t;
+                std::string o;
+                size_t last = 0;
+                refScan(t, [&](size_t i0, size_t, size_t e, long long v, int kind) {
+                    if (kind != 1) return;
+                    auto it = std::lower_bound(sn->begin(), sn->end(), (int)v);
+                    if (it == sn->end() || *it != (int)v) return;
+                    o.append(t, last, i0 - last);
+                    o += "LS_" + std::to_string(it - sn->begin());
+                    last = e;
+                });
+                o.append(t, last, std::string::npos);
+                return o;
+            };
+            if (sn)
+                for (size_t k = 0; k < sn->size(); k++) {
+                    const std::string ks = std::to_string(k), ps = "P" + std::to_string((*sn)[k]);
+                    allF << " const auto LS_" << ks << " = " << ps << ";";
+                    allF2 << " const PSig LS_" << ks << "{" << ps << ".v, 0, 0};";   // the 2-state body: known bits
+                }
+            if (sn) { allF << "\n"; allF2 << "\n"; }
             for (size_t pc = 1; pc < end; pc++) {
                 const Instr& i = p.code[pc];
+                std::ostringstream fns, fns2;
+                bool renamed = false;   // the text below already reads the snapshots
                 fns << L(pc) << ":";
                 fns2 << L(pc) << ":";
                 noteRefs(i.e);
@@ -3896,8 +3942,11 @@ private:
                         if (i.hi < 0 && direct[i.sig]) {   // stored here: nobody reads it before the commit (above)
                             std::string g, u, sl;
                             const std::string slow = pw(i.sig, "@V@") + " if (P" + std::to_string(i.sig) + ".x | P" + std::to_string(i.sig) + ".z) pclean = false;";
-                            auto at = [&](const std::string& v) { std::string t = slow; t.replace(t.find("@V@"), 3, v); return t; };
+                            auto at = [&](const std::string& v) { std::string t = slow; t.replace(t.find("@V@"), 3, snapRen(v)); return t; };
+                            renamed = sn != nullptr;
                             if (i.hi < 0 && split(i.e, g, u, sl)) {
+                                g = snapRen(g);
+                                u = snapRen(u);
                                 fns2 << " " << pwv(i.sig, u) << "\n";
                                 if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
                                 else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(at(sl)) << "\n";
@@ -4015,11 +4064,13 @@ private:
                     }
                     default: throw CodegenUnsupported("instruction in a clocked process");
                 }
+                if (renamed || !sn) { allF << fns.str(); allF2 << fns2.str(); }
+                else { allF << snapRen(fns.str()); allF2 << snapRen(fns2.str()); }
             }
-            fns << L(end) << ": return;\n";
-            fns2 << L(end) << ": return;\n";
-            dsB4[n] = fns.str();
-            dsB2[n] = fns2.str();
+            allF << L(end) << ": return;\n";
+            allF2 << L(end) << ": return;\n";
+            dsB4[n] = allF.str();
+            dsB2[n] = allF2.str();
             dsTmp[n] = hasTmp;
         }
         emitDomainFns(fns, fns2, dom, procs, dsB4, dsB2, dsTmp);
@@ -4508,6 +4559,16 @@ private:
                 islGroup[i] = std::min(G - 1, tot > 0 ? (int)(acc * G / tot) : (int)((int64_t)i * G / nIsl));
                 acc += wt[i];
             }
+            // An island heavier than 1/G of the work leaves the groups it
+            // spans empty (16 PicoRV32 cores: 48 of 64), each still a call
+            // and a commit per pass: number the used ones only.
+            std::vector<int> used(G, -1);
+            int k = 0;
+            for (int i = 0; i < nIsl; i++) {
+                if (used[islGroup[i]] < 0) used[islGroup[i]] = k++;
+                islGroup[i] = used[islGroup[i]];
+            }
+            G = std::max(k, 1);
         }
         auto groupOf = [&](int sig) { return islGroup[islandOf(sig)]; };
         if (par) {
