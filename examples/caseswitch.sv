@@ -7,7 +7,7 @@
 // process.
 module csdec(input clk, input [31:0] ins, output reg [7:0] y = 0);
   reg [7:0] a, b, c, d;
-  always @* begin
+  always_comb begin
     case (ins[6:0])
       7'h33, 7'h3b: a = 8'd1;
       7'h13: a = 8'd2;
