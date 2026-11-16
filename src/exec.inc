@@ -125,22 +125,26 @@ static bool memView(Instr& i) {
     i.arr = view;
     return true;
 }
+// A $readmem / $writemem target that is a dynamic array, queue or
+// associative array (21.4.1, 21.5.3): its store entry, or null.
+static DynObj* memDyn(const Instr& i) {
+    if (i.dyn < 0) return nullptr;
+    return &dynStore()[R(i.dyn)];
+}
 static void writeMem(const Instr& i) {
     const ArrShape& a = *i.arr;
+    DynObj* dobj = memDyn(i);
     auto [l, r] = a.dims[0];
     int64_t lowA = std::min(l, r), highA = std::max(l, r);
+    if (dobj) { lowA = 0; highA = dobj->kind == 2 ? INT64_MAX : (int64_t)dobj->vec.size() - 1; }
     int64_t start = lowA, finish = highA;
-    if (i.args.size() > 0) { Val v = eval(i.args[0], rd); if (!v.x) start = v_to_i64(v); }
+    bool haveStart = false;
+    if (i.args.size() > 0) { Val v = eval(i.args[0], rd); if (!v.x) { start = v_to_i64(v); haveStart = true; } }
     if (i.args.size() > 1) { Val v = eval(i.args[1], rd); if (!v.x) finish = v_to_i64(v); }
     std::ofstream out(i.fmt);
     if (!out) { std::cerr << "$writemem: cannot open " << i.fmt << "\n"; return; }
     int64_t step = finish < start ? -1 : 1;
-    const int64_t sub = memSub(a);
-    for (int64_t ad = start;; ad += step) {
-      for (int64_t k = 0; k < sub; k++) {
-        int64_t off = a.offset(memIdx(a, ad, k));
-        if (off >= 0) {
-            Val v = S.get(R(a.base) + (int)off);
+    auto word = [&](Val v) {
             v.sgn = false;
             int bits = i.hex ? 4 : 1;
             int n = (a.elemW + bits - 1) / bits;
@@ -156,7 +160,45 @@ static void writeMem(const Instr& i) {
                 s[n - 1 - d] = zs == cnt ? 'z' : (xs || zs) ? 'x' : "0123456789abcdef"[val];
             }
             out << s << "\n";
+    };
+    if (dobj && dobj->kind == 2) {   // an associative array: its elements in index order, each run after an @address (21.5.3)
+        int64_t lo = haveStart ? std::min(start, finish) : INT64_MIN, hi = haveStart ? std::max(start, finish) : INT64_MAX;
+        std::vector<std::pair<int64_t, Val>> els;
+        for (auto& [k, v] : dobj->map) {
+            Val kv = dobj->keyVal(k);
+            if (kv.x) continue;
+            int64_t ad = v_to_i64(kv);
+            if (ad >= lo && ad <= hi) els.push_back({ad, v});
         }
+        if (step < 0) std::reverse(els.begin(), els.end());
+        bool first = true;
+        int64_t next = 0;
+        for (auto& [ad, v] : els) {
+            if (first || ad != next) {
+                char buf[32];
+                snprintf(buf, sizeof buf, "@%llx", (unsigned long long)ad);
+                out << buf << "\n";
+            }
+            word(v);
+            first = false;
+            next = ad + step;
+        }
+        return;
+    }
+    if (dobj) {   // a dynamic array or queue: no addresses
+        int64_t n = (int64_t)dobj->vec.size();
+        if (!n) return;
+        for (int64_t ad = start;; ad += step) {
+            if (ad >= 0 && ad < n) word(dobj->vec[(size_t)ad]);
+            if (ad == finish) break;
+        }
+        return;
+    }
+    const int64_t sub = memSub(a);
+    for (int64_t ad = start;; ad += step) {
+      for (int64_t k = 0; k < sub; k++) {
+        int64_t off = a.offset(memIdx(a, ad, k));
+        if (off >= 0) word(S.get(R(a.base) + (int)off));
       }
         if (ad == finish) break;
     }
@@ -278,11 +320,28 @@ static void freadMem(const Instr& i) {
     S.set(i.dres, make((uint64_t)total, 0, 32, 0, true));
 }
 
+inline void dynBump(int sig);
 static void readMem(const Instr& i) {
     if (i.pw == 1) { freadMem(i); return; }
     const ArrShape& a = *i.arr;
+    DynObj* dobj = memDyn(i);
     auto [l, r] = a.dims[0];
     int64_t lowA = std::min(l, r), highA = std::max(l, r);
+    // A dynamic array or queue keeps its size; an associative array gets
+    // an element at each address loaded (21.4.1).
+    if (dobj) { lowA = 0; highA = dobj->kind == 2 ? INT64_MAX : (int64_t)dobj->vec.size() - 1; }
+    auto put = [&](int64_t ad, int64_t k, Val v) {
+        if (dobj) {
+            if (dobj->kind == 2) dobj->map[dobj->key(make((uint64_t)ad, 0, 64, 0, true))] = v;
+            else if (ad >= 0 && ad < (int64_t)dobj->vec.size()) dobj->vec[(size_t)ad] = v;
+            else return false;
+            return true;
+        }
+        int64_t off = a.offset(memIdx(a, ad, k));
+        if (off < 0) return false;
+        S.set(R(a.base) + (int)off, v);
+        return true;
+    };
     int64_t start = lowA, finish = highA;
     bool haveFinish = false;
     if (i.args.size() > 0) { Val v = eval(i.args[0], rd); if (!v.x) start = v_to_i64(v); }
@@ -298,7 +357,7 @@ static void readMem(const Instr& i) {
         text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     }
     int64_t addr = start, k = 0;
-    const int64_t sub = memSub(a);
+    const int64_t sub = dobj ? 1 : memSub(a);
     int bits = i.hex ? 4 : 1;
     int64_t words = 0;
     bool sawAddr = false;
@@ -342,13 +401,11 @@ static void readMem(const Instr& i) {
                 acc = v_or(v_shl(acc, sh), dig);
             }
             if (!inRange(addr)) break;
-            int64_t off = a.offset(memIdx(a, addr, k));
-            if (off < 0) break;
             if (a.twoState) {
                 acc.v &= ~acc.x; acc.x = acc.z = 0;
                 for (auto& h : acc.hi) { h.v &= ~h.x; h.x = h.z = 0; }
             }
-            S.set(R(a.base) + (int)off, acc);
+            if (!put(addr, k, acc)) break;
             if (++k == sub) { k = 0; addr += step; }
             words++;
             continue;
@@ -365,16 +422,18 @@ static void readMem(const Instr& i) {
             else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
         }
         if (!inRange(addr)) break;
-        int64_t off = a.offset(memIdx(a, addr, k));
-        if (off < 0) break;
         if (a.twoState) { v &= ~x; x = z = 0; }
-        S.set(R(a.base) + (int)off, make(v, x, a.elemW, z));
+        Val wv = make(v, x, a.elemW, z);
+        if (dobj) wv.sgn = a.sgn;
+        if (!put(addr, k, wv)) break;
         if (++k == sub) { k = 0; addr += step; }
         words++;
     }
     // A file with no @address whose word count differs from the range warns
     // (21.4): the range given by start and finish addresses, or, with no
     // finish address, a file with more words than the memory has room for.
+    if (dobj) dynBump(R(i.dyn));
+    if (dobj && dobj->kind == 2) return;   // no size to compare with
     int64_t range = ((step > 0 ? finish - start : start - finish) + 1) * sub;
     if (!sawAddr && (haveFinish ? words != range : words > range))
         std::cerr << "$readmem: warning: " << i.fmt << " has " << words << " words for a range of " << range << "\n";
@@ -1698,8 +1757,13 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 pc++;
                 if (i.hi == PO_STATUS) S.set(R(i.sig), make((uint64_t)procStatus(c, ctl.get()), 0, 32, 0, true));
                 else if (i.hi == PO_KILL) {
+                    // A process that already ended still takes its live
+                    // descendants down (9.7).
                     if (!c->ended) {
                         for (auto& t : procTable()) if (t.get() == c) { procKill(t); break; }
+                    } else {
+                        auto kids = c->kids;
+                        for (auto& k : kids) procKill(k);
                     }
                 } else if (i.hi == PO_AWAIT) {
                     if (c == ctl.get()) relFail("a process awaiting itself (9.7)");
