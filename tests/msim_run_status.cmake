@@ -1,0 +1,73 @@
+# msim's exit status and -result verdict (README, "Exit status and run
+# verdict"): -maxtime, -maxtime-status, -uvm-error-status, $fatal, compile errors.
+set(dir ${CMAKE_CURRENT_BINARY_DIR}/msim_run_status)
+file(MAKE_DIRECTORY ${dir})
+set(T ${SRC}/tests/run_status)
+
+function(run name expect_rc)
+  execute_process(COMMAND ${MSIM} ${ARGN} -result ${dir}/${name}.json
+                  WORKING_DIRECTORY ${dir} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+  if(NOT rc EQUAL expect_rc)
+    message(FATAL_ERROR "${name}: exit status ${rc}, expected ${expect_rc}\n${out}\n${err}")
+  endif()
+  file(READ ${dir}/${name}.json j)
+  set(json "${j}" PARENT_SCOPE)
+  set(stderr "${err}" PARENT_SCOPE)
+endfunction()
+# want(name key... value): the value at that path of the JSON
+function(want name)
+  set(keys ${ARGN})
+  list(POP_BACK keys value)
+  string(JSON v ERROR_VARIABLE e GET "${json}" ${keys})
+  if(e OR NOT "${v}" STREQUAL "${value}")
+    message(FATAL_ERROR "${name}: ${keys} is '${v}', expected '${value}' ${e}\n${json}")
+  endif()
+endfunction()
+
+# -maxtime stops a clock that never ends: a note on stderr, and status 4
+# with -maxtime-status
+run(maxtime0 0 ${SRC}/examples/cli/spin.sv -maxtime 25)
+want(maxtime0 status timeout)
+run(maxtime 4 ${SRC}/examples/cli/spin.sv -maxtime 25 -maxtime-status)
+want(maxtime status timeout)
+want(maxtime maxtime_reached ON)
+want(maxtime end_time 25ns)
+if(NOT stderr MATCHES "msim: stopped by -maxtime at time 25ns with events still pending")
+  message(FATAL_ERROR "maxtime: no note on stderr: ${stderr}")
+endif()
+# a run that ends before the limit is not a timeout
+run(clean 0 ${T}/clean.sv -maxtime 100 -maxtime-status)
+want(clean status pass)
+want(clean maxtime_reached OFF)
+want(clean end_time 7ns)
+want(clean uvm error 0)
+# UVM messages: status 0 unless -uvm-error-status
+run(uvm0 0 ${T}/uvm_msgs.sv)
+want(uvm0 status uvm_error)
+want(uvm0 uvm info 1)
+want(uvm0 uvm error 1)
+want(uvm0 uvm summary_seen OFF)
+want(uvm0 finish_called ON)
+run(uvm3 3 ${T}/uvm_msgs.sv -uvm-error-status)
+want(uvm3 exit_status 3)
+# the report summary wins over the messages seen
+run(summary 0 ${T}/uvm_summary.sv -uvm-error-status)
+want(summary status pass)
+want(summary uvm error 0)
+want(summary uvm warning 1)
+want(summary uvm info 3)
+want(summary uvm summary_seen ON)
+# $fatal
+run(fatal 1 ${T}/fatal.sv -uvm-error-status)
+want(fatal status fatal)
+want(fatal fatal ON)
+want(fatal end_time 3ns)
+# a design that does not compile still gets a verdict
+run(bad 1 ${T}/bad.sv)
+want(bad status compile_error)
+want(bad compile_error ON)
+want(bad simulated OFF)
+string(JSON t TYPE "${json}" uvm)
+if(NOT t STREQUAL "NULL")
+  message(FATAL_ERROR "bad: uvm should be null\n${json}")
+endif()

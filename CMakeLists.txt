@@ -212,7 +212,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_notimingcheck COMMAND msim +notimingcheck ${CMAKE_SOURCE_DIR}/tests/spec/31.3-setup-hold.sv)
   set_tests_properties(msim_notimingcheck PROPERTIES PASS_REGULAR_EXPRESSION "^notifier=x\n$")
   add_test(NAME msim_maxtime COMMAND msim ${CLI}/spin.sv -maxtime 25)
-  set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION "^tick\ntick\ntick\n$")
+  set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION
+                       "^tick\ntick\ntick\nmsim: stopped by -maxtime at time 25ns with events still pending\n$")
+  add_test(NAME msim_run_status
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_run_status.cmake)
   add_test(NAME msim_vcd
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)
@@ -461,6 +465,20 @@ if(MINISIM_WITH_SLANG)
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_uvm_tr
                      -P ${CMAKE_SOURCE_DIR}/tests/mdebug_uvm_tr.cmake)
     set_tests_properties(mdebug_uvm_tr PROPERTIES LABELS "uvm")
+  endif()
+
+  # The same tests against Accellera UVM 1.2 when -DUVM12_HOME=<UVM 1.2
+  # release> is given. Only the tests that use no 1800.2-2020 API, and whose
+  # expected output does not depend on the library's print format.
+  set(UVM12_HOME "$ENV{UVM12_HOME}" CACHE PATH "Accellera UVM 1.2 release for the UVM 1.2 tests")
+  if(UVM12_HOME AND EXISTS ${UVM12_HOME}/src/uvm_pkg.sv)
+    foreach(name hello hello_nodpi agent dpi reg_sequences)
+      add_test(NAME uvm12/${name}
+               COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DUVM_HOME=${UVM12_HOME}
+                       -DSV=${CMAKE_SOURCE_DIR}/tests/uvm/${name}.sv
+                       -P ${CMAKE_SOURCE_DIR}/tests/uvm/run_uvm.cmake)
+      set_tests_properties(uvm12/${name} PROPERTIES LABELS "uvm")
+    endforeach()
   endif()
 
   # mini45's Verilog models against the functions in its Liberty files.
