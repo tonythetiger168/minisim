@@ -15247,7 +15247,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             if (any) sp->vars.push_back(std::move(rv));
                             continue;
                         }
-                        if (isHandleType(*et)) {
+                        if (et->isUnpackedStruct() && rv.dyn) {   // a container of structs (18.4) whose members are all rand bits
+                            std::vector<RandVar::Part> parts;
+                            std::vector<std::tuple<int, int, const Type*>> enums;
+                            int w = uWidth(*et);
+                            bool all = w > 0 && randParts(*et, parts, enums, w) && enums.empty();
+                            for (auto& pt : parts) all = all && pt.rand && !pt.randc;
+                            if (!all) Lowerer::unsupported("rand container of unpacked structs with a member that is not rand bits");
+                            rv.w = w;
+                        } else if (isHandleType(*et)) {
                             rv.obj = true; rv.w = 64;   // a dynamic array or queue of them too: each object
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
