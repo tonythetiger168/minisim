@@ -566,9 +566,56 @@ can make X from known inputs. `-no-2state` turns the fast path off, and
 `ctest -R msim_fuzz` compares it with the interpreter on random expressions
 (`tests/fuzz/gen_expr.py`) with X and Z inputs.
 
-`$display` output goes to stdout and diagnostics to stderr. The exit status is
-0 when the simulation ran, 1 on a compile or lowering error, and 2 on a bad
-command line.
+`$display` output goes to stdout and diagnostics to stderr.
+
+#### Exit status and run verdict
+
+| Exit status | Meaning |
+|---|---|
+| 0 | the simulation ran and ended normally, by `$finish` or with no events left |
+| 1 | a compile, elaboration or lowering error, or `$fatal` (its finish number decides nothing; the status is 1) |
+| 2 | a bad command line |
+| 3 | with `-uvm-error-status`: the run reported a `UVM_ERROR` or `UVM_FATAL` |
+| 4 | with `-maxtime-status`: `-maxtime` stopped the run while events were still pending |
+
+When `-maxtime` stops a run that still has events pending, msim says so on
+stderr (`msim: stopped by -maxtime at time 25ns with events still pending`)
+whether or not `-maxtime-status` is given; without it the status stays 0.
+
+UVM ends a run with `uvm_fatal` or a report summary by calling `$finish`, so
+without `-uvm-error-status` such a run still exits 0. msim counts the UVM
+messages on its own standard output; when the report server prints its
+summary (`UVM_ERROR :    2`), the summary's numbers win, since a report
+catcher may demote or drop messages.
+
+`-result run.json` writes the verdict as JSON, also when the design does
+not compile:
+
+```json
+{
+  "tool": "msim",
+  "version": "0.1.0",
+  "status": "uvm_error",
+  "exit_status": 3,
+  "compile_error": false,
+  "simulated": true,
+  "fatal": false,
+  "finish_called": true,
+  "maxtime_reached": false,
+  "end_time": "1250ns",
+  "uvm": {"info": 14, "warning": 0, "error": 1, "fatal": 0, "summary_seen": true}
+}
+```
+
+`status` is one of `pass`, `compile_error`, `usage_error`, `fatal`
+(`$fatal`), `uvm_error` (any `UVM_ERROR` or `UVM_FATAL`, whether or not
+`-uvm-error-status` is given), `timeout` (`-maxtime`) or `error` (any other
+non-zero status, such as a waveform file that cannot be written);
+`timeout` does not need `-maxtime-status`. A
+wall-clock limit is not msim's: run it under `timeout 300 msim ...` (status
+124) or use `mregress`, which records it. With `-compile` the compiled
+program writes its own output, so `uvm` is `null`, and the `-maxtime` note,
+`maxtime_reached` and status 4 do not apply.
 
 slang is pinned to release **v12.1**. Mimalloc is off by default (`-mno-outline` is not a g++ flag); pass `-DSLANG_USE_MIMALLOC=ON` to turn it back on.
 

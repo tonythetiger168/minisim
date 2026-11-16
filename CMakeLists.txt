@@ -212,7 +212,11 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_notimingcheck COMMAND msim +notimingcheck ${CMAKE_SOURCE_DIR}/tests/spec/31.3-setup-hold.sv)
   set_tests_properties(msim_notimingcheck PROPERTIES PASS_REGULAR_EXPRESSION "^notifier=x\n$")
   add_test(NAME msim_maxtime COMMAND msim ${CLI}/spin.sv -maxtime 25)
-  set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION "^tick\ntick\ntick\n$")
+  set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION
+                       "^tick\ntick\ntick\nmsim: stopped by -maxtime at time 25ns with events still pending\n$")
+  add_test(NAME msim_run_status
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_run_status.cmake)
   add_test(NAME msim_vcd
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_vcd.cmake)

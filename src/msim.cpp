@@ -52,6 +52,11 @@
 //                    activity of its cells, an RTL one keeps only its mapped
 //                    points (repeatable)
 //   -maxtime <n>     stop after simulation time n: time-precision ticks, or with a unit (3ms, 500ns) (default: run until no events or $finish)
+//                    when the limit ends a run with events pending: a note on stderr
+//   -maxtime-status  exit status 4 when -maxtime ended the run that way
+//   -uvm-error-status exit status 3 when the run reports a UVM_ERROR or UVM_FATAL
+//   -result <file>   write the run's verdict as JSON (status, exit status, compile error,
+//                    $fatal, -maxtime, UVM counts); see README.md "Exit status and run verdict"
 //   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
 //   -seed <n>        seed for $urandom / $urandom_range (also +ntb_random_seed=<n>)
@@ -198,6 +203,7 @@
 #include "objview.inc"
 #include "statview.inc"
 #include "xrun.inc"
+#include "runresult.inc"
 #include "mstep.inc"
 #include "vhdl/front.hpp"
 
@@ -2792,7 +2798,9 @@ static void usage() {
                  "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
                  "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n (ticks, or with a unit: 3ms)\n"
-                 "  -i             interactive: run, step, stop on a signal, print (signals and class objects),\n"
+                 "  -maxtime-status  exit status 4 when -maxtime ends a run with events pending\n"
+                 "  -uvm-error-status  exit status 3 when UVM_ERROR or UVM_FATAL is reported\n"
+                 "  -result <file> write the run's verdict as JSON\n"                 "  -i             interactive: run, step, stop on a signal, print (signals and class objects),\n"
                  "                 force, release, deposit; commands on the standard input (help lists them)\n"
                  "  -do <file>     the same, with the commands from a file; then the run goes on to its end\n"
                  "  -compile       generate C++, build it (<dir>/simv) and run it; works with -cov,\n"
@@ -2826,7 +2834,10 @@ static void usage() {
                  "  --help-slang   list every front-end option\n";
 }
 
-int main(int argc, char** argv) {
+static int msimMain(int argc, char** argv);
+int main(int argc, char** argv) { return runres::finish(msimMain(argc, argv)); }
+
+static int msimMain(int argc, char** argv) {
     annexStartup(argc, argv);   // $reset / $restart run msim again (Annex D)
     std::atexit([] { g_framesDead = true; });   // before the kernel's waiting processes are destroyed
     for (int sg : {SIGSEGV, SIGABRT})
@@ -3153,6 +3164,9 @@ int main(int argc, char** argv) {
             catch (...) { std::cerr << "msim: bad -maxtime " << n << " (a number, or with fs, ps, ns, us, ms or s)\n"; return 2; }
             continue;
         }
+        if (a == "-result") { runres::R().path = next("a file name"); continue; }   // the run's verdict as JSON
+        if (a == "-uvm-error-status") { runres::R().uvmStatus = true; continue; }   // exit 3 on UVM_ERROR / UVM_FATAL
+        if (a == "-maxtime-status") { runres::R().limitStatus = true; continue; }   // exit 4 when -maxtime ends the run
         if (a == "-seed") {
             std::string n = next("a seed");
             try { seed = std::stoull(n); }
@@ -3764,6 +3778,8 @@ int main(int argc, char** argv) {
                 seqShape(lowered.procs[i].prog, plC.ev[i], true))
                 plC.seq[i] = 1;
     if (compiled) {
+        runres::R().phase = 1;   // the compiled program writes its own output: no UVM counts, no -maxtime check
+        runres::R().compiledMode = true;
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, plC, threads, staticPart, twoState, cycle,
                              seed, covPath);
         if (st >= 0) {
@@ -3962,11 +3978,28 @@ int main(int argc, char** argv) {
             if (!df) { std::cerr << "msim: cannot read " << doPath << "\n"; return 2; }
             ses.loop(df);
         }
-    } else S.run(maxTime);
+    } else {
+        runres::scanStdout();
+        runres::R().phase = 1;
+        S.run(maxTime);
+        if (maxTime != ~0ULL && !S.finished && !S.wheel.empty()) {   // the limit, not the design, ended the run
+            runres::R().limitHit = true;
+            std::cout.flush();
+            std::cerr << "msim: stopped by -maxtime at time " << runres::timeText(S.now, S.timescale)
+                      << " with events still pending\n";
+        }
+    }
     std::vector<Task> finals = concEnd();   // strong obligations still pending fail (16.12.21)
     for (auto& pr : lowered.finals) finals.push_back(process(&pr.prog));
     S.runFinal(finals);
     if (vpi::st().active) vpi::end();   // cbEndOfSimulation
+    {
+        auto& rr = runres::R();
+        rr.phase = 2;
+        rr.fatalStatus = S.exitCode;
+        rr.finishCalled = S.finished;
+        rr.endTime = runres::timeText(S.now, S.timescale);
+    }
     std::cout.flush();
     if (g_cov && !writeCoverage(covPath, lowered, S.vcdTop)) {
         std::cerr << "msim: cannot write " << covPath << "\n";
