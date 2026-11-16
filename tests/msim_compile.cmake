@@ -65,6 +65,8 @@ set(CASES
   "examples/parpub.sv"
   "examples/cdly.sv"
   "examples/partchain.sv"
+  "examples/snapnba.sv"
+  "-x-assign 0 -x-initial 0 examples/snapnba.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
   "examples/islands.sv"
