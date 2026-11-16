@@ -8686,6 +8686,32 @@ struct Lowerer {
             if (mem.kind == ExpressionKind::NamedValue) msym = &mem.as<NamedValueExpression>().symbol;
             else if (mem.kind == ExpressionKind::ArbitrarySymbol) msym = mem.as<ArbitrarySymbolExpression>().symbol;
             if (!msym) unsupported("$readmem target that is not a memory");
+            if (isDynType(*mem.type) && idx.empty() && !slice) {   // a dynamic array, queue or associative array (21.4.1, 21.5.3)
+                const Type& mt = mem.type->getCanonicalType();
+                const Type& et = mt.getArrayElementType()->getCanonicalType();
+                if (!et.isIntegral()) unsupported("$readmem / $writemem of a container of non-integral elements");
+                if (mt.kind == SymbolKind::AssociativeArrayType) {
+                    const Type* kt = mt.as<AssociativeArrayType>().indexType;
+                    if (kt && !kt->isIntegral()) unsupported("$readmem / $writemem of an associative array with a non-integral index");
+                }
+                int d = dynSig(mem);
+                if (d < 0) unsupported("$readmem target");
+                auto shape = std::make_shared<ArrShape>();
+                shape->dims.push_back({0, 0});
+                shape->count = 1;
+                shape->elemW = (int)et.getBitWidth();
+                shape->sgn = et.isSigned();
+                shape->twoState = !et.isFourState();
+                Instr i; i.k = n[1] == 'r' ? IK::ReadMem : IK::WriteMem;
+                if (fname) i.fmt = *fname;
+                else i.e = strOf(*args[0]);
+                i.arr = shape;
+                i.dyn = d;
+                i.hex = n.ends_with('h');
+                for (size_t a = 2; a < args.size() && a < 4; a++) i.args.push_back(expr(*args[a]));
+                prog.emit(i);
+                return;
+            }
             auto ap = arrFind(msym);
             if (!ap) unsupported("$readmem target that is not an unpacked array");
             if (ap->dynElem) unsupported("$readmem into an array of containers");
