@@ -310,6 +310,10 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fuzz.cmake)
+    add_test(NAME msim_simp
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_simp.cmake)
   endif()
   # mregress: test lists, seeds, pass/fail checks, reports, -rerun. With
   # Icarus installed it also runs the spec suite through the iverilog backend.

@@ -173,6 +173,7 @@
 #include <unistd.h>
 
 #include "codegen.hpp"
+#include "exprsimp.hpp"
 #include "cov_select.hpp"
 #include "lower.hpp"
 #include "saif.hpp"
@@ -541,6 +542,27 @@ static size_t propagateConstants(LowerResult& lowered, const Plan& pl) {
         }
     }
     return nk;
+}
+
+// Algebraic simplification of the compiled processes' expressions
+// (exprsimp.hpp): rules exact under 4-state semantics only. The
+// interpreter keeps the expressions as lowered, so it stays the reference
+// the compiled model is checked against. MSIM_NOSIMP=1 turns it off.
+static exprsimp::Stats simplifyExprs(LowerResult& lowered, const Plan& pl) {
+    exprsimp::Simplifier sp([](int s) -> int {
+        if (s < 0 || (size_t)s >= S.sigs.size()) return -1;
+        const Sig& g = S.sigs[s];
+        return g.val.real || g.val.str ? -1 : g.w;
+    });
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        if (pl.rank[i] < 0 && !pl.seq[i]) continue;
+        for (auto& in : lowered.procs[i].prog.code) {
+            in.e = sp.run(in.e);
+            in.bidx = sp.run(in.bidx);
+            for (auto& a : in.aidx) a = sp.run(a);
+        }
+    }
+    return sp.stats;
 }
 
 // -x-assign 0 / -x-initial 0 (Verilator's options of the same names): the
@@ -3768,6 +3790,10 @@ static int msimMain(int argc, char** argv) {
     if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCONST")) {
         size_t nk = propagateConstants(lowered, pl);
         if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constants: %zu signals\n", nk);
+    }
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOSIMP")) {
+        exprsimp::Stats st = simplifyExprs(lowered, pl);
+        if (std::getenv("MSIM_WHYSIMP")) std::fprintf(stderr, "simplified: %zu rewrites\n", st.rewrites);
     }
     // A testbench's clocked block with $display / $finish: a clocked
     // process of the compiled model too (the interpreter keeps it a coroutine).
