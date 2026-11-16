@@ -40,6 +40,7 @@ struct Var {
     std::vector<int> items;   // the constraints that read it
     const RandItem* dist = nullptr;   // a `v dist {...}` on it
     Frame* distFr = nullptr;
+    std::vector<std::pair<const RandItem*, Frame*>> gdists;   // ones under an if or ->: used when the condition holds
     bool ordered = false;     // solved first on purpose (solve-before, a function argument): its values alike
 };
 struct Item {
@@ -639,13 +640,24 @@ inline bool pickVar(Var& v) {
         v.lo = flo; v.hi = fhi; v.set = false;
         return false;
     }
-    if (v.dist) {
+    const RandItem* vd = v.dist;
+    Frame* vdFr = v.distFr;
+    if (!vd)   // a dist under a condition: weighted once the condition is sure to hold
+        for (auto& [gd, gf] : v.gdists) {
+            Frame* sv = g_fr;
+            g_fr = gf;
+            bool ex;
+            AV g = aeval(gd->guard, ex);
+            g_fr = sv;
+            if (canTrue(g) && !canFalse(g)) { vd = gd; vdFr = gf; break; }
+        }
+    if (vd) {
         // Pick a range by weight (18.5.3), then a value in it.
         struct Opt { i128 lo, hi; double w; };
         std::vector<Opt> opts;
         Frame* saved = g_fr;
-        g_fr = v.distFr;
-        for (const RandDist& d : v.dist->dist) {
+        g_fr = vdFr;
+        for (const RandDist& d : vd->dist) {
             Val lo = eval(d.lo, rcReader()), hi = d.hi ? eval(d.hi, rcReader()) : lo, wt = eval(d.weight, rcReader());
             i128 l, h, wv;
             if (!valOf(lo, l) || !valOf(hi, h) || !valOf(wt, wv) || wv <= 0) continue;
@@ -655,14 +667,14 @@ inline bool pickVar(Var& v) {
             double weight = d.perRange || !d.hi ? (double)wv : (double)wv * (double)(h - l + 1);
             opts.push_back({l, h, weight});
         }
-        if (v.dist->distDefault) {
+        if (vd->distDefault) {
             // default :/ w (18.5.3): w over the values in [flo, fhi] that no
             // item names, each gap by its size.
-            Val wt = eval(v.dist->distDefault, rcReader());
+            Val wt = eval(vd->distDefault, rcReader());
             i128 wv;
             if (valOf(wt, wv) && wv > 0) {
                 std::vector<std::pair<i128, i128>> named;
-                for (const RandDist& d : v.dist->dist) {
+                for (const RandDist& d : vd->dist) {
                     Val lo = eval(d.lo, rcReader()), hi = d.hi ? eval(d.hi, rcReader()) : lo;
                     i128 l, h;
                     if (!valOf(lo, l) || !valOf(hi, h)) continue;
@@ -958,7 +970,7 @@ inline bool sampleExact(int tries) {
 }
 inline bool exactEligible(const std::vector<int>& rank) {
     for (auto& v : g_ctx->vars)
-        if (v.randc || v.ordered || v.dist) return false;
+        if (v.randc || v.ordered || v.dist || !v.gdists.empty()) return false;
     for (int r : rank) if (r < 0) return false;
     for (auto& it : g_ctx->items)
         if (it.on && (it.it->isDist || !it.it->fns.empty() || !it.fnVars.empty())) return false;
@@ -1591,10 +1603,14 @@ static int doRandomize(int obj, const RandCall* rc) {
                 }
             const Expr* de = it.it->e.get();
             while (de && de->op == Op::Resize && !de->kids.empty() && de->kids[0]->op != Op::Const) de = de->kids[0].get();
-            if (it.it->isDist && !it.it->guard && de && de->op == Op::Ref && it.vars.size() == 1 && !it.it->soft) {
-                Var& v = ctx.vars[(size_t)it.vars[0]];
-                if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
-            } else if (it.it->isDist && !it.it->guard && de && de->op == Op::ArrRead && de->arr && !it.it->soft &&
+            auto attach = [&](Var& v) {
+                if (it.it->guard) v.gdists.push_back({it.it, it.fr});
+                else if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
+            };
+            if (it.it->isDist && de && de->op == Op::Ref && !de->at && !it.it->soft &&
+                (it.vars.size() == 1 || it.it->guard)) {
+                if (auto f = ctx.idx.find(R(de->sig)); f != ctx.idx.end()) attach(ctx.vars[(size_t)f->second]);
+            } else if (it.it->isDist && de && de->op == Op::ArrRead && de->arr && !it.it->soft &&
                        std::all_of(de->kids.begin(), de->kids.end(), [](const E& x) { return x && x->op == Op::Const; })) {
                 // a[2] dist {...} (a foreach over a fixed-size array names each
                 // element so): the weights belong to that element.
@@ -1602,15 +1618,23 @@ static int doRandomize(int obj, const RandCall* rc) {
                 for (const E& x : de->kids) ix.push_back(v_to_i64(x->k));
                 int64_t off = de->arr->offset(ix);
                 if (off >= 0)
-                    if (auto f = ctx.idx.find(R(de->arr->base) + (int)off); f != ctx.idx.end()) {
-                        Var& v = ctx.vars[(size_t)f->second];
-                        if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
-                    }
+                    if (auto f = ctx.idx.find(R(de->arr->base) + (int)off); f != ctx.idx.end()) attach(ctx.vars[(size_t)f->second]);
             }
         }
         // disable soft x: soft constraints on x of lower priority are dropped.
         for (auto& d : ctx.items) {
             if (!d.it->disableSoft) continue;
+            if (d.it->guard) {   // c -> disable soft x: only when c holds; a c on state variables is known now
+                g_fr = d.fr;
+                std::vector<int> ga;
+                collectAddrs(d.it->guard, ga);
+                bool randDep = false;
+                for (int s : ga) if (ctx.idx.count(s)) randDep = true;
+                if (!randDep) {
+                    Val gv = eval(d.it->guard, rcReader());
+                    if (gv.x || !(gv.v & 1)) continue;
+                }
+            }
             for (auto& sft : ctx.items) {
                 if (!sft.it->soft || sft.prio >= d.prio) continue;
                 for (int a : sft.vars)
