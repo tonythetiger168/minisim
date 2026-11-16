@@ -118,6 +118,14 @@ inline const Reader& rcReader() { static const Reader r = rcRead; return r; }
 inline AV fromVal(const Val& v) {
     i128 x;
     if (valOf(v, x)) return single(x, v.w, v.sgn);
+    if (v.w > 64 && v.w <= kMaxW && !v.real && !v.x && (v.hi.size() == 0 || (v.hi.size() == 1 && !v.hi[0].x))) {
+        // a wide known value (up to 120 bits): as a 128-bit number
+        uint64_t top = v.hi.size() ? v.hi[0].v : 0;
+        if (v.w < 128) top &= (1ULL << (v.w - 64)) - 1;
+        x = (i128)(((unsigned __int128)top << 64) | v.v);
+        if (v.sgn && (top >> (v.w - 65) & 1)) x -= (i128)1 << v.w;
+        return single(x, v.w, v.sgn);
+    }
     return full(v.w, v.sgn);
 }
 // Evaluate e for real; exact unless it read an unsolved variable.
@@ -438,7 +446,8 @@ inline AV aeval(const E& e, bool& exact) {
                 parts.push_back(conv(p, p.w, false));
             }
             exact = all;
-            if (all || tw > 64) return concrete(e, exact);
+            if (all || tw > kMaxW) return concrete(e, exact);
+            for (const AV& p : parts) if (isFull(p)) return full(tw, false);
             i128 lo = 0, hi = 0;
             for (const AV& p : parts) { lo = (lo << p.w) + p.lo; hi = (hi << p.w) + p.hi; }
             return AV{lo, hi, tw, false};
@@ -1596,6 +1605,14 @@ struct Rewrite {
         for (auto& kd : e->kids) { kids.push_back((*this)(kd)); changed |= kids.back() != kd; }
         E at = (*this)(e->at);
         changed |= at != e->at;
+        if (e->op == Op::ArrRead && e->arr && !e->at && wide && !wide->empty() &&
+            std::all_of(kids.begin(), kids.end(), [](const E& x) { return x && x->op == Op::Const && !x->k.x; })) {
+            // a[1] of a wide element being solved (randomize(a), a foreach over it): its chunks
+            std::vector<int64_t> ix;
+            for (const E& x : kids) ix.push_back(v_to_i64(x->k));
+            int64_t off = e->arr->offset(ix);
+            if (off >= 0 && isWide(R(e->arr->base) + (int)off)) return wideRef(R(e->arr->base) + (int)off, e->arr->sgn);
+        }
         if (!changed) return e;
         auto c = std::make_shared<Expr>(*e);
         c->kids = std::move(kids);
