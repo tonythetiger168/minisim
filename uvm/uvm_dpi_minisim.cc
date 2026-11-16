@@ -136,7 +136,10 @@ int uvm_hdl_release_and_read(char* path, p_vpi_vecval value) {
     return uvm_hdl_get(path, value);
 }
 
+// uvm-core 2020 has the HDL polling API; UVM 1.2 does not.
+#if __has_include("uvm_hdl_polling.c")
 #include "uvm_hdl_polling.c"
+#endif
 
 #ifdef __cplusplus
 }

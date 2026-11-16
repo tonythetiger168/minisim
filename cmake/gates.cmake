@@ -30,6 +30,9 @@ minisim_gate("mregress_spec_icarus" "Icarus Verilog (iverilog, vvp)"
 minisim_gate("uvm/* and mdebug_uvm_tr" "an Accellera uvm-core checkout"
              "configure -DUVM_HOME=<uvm-core 2020.3.1 checkout>"
              UVM_HOME AND EXISTS "${UVM_HOME}/src/uvm_pkg.sv")
+minisim_gate("uvm12/*" "an Accellera UVM 1.2 release"
+             "configure -DUVM12_HOME=<UVM 1.2 release>"
+             UVM12_HOME AND EXISTS "${UVM12_HOME}/src/uvm_pkg.sv")
 minisim_gate("vip/*" "an Accellera uvm-core checkout" "as above"
              UVM_HOME AND EXISTS "${UVM_HOME}/src/uvm_pkg.sv")
 minisim_gate("test_protect" "OpenSSL" "apt-get install libssl-dev" OPENSSL_FOUND)
