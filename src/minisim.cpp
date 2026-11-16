@@ -869,7 +869,32 @@ struct Sim {
         if (g.w <= 64 && !g_cov && g.val.hi.empty() && (g.val.v & mask(g.w)) == (v & mask(g.w)) && !(g.val.x & mask(g.w)) &&
             !(g.val.z & mask(g.w)) && !g.val.real && !g.val.str)
             return;
+        if (g.w == 1) { fwBit(s, v & 1); return; }
         fwSlow(s, make(v & mask(g.w), 0, g.w));
+    }
+    // A known one-bit signal flips (a clock copy the clock cone writes, two
+    // a cycle): the edge wakes its clocked batches and comb ranks directly,
+    // as set() would, when nothing else watches it (no waiter, waveform,
+    // $monitor, coverage, force, VPI or path delay). Otherwise set().
+    const bool noFwBit = std::getenv("MSIM_NOFWBIT") != nullptr;
+    __attribute__((noinline)) void fwBit(int s, uint64_t n) {
+        Sig& g = sigs[s];
+        if (g.fl || g.val.x || g.val.z || g.val.real || g.val.str || !g.val.hi.empty() || g_cov || observed || edgeTrack || tlPart ||
+            !waiters[s].empty() || !pathIn.empty() || !fmons.empty() || mon.on || (g.val.v & 1) == n || noFwBit) {
+            fwSlow(s, make(n, 0, 1));
+            return;
+        }
+        g.val.v = n;
+        g.val.sgn = false;
+        const bool pos = n == 1, neg = !pos;
+        if ((size_t)s < combOf.size())
+            for (int r : combOf[s]) if (r != curComb) markComb(r);
+        if ((size_t)s < seqOf.size())
+            for (auto& [id, e] : seqOf[s])
+                if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
+                    seqPend[id] = 1;
+                    seqq.push_back(id);
+                }
     }
     __attribute__((always_inline)) void fwdv(int s, int d, uint64_t v, int s0, int s1) {
         Sig& g = sigs[s];
