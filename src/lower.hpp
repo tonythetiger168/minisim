@@ -4226,6 +4226,26 @@ struct Lowerer {
             case ExpressionKind::SimpleAssignmentPattern:
                 for (auto* el : x.as<SimpleAssignmentPatternExpression>().elements()) arrayElems(et, *el, out);
                 return;
+            case ExpressionKind::ConditionalOp: {   // c ? a : b on unpacked arrays (11.4.11): element by element
+                const auto& c = x.as<ConditionalExpression>();
+                std::vector<E> l, r;
+                arrayElems(t, c.left(), l);
+                arrayElems(t, c.right(), r);
+                if (l.size() != r.size()) unsupported("conditional on arrays of different sizes");
+                const Type* leaf = &et.getCanonicalType();
+                while (leaf->isUnpackedArray()) leaf = &leaf->getArrayElementType()->getCanonicalType();
+                E cond = un(Op::LogNot, un(Op::LogNot, condOf(c)));
+                // An x or z condition: an element both arms agree on, else the
+                // element type's default (Table 7-1).
+                bool merge = leaf->isIntegral() && !leaf->isUnpackedStruct() && !leaf->isUnpackedUnion();
+                E amb = merge ? bin(Op::CaseEq, cond, konst(make(0, 1, 1))) : nullptr;
+                for (size_t k = 0; k < l.size(); k++) {
+                    E v = mux(cond, l[k], r[k]);
+                    if (merge) v = mux(amb, mux(bin(Op::CaseEq, l[k], r[k]), l[k], konst(initOf(*leaf))), v);
+                    out.push_back(v);
+                }
+                return;
+            }
             case ExpressionKind::ReplicatedAssignmentPattern: {
                 const auto& r = x.as<ReplicatedAssignmentPatternExpression>();
                 int64_t c = constInt(r.count());
@@ -4999,6 +5019,45 @@ struct Lowerer {
                 Instr i = dynCmd(t, D_APPEND); i.dsrc = locatorCall(c); prog.emit(i);
                 return;
             }
+        }
+        if (x.kind == ExpressionKind::ConditionalOp && isDynType(*x.type)) {   // c ? q1 : q2 (11.4.11)
+            const auto& c = x.as<ConditionalExpression>();
+            int cs = fresh(1);
+            Instr ci; ci.k = IK::Assign; ci.sig = cs; ci.e = un(Op::LogNot, un(Op::LogNot, condOf(c))); prog.emit(ci);
+            std::vector<size_t> ends;
+            Instr jk; jk.k = IK::JmpIfNot; jk.e = bin(Op::CaseEq, ref(cs), konst(make(0, 1, 1)));
+            size_t known = prog.emit(jk);
+            // An x or z condition: both arms, element by element where they
+            // have as many elements; a mismatch reads as the element type's
+            // default (Table 7-1), and arms of different sizes give an empty
+            // container.
+            if (dynShape(t).kind == 2) {   // an associative array: empty
+                ends.push_back(emitJmp());
+            } else {
+            int a = dynTemp(t), b = dynTemp(t);
+            prog.emit(dynCmd(a, D_DELETE)); prog.emit(dynCmd(b, D_DELETE));
+            dynAppend(a, c.left()); dynAppend(b, c.right());
+            Instr js; js.k = IK::JmpIfNot; js.e = bin(Op::Eq, dynSize(a), dynSize(b));
+            ends.push_back(prog.emit(js));
+            Val dv = dynShape(t).dflt;
+            bool integral = !dv.str && !dynShape(t).elem;
+            dynLoop(a, false, [&](int ix, std::vector<size_t>&) {
+                Instr p = dynCmd(t, D_PUSH_BACK);
+                p.e = integral ? mux(bin(Op::CaseEq, elemAt(a, ix), elemAt(b, ix)), elemAt(a, ix), konst(dv))
+                               : elemAt(a, ix);
+                prog.emit(p);
+            });
+            ends.push_back(emitJmp());
+            }
+            prog.code[known].target = prog.here();
+            Instr jf; jf.k = IK::JmpIfNot; jf.e = ref(cs);
+            size_t toFalse = prog.emit(jf);
+            dynAppend(t, c.left());
+            ends.push_back(emitJmp());
+            prog.code[toFalse].target = prog.here();
+            dynAppend(t, c.right());
+            for (size_t e : ends) prog.code[e].target = prog.here();
+            return;
         }
         if (x.type->isUnpackedArray()) unsupported("container value");
         if (dynShape(t).dflt.str && !x.type->isString()) {   // {"a", "b"} into strings: each literal as a string (10.10)
@@ -7079,7 +7138,30 @@ struct Lowerer {
         }
         if (int d = dynSig(it); d >= 0) {   // a queue or dynamic array as an item
             if (dynShape(d).kind == 2) unsupported("an associative array inside an inside list");
-            if (!l.type->isIntegral()) unsupported("inside a container with a non-integral value");
+            const Type& et = it.type->getCanonicalType().getArrayElementType()->getCanonicalType();
+            if (!l.type->isIntegral() || et.isString() || et.isFloating()) {   // strings, reals, handles: compared with each element
+                if (!stmtDepth) unsupported("inside a container with a non-integral value outside a procedural statement");
+                bool str = l.type->isString() || et.isString(), flt = !str && (l.type->isFloating() || et.isFloating());
+                E lv = str ? strOf(l) : flt ? realOf(l) : isHandleType(*l.type) ? exprH(l) : nullptr;
+                if (!lv) unsupported("inside a container with this value type");
+                int lt = fresh(64), res = fresh(1);
+                { Instr i; i.k = IK::Assign; i.sig = lt; i.e = lv; prog.emit(i); }
+                { Instr i; i.k = IK::Assign; i.sig = res; i.e = konst(mk(0, 1)); prog.emit(i); }
+                dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                    E m;
+                    if (str) {
+                        if (!et.isString()) unsupported("inside a container of another element type");
+                        m = node(Op::StrCmp, {un(Op::AsStr, ref(lt)), un(Op::AsStr, elemAt(d, ix))});
+                        m->hi = 4;
+                    } else if (flt) {
+                        m = fcmp(4, un(Op::AsReal, ref(lt)), et.isFloating() ? un(Op::AsReal, elemAt(d, ix)) : un(Op::IToR, elemAt(d, ix)));
+                    } else {
+                        m = bin(Op::Eq, ref(lt), elemAt(d, ix));
+                    }
+                    Instr i; i.k = IK::Assign; i.sig = res; i.e = bin(Op::LogOr, ref(res), m); prog.emit(i);
+                });
+                return ref(res);
+            }
             auto n = node(Op::DynHas, {expr(l)});
             n->sig = d;
             return n;
@@ -10566,7 +10648,21 @@ struct Lowerer {
                 if (auto it = dynMap().find(&vd.symbol); it != dynMap().end()) {
                     if (vd.symbol.lifetime == slang::ast::VariableLifetime::Static && current) {
                         // keeps its contents from call to call (6.21)
-                        if (init) unsupported("static container with an initializer in a task or function");
+                        // An initializer runs once, on the first entry (only
+                        // the subroutine can see the variable, so that reads
+                        // the same as before time 0).
+                        if (init) {
+                            int flag = freshStatic(1);
+                            Instr j; j.k = IK::JmpIfNot; j.e = ref(flag);
+                            size_t jf = prog.emit(j);
+                            size_t js = emitJmp();
+                            prog.code[jf].target = prog.here();
+                            Instr set; set.k = IK::Assign; set.sig = flag; set.e = konst(mk(1, 1));
+                            prog.emit(set);
+                            prog.emit(dynCmd(it->second, D_DELETE));
+                            assignContainer(it->second, *init);
+                            prog.code[js].target = prog.here();
+                        }
                         break;
                     }
                     prog.emit(dynCmd(it->second, D_DELETE));   // a block entry starts it empty
