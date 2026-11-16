@@ -10,6 +10,7 @@
 #include <cassert>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "licproxy.hpp"
 #include "protect.hpp"
@@ -122,6 +123,47 @@ int main() {
         std::string bad = enc;
         bad[p] = bad[p] == 'A' ? 'B' : 'A';
         assert(throws([&] { decryptSource(bad, ra, "s"); }));
+    }
+
+    // Padding oracle (Chhotaray et al., CCS 2017; CERT VU#739007): a changed
+    // data_block gives the same message whether its padding still holds (a
+    // change in the IV, so only the digest catches it) or not (a change in
+    // the block before the last).
+    {
+        auto mutate = [&](const std::string& e, bool nearEnd) {
+            size_t b = e.find("`pragma protect data_block\n") + 27;
+            size_t end = e.find("`pragma", b);
+            std::string body = e.substr(b, end - b);
+            size_t lineLen = body.find('\n');
+            std::string bin = base64Decode(body);
+            size_t at = nearEnd ? bin.size() - 17 : 0;
+            bin[at] = (char)(bin[at] ^ 0x5a);
+            return e.substr(0, b) + base64Encode(bin, (int)lineLen) + e.substr(end);
+        };
+        std::string msg[2];
+        for (int k = 0; k < 2; k++) {
+            std::string bad = mutate(enc, k == 1);
+            try {
+                decryptSource(bad, ra, "s");
+                assert(false);
+            } catch (const Error& x) {
+                msg[k] = x.what();
+            }
+        }
+        assert(msg[0] == msg[1]);
+        assert(msg[0].find("was modified or damaged") != std::string::npos);
+        // Without a digest the change cannot be caught, and msim says so.
+        EncryptOptions on = o;
+        on.digestMethod = "";
+        std::string plainEnv = encryptSource(SRC, on, "s");
+        std::vector<std::string> warns;
+        DecryptOptions dw;
+        dw.warn = [&](const std::string& m) { warns.push_back(m); };
+        decryptSource(plainEnv, ra, "s", dw);
+        assert(warns.size() == 1 && warns[0].find("no digest_block") != std::string::npos);
+        warns.clear();
+        decryptSource(enc, ra, "s", dw);
+        assert(warns.empty());
     }
 
     // Nesting: an envelope inside an encrypted region decrypts too (34.3.2).
