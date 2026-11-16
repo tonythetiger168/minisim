@@ -145,6 +145,10 @@ inline std::shared_ptr<ArrShape> eventArrayShape(const slang::ast::Type& t0) {
     sh->elemW = 0;
     return sh;
 }
+// A parameter unpacked array read with a run-time index that no ROM mux
+// covers (P[i][j], P[i][7:0]): its elements become signals that one process
+// sets at time 0, and the read is an ordinary array read.
+inline std::vector<std::pair<int, E>>& paramArrayInits() { static std::vector<std::pair<int, E>> v; return v; }
 inline std::unordered_set<const slang::ast::Symbol*>& assignedEvents() {
     static std::unordered_set<const slang::ast::Symbol*> m;
     return m;
@@ -3988,6 +3992,7 @@ struct Lowerer {
             return;
         }
         if (cv.isReal()) { out.push_back(konst(mkreal(cv.real()))); return; }
+        if (cv.isString() && t.isString()) { out.push_back(konst(mkstr(cv.str()))); return; }
         unsupported("constant array element of this kind");
     }
 
@@ -4000,9 +4005,47 @@ struct Lowerer {
         auto cv = tryConst(e, b);
         if (!cv || !cv.isInteger()) {
             if (E rom = paramRom(e, *b, ctx)) return rom;
+            if (paramArray(*b)) return nullptr;   // an ordinary array read of its signals
             unsupported("non-constant select of a parameter unpacked array");
         }
         return svLit(cv.integer(), e.type->isSigned(), ctx);
+    }
+    // The signals of parameter array P (fixed-size, integral or real
+    // elements), made once and set at time 0; false when P has another shape.
+    bool paramArray(const slang::ast::Symbol& b) {
+        using namespace slang::ast;
+        if (arrMap().count(&b)) return true;
+        if (!mkSig) return false;
+        const Type& t0 = b.as<ParameterSymbol>().getType().getCanonicalType();
+        auto shape = std::make_shared<ArrShape>();
+        const Type* t = &t0;
+        int64_t total = 1;
+        while (t->kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            const auto& ft = t->as<FixedSizeUnpackedArrayType>();
+            shape->dims.push_back({ft.range.left, ft.range.right});
+            total *= (int64_t)ft.range.width();
+            if (total > (1 << 16)) return false;
+            t = &ft.elementType.getCanonicalType();
+        }
+        if (t->isUnpackedArray() || !(t->isIntegral() || t->isFloating() || t->isString())) return false;
+        const auto& cv = b.as<ParameterSymbol>().getValue();
+        if (!cv.isUnpacked()) return false;
+        std::vector<E> elems;
+        constElems(t0, cv, elems);
+        if ((int64_t)elems.size() != total) return false;
+        shape->count = (int)total;
+        shape->elemW = storeW(*t);
+        shape->sgn = t->isSigned();
+        shape->twoState = !t->isFourState();
+        std::string base = std::string(b.name) + "$rom";
+        for (int64_t k = 0; k < total; k++) {
+            int id = mkSig(base + "[" + std::to_string(k) + "]", shape->elemW, false);
+            if (!k) shape->base = id;
+            else if (id != shape->base + k) return false;
+            paramArrayInits().push_back({id, elems[(size_t)k]});
+        }
+        arrMap()[&b] = shape;
+        return true;
     }
     // P[i] with i known only at run time, P a one-dimensional parameter array
     // of integral elements (a ROM table): a balanced tree of muxes on the
@@ -4034,7 +4077,13 @@ struct Lowerer {
             b1->hi = b1->lo = bit;
             return node(Op::Mux, {b1, tree(base + half, bit - 1), tree(base, bit - 1)});
         };
-        return sized(tree(0, bits - 1), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+        // An index outside the array reads the element type's default (7.4.6).
+        const Type& et = *e.type;
+        int ew = (int)et.getBitWidth();
+        E dflt = konst(et.isFourState() ? (ew > 64 ? allx(ew) : make(0, mask(ew), ew)) : make(0, 0, ew));
+        E in = bin(Op::LogAnd, bin(Op::Ge, pos, konst(make(0, 0, 64, 0, true))),
+                   bin(Op::Lt, pos, konst(make((uint64_t)elems.size(), 0, 64, 0, true))));
+        return sized(node(Op::Mux, {in, tree(0, bits - 1), dflt}), ew, et.isSigned(), ctx);
     }
     // a[i][j] on an unpacked array: the array and one index per dimension.
     // Fewer indices than dimensions (a slice) is not supported yet.
@@ -4160,6 +4209,16 @@ struct Lowerer {
                 auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
                 g->sig = d;
                 out.push_back(g);
+            }
+            return;
+        }
+        if (x.kind == ExpressionKind::StringLiteral) {   // byte b[0:3] = "abc" (5.9): one character per element, left justified, 0 after
+            const Type& ec = et.getCanonicalType();
+            if (!ec.isIntegral() || ec.getBitWidth() != 8) unsupported("string literal into an array of this element type");
+            std::string str(x.as<StringLiteral>().getValue());
+            for (int64_t k = 0; k < n; k++) {
+                uint64_t ch = k < (int64_t)str.size() ? (unsigned char)str[(size_t)k] : 0;
+                out.push_back(konst(make(ch, 0, 8, 0, ec.isSigned())));
             }
             return;
         }
@@ -6536,6 +6595,13 @@ struct Lowerer {
                 fs.replace(st, i - st + 1, rep);
                 i = st + rep.size() - 1;
                 letters.push_back('h');
+                continue;
+            }
+            if (c == 't') {   // %t: scaled to this module's time unit and precision (21.3.4.3)
+                std::string rep = {'\x03', (char)(tsUnit + 64), (char)(tsPrec + 64)};
+                fs.replace(i, 1, rep);
+                i += rep.size() - 1;
+                if (!skip) letters.push_back('f');
                 continue;
             }
             if (!skip) letters.push_back(c);
@@ -10784,13 +10850,66 @@ struct Lowerer {
                 // A selector without side effects is lowered once and shared by
                 // every compare, so the interpreter can find the item through a
                 // table (Instr::caseId) instead of comparing label by label.
-                E sel1 = c.condition == CaseStatementCondition::Normal ? expr(c.expr) : nullptr;
-                if (sel1 && !pureSel(sel1)) sel1 = nullptr;
+                // The case expression is evaluated once (12.5): one with side
+                // effects (a call, q.pop_front()) goes into a temporary first.
+                E selOnce;
+                struct Unpin {
+                    std::unordered_map<const slang::ast::Expression*, int>* m = nullptr;
+                    const slang::ast::Expression* x = nullptr;
+                    ~Unpin() { if (m) m->erase(x); }
+                } unpin;
+                if (c.expr.type->isIntegral() && !exprOverride.count(&c.expr)) {
+                    E se = expr(c.expr);
+                    if (pureSel(se) && !hasUserCall(c.expr)) selOnce = se;
+                    else {   // also read by the inside items and the casez/casex checks below
+                        int w = (int)c.expr.type->getBitWidth();
+                        int t = fresh(w);
+                        Instr i; i.k = IK::Assign; i.sig = t; i.e = se;
+                        prog.emit(i);
+                        selOnce = ref(t, c.expr.type->isSigned());
+                        exprOverride[&c.expr] = t;
+                        unpin.m = &exprOverride;
+                        unpin.x = &c.expr;
+                    }
+                }
+                if (c.condition == CaseStatementCondition::Inside) selOnce = nullptr;
+                E sel1 = c.condition == CaseStatementCondition::Normal ? selOnce : nullptr;
+                // Labels that call a function are evaluated in order, each at
+                // most once, until one matches (12.5): one test at a time.
+                bool lazyLabels = false;
+                for (const auto& item : c.items)
+                    for (const Expression* x : item.expressions) lazyLabels = lazyLabels || hasUserCall(*x);
+                if (lazyLabels && c.check != UniquePriorityCheck::Unique && c.check != UniquePriorityCheck::Unique0) {
+                    std::vector<size_t> toEnd;
+                    for (const auto& item : c.items) {
+                        std::vector<size_t> hits;
+                        for (const Expression* x : item.expressions) {
+                            E m = c.condition == CaseStatementCondition::Inside ? insideItem(c.expr, *x)
+                                                                                 : bin(cmp, selOnce ? selOnce : expr(c.expr), expr(*x));
+                            Instr j; j.k = IK::JmpIfNot; j.e = m;
+                            size_t jf = prog.emit(j);
+                            Instr go; go.k = IK::Jmp;
+                            hits.push_back(prog.emit(go));
+                            prog.code[jf].target = prog.here();
+                        }
+                        Instr next; next.k = IK::Jmp;
+                        size_t jn = prog.emit(next);
+                        for (size_t h : hits) prog.code[h].target = prog.here();
+                        stmt(*item.stmt);
+                        Instr skip; skip.k = IK::Jmp;
+                        toEnd.push_back(prog.emit(skip));
+                        prog.code[jn].target = prog.here();
+                    }
+                    if (c.defaultCase) stmt(*c.defaultCase);
+                    else if (c.check == UniquePriorityCheck::Priority) violation(s, checkName(c.check) + " case: no case item matches", c.check);
+                    for (size_t k : toEnd) prog.code[k].target = prog.here();
+                    break;
+                }
                 for (const auto& item : c.items) {
                     E cond;   // OR of (selector === item_expr) over this item's labels
                     for (const Expression* x : item.expressions) {
                         E m = c.condition == CaseStatementCondition::Inside ? insideItem(c.expr, *x)
-                                                                             : bin(cmp, sel1 ? sel1 : expr(c.expr), expr(*x));
+                                                                             : bin(cmp, selOnce ? selOnce : expr(c.expr), expr(*x));
                         cond = cond ? bin(Op::LogOr, cond, m) : m;
                     }
                     conds.push_back(cond);
@@ -10813,7 +10932,7 @@ struct Lowerer {
                 E selUnknown;   // casez / casex labels that never overlap can still
                                 // both match a selector with z (or x) bits
                 if (ov == 1)
-                    selUnknown = bin(Op::Ne, sysFnNode(SF_COUNTBITS, {expr(c.expr)}, 12), konst(make(0, 0, 32, 0, true)));
+                    selUnknown = bin(Op::Ne, sysFnNode(SF_COUNTBITS, {selOnce ? selOnce : expr(c.expr)}, 12), konst(make(0, 0, 32, 0, true)));
                 std::vector<size_t> toEnd;
                 if (mayOverlap && c.items.size() > 8) {   // many items: a check of linear size
                     uniqueCaseLinear(s, c, conds, selUnknown);
@@ -13783,6 +13902,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
         };
     }
     arrMap().clear();
+    paramArrayInits().clear();
     localMap().clear();
     localArr().clear();
     localDyn().clear();
@@ -14588,6 +14708,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             for (auto& t : x.trans) d.trans.push_back({t.from, t.to, t.reset});
             fsmDefs().push_back(std::move(d));
         }
+    }
+    if (!paramArrayInits().empty()) {   // parameter arrays read through a run-time index: set first
+        Prog p;
+        for (auto& [sig, e] : paramArrayInits()) {
+            Instr i; i.k = IK::Assign; i.sig = sig; i.e = e;
+            p.emit(i);
+        }
+        out.procs.insert(out.procs.begin(), {std::move(p), false, "init"});
+        paramArrayInits().clear();
     }
     out.sigOf = sigmap;
     out.subrs = std::move(owned);
