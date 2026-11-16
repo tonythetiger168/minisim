@@ -473,6 +473,21 @@ inline bool isClassMethod(const slang::ast::SubroutineSymbol& s) {
 inline bool staticOfProcedure(const slang::ast::VariableSymbol& v) {
     using namespace slang::ast;
     if (v.lifetime != VariableLifetime::Static || !v.getInitializer()) return false;
+    // only a constant initializer: one with calls (process::self()) or that
+    // reads other variables keeps running in the process that reaches the
+    // declaration, where those have their values
+    struct Calls : public ASTVisitor<Calls, VisitFlags::Expressions> {
+        bool found = false;
+        void handle(const CallExpression&) { found = true; }
+        void handle(const NewClassExpression&) { found = true; }
+        void handle(const NamedValueExpression& n) { look(n.symbol); }
+        void handle(const HierarchicalValueExpression& n) { look(n.symbol); }
+        void look(const Symbol& s) {
+            if (s.kind != SymbolKind::Parameter && s.kind != SymbolKind::EnumValue && s.kind != SymbolKind::Specparam) found = true;
+        }
+    } c;
+    v.getInitializer()->visit(c);
+    if (c.found) return false;
     const Scope* sc = v.getParentScope();
     if (!sc || sc->asSymbol().kind != SymbolKind::StatementBlock) return false;
     for (; sc; sc = sc->asSymbol().getParentScope()) {
