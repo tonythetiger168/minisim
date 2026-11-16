@@ -63,6 +63,8 @@ set(CASES
   "-x-assign 0 -x-initial 0 examples/privpart.sv"
   "-noassert examples/noassert.sv"
   "examples/parpub.sv"
+  "examples/cdly.sv"
+  "examples/partchain.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
   "examples/islands.sv"

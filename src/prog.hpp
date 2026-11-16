@@ -792,6 +792,13 @@ struct CombShape {
     size_t body = 0;  // instructions before the wait: Assigns, and jumps within them when `branches`
     bool branches = false;
     bool asserts = false;   // deferred immediate assertions in the body
+    // The bits written and read, per signal, where they are constant parts
+    // ({sig, lo, hi}; lo < 0: the whole signal). combSchedule uses them to
+    // drop the edges between drivers of different parts of one vector
+    // (assign t[(i+1)*8 +: 8] = t[i*8 +: 8] | ..., a chain built by a
+    // generate loop), which are not a cycle bit by bit.
+    struct Bits { int sig, lo, hi; };
+    std::vector<Bits> wbits, rbits;
 };
 inline bool combShape(const Prog& p, CombShape& c) {
     size_t n = p.code.size();
@@ -826,8 +833,30 @@ inline bool combShape(const Prog& p, CombShape& c) {
         bool seen = false;
         for (int o : c.outs) seen |= o == p.code[i].sig;
         if (!seen) c.outs.push_back(p.code[i].sig);
+        const Instr& a = p.code[i];
+        if (a.hi >= 0 && !a.bidx) c.wbits.push_back({a.sig, a.lo, a.hi});
+        else c.wbits.push_back({a.sig, -1, -1});
     }
     c.body = n - 2;
+    // The reads: a constant part select of a signal reads those bits,
+    // any other reference all of it.
+    std::function<void(const E&)> rd = [&](const E& e) {
+        if (!e) return;
+        if (e->op == Op::Slice && !e->kids.empty() && e->kids[0] && e->kids[0]->op == Op::Ref && e->kids[0]->sig >= 0 && !e->kids[0]->at &&
+            e->lo >= 0 && e->hi >= e->lo) {
+            c.rbits.push_back({e->kids[0]->sig, e->lo, e->hi});
+            return;
+        }
+        if (e->sig >= 0) c.rbits.push_back({e->sig, -1, -1});
+        rd(e->at);
+        for (auto& k : e->kids) rd(k);
+    };
+    for (size_t i = 0; i + 2 < n; i++) {
+        const Instr& a = p.code[i];
+        rd(a.e); rd(a.bidx); rd(a.de); rd(a.fd); rd(a.self);
+        for (auto& x : a.args) rd(x);
+        for (auto& x : a.aidx) rd(x);
+    }
     if (w.events.size() > 1) {
         for (auto& [s, e] : w.events) {
             if (e != ANY) return false;
@@ -855,13 +884,28 @@ inline std::vector<size_t> combSchedule(const std::vector<CombShape>& cs, std::v
     std::unordered_map<int, std::vector<size_t>> readers;  // signal -> processes waiting on it
     for (size_t b = 0; b < n; b++)
         for (int i : cs[b].ins) readers[i].push_back(b);
+    // Whether b reads bits of o that a writes (the parts above; a signal b
+    // waits on that no expression of it names, e.g. read by a function it
+    // calls, counts as read whole).
+    static const bool wholeOnly = std::getenv("MSIM_NOPARTCOMB") != nullptr;
+    auto overlaps = [&](size_t a, size_t b, int o) {
+        if (wholeOnly) return true;
+        bool any = false;
+        for (auto& r : cs[b].rbits) {
+            if (r.sig != o) continue;
+            any = true;
+            for (auto& w : cs[a].wbits)
+                if (w.sig == o && (w.lo < 0 || r.lo < 0 || (w.lo <= r.hi && r.lo <= w.hi))) return true;
+        }
+        return !any;
+    };
     for (size_t a = 0; a < n; a++) {
         std::vector<size_t> to;
         for (int o : cs[a].outs) {
             auto it = readers.find(o);
             if (it == readers.end()) continue;
             for (size_t b : it->second)
-                if (b != a) to.push_back(b);
+                if (b != a && overlaps(a, b, o)) to.push_back(b);
         }
         std::sort(to.begin(), to.end());
         to.erase(std::unique(to.begin(), to.end()), to.end());

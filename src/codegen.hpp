@@ -765,6 +765,20 @@ public:
             if (!iv.empty())
                 o << "    static const struct { int s; uint64_t v, x, z; } SIV[] = {\n" << iv << "    };\n"
                      "    for (auto& e : SIV) { Val& g = S.sigs[e.s].val; g.v = e.v; g.x = e.x; g.z = e.z; }\n";
+            // A delayed driver is x until its first update arrives (10.3.3,
+            // 28.16), with its own strengths, as msim sets it up.
+            std::set<int> dlyNets;
+            for (const auto& pr : procs)
+                for (const Instr& i : pr.prog->code)
+                    if ((!i.dly.empty() || !i.dlyE.empty()) && i.drv >= 0 && i.k == IK::Assign) {
+                        o << "    { auto& dr = S.sigs[" << i.sig << "].drv[" << i.drv << "]; dr.v = ";
+                        if (i.hi >= 0) o << "v_insert(allz(S.sigs[" << i.sig << "].w), allx(" << i.hi - i.lo + 1 << "), " << i.hi << ", " << i.lo << ")";
+                        else o << "allx(S.sigs[" << i.sig << "].w)";
+                        o << "; dr.s0 = " << (int)i.s0 << "; dr.s1 = " << (int)i.s1 << "; }\n";
+                        dlyNets.insert(i.sig);
+                    }
+            for (int s : dlyNets)
+                o << "    { auto& g = S.sigs[" << s << "]; g.val = resolveDrives(g.drv.data(), g.drv.size(), g.w); }\n";
         }
         if (upf) {   // the power intent msim bound to the design (upf_rt.inc Rt::writeSnapshot)
             o << "    static Task (*const UPFPROC[])() = {";   // sim_replay_control runs these again
@@ -5090,7 +5104,29 @@ private:
                 if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
                 if (!p.roots.empty() || !p.spans.empty()) throw CodegenUnsupported("disable of a named block");
                 if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
-                if (!i.dly.empty()) throw CodegenUnsupported("delayed continuous assignment");
+                if ((!i.dly.empty() || !i.dlyE.empty()) && (i.k != IK::Assign || i.drv < 0 || i.tmp || i.xq || isPriv(i.sig)))   // (SDF timing keeps the interpreter)
+                    throw CodegenUnsupported("delayed continuous assignment");
+                if (!i.dly.empty() || !i.dlyE.empty()) {   // assign #d (10.3.3): the kernel's pending-driver queue, as the interpreter does
+                    std::string v = W(i, fast(i.e));
+                    if (i.hi >= 0)
+                        v = "v_insert(allz(S.sigs[" + std::to_string(i.sig) + "].w), " + v + ", " + std::to_string(i.hi) + ", " +
+                            std::to_string(i.lo) + ")";
+                    std::string dl;
+                    if (!i.dlyE.empty()) {   // assign #(expr): the delay as it is now
+                        dl = "std::vector<uint64_t>{";
+                        for (size_t k = 0; k < i.dlyE.size(); k++)
+                            dl += (k ? ", " : "") + std::string("[](const Val& d) { int64_t t = d.x ? 0 : v_to_i64(d); return t < 0 ? 0ULL : (uint64_t)t; }(") + fast(i.dlyE[k]) + ")";
+                        dl += "}";
+                    } else {
+                        dl = "DL";
+                        o << " { static const std::vector<uint64_t> DL{";
+                        for (size_t k = 0; k < i.dly.size(); k++) o << (k ? ", " : "") << i.dly[k] << "ULL";
+                        o << "};";
+                    }
+                    if (i.dlyE.empty()) o << " S.driveLater(" << i.sig << ", " << i.drv << ", " << v << ", " << (int)i.s0 << ", " << (int)i.s1 << ", " << dl << "); }\n";
+                    else o << " S.driveLater(" << i.sig << ", " << i.drv << ", " << v << ", " << (int)i.s0 << ", " << (int)i.s1 << ", " << dl << ");\n";
+                    continue;
+                }
                 if (i.k == IK::ReadMem || i.k == IK::WriteMem) {   // $readmem / $writemem (21.4, 21.5)
                     if (!i.arr || readsPriv(i.e) || i.pw == 2 || !i.aidx.empty()) throw CodegenUnsupported("$readmem form");
                     for (auto& a : i.args) if (readsPriv(a)) throw CodegenUnsupported("$readmem form");
