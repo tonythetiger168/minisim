@@ -3192,10 +3192,12 @@ private:
                         // A temporary of this process (a decoder's locals): private
                         // when it is written whole, by this process only. Two
                         // processes would race on it when the domain runs in parallel.
-                        bool whole = in.tmp && in.hi < 0 && in.drv < 0 && !in.arr && in.aidx.empty() && !in.bidx &&
+                        // A constant part of one (v[3] = 1) too (MSIM_NOPRIVTMPPART: not).
+                        bool whole = in.tmp && (in.hi < 0 || (in.lo >= 0 && in.hi < sigs[in.sig].w && !std::getenv("MSIM_NOPRIVTMPPART"))) &&
+                                     in.drv < 0 && !in.arr && in.aidx.empty() && !in.bidx &&
                                      sigs[in.sig].w <= 64 && !std::getenv("MSIM_NOPRIVTMP");
                         if (whole && (tmpOwner[in.sig] < 0 || tmpOwner[in.sig] == (int)i)) { tmpOwner[in.sig] = (int)i; cand[in.sig] = 1; }
-                        else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
+                        else bad[in.sig] = 1, whyL[in.sig] = __LINE__;
                     }
                 continue;
             }
@@ -4117,6 +4119,21 @@ private:
                             std::string t = dynTarget(i, fast(i.e), " S.poke(s, v, hi, lo);", true);
                             fns << t;
                             fns2 << t;
+                        } else if (isPriv(i.sig) && i.hi >= 0) {   // a constant part of a private temporary
+                            const std::string P_ = "P" + std::to_string(i.sig), W_ = std::to_string(sigW_[i.sig]);
+                            const std::string H_ = std::to_string(i.hi), L_ = std::to_string(i.lo);
+                            std::string g, u, sl;
+                            std::string slow = " PW(" + P_ + ", " + W_ + ", v_insert(PR(" + P_ + ", " + W_ + ", false), " + fast(i.e) + ", " + H_ + ", " + L_ + "));\n";
+                            if (split(i.e, g, u, sl)) {
+                                std::string fastW = " { const uint64_t m = " + M(i.hi - i.lo + 1) + " << " + L_ + "; " + P_ + ".v = (" + P_ + ".v & ~m) | (((uint64_t)(" + u + ") << " + L_ + ") & m); }";
+                                // 4-state: known value and known bits there; otherwise the general insert
+                                if (g.empty()) fns << " { const uint64_t m = " << M(i.hi - i.lo + 1) << " << " << L_ << "; " << P_ << ".v = (" << P_ << ".v & ~m) | (((uint64_t)(" << u << ") << " << L_ << ") & m); " << P_ << ".x &= ~m; " << P_ << ".z &= ~m; }\n";
+                                else fns << " if (__builtin_expect(" << g << ", 1)) { const uint64_t m = " << M(i.hi - i.lo + 1) << " << " << L_ << "; " << P_ << ".v = (" << P_ << ".v & ~m) | (((uint64_t)(" << u << ") << " << L_ << ") & m); " << P_ << ".x &= ~m; " << P_ << ".z &= ~m; } else " << cold(slow) << "\n";
+                                fns2 << fastW << "\n";
+                            } else {
+                                fns << slow;
+                                fns2 << slow;
+                            }
                         } else if (isPriv(i.sig) && i.hi < 0) {   // a private temporary (privateSigs): no write through the kernel
                             std::string g, u, sl;
                             if (!split(i.e, g, u, sl)) {
