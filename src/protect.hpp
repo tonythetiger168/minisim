@@ -1612,6 +1612,10 @@ struct EncryptOptions {
     int lineLen = 76;
     std::string agent = "msimprotect";
     std::string agentInfo = "minisim";
+    // Write each recipient's key_public_key beside its key_block. AMD Vivado
+    // 2026.1 refuses an envelope that has one, and one with a digest_block,
+    // so for Vivado use publicKey=false and digestMethod="" (docs/PROTECT.md).
+    bool publicKey = true;
 };
 
 namespace detail {
@@ -1697,7 +1701,7 @@ inline std::string makeEnvelope(std::string_view plain, const State& st, const E
     for (const Recipient* r : rs) {
         env += "`pragma protect key_keyowner=" + quote(r->owner) + ", key_keyname=" + quote(r->name) +
                ", key_method=\"rsa\"\n";
-        env += block("key_public_key", publicDer(r->pub.get()), enctype, lineLen);
+        if (o.publicKey) env += block("key_public_key", publicDer(r->pub.get()), enctype, lineLen);
         env += block("key_block", rsaEncrypt(r->pub.get(), sk), enctype, lineLen);
         if (!digestMethod.empty())
             env += block("digest_block", cbcEncrypt(dataMethod, sk, digest(digestMethod, sk)), enctype, lineLen);
