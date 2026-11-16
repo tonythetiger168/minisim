@@ -1132,7 +1132,23 @@ inline const FrameLayout* wideLayout(int w) {
     }
     return l.get();
 }
-struct WideVar { int base = 0, w = 0; };   // its chunks: signals base .. base + (w + 63) / 64 - 1
+struct WideVar {   // its chunks: signals base .. base + (w + 63) / 64 - 1
+    int base = 0, w = 0;
+    // An unpacked struct with rand members (18.4): its parts top first, each
+    // a solved signal or (-1) the bits it keeps.
+    std::vector<std::pair<int, Val>> parts;
+};
+// Frame slots for the rand parts of an unpacked struct, one per part width.
+inline const FrameLayout* partsLayout(const std::vector<int>& ws) {
+    static std::map<std::vector<int>, std::unique_ptr<FrameLayout>> m;
+    auto& l = m[ws];
+    if (!l) {
+        l = std::make_unique<FrameLayout>();
+        l->name = "randomize struct members";
+        for (int w : ws) l->add(w, make(0, 0, w));
+    }
+    return l.get();
+}
 constexpr int kSizeW = 17;    // a solved size is at most 2^17 - 1
 inline const FrameLayout* scratchLayout(int w, bool sgn, int64_t n) {
     static std::map<std::tuple<int, bool, int64_t>, std::unique_ptr<FrameLayout>> m;
@@ -1159,7 +1175,10 @@ struct Rewrite {
         auto it = wide->find(addr);
         const WideVar& v = it->second;
         std::vector<E> parts;
-        for (int k = (v.w + 63) / 64; k-- > 0;) parts.push_back(ref(v.base + k, false));
+        if (!v.parts.empty())
+            for (auto& [a, kv] : v.parts) parts.push_back(a >= 0 ? ref(a, false) : konst(kv));
+        else
+            for (int k = (v.w + 63) / 64; k-- > 0;) parts.push_back(ref(v.base + k, false));
         auto c = node(Op::Concat, std::move(parts));
         c->sgn = sgn;
         return c;
@@ -1169,11 +1188,35 @@ struct Rewrite {
     // the solver sees variables of at most 64 bits: x[127:120] is a slice of
     // the top chunk.
     E wideSel(const E& c) {
+        // arithmetic on constants only (an unrolled foreach index): its value
+        std::function<bool(const E&)> pure = [&](const E& x) {
+            if (x->at) return false;
+            switch (x->op) {
+                case Op::Const: return true;
+                case Op::Add: case Op::Sub: case Op::Mul: case Op::Shl: case Op::Resize:
+                    for (auto& k : x->kids) if (!pure(k)) return false;
+                    return true;
+                default: return false;
+            }
+        };
+        if (c->op == Op::DynSlice && c->kids.size() == 2 && c->hi > 0 && c->kids[0]->op == Op::Concat && pure(c->kids[1])) {
+            // s.arr[i] once i is known: a constant slice
+            Val sv = eval(c->kids[1], rd);
+            if (sv.x) return c;
+            int64_t st = sv.sgn && sv.w < 64 && ((sv.v >> (sv.w - 1)) & 1) ? -1 : (int64_t)sv.v;
+            if (st < 0 || st > (1 << 24)) return c;
+            auto sl = node(Op::Slice, {c->kids[0]});
+            sl->lo = (int)st; sl->hi = (int)st + c->hi - 1; sl->sgn = c->sgn;
+            E r = wideSel(sl);
+            return r == sl ? c : r;
+        }
         if ((c->op != Op::Slice && c->op != Op::Index) || c->kids.empty()) return c;
         const E& w = c->kids[0];
         if (w->op != Op::Concat || w->kids.empty()) return c;
         int total = 0;
+        auto kw = [](const E& k) { return k->op == Op::Const ? k->k.w : S.sigs[k->sig].w; };
         for (auto& k : w->kids) {
+            if (k->op == Op::Const) { total += k->k.w; continue; }   // bits of a struct that are not rand
             if (k->op != Op::Ref || k->at || !wideChunk.count(k->sig)) return c;
             total += S.sigs[k->sig].w;
         }
@@ -1188,7 +1231,7 @@ struct Rewrite {
         std::vector<E> parts;
         int top = total;
         for (auto& k : w->kids) {
-            int cw = S.sigs[k->sig].w, bot = top - cw;
+            int cw = kw(k), bot = top - cw;
             int h = std::min(hi, top - 1), l = std::max(lo, bot);
             if (h >= l) {
                 if (h - bot == cw - 1 && l == bot) parts.push_back(k);
@@ -1368,6 +1411,8 @@ static int doRandomize(int obj, const RandCall* rc) {
     // What takes part: scalar variables, containers, constraint lists.
     struct ScalarVar { int addr, w; bool sgn, randc; int owner; };
     std::vector<ScalarVar> scalars;
+    struct StructVar { int addr; const RandVar* rv; int owner; };   // an unpacked struct with rand members
+    std::vector<StructVar> structs;
     std::vector<RCont> conts;
     std::unordered_map<int, int> contIdx;
     struct Src { const std::vector<RandItem>* items; Frame* fr; };
@@ -1426,6 +1471,10 @@ static int doRandomize(int obj, const RandCall* rc) {
                     if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
                 }
                 if (rv.dyn) continue;
+                if (!rv.parts.empty()) {
+                    for (int k = 0; k < rv.count; k++) structs.push_back({o + rv.off + k, &rv, o});
+                    continue;
+                }
                 for (int k = 0; k < rv.count; k++) scalars.push_back({o + rv.off + k, rv.w, rv.sgn, rv.randc, o});
             }
         for (const auto& b : sp->blocks) {
@@ -1469,6 +1518,27 @@ static int doRandomize(int obj, const RandCall* rc) {
             ctx.vars.push_back(v);
         };
         for (auto& sv : scalars) addVar(sv.addr, sv.w, sv.sgn, sv.randc, sv.owner);
+        for (auto& st : structs) {   // its rand members solved in slots of their own, the rest kept
+            if (wides.count(st.addr) || ctx.idx.count(st.addr)) continue;
+            std::vector<int> ws;
+            for (auto& p : st.rv->parts) if (p.rand) ws.push_back(p.w);
+            FrameP f = newFrame(partsLayout(ws), nullptr, 0);
+            WideVar wv{f->base, st.rv->w, {}};
+            Val cur = S.get(st.addr);
+            int top = st.rv->w, slot = 0;
+            for (auto& p : st.rv->parts) {
+                int bot = top - p.w;
+                if (p.rand) {
+                    int a = f->base + slot++;
+                    wv.parts.push_back({a, Val{}});
+                    wideChunks.insert(a);
+                    addVar(a, p.w, p.sgn, p.randc, st.owner);
+                } else wv.parts.push_back({-1, v_slice(cur, top - 1, bot)});
+                top = bot;
+            }
+            wides[st.addr] = std::move(wv);
+            wideFrs.push_back(std::move(f));
+        }
         if (pass == 2)
             for (auto& c : conts)
                 for (int64_t k = 0; k < c.n; k++) addVar(c.elems->base + (int)k, c.w, c.sgn, false, c.owner);
@@ -1733,7 +1803,10 @@ static int doRandomize(int obj, const RandCall* rc) {
             if (pass != 1)
                 for (auto& [addr, wv] : wides) {   // the chunks put together
                     std::vector<Val> parts;
-                    for (int k = (wv.w + 63) / 64; k-- > 0;) parts.push_back(S.get(wv.base + k));
+                    if (!wv.parts.empty())
+                        for (auto& [a, kv] : wv.parts) parts.push_back(a >= 0 ? S.get(a) : kv);
+                    else
+                        for (int k = (wv.w + 63) / 64; k-- > 0;) parts.push_back(S.get(wv.base + k));
                     Val whole = v_concat(parts);
                     whole.sgn = S.get(addr).sgn;
                     S.set(addr, whole);

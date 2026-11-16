@@ -431,6 +431,64 @@ inline std::pair<int, int> uField(const slang::ast::Type& t0, const slang::ast::
     }
     return {after, fw};
 }
+// The enum fields of a packed value (an enum, or packed structs of them at
+// any depth): their low bit (lo for the value's bit 0), width and type.
+// Each takes only its named values when randomized (18.4).
+inline void packedEnums(const slang::ast::Type& t0, int lo, std::vector<std::tuple<int, int, const slang::ast::Type*>>& out) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (t.isEnum()) { out.push_back({lo, (int)t.getBitWidth(), &t}); return; }
+    if (t.kind != SymbolKind::PackedStructType) return;
+    for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>())
+        packedEnums(f.getType(), lo + (int)f.bitOffset, out);
+}
+// The rand members of an unpacked struct (7.2, 18.4) as parts of its bits,
+// top first: a rand integral member (or each element of a rand fixed-size
+// array member) is solved, a rand unpacked struct member is split the same
+// way, anything else keeps its bits. enums: the low bit, width and type of
+// each rand enum part. False when a rand member cannot be solved this way.
+inline bool randParts(const slang::ast::Type& t0, std::vector<RandVar::Part>& out,
+                      std::vector<std::tuple<int, int, const slang::ast::Type*>>& enums, int top) {
+    using namespace slang::ast;
+    const auto& t = t0.getCanonicalType();
+    if (!t.isUnpackedStruct()) return false;
+    for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) {
+        const Type& ft = f.getType().getCanonicalType();
+        int fw = uMemberW(ft);
+        if (fw <= 0) return false;
+        bool rnd = f.randMode != RandMode::None;
+        auto leaf = [&](const Type& lt, int w, int at) {   // one solved part; at: its top bit + 1
+            if (!lt.isIntegral() || lt.isUnpackedStruct()) return false;
+            packedEnums(lt, at - w, enums);
+            if (w > 64) {   // a wide member (a packed struct, a long vector): chunks of 64 bits, top first
+                if (f.randMode == RandMode::RandC || lt.isEnum()) return false;
+                for (int left = w; left > 0;) {
+                    int cw = left % 64 ? left % 64 : 64;
+                    out.push_back({cw, true, false, false});
+                    left -= cw;
+                }
+                return true;
+            }
+            out.push_back({w, true, lt.isSigned(), f.randMode == RandMode::RandC});
+            return true;
+        };
+        if (!rnd) out.push_back({fw, false, false, false});
+        else if (ft.isUnpackedStruct()) { if (!randParts(ft, out, enums, top)) return false; }
+        else if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            const Type* et = &ft;
+            int n = 1;
+            while (et->kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                n *= (int)et->as<FixedSizeUnpackedArrayType>().range.width();
+                et = &et->getArrayElementType()->getCanonicalType();
+            }
+            int ew = fw / n;
+            for (int k = 0; k < n; k++)
+                if (!leaf(*et, ew, top - k * ew)) return false;
+        } else if (!leaf(ft, fw, top)) return false;
+        top -= fw;
+    }
+    return true;
+}
 inline Val structDefaultVal(const slang::ast::Type& t0);
 inline bool memberInitVal(const slang::ast::FieldSymbol& f, int w, Val& out);
 inline bool unpackedConstVal(const slang::ast::Type& t, const slang::ConstantValue& cv, Val& out);
@@ -15161,6 +15219,30 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             }
                             if (et->isUnpackedArray()) Lowerer::unsupported("rand container of fixed-size arrays");
                         }
+                        if (et->isUnpackedStruct() && !rv.dyn) {   // rand members of an unpacked struct (18.4)
+                            std::vector<std::tuple<int, int, const Type*>> enums;
+                            rv.w = uWidth(*et);
+                            if (rv.w <= 0 || !randParts(*et, rv.parts, enums, rv.w))
+                                Lowerer::unsupported("rand unpacked struct with a member of this kind");
+                            bool any = false;
+                            for (auto& pt : rv.parts) any |= pt.rand;
+                            if (!any) rv.parts.clear();   // nothing in it is rand: left alone
+                            for (int k = 0; k < rv.count && any; k++)
+                                for (auto& [lo, w, en] : enums) {   // an enum member takes only its named values
+                                    E any2;
+                                    for (const auto& ev : en->as<EnumType>().values()) {
+                                        const auto& cv = ev.getValue();
+                                        if (!cv.isInteger()) continue;
+                                        auto u = cv.integer().as<uint64_t>();
+                                        E eq = bin(Op::Eq, slice(ref(lw.thisRel(rv.off + k), false), lo + w - 1, lo),
+                                                   konst(mk(u ? *u : 0, w)));
+                                        any2 = any2 ? bin(Op::LogOr, any2, eq) : eq;
+                                    }
+                                    if (any2) { RandItem it; it.e = any2; enumBlock->items.push_back(std::move(it)); }
+                                }
+                            if (any) sp->vars.push_back(std::move(rv));
+                            continue;
+                        }
                         if (isHandleType(*et)) {
                             rv.obj = true; rv.w = 64;   // a dynamic array or queue of them too: each object
                         }
@@ -15216,6 +15298,21 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                                 }
                                 if (any) { RandItem it; it.e = any; enumBlock->items.push_back(std::move(it)); }
                             }
+                        } else if (et->kind == SymbolKind::PackedStructType && !rv.dyn) {   // its enum fields: named values only (18.4)
+                            std::vector<std::tuple<int, int, const Type*>> enums;
+                            packedEnums(*et, 0, enums);
+                            for (int k = 0; k < rv.count; k++)
+                                for (auto& [lo, w, en] : enums) {
+                                    E any;
+                                    for (const auto& ev : en->as<EnumType>().values()) {
+                                        const auto& cv = ev.getValue();
+                                        if (!cv.isInteger()) continue;
+                                        auto u = cv.integer().as<uint64_t>();
+                                        E eq = bin(Op::Eq, slice(ref(lw.thisRel(rv.off + k), false), lo + w - 1, lo), konst(mk(u ? *u : 0, w)));
+                                        any = any ? bin(Op::LogOr, any, eq) : eq;
+                                    }
+                                    if (any) { RandItem it; it.e = any; enumBlock->items.push_back(std::move(it)); }
+                                }
                         }
                         sp->vars.push_back(std::move(rv));
                         continue;

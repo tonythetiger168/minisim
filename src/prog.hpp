@@ -492,6 +492,10 @@ struct RandVar {
     bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
     int depth = 1;      // containers of containers (int m[][]): how many levels
     bool stat = false;  // a static rand property (18.6.3): off and mode are signals shared by every object
+    // An unpacked struct (7.2, 18.4): its bits, top first, a part per member.
+    // Rand parts are solved; the others keep their values. w is the whole width.
+    struct Part { int w = 0; bool rand = false, sgn = false, randc = false; };
+    std::vector<Part> parts;
 };
 struct RandSpec {
     std::vector<RandVar> vars;
