@@ -14,6 +14,8 @@
 // soft constraints, they are added back from the highest priority down, each
 // kept only if a solution remains (18.5.13.1).
 
+#include <cfloat>
+#include <cstring>
 #include "interval.hpp"   // AV, wrap, conv and the interval rule of each operator (shared with mpss)
 
 using i128 = __int128;
@@ -30,9 +32,43 @@ inline bool valOf(const Val& v, i128& out) {
     return true;
 }
 
+// A rand real or shortreal (18.4.1) is solved as a key: a signed integer
+// whose order is the order of the values (the bits of a non-negative value
+// as they are, the magnitude bits of a negative one flipped), so a range of
+// keys is a range of reals. Only finite values have keys in the range.
+inline uint64_t keyBits(i128 k, int rk) {   // the double's bits stored for key k
+    if (rk == 32) {
+        int32_t s = (int32_t)(int64_t)k;
+        uint32_t b = (uint32_t)(s < 0 ? s ^ 0x7FFFFFFF : s);
+        float f;
+        std::memcpy(&f, &b, 4);
+        double d = f;
+        uint64_t r;
+        std::memcpy(&r, &d, 8);
+        return r;
+    }
+    int64_t s = (int64_t)k;
+    return (uint64_t)(s < 0 ? s ^ 0x7FFFFFFFFFFFFFFFLL : s);
+}
+inline double keyReal(i128 k, int rk) { uint64_t b = keyBits(k, rk); double d; std::memcpy(&d, &b, 8); return d; }
+inline i128 realKey(double d, int rk) {
+    if (rk == 32) {
+        float f = (float)d;
+        int32_t s;
+        std::memcpy(&s, &f, 4);
+        return s < 0 ? s ^ 0x7FFFFFFF : s;
+    }
+    int64_t s;
+    std::memcpy(&s, &d, 8);
+    return s < 0 ? s ^ 0x7FFFFFFFFFFFFFFFLL : s;
+}
+inline i128 keyMin(int rk) { return rk == 32 ? realKey(-FLT_MAX, 32) : realKey(-DBL_MAX, 64); }
+inline i128 keyMax(int rk) { return rk == 32 ? realKey(FLT_MAX, 32) : realKey(DBL_MAX, 64); }
+
 struct Var {
     int addr = 0, w = 1;
     bool sgn = false, randc = false;
+    int rk = 0;               // a real (64) or shortreal (32): val, lo and hi are keys
     int owner = 0;            // the object (randc state)
     bool set = false;
     i128 val = 0;
@@ -42,6 +78,10 @@ struct Var {
     Frame* distFr = nullptr;
     std::vector<std::pair<const RandItem*, Frame*>> gdists;   // ones under an if or ->: used when the condition holds
     bool ordered = false;     // solved first on purpose (solve-before, a function argument): its values alike
+    i128 dmin() const { return rk ? keyMin(rk) : rMin(w, sgn); }
+    i128 dmax() const { return rk ? keyMax(rk) : rMax(w, sgn); }
+    // The bits a value is stored as.
+    uint64_t bits(i128 x) const { return rk ? keyBits(x, rk) : w >= 64 ? (uint64_t)x : (uint64_t)x & ((1ULL << w) - 1); }
 };
 struct Item {
     const RandItem* it;
@@ -67,6 +107,7 @@ inline Val rcRead(int s) {
     Var& v = g_ctx->vars[(size_t)it->second];
     if (v.set || v.lo == v.hi) {
         i128 x = v.set ? v.val : v.lo;
+        if (v.rk) return make(v.bits(x), 0, 64, 0, false);
         return make((uint64_t)x, 0, v.w, 0, v.sgn);
     }
     g_ctx->touched = true;
@@ -107,6 +148,11 @@ inline AV aAddr(int addr, bool sgn, bool& exact) {
     auto it = g_ctx->idx.find(addr);
     if (it != g_ctx->idx.end()) {
         Var& v = g_ctx->vars[(size_t)it->second];
+        if (v.rk) {   // its bits: known once it is picked (read as a real through AsReal)
+            exact = v.set || v.lo == v.hi;
+            if (!exact) return full(64, sgn);
+            return conv(single((i128)v.bits(v.set ? v.val : v.lo), 64, false), 64, sgn);
+        }
         if (v.set) { exact = true; return conv(single(v.val, v.w, v.sgn), v.w, sgn); }
         exact = v.lo == v.hi;
         return conv(AV{v.lo, v.hi, v.w, v.sgn}, v.w, sgn);
@@ -116,8 +162,109 @@ inline AV aAddr(int addr, bool sgn, bool& exact) {
     v.sgn = sgn;
     return fromVal(v);
 }
+// The range of a real expression (18.4.1): a rand real stands for the
+// values of its keys' range. False when not known.
+inline bool rIv(const E& e, double& lo, double& hi, bool& exact) {
+    auto widen = [&]() { lo = std::nextafter(lo, -INFINITY); hi = std::nextafter(hi, INFINITY); };
+    switch (e->op) {
+        case Op::AsReal: {
+            const E& k = e->kids[0];
+            if (k->op == Op::Ref) {
+                int addr;
+                if (k->at) {
+                    Val h = eval(k->at, rcReader());
+                    if (h.x || !h.v) return false;
+                    addr = (int)h.v + k->sig;
+                } else addr = R(k->sig);
+                auto it = g_ctx->idx.find(addr);
+                if (it != g_ctx->idx.end()) {
+                    Var& v = g_ctx->vars[(size_t)it->second];
+                    if (!v.rk) return false;
+                    i128 a = v.set ? v.val : v.lo, b = v.set ? v.val : v.hi;
+                    lo = keyReal(a, v.rk); hi = keyReal(b, v.rk);
+                    exact = a == b;
+                    return true;
+                }
+            }
+            break;
+        }
+        case Op::FMath: {   // rounding to a shortreal keeps the order
+            if (e->hi != M_F32 || e->kids.size() != 1) break;
+            bool ea;
+            if (!rIv(e->kids[0], lo, hi, ea)) return false;
+            exact = ea;
+            if (ea) break;
+            lo = (double)(float)lo; hi = (double)(float)hi;
+            return true;
+        }
+        case Op::FNeg: {
+            if (!rIv(e->kids[0], lo, hi, exact)) return false;
+            std::swap(lo, hi);
+            lo = -lo; hi = -hi;
+            return true;
+        }
+        case Op::FAdd: case Op::FSub: case Op::FMul: {
+            double al, ah, bl, bh;
+            bool ea, eb;
+            if (!rIv(e->kids[0], al, ah, ea) || !rIv(e->kids[1], bl, bh, eb)) return false;
+            exact = ea && eb;
+            if (exact) break;
+            if (e->op == Op::FAdd) { lo = al + bl; hi = ah + bh; }
+            else if (e->op == Op::FSub) { lo = al - bh; hi = ah - bl; }
+            else {
+                double c[4] = {al * bl, al * bh, ah * bl, ah * bh};
+                lo = *std::min_element(c, c + 4); hi = *std::max_element(c, c + 4);
+            }
+            if (std::isnan(lo) || std::isnan(hi)) return false;
+            widen();
+            return true;
+        }
+        case Op::IToR: {
+            bool ea;
+            AV a = aeval(e->kids[0], ea);
+            exact = ea;
+            if (ea) break;
+            if (isFull(a) && a.w > 64) return false;
+            lo = (double)a.lo; hi = (double)a.hi;
+            widen();
+            return true;
+        }
+        default: break;
+    }
+    bool saved = g_ctx->touched;
+    g_ctx->touched = false;
+    Val v = eval(e, rcReader());
+    exact = !g_ctx->touched;
+    g_ctx->touched = saved || g_ctx->touched;
+    if (!exact) return false;
+    if (v.real) lo = hi = v_real(v);
+    else {   // an integer (a dist bound)
+        i128 x;
+        if (!valOf(v, x)) return false;
+        lo = hi = (double)x;
+    }
+    return !std::isnan(lo);
+}
+
 inline AV aeval(const E& e, bool& exact) {
     switch (e->op) {
+        case Op::FCmp: {   // a real compared (18.4.1): decided once the ranges no longer overlap
+            double al, ah, bl, bh;
+            bool ea, eb;
+            if (e->hi > 5 || !rIv(e->kids[0], al, ah, ea) || !rIv(e->kids[1], bl, bh, eb)) return concrete(e, exact);
+            exact = ea && eb;
+            if (exact) return concrete(e, exact);
+            bool t, f;
+            switch (e->hi) {
+                case 0: t = al < bh; f = ah >= bl; break;
+                case 1: t = al <= bh; f = ah > bl; break;
+                case 2: t = ah > bl; f = al <= bh; break;
+                case 3: t = ah >= bl; f = al < bh; break;
+                case 4: t = al <= bh && bl <= ah; f = !(al == ah && bl == bh && al == bl); break;
+                default: t = !(al == ah && bl == bh && al == bl); f = al <= bh && bl <= ah; break;
+            }
+            return boolAV(f, t);
+        }
         case Op::Const: exact = true; return fromVal(e->k);
         case Op::Ref: return aRef(e, exact);
         case Op::ArrRead: {   // an element: a variable when the index is known
@@ -366,7 +513,7 @@ inline bool runFns(Item& k) {
         const Var& v = g_ctx->vars[(size_t)vi];
         i128 x = v.set ? v.val : v.lo;
         old.push_back({v.addr, S.get(v.addr)});
-        S.set(v.addr, make(v.w >= 64 ? (uint64_t)x : (uint64_t)x & ((1ULL << v.w) - 1), 0, v.w, 0, v.sgn));
+        S.set(v.addr, make(v.bits(x), 0, v.w, 0, v.sgn && !v.rk));
     }
     Frame* sf = g_fr;
     Frame* sr = g_ret;
@@ -401,6 +548,19 @@ inline bool itemOk(Item& k, bool* sure = nullptr) {
     bool ex;
     if (k.it->isDist && k.it->guard && canFalse(aeval(k.it->guard, ex))) {
         ok = true;   // under an implication that need not hold
+    } else if (double rl, rh; k.it->isDist && rIv(k.it->e, rl, rh, ex)) {   // a real (18.4.1, 18.5.3)
+        ok = false;
+        bool e0;
+        if (k.it->distDefault && canTrue(aeval(k.it->distDefault, e0))) ok = true;
+        for (const RandDist& d : k.it->dist) {
+            if (ok) break;
+            double ll, lh, hl, hh;
+            bool e1;
+            if (!rIv(d.lo, ll, lh, e1) || !(d.hi ? rIv(d.hi, hl, hh, e1) : (hl = ll, hh = lh, true))) { ok = true; break; }
+            AV wt = aeval(d.weight, e1);
+            if (!canTrue(wt)) continue;
+            if (rl <= hh && ll <= rh) ok = true;
+        }
     } else if (k.it->isDist) {
         AV a = aeval(k.it->e, ex);
         ok = false;
@@ -642,6 +802,68 @@ inline bool pickVar(Var& v) {
     }
     const RandItem* vd = v.dist;
     Frame* vdFr = v.distFr;
+    if (v.rk) {
+        // A real (18.4.1): uniform over the values of a range of keys when
+        // its width is finite (the whole range of a double is not: there the
+        // keys are uniform, so every bit pattern of a finite value is alike).
+        auto inKeys = [&](i128 a, i128 b) -> bool {
+            a = std::max(a, flo); b = std::min(b, fhi);
+            if (a > b) return false;
+            double dl = keyReal(a, v.rk), dh = keyReal(b, v.rk);
+            bool byValue = std::isfinite(dh - dl);
+            for (int t = 0; t < 64; t++) {
+                i128 k;
+                if (byValue) {
+                    double u = (double)(rnd64() >> 11) / 9007199254740992.0;
+                    k = std::clamp(realKey(dl + u * (dh - dl), v.rk), a, b);
+                } else k = a + below(b - a + 1);
+                if (search(v, k, k)) return true;
+                v.lo = flo; v.hi = fhi;
+            }
+            if (search(v, a, b)) return true;   // thin: by halves
+            v.lo = flo; v.hi = fhi;
+            return false;
+        };
+        if (vd) {   // dist (18.5.3): a range by weight, then a value in it
+            struct Opt { i128 lo, hi; double w; };
+            std::vector<Opt> opts;
+            Frame* saved = g_fr;
+            g_fr = vdFr;
+            auto keyOf = [&](const Val& x, i128& k) {
+                if (x.x) return false;
+                double d;
+                if (x.real) d = v_real(x);
+                else { i128 iv; if (!valOf(x, iv)) return false; d = (double)iv; }
+                if (!std::isfinite(d)) return false;
+                k = realKey(d, v.rk);
+                return true;
+            };
+            for (const RandDist& d : vd->dist) {
+                Val lo = eval(d.lo, rcReader()), hi = d.hi ? eval(d.hi, rcReader()) : lo, wt = eval(d.weight, rcReader());
+                i128 l, h, wv;
+                if (!keyOf(lo, l) || !keyOf(hi, h) || !valOf(wt, wv) || wv <= 0) continue;
+                if (l > h) continue;
+                opts.push_back({l, h, (double)wv});   // a range of reals: its weight as a whole
+            }
+            if (vd->distDefault) {   // default :/ w: the values no item names
+                Val wt = eval(vd->distDefault, rcReader());
+                i128 wv;
+                if (valOf(wt, wv) && wv > 0) opts.push_back({flo, fhi, (double)wv});
+            }
+            g_fr = saved;
+            while (!opts.empty()) {
+                double tot = 0;
+                for (auto& o : opts) tot += o.w;
+                double r = (double)(rnd64() >> 11) / 9007199254740992.0 * tot;
+                size_t k = 0;
+                for (; k + 1 < opts.size(); k++) { if (r < opts[k].w) break; r -= opts[k].w; }
+                if (inKeys(opts[k].lo, opts[k].hi)) return true;
+                opts.erase(opts.begin() + (long)k);
+            }
+            return false;
+        }
+        return inKeys(flo, fhi);
+    }
     if (!vd)   // a dist under a condition: weighted once the condition is sure to hold
         for (auto& [gd, gf] : v.gdists) {
             Frame* sv = g_fr;
@@ -840,7 +1062,7 @@ inline bool pickVar(Var& v) {
 
 // One attempt at the variables in `order`.
 inline bool solveOnce(const std::vector<int>& order) {
-    for (auto& v : g_ctx->vars) { v.set = false; v.lo = rMin(v.w, v.sgn); v.hi = rMax(v.w, v.sgn); }
+    for (auto& v : g_ctx->vars) { v.set = false; v.lo = v.dmin(); v.hi = v.dmax(); }
     if (!propagate()) return false;
     // Many variables (rand arrays): full propagation after every pick costs
     // O(n^2) item checks per pick, so narrow only the variable picked next.
@@ -866,7 +1088,7 @@ inline bool solveOnce(const std::vector<int>& order) {
 // box to be hit within the tries, they are listed depth first when there
 // are few of them; else the variable-by-variable search below is used.
 inline bool sampleExact(int tries) {
-    for (auto& v : g_ctx->vars) { v.set = false; v.lo = rMin(v.w, v.sgn); v.hi = rMax(v.w, v.sgn); }
+    for (auto& v : g_ctx->vars) { v.set = false; v.lo = v.dmin(); v.hi = v.dmax(); }
     if (!propagate()) return false;
     std::vector<std::pair<i128, i128>> box;
     for (auto& v : g_ctx->vars) box.push_back({v.lo, v.hi});
@@ -970,7 +1192,7 @@ inline bool sampleExact(int tries) {
 }
 inline bool exactEligible(const std::vector<int>& rank) {
     for (auto& v : g_ctx->vars)
-        if (v.randc || v.ordered || v.dist || !v.gdists.empty()) return false;
+        if (v.randc || v.ordered || v.dist || !v.gdists.empty() || v.rk) return false;   // a real: uniform by value, not key
     for (int r : rank) if (r < 0) return false;
     for (auto& it : g_ctx->items)
         if (it.on && (it.it->isDist || !it.it->fns.empty() || !it.fnVars.empty())) return false;
@@ -993,7 +1215,7 @@ inline void mixPairs() {
     if (n < 2) return;
     std::vector<i128> sol(n);
     for (size_t k = 0; k < n; k++) sol[k] = g_ctx->vars[k].val;
-    for (auto& v : g_ctx->vars) { v.set = false; v.lo = rMin(v.w, v.sgn); v.hi = rMax(v.w, v.sgn); }
+    for (auto& v : g_ctx->vars) { v.set = false; v.lo = v.dmin(); v.hi = v.dmax(); }
     long budget0 = g_ctx->budget;
     g_ctx->budget = 20000 + 2000 * (long)n;
     bool ok = propagate();
@@ -1409,7 +1631,7 @@ static int doRandomize(int obj, const RandCall* rc) {
         return selfFrames.back().get();
     };
     // What takes part: scalar variables, containers, constraint lists.
-    struct ScalarVar { int addr, w; bool sgn, randc; int owner; };
+    struct ScalarVar { int addr, w; bool sgn, randc; int owner; int rk = 0; };   // rk: a real (Var::rk)
     std::vector<ScalarVar> scalars;
     struct StructVar { int addr; const RandVar* rv; int owner; };   // an unpacked struct with rand members
     std::vector<StructVar> structs;
@@ -1421,14 +1643,16 @@ static int doRandomize(int obj, const RandCall* rc) {
     if (rc && rc->argsGiven) {
         // randomize(a, b) / std::randomize(a, b): just these (18.11, 18.12).
         g_fr = callFr;
-        for (const E& a : rc->args) {
+        for (size_t ai = 0; ai < rc->args.size(); ai++) {
+            const E& a = rc->args[ai];
             int addr = a->at ? (int)eval(a->at, rd).v + a->sig : R(a->sig);
             bool cyc = false;   // a randc property stays cyclic when named (18.11)
+            int rk = ai < rc->argReal.size() ? rc->argReal[ai] : 0;
             if (obj > 0 && !S.sigs[obj].val.x && S.sigs[obj].val.v < classRt().size())
                 if (const auto& sp = classRt()[(size_t)S.sigs[obj].val.v].rand)
                     for (const RandVar& rv : sp->vars)
                         if (!rv.dyn && !rv.obj && !rv.stat && addr >= obj + rv.off && addr < obj + rv.off + rv.count) cyc = rv.randc;
-            scalars.push_back({addr, S.sigs[addr].w, a->sgn, cyc, obj});
+            scalars.push_back({addr, S.sigs[addr].w, a->sgn, cyc, obj, rk});
         }
         for (const auto& ca : rc->contArgs) {   // randomize(q): its size and elements
             RCont c;
@@ -1475,7 +1699,7 @@ static int doRandomize(int obj, const RandCall* rc) {
                     for (int k = 0; k < rv.count; k++) structs.push_back({o + rv.off + k, &rv, o});
                     continue;
                 }
-                for (int k = 0; k < rv.count; k++) scalars.push_back({o + rv.off + k, rv.w, rv.sgn, rv.randc, o});
+                for (int k = 0; k < rv.count; k++) scalars.push_back({o + rv.off + k, rv.w, rv.sgn, rv.randc, o, rv.real});
             }
         for (const auto& b : sp->blocks) {
             if (b->staticMode) { Val m = S.get(b->mode); if (!m.x && !(m.v & 1)) continue; }
@@ -1517,7 +1741,11 @@ static int doRandomize(int obj, const RandCall* rc) {
             v.addr = addr; v.w = w; v.sgn = sgn; v.randc = randc; v.owner = owner;
             ctx.vars.push_back(v);
         };
-        for (auto& sv : scalars) addVar(sv.addr, sv.w, sv.sgn, sv.randc, sv.owner);
+        for (auto& sv : scalars) {
+            bool fresh = !ctx.idx.count(sv.addr);
+            addVar(sv.addr, sv.w, sv.sgn, sv.randc, sv.owner);
+            if (fresh && sv.rk && ctx.idx.count(sv.addr)) ctx.vars[(size_t)ctx.idx[sv.addr]].rk = sv.rk;
+        }
         for (auto& st : structs) {   // its rand members solved in slots of their own, the rest kept
             if (wides.count(st.addr) || ctx.idx.count(st.addr)) continue;
             std::vector<int> ws;
@@ -1673,6 +1901,8 @@ static int doRandomize(int obj, const RandCall* rc) {
                 }
             const Expr* de = it.it->e.get();
             while (de && de->op == Op::Resize && !de->kids.empty() && de->kids[0]->op != Op::Const) de = de->kids[0].get();
+            if (de && de->op == Op::FMath && de->hi == M_F32) de = de->kids[0].get();   // a shortreal
+            if (de && de->op == Op::AsReal) de = de->kids[0].get();   // a real (18.4.1)
             auto attach = [&](Var& v) {
                 if (it.it->guard) v.gdists.push_back({it.it, it.fr});
                 else if (!v.dist) { v.dist = it.it; v.distFr = it.fr; }
@@ -1791,8 +2021,7 @@ static int doRandomize(int obj, const RandCall* rc) {
         if (ok) {
             for (auto& v : ctx.vars) {
                 if (pass == 1 && !ctx.idx.count(v.addr)) continue;
-                uint64_t bits = (uint64_t)v.val;
-                Val nv = make(v.w >= 64 ? bits : bits & ((1ULL << v.w) - 1), 0, v.w, 0, false);
+                Val nv = make(v.bits(v.val), 0, v.w, 0, false);
                 if (pass == 1) {   // only the sizes are kept from this pass
                     bool isSize = false;
                     for (int ci : sizeVars) if (conts[(size_t)ci].sizeFr->base == v.addr) isSize = true;
