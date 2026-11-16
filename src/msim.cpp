@@ -161,6 +161,7 @@
 #include <set>
 
 #include <fcntl.h>
+#include <malloc.h>
 #include <sys/file.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1930,6 +1931,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         files.push_back({name, src.substr(nl + 1, next == std::string::npos ? std::string::npos : next + 1 - (nl + 1))});
         at = next == std::string::npos ? next : next + 1;
     }
+    // The split text is all in `files`: drop the whole (a large design's is
+    // over a gigabyte, held while the compiler runs beside this process).
+    if (!files.empty()) std::string().swap(src);
     if (!files.empty()) {
         std::string cflags = " -std=c++20 " + opt + " -I" + shq(inc) + fstC;
         // Signal numbers resolved at link time (codegen.hpp relocText): absolute
@@ -1942,6 +1946,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         std::filesystem::remove(dir + "/simv.stamp", ec);
         std::vector<std::string> jobs, objs;
         std::vector<double> jobMB;   // the compiler's estimated memory for each job
+        const size_t hdrSize = files[0].second.size();
         for (auto& [name, text] : files) {
             std::string path = dir + "/" + name;
             bool same = slurp(path) == text;
@@ -1961,8 +1966,12 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             // the 600 of code. Estimated as code, it ran alone for half an hour
             // while every part waited.
             const bool tables = name == "design.cpp" && files.size() > 2;
-            jobMB.push_back(300 + (tables ? 80.0 : 600.0) * (text.size() + files[0].second.size()) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
+            jobMB.push_back(300 + (tables ? 80.0 : 600.0) * (text.size() + hdrSize) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
         }
+        // Written: the texts are not needed again, and the memory they and
+        // codegen's buffers held goes back to the system for the compilers.
+        for (auto& f : files) std::string().swap(f.second);
+        malloc_trim(0);
         // Remove parts left from an earlier, larger split.
         for (int k = (int)files.size() - 2;; k++) {
             std::string old = dir + "/part" + std::to_string(k);
