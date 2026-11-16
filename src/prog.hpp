@@ -492,6 +492,7 @@ struct RandVar {
     bool dyn = false;   // a dynamic array or queue: off is its container slot, w / sgn its elements'
     int depth = 1;      // containers of containers (int m[][]): how many levels
     bool stat = false;  // a static rand property (18.6.3): off and mode are signals shared by every object
+    int real = 0;       // a rand real (64) or shortreal (32) (18.4.1): w is 64, the double's bits
     // An unpacked struct (7.2, 18.4): its bits, top first, a part per member.
     // Rand parts are solved; the others keep their values. w is the whole width.
     struct Part { int w = 0; bool rand = false, sgn = false, randc = false; };
@@ -509,6 +510,7 @@ struct RandCall {
     std::vector<RandItem> items;
     std::vector<std::pair<std::vector<E>, std::vector<E>>> before;
     std::vector<E> args;        // the variables to randomize, as Refs
+    std::vector<int> argReal;   // by argument: a real (64) or shortreal (32), else 0 (18.4.1)
     bool argsGiven = false;     // randomize(...) with arguments (18.11): only those
     int objTmp = -1;
     // Container arguments (randomize(q), 18.11): the container, its

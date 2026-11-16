@@ -8856,9 +8856,13 @@ struct Lowerer {
                 for (E& n : addrs) rc->contArgs.push_back({-1, (int)ec.getBitWidth(), ec.isSigned(), depth, std::move(n)});
                 continue;
             }
-            if (!a.type->isIntegral()) unsupported("randomize() argument of this type");
+            const Type& at = a.type->getCanonicalType();
+            if (!at.isIntegral() && !at.isFloating()) unsupported("randomize() argument of this type");
             E r = expr(a);
+            if (at.isFloating() && r->op == Op::AsReal) r = r->kids[0];   // a real (18.4.1): its bits
             if (r->op != Op::Ref) unsupported("randomize() argument that is not a variable");
+            rc->argReal.resize(rc->args.size());
+            rc->argReal.push_back(at.isFloating() ? (at.getBitWidth() == 32 ? 32 : 64) : 0);
             rc->args.push_back(r);
             rc->argsGiven = true;
         }
@@ -15243,12 +15247,23 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                             if (any) sp->vars.push_back(std::move(rv));
                             continue;
                         }
-                        if (isHandleType(*et)) {
+                        if (et->isUnpackedStruct() && rv.dyn) {   // a container of structs (18.4) whose members are all rand bits
+                            std::vector<RandVar::Part> parts;
+                            std::vector<std::tuple<int, int, const Type*>> enums;
+                            int w = uWidth(*et);
+                            bool all = w > 0 && randParts(*et, parts, enums, w) && enums.empty();
+                            for (auto& pt : parts) all = all && pt.rand && !pt.randc;
+                            if (!all) Lowerer::unsupported("rand container of unpacked structs with a member that is not rand bits");
+                            rv.w = w;
+                        } else if (isHandleType(*et)) {
                             rv.obj = true; rv.w = 64;   // a dynamic array or queue of them too: each object
                         }
                         else if (et->isIntegral() && !et->isUnpackedStruct()) {
                             rv.w = (int)et->getBitWidth(); rv.sgn = et->isSigned();
                             if (rv.w > 64 && rv.randc) Lowerer::unsupported("randc variable wider than 64 bits");
+                        } else if (et->isFloating() && !rv.dyn && !rv.randc) {   // rand real / shortreal (18.4.1)
+                            rv.w = 64;
+                            rv.real = (int)et->getBitWidth() == 32 ? 32 : 64;
                         } else Lowerer::unsupported("rand property of this type");
                         if (et->isEnum() && rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // each element: one of the named values
                             RandItem loop;
