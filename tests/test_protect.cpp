@@ -377,6 +377,22 @@ int main() {
             assert(l.size() == 2 && l[0].name == "m.a" && l[1].name == "m.blk.b");
         }
 
+        // The same viewports in a clause 34 envelope (msimprotect -v1): read
+        // and blanked too, so the compiler never sees `pragma protect viewport.
+        {
+            EncryptOptions o1;
+            o1.recipients.push_back(recipient(alice.get(), "Alice Corp", "alice-1"));
+            Decrypted d1 = decryptSource(encryptSource(VP, o1, "vp.sv"), a, "vp.svp");
+            assert(d1.text.find("viewport") == std::string::npos);
+            auto& v1 = d1.envs[0].viewports;
+            assert(v1.size() == 3);
+            assert(d1.text.substr(v1[0].targetBegin, v1[0].targetEnd - v1[0].targetBegin) == "reg [1:0] seen, also;");
+            assert(v1[1].name == "m.hidden2" && v1[2].iface);
+            // The IEEE 1800 form stays as it was: not a 1735 viewport.
+            const char* V18 = "`pragma protect begin\n`pragma protect viewport=(object=\"m.x\", access=\"R\")\nmodule m; endmodule\n`pragma protect end\n";
+            assert(decryptSource(encryptSource(V18, o1, "v18.sv"), a, "v18.svp").envs[0].viewports.empty());
+        }
+
         // IEEE 1735-2023 5.2 and Annex A, rule by rule.
         auto enc = [&](const std::string& src) { return encryptSourceV3(src, va, "r.sv"); };
         const std::string body = "`pragma protect begin\nmodule m; endmodule\n`pragma protect end\n";

@@ -448,6 +448,10 @@ Spec references are IEEE 1800-2023 clauses.
   whether its padding or its digest fails, after the same work, so msim
   cannot serve as a padding oracle (CCS 2017, CERT VU#739007). An envelope
   whose data has no digest opens with a warning.
+- msim: `` `pragma protect viewport `` and `interface_viewport` inside an
+  IEEE 1800 clause 34 envelope (`msimprotect -v1`, the form AMD Vivado
+  opens) are now read and blanked as in version 3. Before, the compiler saw
+  the pragma line, and a scoped name in it stopped the run.
 
 ### Added
 - Floating point datapath modules, IEEE 754 in any exponent and fraction
