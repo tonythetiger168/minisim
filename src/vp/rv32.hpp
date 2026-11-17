@@ -13,7 +13,9 @@
 #include <memory>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -183,7 +185,7 @@ struct Hart {
     // (with A, and D for a store, set) and found allowed by PMP as a whole.
     // Emptied with the TLB and by PMP writes.
     struct DataPage { uint64_t vpn = ~0ull; uint8_t* host = nullptr; uint32_t ctx = 0; };
-    static constexpr unsigned DP_SIZE = 64;
+    static constexpr unsigned DP_SIZE = 256;
     DataPage dl[DP_SIZE], ds[DP_SIZE];
     void flushDataPages() {
         for (auto& e : dl) e.vpn = ~0ull;
@@ -196,8 +198,8 @@ struct Hart {
     unsigned fpPriv = 0;
     // The fast loop's record of pages instructions were fetched from the same
     // way (fpVpn and fpPriv as each was set), by virtual page.
-    struct FetchPage { uint64_t vpn = ~0ull; unsigned priv = 0; };
-    static constexpr unsigned FP_SIZE = 16;
+    struct FetchPage { uint64_t vpn = ~0ull; unsigned priv = 0; uint64_t pa = 0; };
+    static constexpr unsigned FP_SIZE = 256;
     FetchPage fp[FP_SIZE];
     void flushFetchPages() { for (auto& e : fp) e.vpn = ~0ull; }
     // The active PMP entries, decoded from the CSRs in priority order
@@ -220,11 +222,11 @@ struct Hart {
     int watchKind = 0;      // 0 none, 2 write, 3 read, 4 access (gdb Z types)
     Overlay ov;
 
-    // Decoded instructions by pc (direct mapped). Instruction fetch sees
+    // Decoded instructions by physical address (direct mapped). Instruction fetch sees
     // stores to code only after FENCE.I, as the ISA allows; loading a
     // program, a debugger write and a restore empty it too.
     struct Decoded {
-        uint64_t pc;  // the instruction's address, | 1 when fetched through the MMU (~0: empty)
+        uint64_t pc;  // the tag: (physical address, | 1 when fetched through the MMU) ^ mmuTag (~0: empty)
         uint32_t insn, raw;
         uint8_t len, op, rd, f3, rs1, rs2, f7;
         bool xlat;  // fetched through the MMU (the same pc means another page bare)
@@ -233,15 +235,42 @@ struct Hart {
         uint8_t step;  // bytes from this entry to the next instruction's (len / 2 entries)
         int32_t imm;   // its immediate, decoded (I, U, J, B or S type)
     };
-    static constexpr unsigned DC_SIZE = 32768;
+    static constexpr unsigned DC_SIZE = 262144;
     // Two entries past the end that never hold a pc: the fast loop steps to
     // the next entry without wrapping and leaves when it lands there.
-    std::unique_ptr<Decoded[]> dc{new Decoded[DC_SIZE + 2]};
-    Hart() { flushDecoded(); }
-    void flushDecoded() {
-        for (unsigned i = 0; i < DC_SIZE + 2; i++) dc[i].pc = ~0ull;
-        dcGen++;
+    // Zeroed by the system as pages are first touched: a zero tag never
+    // matches, the epoch (below) being at least 1.
+    struct Free { void operator()(void* p) const { std::free(p); } };
+    std::unique_ptr<Decoded[], Free> dc{(Decoded*)std::calloc(DC_SIZE + 2, sizeof(Decoded))};
+    Hart() {
+        if (!dc) throw std::bad_alloc();
     }
+    // Forget every decoded instruction (the code may have changed). An
+    // entry's tag is the physical address it was read from (| 1 when fetched
+    // through the MMU) with an epoch in bits 63..57, which no physical
+    // address has, so a new epoch drops them all at once; every 127th
+    // empties the array. SFENCE.VMA and satp leave the cache alone.
+    void flushDecoded() {
+        dcGen++;
+        codeGen++;
+        if (++mmuEpoch == 128) {
+            memset((void*)dc.get(), 0, (DC_SIZE + 2) * sizeof(Decoded));
+            mmuEpoch = 1;
+        }
+        mmuTag = (uint64_t)mmuEpoch << 57;
+        codePages.clear();
+        codeUntracked = false;
+    }
+    // The physical pages decoded instructions came from since the last
+    // flush, each with a copy of its bytes as they were then: FENCE.I drops
+    // only what came from a page that has changed since (whoever changed
+    // it: a store on any path, DMA, another hart's write buffer). A page
+    // that cannot be copied, or too many of them, makes it a full flush.
+    struct CodePage { const uint8_t* host; std::unique_ptr<uint8_t[]> snap; bool changed; };
+    static constexpr size_t CODE_PAGES = 512;
+    std::unordered_map<uint64_t, CodePage> codePages;
+    bool codeUntracked = false;
+    uint64_t fenceFull = 0, fencePart = 0, fencePages = 0;
     // The fast loop's basic blocks: runs of decoded instructions ending at a
     // jump or branch, each a list of handlers with their operands. A block
     // holds for the decoded-cache generation it was built in.
@@ -251,15 +280,21 @@ struct Hart {
         uint8_t off;            // halfwords from the block's pc
         int32_t imm;
     };
-    static constexpr unsigned BLOCK_OPS = 32, BLOCKS = 2048;
+    static constexpr unsigned BLOCK_OPS = 32, BLOCKS = 16384;
+    // All zero (gen 0, which no generation is) when made: calloc'd, so a
+    // hart pays only for the pages its blocks use.
     struct Block {
-        uint64_t pc = ~0ull, end = 0, target = 0;  // pc: as Decoded::pc; end: after the last op; target: a branch's or JAL's
-        uint32_t gen = 0;
-        uint32_t n = 0;
+        uint64_t pc, end, target;  // pc: | 1 with paging; end: after the last op; target: a branch's or JAL's
+        uint64_t poff;             // with paging: physical minus virtual address of its page
+        uint32_t gen;
+        uint32_t n;
         BlockOp ops[BLOCK_OPS + 1];  // the last is the fall-through exit
     };
-    uint32_t dcGen = 1;
-    std::unique_ptr<Block[]> blocks;  // made on first use
+    uint32_t dcGen = 1;    // any flush (the fast loop's blocks)
+    uint32_t codeGen = 1;  // a flush of everything: FENCE.I, a load, a debugger write (translations)
+    uint32_t mmuEpoch = 1;
+    uint64_t mmuTag = 1ull << 57;   // mmuEpoch << 57: the decoded cache's tags carry it
+    std::unique_ptr<Block[], Free> blocks;  // made on first use
 
     // The last plain memory device used, for the fast path.
     uint64_t cBase = 1, cEnd = 0;

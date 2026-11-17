@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <vector>
 
 #if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__))
 #include <sys/mman.h>
@@ -61,6 +62,7 @@ struct Jit {
         if (p == MAP_FAILED) { failed = true; return; }
         buf = (uint8_t*)p;
         jt = new JtEntry[JT];
+        for (unsigned i = 0; i < JT; i++) jt[i] = {~0ull, nullptr};
         prologue();
         flush();
 #else
@@ -76,11 +78,14 @@ struct Jit {
     Jit(const Jit&) = delete;
     Jit& operator=(const Jit&) = delete;
 
+    std::vector<uint32_t> jtUsed;  // the table entries filled since the last flush
     void flush() {
         used = codeStart;
         blocks.clear();
         steps.clear();
-        for (unsigned i = 0; i < JT; i++) jt[i] = {~0ull, nullptr};
+        if (jtUsed.size() > JT / 8) for (unsigned i = 0; i < JT; i++) jt[i] = {~0ull, nullptr};
+        else for (uint32_t i : jtUsed) jt[i] = {~0ull, nullptr};
+        jtUsed.clear();
         flushes++;
     }
     uint8_t* find(uint64_t pc) {
@@ -88,12 +93,15 @@ struct Jit {
         if (e.pc == pc) return e.code;
         auto it = blocks.find(pc);
         if (it == blocks.end()) return nullptr;
+        if (e.pc == ~0ull) jtUsed.push_back((uint32_t)((pc >> 1) & (JT - 1)));
         e = {pc, it->second};
         return it->second;
     }
     void add(uint64_t pc, uint8_t* code) {
         blocks[pc] = code;
-        jt[(pc >> 1) & (JT - 1)] = {pc, code};
+        JtEntry& e = jt[(pc >> 1) & (JT - 1)];
+        if (e.pc == ~0ull) jtUsed.push_back((uint32_t)((pc >> 1) & (JT - 1)));
+        e = {pc, code};
         compiled++;
     }
     static void patch(uint64_t site, uint8_t* to) {
