@@ -4651,16 +4651,30 @@ private:
         // that group's processes; one marker NBA per slot commits them all.
         const bool multi = domGroups_ > 1;
         if (multi) {
-            // The processes of each group: DSO[DOFF[g] .. DOFF[g + 1]), indices into DS.
+            // The processes of each group in run order, as direct calls in one
+            // function per group: no table loop and no indirect call per
+            // process (Ibex: 79 processes a cycle).
             std::vector<std::vector<size_t>> byG(domGroups_);
             for (size_t j = 0; j < run_.size(); j++) byG[domGroup_[run_[j]]].push_back(j);
-            o << "static const uint32_t DSO[] = {";
-            size_t c = 0;
-            for (auto& v : byG) for (size_t j : v) o << (c++ ? ", " : "") << j;
-            o << "};\nstatic const uint32_t DOFF[] = {0";
-            c = 0;
-            for (auto& v : byG) { c += v.size(); o << ", " << c; }
-            o << "};\nstatic bool dpend = false;\n";
+            o << "static bool dpend = false;\n";
+            for (int g = 0; g < domGroups_; g++) {
+                o << "static void dsQ" << g << "() {";
+                for (size_t j : byG[g]) o << " ds" << run_[j] << "();";
+                o << " }\n";
+                if (two) {
+                    o << "static void dsQ2_" << g << "() {";
+                    for (size_t j : byG[g]) o << " ds" << run_[j] << "_2();";
+                    o << " }\n";
+                }
+            }
+            o << "static void (*const DSQ[])() = {";
+            for (int g = 0; g < domGroups_; g++) o << (g ? ", " : "") << "dsQ" << g;
+            o << "};\n";
+            if (two) {
+                o << "static void (*const DSQ2[])() = {";
+                for (int g = 0; g < domGroups_; g++) o << (g ? ", " : "") << "dsQ2_" << g;
+                o << "};\n";
+            }
         }
         // Islands (like the kernel's partitions): processes and comb statements
         // that share no signal the domain writes. When every domain target is
@@ -4960,8 +4974,8 @@ private:
             // in between (NBAs only): one twoNow() for all of them.
             if (two) o << "    static uint64_t tAt = ~0ULL; static bool tNow = false;\n"
                           "    if (S.seqRun != tAt) { tAt = S.seqRun; tNow = twoNow(); }\n"
-                          "    if (tNow) { for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS2[DSO[k]](); } else\n";
-            o << "    for (uint32_t k = DOFF[grp]; k < DOFF[grp + 1]; k++) DS[DSO[k]]();\n"
+                          "    if (tNow) DSQ2[grp](); else\n";
+            o << "    DSQ[grp]();\n"
                  "    if (dpend) return;\n    dpend = true;\n";
         } else if (two) o << "    if (twoNow()) { for (auto f : DS2) f(); } else\n";
         if (!par && !multi) o << "    for (auto f : DS) f();\n";
