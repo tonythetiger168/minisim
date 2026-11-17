@@ -58,6 +58,16 @@ for t in 1 4; do
 done
 cmp -s smp64_1.log smp64_4.log && ok "RV64: the same run on 1 and 4 threads" || bad "RV64: the run depends on the thread count"
 head -1 smp64_1.log | grep -q "^core   0: 3 0x0000000080000000 (0x" && ok "RV64: 64-bit commit log" || { bad "RV64 -trace"; head -3 smp64_1.log; }
+# -serial: the harts take turns on one thread, storing to memory directly.
+for e in smp smp64; do
+  for o in "" "-quantum 7" -nojit; do
+    "$MVPLAT" "$E/$e.elf" -harts 4 -serial -q $o > ser.out 2>&1; rc=$?
+    expect "-serial $e $o: atomics and LR/SC" 0 ser.out "harts 4 atomic 8000 locked 8000"
+  done
+done
+"$MVPLAT" "$E/smp64.elf" -harts 4 -serial -q -trace ser1.log > /dev/null 2>&1
+"$MVPLAT" "$E/smp64.elf" -harts 4 -serial -q -trace ser2.log > /dev/null 2>&1
+cmp -s ser1.log ser2.log && ok "-serial: the same run twice" || bad "-serial: two runs differ"
 
 # The V extension: clang's vectorized loops agree with its scalar ones
 # (RV32 and RV64, at the smallest and largest VLEN), and single
@@ -92,10 +102,13 @@ cmp -s jit.out jit_nojit.out && cmp -s jit.out jit_q7.out && \
   [ "$(grep -o '[0-9]* instructions' jit_count.out)" = "$(grep -o '[0-9]* instructions' jit_count_nojit.out)" ] \
   && ok "translator: the same checksum and instruction count as -nojit, and with a 7-cycle quantum" \
   || bad "translator: differs from -nojit"
-for o in "" -nojit "-quantum 7" "-harts 2"; do
+for o in "" -nojit "-quantum 7" "-harts 2" "-harts 2 -serial"; do
   "$MVPLAT" "$E/smc64.elf" -q $o > smc.out 2>&1; rc=$?
   expect "self-modifying code and FENCE.I, machine and supervisor mode (Sv39, an alias) ${o:-(translated)}" 0 smc.out "checks passed, all"
 done
+# the same with code pages compared at every FENCE.I instead of watched
+MVPLAT_NO_WTRACK=1 "$MVPLAT" "$E/smc64.elf" -q > smc.out 2>&1; rc=$?
+expect "self-modifying code, pages not watched" 0 smc.out "checks passed, all"
 "$MVPLAT" "$E/svpbmt64.elf" -q > svpbmt.out 2>&1; rc=$?
 expect "Svpbmt (PBMT, menvcfg.PBMTE) and Zalasr (load-acquire, store-release)" 0 svpbmt.out "checks passed, all"
 
@@ -237,6 +250,10 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
   "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd "$E/initramfs64.cpio" \
     -append "console=ttyS0 rdinit=/init" -harts 2 -q > linux.out 2>&1; rc=$?
   expect "Linux boots to /init on 2 harts and powers off" 0 linux.out "mvplat-init: powering off"
+  "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd "$E/initramfs64.cpio" \
+    -append "console=ttyS0 rdinit=/init" -harts 4 -serial -q > linux_serial.out 2>&1; rc=$?
+  expect "Linux on 4 harts, -serial" 0 linux_serial.out "mvplat-init: powering off"
+  grep -q "smp: Brought up 1 node, 4 CPUs" linux_serial.out && ok "Linux -serial brought up 4 harts" || bad "Linux -serial SMP bring-up"
   grep -q "^Linux version" linux.out && grep -q "smp: Brought up 1 node, 2 CPUs" linux.out &&
     ok "Linux brought up both harts and printed /proc/version" || bad "Linux SMP bring-up"
   # An rv64gc user space (floating point included): BusyBox's shell runs

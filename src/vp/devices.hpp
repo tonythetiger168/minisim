@@ -18,6 +18,7 @@
 #include <sstream>
 
 #include "bus.hpp"
+#include "wtrack.hpp"
 
 namespace vp {
 
@@ -99,6 +100,7 @@ private:
         uint8_t* data() { return p; }
         size_t size() const { return n; }
         void clear() {
+            WriteWatch::remapped(p);
             if (n && mmap(p, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED)
                 memset(p, 0, n);
         }

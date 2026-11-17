@@ -273,7 +273,14 @@ struct Hart {
     // only what came from a page that has changed since (whoever changed
     // it: a store on any path, DMA, another hart's write buffer). A page
     // that cannot be copied, or too many of them, makes it a full flush.
-    struct CodePage { const uint8_t* host; std::unique_ptr<uint8_t[]> snap; bool changed; uint64_t used; };  // used: 64-byte pieces code came from
+    struct CodePage {
+        const uint8_t* host;
+        std::unique_ptr<uint8_t[]> snap;
+        bool changed;
+        uint64_t used;  // the 64-byte pieces code came from
+        int wr;         // its WriteWatch region (-1: none, compare; -2: read-only memory)
+        uint32_t seen;  // the region's write count for the page when last compared
+    };
     static constexpr size_t CODE_PAGES = 512;
     std::unordered_map<uint64_t, CodePage> codePages;
     bool codeUntracked = false;

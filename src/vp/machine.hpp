@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -81,6 +82,11 @@ public:
     bool profile = false;
     // The dynamic translator (x86-64 hosts): on unless -nojit.
     bool jit = true;
+    // Several harts take turns on one thread, a quantum each, storing to
+    // memory directly (no write buffers, no ordered phase): another
+    // interleaving than the parallel rounds', also the same on every run,
+    // and each hart runs on the fast loop and the translator.
+    bool serial = false;
 
     // Debugger state.
     std::set<uint64_t> breakpoints;
@@ -214,7 +220,7 @@ public:
                 if (d->memory() && ((d->base | d->size) & 4095))
                     throw std::runtime_error("'" + d->name + "': with more than one hart, memory must start and end on a 4 KiB boundary");
         updateIrqs();
-        if (harts.size() > 1 && threads > 1) {
+        if (harts.size() > 1 && threads > 1 && !serial) {
             pool_ = std::make_unique<par::Pool>(std::min<unsigned>(threads, (unsigned)harts.size()));
             pool_->spin(20000);
         }
@@ -253,6 +259,7 @@ public:
                 break;
             }
             if (harts.size() == 1) runOne(*harts[0], end);
+            else if (serial) runSerial(end);
             else runRound(end);
             if (exit_) break;
             if (cut_ < end) end = cut_;
@@ -1332,7 +1339,7 @@ private:
             uint8_t k = fastKind(insn, true, imm);
             if (!k) {
                 k = jitKind(insn, pg);
-                if (k == J_AMO && harts.size() > 1) k = K_NONE;  // AMOs break other harts' reservations
+                if (k == J_AMO && harts.size() > 1 && !serial) k = K_NONE;  // AMOs break other harts' reservations
                 if (k == J_AMO) imm = (int32_t)((insn >> 27) | ((insn >> 12) & 7) << 8);  // funct5, width
                 else if (k == J_CBOZ) imm = 0;
             }
@@ -1814,7 +1821,13 @@ private:
             h.codeUntracked = true;
             return;
         }
-        Hart::CodePage cp{d->memory() + ((pg << 12) - d->base), std::unique_ptr<uint8_t[]>(new uint8_t[4096]), false, pieces};
+        Hart::CodePage cp{d->memory() + ((pg << 12) - d->base), std::unique_ptr<uint8_t[]>(new uint8_t[4096]), false, pieces, -1, 0};
+        // watched first, then copied: a write after the copy counts
+        if (!d->writable()) cp.wr = -2;
+        else if (int id = watchRegion(d); id >= 0) {
+            const size_t wp = ((pg << 12) - d->base) >> 12;
+            if (WriteWatch::watch(id, wp)) { cp.wr = id; cp.seen = WriteWatch::gen(id, wp); }
+        }
         memcpy(cp.snap.get(), cp.host, 4096);
         if (memcmp(cp.snap.get() + (fa & 0xfff), &raw, n)) cp.changed = true;
         h.codePages.emplace(pg, std::move(cp));
@@ -1825,6 +1838,19 @@ private:
             noteCode(h, fa + 2, raw >> 16, 2);
         } else noteCode(h, fa, raw, len);
     }
+    // The device's memory as a WriteWatch region (-1: not watched).
+    // Harts of a parallel round call it at once (only for a page not seen
+    // before, so a lock is cheap enough).
+    int watchRegion(Device* d) {
+        std::lock_guard<std::mutex> l(wrMu_);
+        auto it = wrIds_.find(d);
+        if (it != wrIds_.end()) return it->second;
+        const int id = (d->base & 4095) || (d->size & 4095) ? -1 : WriteWatch::add(d->memory(), d->size);
+        wrIds_[d] = id;
+        return id;
+    }
+    std::mutex wrMu_;
+    std::unordered_map<Device*, int> wrIds_;
     // FENCE.I: forget what was decoded from pages that changed.
     void fenceI(Hart& h) {
         if (h.codeUntracked || (h.par && !h.ov.empty())) {
@@ -1836,13 +1862,29 @@ private:
         bool any = false;
         for (auto it = h.codePages.begin(); it != h.codePages.end();) {
             Hart::CodePage& c = it->second;
+            // not written since it was last compared (or read-only)
+            if (!c.changed && c.wr != -1) {
+                if (c.wr == -2) { ++it; continue; }
+                const size_t wp = (size_t)(c.host - WriteWatch::base(c.wr)) >> 12;
+                if (WriteWatch::readOnly(c.wr, wp) && WriteWatch::gen(c.wr, wp) == c.seen) { ++it; continue; }
+            }
+            // watched again before comparing, so a write after the compare
+            // counts next time
+            if (!c.changed && c.wr >= 0) {
+                const size_t wp = (size_t)(c.host - WriteWatch::base(c.wr)) >> 12;
+                if (WriteWatch::watch(c.wr, wp)) c.seen = WriteWatch::gen(c.wr, wp);
+                else c.wr = -1;
+            }
             // only the pieces instructions were decoded from matter
             bool changed = c.changed;
             for (uint64_t m = c.used; m && !changed; m &= m - 1) {
                 const unsigned o = 64 * (unsigned)__builtin_ctzll(m);
                 changed = memcmp(c.snap.get() + o, c.host + o, 64) != 0;
             }
-            if (!changed) { ++it; continue; }
+            if (!changed) {
+                ++it;
+                continue;
+            }
             const uint64_t pg = it->first;
             // its entries, and one at the end of the page before (4 bytes across)
             Hart::Decoded* e = &h.dc[((pg << 12) >> 1) & (Hart::DC_SIZE - 1)];
@@ -2375,6 +2417,19 @@ private:
         if (dbg) dbg->stopped(h.id);
         h.stopSig = 0;
         h.watchKind = 0;
+    }
+
+    // Several harts, -serial: each in turn runs to the end of the quantum.
+    // A hart's LR reservation does not outlast its turn (the others' stores
+    // in theirs did not break it), so an SC after another hart ran fails.
+    void runSerial(uint64_t end) {
+        for (auto& hp : harts) {
+            Hart& h = *hp;
+            if (irqDirty_) updateIrqs();
+            runOne(h, end);
+            h.resv = false;
+            if (exit_) break;
+        }
     }
 
     // Several harts: rounds of a parallel phase and an ordered phase.

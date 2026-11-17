@@ -78,6 +78,9 @@ void usage() {
         "  -input TEXT        characters the first UART receives\n"
         "  -trace FILE        commit log, one line per instruction (spike's format)\n"
         "  -nojit             interpret only (no translation to host code)\n"
+        "  -serial            harts take turns on one thread, a quantum each, with no\n"
+        "                     write buffers (fastest for an SMP OS; another\n"
+        "                     interleaving than the parallel rounds)\n"
         "Booting an operating system (as QEMU's -bios, -kernel, -initrd, -append, -dtb):\n"
         "  -bios FILE         firmware run first, in machine mode (OpenSBI fw_dynamic)\n"
         "  -kernel FILE       kernel (a raw Image or an ELF) the firmware starts in supervisor mode\n"
@@ -119,7 +122,7 @@ struct Options {
     unsigned threads = par::defaultThreads();
     long long quantum = -1, maxCycles = 0;
     double mhz = 0;
-    bool map = false, quiet = false, nojit = false;
+    bool map = false, quiet = false, nojit = false, serial = false;
     bool haveInput = false;
 };
 
@@ -173,6 +176,8 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : 1000;
     if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
     if (o.nojit) m.jit = false;
+    if (pl.get("serial")) m.serial = pl.get("serial")->u64() != 0;
+    if (o.serial) m.serial = true;
     if (!m.quantum) throw std::runtime_error("the quantum must be at least one cycle");
     uint64_t reset = pl.get("reset") ? pl.get("reset")->u64() : 0x80000000u;
     m.addHarts(nh, reset);
@@ -518,6 +523,7 @@ int main(int argc, char** argv) {
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
         else if (s == "-nojit") o.nojit = true;
+        else if (s == "-serial") o.serial = true;
         else if (!s.empty() && s[0] == '-') {
             int used = 0;
             try {
