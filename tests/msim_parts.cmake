@@ -35,7 +35,10 @@ message(STATUS "${changed} of 4 parts changed")
 # A signal and a process added to one module (linux x86-64: the parts name
 # signals by link-time symbols, codegen.hpp relocText): design.hpp and the
 # parts of the other modules stay the same; only the part of the edited
-# process and the part of the new one change.
+# process and the part of the new one change. MSIM_NOORDER=1: a new process
+# may change the order the domain runs its processes in (codegen.hpp
+# orderDomain), and with it which registers of the other modules are stored
+# at once, so their code too.
 cmake_host_system_information(RESULT os QUERY OS_NAME)
 cmake_host_system_information(RESULT cpu QUERY OS_PLATFORM)
 if(os STREQUAL "Linux" AND cpu MATCHES "x86_64|AMD64")
@@ -45,7 +48,7 @@ if(os STREQUAL "Linux" AND cpu MATCHES "x86_64|AMD64")
     if(v STREQUAL "d")
       set(def "+define+SIG")
     endif()
-    execute_process(COMMAND ${CMAKE_COMMAND} -E env MSIM_NOKOBJ=1
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env MSIM_NOKOBJ=1 MSIM_NOORDER=1
                     "${MSIM}" -compile -cfiles 4 -cc true -o "${OUT}/${v}" ${def} "${SRC}/examples/partsig.sv"
                     OUTPUT_QUIET ERROR_QUIET)
     if(NOT EXISTS "${OUT}/${v}/part3.cpp")

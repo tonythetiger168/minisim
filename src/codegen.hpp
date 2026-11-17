@@ -114,6 +114,8 @@ public:
         auto chunk = [&](auto&& emit) { std::ostringstream c; emit(c); chunks.push_back(c.str()); };
         std::vector<int> byRank;
         std::vector<int> dom = cycle && !cov ? cycleDomain(procs, sigs) : std::vector<int>{};
+        run_ = dom;
+        orderDomain(procs, sigs, run_);   // the order they run in; dom keeps the code layout
         {
             // The domain re-evaluates every static combinational statement on
             // each commit (and whenever an input outside the clock cone
@@ -1019,6 +1021,7 @@ private:
     // PA, not S.sigs), so the domain compares them with their values at the
     // start of the wait instead (armChk). Per process: its arm number, or -1.
     std::vector<int> armK_;
+    std::vector<int> run_;   // the domain's processes in the order they run (orderDomain)
     std::vector<std::vector<int>> armIns_;   // per arm: its private inputs
     std::vector<const Instr*> armSet_;       // per arm: the flag's Assign
     static bool armShape(const CodegenProc& p, const std::vector<CodegenSig>& sigs) {
@@ -2650,6 +2653,85 @@ private:
         return best;
     }
 
+    // The order the domain's processes run in, within each clock group. A
+    // register one process writes (NBA) and another reads can be stored at
+    // once when the reader runs first: it still sees the old value, and the
+    // commit list is skipped (see direct). Readers go before writers as far
+    // as the read graph allows (picorv32's decoder and memory interface
+    // read the main state machine's registers). Greedy feedback-arc order
+    // (Eades, Lin, Smyth 1993), weighted by the writes each order saves;
+    // ties keep the original order. MSIM_NOORDER: as found.
+    void orderDomain(const std::vector<CodegenProc>& procs, const std::vector<CodegenSig>& sigs, std::vector<int>& dom) {
+        if (dom.size() < 2 || std::getenv("MSIM_NOORDER")) return;
+        const size_t ns = sigs.size();
+        std::vector<int> wproc(ns, -1), nsite(ns, 0);
+        auto okS = [&](int x) { return x >= 0 && (size_t)x < ns; };
+        for (int p : dom)
+            for (auto& in : procs[p].prog->code)
+                if (in.k == IK::Nba && okS(in.sig)) {
+                    nsite[in.sig]++;
+                    wproc[in.sig] = wproc[in.sig] == -1 || wproc[in.sig] == p ? p : -2;
+                }
+        // reads: proc -> signals
+        std::map<std::pair<int, int>, long> w;   // (reader, writer) -> weight: reader first saves it
+        std::function<void(const E&, std::set<int>&)> refs = [&](const E& e, std::set<int>& out) {
+            if (!e) return;
+            if (okS(e->sig) && e->op != Op::Const) out.insert(e->sig);
+            for (auto& k : e->kids) refs(k, out);
+            if (e->at) refs(e->at, out);
+        };
+        for (int q : dom) {
+            std::set<int> rd;
+            for (auto& in : procs[q].prog->code) {
+                refs(in.e, rd); refs(in.de, rd); refs(in.bidx, rd); refs(in.fd, rd);
+                for (auto& a : in.aidx) refs(a, rd);
+                for (auto& a : in.args) refs(a, rd);
+            }
+            for (int sg : rd)
+                if (wproc[sg] >= 0 && wproc[sg] != q && domGroup_[q] == domGroup_[wproc[sg]]) w[{q, wproc[sg]}] += nsite[sg];
+        }
+        if (w.empty()) return;
+        std::map<int, std::vector<int>> byG;   // clock group -> its processes, in order
+        std::vector<int> gOrder;
+        for (int p : dom) { int g = domGroup_[p]; if (!byG.count(g)) gOrder.push_back(g); byG[g].push_back(p); }
+        std::map<int, std::vector<int>> sorted;
+        for (auto& [g, ps] : byG) {
+            std::set<int> left(ps.begin(), ps.end());
+            std::vector<int> head, tail;
+            std::map<int, long> outW, inW;
+            for (auto& [e, x] : w)
+                if (left.count(e.first) && left.count(e.second)) { outW[e.first] += x; inW[e.second] += x; }
+            auto drop = [&](int v) {
+                left.erase(v);
+                for (auto& [e, x] : w) {
+                    if (e.first == v && left.count(e.second)) inW[e.second] -= x;
+                    if (e.second == v && left.count(e.first)) outW[e.first] -= x;
+                }
+            };
+            std::vector<int> idx(ps);   // original order for ties
+            while (!left.empty()) {
+                bool moved = false;
+                for (int v : idx) if (left.count(v) && outW[v] == 0 && inW[v] != 0) { tail.push_back(v); drop(v); moved = true; }   // sinks: last
+                for (int v : idx) if (left.count(v) && inW[v] == 0 && outW[v] != 0) { head.push_back(v); drop(v); moved = true; }   // sources: first
+                if (moved) continue;
+                int best = -1; long bd = 0;
+                for (int v : idx) if (left.count(v) && (best < 0 || outW[v] - inW[v] > bd)) { best = v; bd = outW[v] - inW[v]; }
+                if (outW[best] == 0 && inW[best] == 0) {   // no edges left: the rest as found
+                    for (int v : idx) if (left.count(v)) head.push_back(v);
+                    left.clear();
+                    break;
+                }
+                head.push_back(best);
+                drop(best);
+            }
+            head.insert(head.end(), tail.rbegin(), tail.rend());
+            sorted[g] = head;
+        }
+        // Each group's processes back into the places that group had.
+        std::map<int, size_t> at;
+        for (int& p : dom) { int g = domGroup_[p]; p = sorted[g][at[g]++]; }
+    }
+
     // ---- shared comb code (one copy per module, like Verilator) ----
     // The instances of one module get their signals at a constant distance
     // (c1.cpu.x = c0.cpu.x + D): the comb statements of one instance are those
@@ -3970,6 +4052,9 @@ private:
                 }
             }
             auto cand = [&](int sg) { return sg >= 0 && (size_t)sg < ns && wproc[sg] >= 0 && !bad[sg]; };
+            std::vector<int> domPos(procs.size(), -1);
+            for (size_t j = 0; j < run_.size(); j++) domPos[run_[j]] = (int)j;
+            static const bool noEarly = std::getenv("MSIM_NOORDER") != nullptr;
             std::vector<int> cidx(ns, -1);
             for (size_t p = 0; p < procs.size(); p++) {
                 if (!procs[p].prog) continue;
@@ -3992,6 +4077,11 @@ private:
                         // An @* arming process (armChk compares the inputs; it arms
                         // its block once, which runs in combAll after fcommit either way).
                         if (wproc[sg] != (int)p && p < armK_.size() && armK_[p] >= 0) return;
+                        // Another process of the domain that runs before the writer, in
+                        // the same clock group (orderDomain), sees the old value too.
+                        if (wproc[sg] != (int)p && inDom[p] && domPos[p] >= 0 && domPos[p] < domPos[wproc[sg]] &&
+                            domGroup_[p] == domGroup_[wproc[sg]] && !noEarly)
+                            return;
                         if (wproc[sg] != (int)p) { if (!bad[sg] && dbgD) std::fprintf(stderr, "WD other %s w=%d r=%zu %s rank=%d seq=%d dom=%d line=%d\n", sigName_[sg].c_str(), wproc[sg], p, procs[p].kind.c_str(), procs[p].combRank, (int)procs[p].seq, (int)inDom[p], procs[p].prog->code.empty() ? 0 : procs[p].prog->code[0].line); bad[sg] = 1; return; }
                         const int c = cidx[sg];
                         if (!fwd || (win[pc][(size_t)c / 64] >> (c % 64) & 1)) {
@@ -4548,12 +4638,13 @@ private:
              "    if (wait) { wait--; pclean = false; return; }\n    uint64_t x = 0;\n";
         for (int s : privs) if (!scratch(s) && !deadSig[s]) o << "    x |= P" << s << ".x;\n";
         o << "    pclean = x == 0;\n    skip = x ? (skip < " << scanCap_ << " ? skip * 2 + 1 : " << scanCap_ << ") : 0;\n    wait = skip;\n}\n";
+        // In run order (orderDomain): readers of another process's registers first.
         o << "static void (*const DS[])() = {";
-        for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j];
+        for (size_t j = 0; j < run_.size(); j++) o << (j ? ", " : "") << "ds" << run_[j];
         o << "};\n";
         if (two) {
             o << "static void (*const DS2[])() = {";
-            for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j] << "_2";
+            for (size_t j = 0; j < run_.size(); j++) o << (j ? ", " : "") << "ds" << run_[j] << "_2";
             o << "};\n";
         }
         // Several clock groups: dseq is registered once per group and runs
@@ -4562,7 +4653,7 @@ private:
         if (multi) {
             // The processes of each group: DSO[DOFF[g] .. DOFF[g + 1]), indices into DS.
             std::vector<std::vector<size_t>> byG(domGroups_);
-            for (size_t j = 0; j < dom.size(); j++) byG[domGroup_[dom[j]]].push_back(j);
+            for (size_t j = 0; j < run_.size(); j++) byG[domGroup_[run_[j]]].push_back(j);
             o << "static const uint32_t DSO[] = {";
             size_t c = 0;
             for (auto& v : byG) for (size_t j : v) o << (c++ ? ", " : "") << j;
@@ -4764,7 +4855,7 @@ private:
         auto groupOf = [&](int sig) { return islGroup[islandOf(sig)]; };
         if (par) {
             std::vector<std::vector<int>> gProcs(G);
-            for (int n : dom) if (procSig.count(n)) gProcs[groupOf(procSig[n])].push_back(n);
+            for (int n : run_) if (procSig.count(n)) gProcs[groupOf(procSig[n])].push_back(n);
             for (int g = 0; g < G; g++) {
                 o << "static void dsG" << g << "(bool two) {\n    if (two) {";
                 for (int n : gProcs[g]) o << " ds" << n << "_2();";
