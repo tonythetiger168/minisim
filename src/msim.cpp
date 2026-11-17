@@ -2880,6 +2880,8 @@ static void usage() {
                  "  -load <lib>    load a VPI library before elaboration\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  -version       print the msim version\n"
+                 "  -v <file>      read a library file (33.3.1; -v alone prints the version)\n"
+                 "  --single-unit=false  give each file its own compilation unit (default: one unit, 3.12.1)\n"
                  "  --help-slang   list every front-end option\n";
 }
 
@@ -2977,6 +2979,9 @@ static int msimMain(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "-h" || a == "--help" || a == "-help") { usage(); return 0; }
+        // -v <file> names a library file (33.3.1, as in VCS and Xcelium);
+        // -v alone prints the version.
+        if (a == "-v" && i + 1 < argc && argv[i + 1][0] != '-') { fwd.push_back("-v"); fwd.push_back(argv[++i]); continue; }
         if (a == "-version" || a == "--version" || a == "-v") { version(); return 0; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
@@ -3376,6 +3381,12 @@ static int msimMain(int argc, char** argv) {
     // (--allow-use-before-declare=false turns this off).
     if (auto& f = driver.options.compilationFlags[slang::ast::CompilationFlags::AllowUseBeforeDeclare]; !f)
         f = true;
+    // 3.12.1: the files of one command line make one compilation unit, as
+    // in VCS, Xcelium and Verilator, so a `define or a $unit declaration in
+    // one file is seen in the files after it, library files (-v, -y)
+    // included. --single-unit=false gives each file its own unit.
+    if (!driver.options.singleUnit) driver.options.singleUnit = true;
+    if (!driver.options.librariesInheritMacros) driver.options.librariesInheritMacros = *driver.options.singleUnit;
     if (!driver.processOptions()) return 2;
     // 33.3.1.1: two cells with one name in one library are a warning, and
     // the last one encountered is the one used (slang keeps the later
@@ -3399,6 +3410,12 @@ static int msimMain(int argc, char** argv) {
         bool widthSet = false;
         for (auto& s : fwd) widthSet |= s.find("range-width-oob") != std::string::npos;
         if (!widthSet) driver.diagEngine.setSeverity(slang::diag::RangeWidthOOB, slang::DiagnosticSeverity::Warning);
+        // A reversed constant part select (11.5.1: illegal) reads x; real
+        // designs have one in a branch a parameter disables (`IS64 && v[31:34]`
+        // with IS64 = 0). -Werror=range-select-reversed keeps the error.
+        bool revSet = false;
+        for (auto& s : fwd) revSet |= s.find("range-select-reversed") != std::string::npos;
+        if (!revSet) driver.diagEngine.setSeverity(slang::diag::RangeSelectReversed, slang::DiagnosticSeverity::Warning);
     }
 
     // Protected envelopes (34): decrypt before slang reads the files, and

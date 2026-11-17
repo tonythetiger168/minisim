@@ -91,7 +91,39 @@
 // earlier compilation may share addresses with this one's.
 using ArrMap = std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>>;
 inline ArrMap& arrMap() { static ArrMap m; return m; }
-constexpr int64_t kMaxArrayElems = 1 << 20;
+constexpr int64_t kMaxArrayElems = 1 << 24;
+// True when every invalid node in e is there only because of a reversed
+// constant part select under it (found: there was one).
+inline bool onlyReversedSelects(const slang::ast::Expression& e, bool& found) {
+    using namespace slang::ast;
+    if (e.kind != ExpressionKind::Invalid) return true;   // a valid node has valid operands
+    const Expression* c = e.as<InvalidExpression>().child;
+    if (!c) return false;
+    switch (c->kind) {
+        case ExpressionKind::RangeSelect: {
+            auto& rs = c->as<RangeSelectExpression>();
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple || !rs.value().type->isIntegral()) return false;
+            found = true;
+            return !rs.value().bad();
+        }
+        case ExpressionKind::Assignment: {
+            auto& a = c->as<AssignmentExpression>();
+            return !a.left().bad() && onlyReversedSelects(a.right(), found);
+        }
+        case ExpressionKind::BinaryOp: {
+            auto& b = c->as<BinaryExpression>();
+            return onlyReversedSelects(b.left(), found) && onlyReversedSelects(b.right(), found);
+        }
+        case ExpressionKind::UnaryOp: return onlyReversedSelects(c->as<UnaryExpression>().operand(), found);
+        case ExpressionKind::ConditionalOp: {
+            auto& q = c->as<ConditionalExpression>();
+            if (q.conditions.size() != 1 || q.conditions[0].pattern) return false;
+            return onlyReversedSelects(*q.conditions[0].expr, found) && onlyReversedSelects(q.left(), found) &&
+                   onlyReversedSelects(q.right(), found);
+        }
+        default: return false;
+    }
+}
 // The design's source manager, for file names and line numbers in messages.
 inline const slang::SourceManager*& srcMgr() { static const slang::SourceManager* m = nullptr; return m; }
 // Net types that resolve differently from wire (6.6): signal -> kind.
@@ -6744,6 +6776,54 @@ struct Lowerer {
                 }
                 return sized(concat(parts), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
             }
+            case ExpressionKind::Invalid: {
+                // An expression slang kept only as invalid because of a
+                // diagnostic msim turns into a warning: a reversed constant
+                // part select (11.5.1 makes it illegal; other simulators read
+                // x, and real designs have it in branches a parameter turns
+                // off). The select reads x; the operators around it work on
+                // that x, so `0 && v[31:34]` is still 0 (11.4.7).
+                const Expression* c = e.as<InvalidExpression>().child;
+                if (!c) unsupported("invalid expression");
+                auto xOf = [&](int w) { return sized(konst(allx(std::max(w, 1))), std::max(w, 1), false, ctx); };
+                if (c->kind == ExpressionKind::RangeSelect) {
+                    auto& rs = c->as<RangeSelectExpression>();
+                    int64_t w = 1;
+                    if (rs.getSelectionKind() == RangeSelectionKind::Simple)
+                        w = std::llabs(constInt(rs.left()) - constInt(rs.right())) + 1;
+                    else
+                        w = constInt(rs.right());
+                    return xOf((int)std::min<int64_t>(w, 1 << 20));
+                }
+                if (c->kind == ExpressionKind::Assignment) return expr(*c);
+                if (!c->type->isError()) {
+                    if (c->kind == ExpressionKind::BinaryOp || c->kind == ExpressionKind::UnaryOp) return expr(*c);
+                }
+                if (c->kind == ExpressionKind::BinaryOp) {
+                    auto& b = c->as<BinaryExpression>();
+                    switch (b.op) {
+                        case BinaryOperator::LogicalAnd: return sized(bin(Op::LogAnd, expr(b.left()), expr(b.right())), 1, false, ctx);
+                        case BinaryOperator::LogicalOr: return sized(bin(Op::LogOr, expr(b.left()), expr(b.right())), 1, false, ctx);
+                        default: break;
+                    }
+                    // Any other operator on an operand that reads x: x (11.4).
+                    // Its width is lost with the error, so 1 bit, which is
+                    // what the comparisons and reductions around a select give.
+                    return xOf(1);
+                }
+                if (c->kind == ExpressionKind::UnaryOp) return xOf(1);
+                if (c->kind == ExpressionKind::ConditionalOp) {
+                    auto& q = c->as<ConditionalExpression>();
+                    if (q.conditions.size() == 1 && !q.conditions[0].pattern) {
+                        E l = expr(q.left()), r = expr(q.right());
+                        int w = 1;   // the width a valid arm has (an invalid one lost it)
+                        for (const Expression* x : {&q.left(), &q.right()})
+                            if (!x->type->isError() && x->type->isIntegral()) w = std::max(w, (int)x->type->getBitWidth());
+                        return sized(node(Op::Mux, {expr(*q.conditions[0].expr), sized(l, w, false, ctx), sized(r, w, false, ctx)}), w, false, ctx);
+                    }
+                }
+                unsupported("invalid expression");
+            }
             default:
                 throw std::runtime_error("lower: unsupported expression kind " + std::string(toString(e.kind)));
         }
@@ -10664,6 +10744,13 @@ struct Lowerer {
     // Assignments, ++/--, and system calls used as statements.
     void exprStmt(const slang::ast::Expression& ex) {
         using namespace slang::ast;
+        // An assignment kept invalid only for a reversed part select on its
+        // right (see onlyReversedSelects): the assignment, the select reading x.
+        if (ex.kind == ExpressionKind::Invalid && ex.as<InvalidExpression>().child &&
+            ex.as<InvalidExpression>().child->kind == ExpressionKind::Assignment) {
+            exprStmt(*ex.as<InvalidExpression>().child);
+            return;
+        }
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
             if (syncDrive(a) || vifSyncDrive(a)) return;   // cb.v <= e, v.cb.v <= e (14.16, 25.9)
@@ -10949,6 +11036,12 @@ struct Lowerer {
                 if (c && c->kind != StatementKind::ExpressionStatement && c->kind != StatementKind::ProceduralAssign &&
                     c->kind != StatementKind::ProceduralDeassign)
                     stmt(*c);
+                // A statement whose only fault is a reversed part select (a
+                // warning in msim, see Invalid in expr) runs, the select reading x.
+                else if (c && c->kind == StatementKind::ExpressionStatement) {
+                    bool found = false;
+                    if (onlyReversedSelects(c->as<ExpressionStatement>().expr, found) && found) stmt(*c);
+                }
                 break;
             }
             case StatementKind::List:
@@ -12298,7 +12391,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             shape->dims.push_back({ft.range.left, ft.range.right});
             total *= (int64_t)ft.range.width();
             if (total > kMaxArrayElems)
-                throw std::runtime_error("lower: unsupported array with more than 2^20 elements: " + std::string(s.name));
+                throw std::runtime_error("lower: unsupported array with more than 2^24 elements: " + std::string(s.name));
             t = &ft.elementType.getCanonicalType();
         }
         int w = storeW(*t);
@@ -13300,7 +13393,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
 
     void handle(const slang::ast::ContinuousAssignSymbol& ca) {
         using namespace slang::ast;
-        const auto& a = ca.getAssignment().as<AssignmentExpression>();
+        const Expression* ax = &ca.getAssignment();
+        if (bool found = false; ax->kind == ExpressionKind::Invalid && onlyReversedSelects(*ax, found) && found)
+            ax = ax->as<InvalidExpression>().child;   // a reversed part select on the right reads x
+        if (ax->kind != ExpressionKind::Assignment) Lowerer::unsupported("continuous assignment that did not bind");
+        const auto& a = ax->as<AssignmentExpression>();
         Lowerer::covLoc(ca.location);
         Lowerer::lastLoc() = ca.location;
         Lowerer lw(sigmap);
@@ -14862,7 +14959,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 if (const Symbol* sym = x.getSymbolReference(); sym && sym->kind == SymbolKind::Net) n[sym]++;
             }
             void handle(const slang::ast::ContinuousAssignSymbol& a) {
-                const auto& x = a.getAssignment();
+                const slang::ast::Expression* xp = &a.getAssignment();
+                if (xp->kind == slang::ast::ExpressionKind::Invalid && xp->as<slang::ast::InvalidExpression>().child)
+                    xp = xp->as<slang::ast::InvalidExpression>().child;
+                const auto& x = *xp;
                 if (x.kind == slang::ast::ExpressionKind::Assignment) count(&x.as<slang::ast::AssignmentExpression>().left());
             }
             void handle(const slang::ast::NetSymbol& net) {

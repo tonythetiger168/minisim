@@ -802,7 +802,7 @@ python3 tools/msupport.py -serve 8080            # a local web page and JSON API
 - Declaration initializers (`logic x = 0;`, `wire y = a & b;`) are lowered. A module variable's initializer runs before every `initial` / `always`
 - Tasks and functions have no recursion, no `ref` arguments, no class methods, and no cross-module calls. Each subroutine has one static copy of its arguments and locals, so two processes inside a delaying task can overwrite that copy. `&&`, `||`, and `?:` evaluate every arm, so a call on an arm that Verilog would skip still runs.
 - System tasks other than the display family, `$finish`, and `$stop` are ignored with a warning. `$stop` ends a batch run like `$finish` and says where on stderr
-- Unpacked arrays: fixed size only, at most 2^20 elements; no slices or whole-array operations. Array elements are left out of the VCD. See `docs/COVERAGE.md` for the full list
+- Unpacked arrays: fixed size only, at most 2^24 elements; no slices or whole-array operations. Array elements are left out of the VCD. See `docs/COVERAGE.md` for the full list
 
 ## Spec coverage and tests
 
