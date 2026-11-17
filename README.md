@@ -714,6 +714,20 @@ The viewer page has the hierarchy, clickable source, drivers and loads, a
 schematic of the selected signal, and waves with the values annotated in the
 source. See [`docs/DEBUG.md`](docs/DEBUG.md).
 
+### Editors: `mlsp` and VS Code
+
+`mlsp` is a language server on the msim front end: errors as you type, go to
+definition (across files, through ports, parameters and packages),
+references, hover, outline, workspace symbols, completion, and `mlint`
+findings on save, in any LSP editor. `editors/vscode/` is the VS Code
+extension: it starts `mlsp` and runs `msim`, `mlint`, `mdebug` (waveforms)
+and `mcov` (coverage in the gutter) on the design of the open file, and offers
+the minisim MCP server to agents. See `docs/LSP.md`.
+
+```
+mlsp -check tb/tb.sv          # what the editor would show, on the command line
+```
+
 ### Low-power simulation: UPF (IEEE 1801)
 
 `msim -upf dut.upf` simulates with the design's power intent: power domains,
