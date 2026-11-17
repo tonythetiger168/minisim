@@ -3696,7 +3696,7 @@ private:
         // Then a comb statement that only writes private signals nothing
         // reads has no effect anyone sees. Those go to combDead, which runs
         // only when a VCD or $monitor watches every signal (syncP).
-        std::set<const Instr*> deadIn;
+        std::set<const Instr*> deadIn, deadSeq;
         std::vector<char> deadProc(procs.size(), 0), deadSig(sigW_.size(), 0);
         std::vector<std::string> deadStmts;
         if (!std::getenv("MSIM_NODEAD")) {
@@ -3732,7 +3732,9 @@ private:
                     for (auto* b : in.branches) walk(b, outside);
                 }
             };
-            for (size_t i = 0; i < procs.size(); i++) walk(procs[i].prog, !mine[i]);
+            // An @* arming process (armK_) waits on its block's inputs: those
+            // are the block's reads, live only if the block is (its unit).
+            for (size_t i = 0; i < procs.size(); i++) walk(procs[i].prog, !mine[i] && !(i < armK_.size() && armK_[i] >= 0 && !std::getenv("MSIM_NODEADSEQ")));
             // An assertion's process keeps every signal it names as it is.
             for (int i : byRank)
                 if (i >= 0 && combAsserts(*procs[i].prog))
@@ -3760,7 +3762,7 @@ private:
             for (size_t i = 0; i < procs.size(); i++)
                 if (mine[i]) for (auto& in : procs[i].prog->code) exprs(in, rw);
             // Units: a process with if / case, or one straight assign.
-            struct Unit { int proc; const Instr* one; std::vector<int> wr, rd; bool live; };
+            struct Unit { int proc; const Instr* one; std::vector<int> wr, rd; bool live; bool seq = false; };
             std::vector<Unit> us;
             for (int i : byRank) {
                 if (i < 0) continue;
@@ -3780,8 +3782,44 @@ private:
             // A clocked process's clock edge is a copy's root (the domain
             // waits on that): a port's private clk_i copy nobody else reads
             // is dead (1125 of them in Ibex, two passes a cycle).
+            // A clocked process's write of a private register that nothing
+            // live reads (picorv32's dbg_ascii_instr, cached_ascii_instr) is a
+            // unit too; a dead one runs only while S.observed (deadSeq).
+            // Not in a design with $dumpvars: a dump that starts later would
+            // see such a register's stale value (MSIM_NODEADSEQ: never).
+            static const std::set<Op> pureOp = {Op::Const, Op::Ref, Op::Not, Op::And, Op::Or, Op::Xor, Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Mod,
+                                                Op::Eq, Op::Ne, Op::CaseEq, Op::CaseZEq, Op::CaseXEq, Op::Lt, Op::Le, Op::Gt, Op::Ge, Op::Shl, Op::Shr,
+                                                Op::Asr, Op::Resize, Op::LogNot, Op::LogAnd, Op::LogOr, Op::RedAnd, Op::RedOr, Op::RedXor, Op::Slice,
+                                                Op::Index, Op::Concat, Op::Mux, Op::WildEq, Op::DynSlice};
+            std::function<bool(const E&)> pureE = [&](const E& e) {
+                if (!e) return true;
+                if (e->at || !pureOp.count(e->op)) return false;
+                for (auto& k : e->kids) if (!pureE(k)) return false;
+                return true;
+            };
+            bool seqDead = !std::getenv("MSIM_NODEADSEQ");
+            {
+                std::vector<const Prog*> seenD;
+                std::function<void(const Prog*)> dumps = [&](const Prog* p) {
+                    if (!p || !seqDead || std::find(seenD.begin(), seenD.end(), p) != seenD.end()) return;
+                    seenD.push_back(p);
+                    for (auto& in : p->code) {
+                        if (in.k == IK::Dump || in.k == IK::Vpi) { seqDead = false; return; }
+                        dumps(in.callee);
+                        for (auto* b : in.branches) dumps(b);
+                    }
+                };
+                for (auto& pr : procs) dumps(pr.prog);
+            }
             for (int n : dom)
                 for (auto& in : procs[n].prog->code) {
+                    if (seqDead && (in.k == IK::Assign || in.k == IK::Nba) && ok(in.sig) && isPriv(in.sig) && !keep[in.sig] && !in.arr &&
+                        in.aidx.empty() && in.args.empty() && in.drv < 0 && !in.delay && in.dly.empty() && !in.nbaLater && in.gate < 0 &&
+                        in.dyn < 0 && !in.udp && pureE(in.e) && pureE(in.bidx) && pureE(in.de)) {
+                        us.push_back({n, &in, {in.sig}, {}, false, true});
+                        exprs(in, [&](Expr& x) { if (ok(x.sig)) us.back().rd.push_back(x.sig); });
+                        continue;
+                    }
                     if (in.k == IK::WaitEdge && !std::getenv("MSIM_NOCLKALIAS")) {
                         exprs(in, [&](Expr& x) { if (ok(x.sig)) live[x.sig] = 1; });
                         if (ok(in.sig)) live[alias[in.sig] >= 0 && !wakeSig(in.sig) ? root(in.sig) : in.sig] = 1;
@@ -3795,9 +3833,10 @@ private:
                     if (u.live) for (int r : u.rd) if (!live[r]) { live[r] = 1; ch = true; }
                 }
             }
-            size_t nDead = 0;
+            size_t nDead = 0, nDeadSeq = 0;
             for (auto& u : us) {
                 if (u.live) continue;
+                if (u.seq) { deadSeq.insert(u.one); nDeadSeq++; continue; }
                 nDead++;
                 if (u.one) deadIn.insert(u.one); else deadProc[u.proc] = 1;
                 for (int w : u.wr) deadSig[w] = 1;
@@ -3805,7 +3844,8 @@ private:
             for (int n : dom)
                 for (auto& in : procs[n].prog->code) if (in.k == IK::Nba && ok(in.sig)) deadSig[in.sig] = 0;
             if (std::getenv("MSIM_WHYCYCLE"))
-                std::fprintf(stderr, "cycle domain: %zu copies read at their source, %zu of %zu comb units have no reader\n", nAlias, nDead, us.size());
+                std::fprintf(stderr, "cycle domain: %zu copies read at their source, %zu of %zu comb units have no reader, %zu clocked writes nothing reads\n",
+                             nAlias, nDead, us.size(), nDeadSeq);
         }
         struct Slot { int sig, hi, lo; };
         std::vector<Slot> slots;
@@ -4176,8 +4216,19 @@ private:
                     }
                     default: throw CodegenUnsupported("instruction in a clocked process");
                 }
-                if (renamed || !sn) { allF << fns.str(); allF2 << fns2.str(); }
-                else { allF << snapRen(fns.str()); allF2 << snapRen(fns2.str()); }
+                std::string t4 = fns.str(), t2 = fns2.str();
+                if (deadSeq.count(&i)) {   // nothing live reads it: only for a waveform or $monitor
+                    const std::string lb = L(pc) + ":";
+                    auto guard = [&](std::string& t) {
+                        if (t.compare(0, lb.size(), lb) != 0) return;
+                        while (!t.empty() && t.back() == '\n') t.pop_back();
+                        t = lb + " if (__builtin_expect(S.observed, 0)) {" + t.substr(lb.size()) + "\n }\n";
+                    };
+                    guard(t4);
+                    guard(t2);
+                }
+                if (renamed || !sn) { allF << t4; allF2 << t2; }
+                else { allF << snapRen(t4); allF2 << snapRen(t2); }
             }
             allF << L(end) << ": return;\n";
             allF2 << L(end) << ": return;\n";

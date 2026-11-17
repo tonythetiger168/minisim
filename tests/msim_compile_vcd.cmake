@@ -2,7 +2,8 @@
 # as the interpreter's: also for signals the compiled code keeps in private
 # variables, reads at their source (port copies) or does not compute unless a
 # waveform is open. Called with -DMSIM -DSRC -DOUT -DPY.
-set(CASES "examples/deadcopy.sv" "examples/widesplit.sv" "examples/timeps.sv" "examples/cycle.sv" "examples/combbranch.sv")
+set(CASES "examples/deadcopy.sv" "examples/widesplit.sv" "examples/timeps.sv" "examples/cycle.sv" "examples/combbranch.sv"
+          "examples/deadseq.sv")
 file(MAKE_DIRECTORY ${OUT})
 set(n 0)
 foreach(c IN LISTS CASES)
