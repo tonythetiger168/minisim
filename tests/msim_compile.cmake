@@ -88,6 +88,7 @@ set(CASES
   "examples/combbranch.sv"
   "examples/combcycle.sv"
   "examples/ringcycle.sv"
+  "examples/meshshare.sv"
   "examples/combsplit.sv"
   "examples/combbidx.sv"
   "examples/clkcone.sv"
@@ -204,6 +205,14 @@ foreach(c IN LISTS CASES)
     file(READ ${OUT}/c${n}/design.cpp gen)
     if(NOT gen MATCHES "dsT[0-9]+\\(" OR NOT gen MATCHES "combPT[0-9]+_0\\(")
       message(FATAL_ERROR "${c}: the instances do not share their code")
+    endif()
+  endif()
+  # The tiles of a generate mesh (soc.row[r].col[c].t) share one copy of
+  # their comb code (codegen.hpp instKey).
+  if(c STREQUAL "examples/meshshare.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(NOT gen MATCHES "combPT[0-9]+_0\\(")
+      message(FATAL_ERROR "${c}: the tiles of the mesh do not share their comb code")
     endif()
   endif()
   # Public registers and run-time array NBAs still run the cycle domain
