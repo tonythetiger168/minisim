@@ -622,8 +622,7 @@ public:
                 } else {
                     h.satp = v & 0x803fffffu;  // MODE, PPN; no ASIDs
                 }
-                h.flushTlb();
-                h.flushDecoded();
+                h.flushTlb();  // the decoded cache and blocks go by physical address
                 return true;
             case 0x305: h.mtvec = v & ~2ull; return true;
             case 0x306: h.mcounteren = (uint32_t)v & 7; return true;
@@ -1089,7 +1088,8 @@ public:
     }
     // Fetch through the MMU: the instruction's bits and the trap, if any
     // (cause and tval; cause 0 = none).
-    uint32_t fetchXlat(Hart& h, uint64_t pc, uint32_t& raw, uint64_t& tval, bool readBits, unsigned knownLen) {
+    uint32_t fetchXlat(Hart& h, uint64_t pc, uint32_t& raw, uint64_t& tval, bool readBits, unsigned knownLen,
+                       uint64_t* paOut = nullptr) {
         uint64_t pa;
         tval = pc;
         const bool samePage = (pc >> 12) == h.fpVpn && h.priv == h.fpPriv;
@@ -1104,9 +1104,10 @@ public:
                 h.fpVpn = pc >> 12;
                 h.fpPa = pa & ~0xfffull;
                 h.fpPriv = h.priv;
-                h.fp[(pc >> 12) & (Hart::FP_SIZE - 1)] = {pc >> 12, h.priv};
+                h.fp[(pc >> 12) & (Hart::FP_SIZE - 1)] = {pc >> 12, h.priv, pa & ~0xfffull};
             }
         }
+        if (paOut) *paOut = pa;
         Acc r;
         uint64_t lo = 0;
         if (readBits) {
@@ -1298,6 +1299,7 @@ private:
             uint8_t k = fastKind(insn, true, imm);
             if (!k) k = jitKind(insn);
             if (!k) { toInterp = true; break; }
+            noteInsn(h, p, len == 4 ? raw : raw & 0xffff, len);
             ops[n++] = Op{p, k, (uint8_t)((insn >> 7) & 31), (uint8_t)((insn >> 15) & 31), (uint8_t)((insn >> 20) & 31),
                           (uint8_t)len, imm};
             p += len;
@@ -1637,13 +1639,79 @@ private:
         }
         return keep();
     }
+    // Does the decoded cache hold the instruction at pc for the fast loop?
+    // (Else it would leave at once: the general path decodes it first.)
+    bool turboReady(const Hart& h) const {
+        uint64_t pc = h.pc, fx = 0;
+        if (h.priv != 3 && h.paging()) {
+            const Hart::FetchPage& e = h.fp[(pc >> 12) & (Hart::FP_SIZE - 1)];
+            if (e.vpn != pc >> 12 || e.priv != h.priv) return false;
+            pc = e.pa | (pc & 0xfff);
+            fx = 1;
+        }
+        const Hart::Decoded& d = h.dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
+        return d.pc == ((pc | fx) ^ h.mmuTag) && d.kind;
+    }
+    // An instruction of n bytes (raw) was decoded from physical address fa:
+    // record its page for FENCE.I (see Hart::codePages).
+    void noteCode(Hart& h, uint64_t fa, uint32_t raw, unsigned n) {
+        if (h.codeUntracked) return;
+        const uint64_t pg = fa >> 12;
+        auto it = h.codePages.find(pg);
+        if (it != h.codePages.end()) {
+            // decoded from bytes the copy does not hold: it changed already
+            if (!it->second.changed && memcmp(it->second.snap.get() + (fa & 0xfff), &raw, n)) it->second.changed = true;
+            return;
+        }
+        Device* d = bus.find(pg << 12);
+        if (h.codePages.size() >= Hart::CODE_PAGES || !d || !d->memory() || (pg << 12) + 4096 > d->base + d->size ||
+            (h.par && h.ov.find(pg))) {
+            h.codeUntracked = true;
+            return;
+        }
+        Hart::CodePage cp{d->memory() + ((pg << 12) - d->base), std::unique_ptr<uint8_t[]>(new uint8_t[4096]), false};
+        memcpy(cp.snap.get(), cp.host, 4096);
+        if (memcmp(cp.snap.get() + (fa & 0xfff), &raw, n)) cp.changed = true;
+        h.codePages.emplace(pg, std::move(cp));
+    }
+    void noteInsn(Hart& h, uint64_t fa, uint32_t raw, unsigned len) {
+        if ((fa & 0xfff) + len > 4096) {  // across two pages
+            noteCode(h, fa, raw, 2);
+            noteCode(h, fa + 2, raw >> 16, 2);
+        } else noteCode(h, fa, raw, len);
+    }
+    // FENCE.I: forget what was decoded from pages that changed.
+    void fenceI(Hart& h) {
+        if (h.codeUntracked || (h.par && !h.ov.empty())) {
+            h.flushDecoded();
+            h.fenceFull++;
+            return;
+        }
+        h.fencePart++;
+        bool any = false;
+        for (auto it = h.codePages.begin(); it != h.codePages.end();) {
+            Hart::CodePage& c = it->second;
+            if (!c.changed && !memcmp(c.snap.get(), c.host, 4096)) { ++it; continue; }
+            const uint64_t pg = it->first;
+            // its entries, and one at the end of the page before (4 bytes across)
+            Hart::Decoded* e = &h.dc[((pg << 12) >> 1) & (Hart::DC_SIZE - 1)];
+            for (unsigned i = 0; i < 2048; i++)
+                if (((e[i].pc ^ h.mmuTag) >> 12) == pg) e[i].pc = ~0ull;
+            Hart::Decoded& last = h.dc[(((pg << 12) - 2) >> 1) & (Hart::DC_SIZE - 1)];
+            if (((last.pc ^ h.mmuTag) >> 1) == (((pg << 12) - 2) >> 1)) last.pc = ~0ull;
+            h.fencePages++;
+            any = true;
+            it = h.codePages.erase(it);
+        }
+        if (any) { h.dcGen++; h.codeGen++; }
+    }
     // Run translated code from pc until something needs the fast loop.
     void jitRun(Hart& h, uint64_t* r, uint64_t& pc, uint64_t& left, uint8_t* cp, uint64_t cb, uint64_t span,
                 uint64_t sspan, uint64_t th) {
         Jit* jp = jitFor(h);
         if (!jp) { jit = false; return; }
         Jit& J = *jp;
-        if (J.gen != h.dcGen) { J.flush(); J.gen = h.dcGen; }
+        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; }
         JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt};
         uint8_t* code = J.find(pc);
         if (!code && !(code = jitCompile(J, h, pc))) return;
@@ -1677,6 +1745,7 @@ private:
         uint64_t r[33];
         memcpy(r, h.x, sizeof h.x);
         const Hart::Decoded* const dc = h.dc.get();
+        const uint64_t mt = h.mmuTag;  // the decoded cache's epoch
         const uint64_t cb = h.cBase, th = tohost;
         // An access of up to 8 bytes at ad is in the cached region when
         // ad - cb < span (one compare; the last 7 bytes take the general
@@ -1711,12 +1780,18 @@ private:
                 return ad - cb < sspan && !(th && ad - th + n - 1 < 8 + n - 1) ? cp + (ad - cb) : nullptr;
             }
         };
-        // Is the page holding pc one instructions may come from?
+        // Is the page holding pc one instructions may come from? Then poff
+        // takes its pc to its physical address, which the decoded cache is
+        // indexed and tagged by.
+        uint64_t poff = 0;
         auto fetchOk = [&](uint64_t a) {
             const Hart::FetchPage& e = h.fp[(a >> 12) & (Hart::FP_SIZE - 1)];
-            return e.vpn == a >> 12 && e.priv == priv;
+            if (e.vpn != a >> 12 || e.priv != priv) return false;
+            poff = e.pa - (a & ~0xfffull);
+            return true;
         };
         uint64_t fpage = PG ? ~0ull : 0;  // the page last found in the record
+#define DCE(v) (&dc[(((v) + poff) >> 1) & (Hart::DC_SIZE - 1)])
         // Each handler fetches the next instruction and jumps to its handler
         // itself (computed goto).
         static void* const tbl[] = {&&out, &&L_LUI, &&L_AUIPC, &&L_JAL, &&L_JALR, &&L_BEQ, &&L_BNE, &&L_BLT, &&L_BGE, &&L_BLTU, &&L_BGEU, &&L_LB, &&L_LH, &&L_LW, &&L_LD, &&L_LBU, &&L_LHU, &&L_LWU, &&L_SB, &&L_SH, &&L_SW, &&L_SD, &&L_ADDI, &&L_SLLI, &&L_SLTI, &&L_SLTIU, &&L_XORI, &&L_SRLI, &&L_SRAI, &&L_ORI, &&L_ANDI, &&L_ADD, &&L_SUB, &&L_SLL, &&L_SLT, &&L_SLTU, &&L_XOR, &&L_SRL, &&L_SRA, &&L_OR, &&L_AND, &&L_MUL, &&L_ADDIW, &&L_SLLIW, &&L_SRLIW, &&L_SRAIW, &&L_ADDW, &&L_SUBW, &&L_SLLW, &&L_SRLW, &&L_SRAW, &&L_MULW};
@@ -1726,11 +1801,12 @@ private:
         uint64_t* o;
 #define DISPATCH                                                         \
         do {                                                             \
-            if (d->pc != (pc | PG)) goto out;                            \
             if (PG && (pc ^ fpage) >> 12) {                              \
                 if (!fetchOk(pc)) goto out;                              \
                 fpage = pc;                                              \
+                d = DCE(pc);                                             \
             }                                                            \
+            if (d->pc != (((pc + poff) | PG) ^ mt)) goto out;            \
             npc = ax(pc + d->len);                                       \
             a = r[d->rs1]; b = r[d->rs2]; i = d->imm; o = &r[d->trd];    \
             goto *tbl[d->kind];                                          \
@@ -1763,7 +1839,10 @@ private:
         if (cyc >= end) return;
         uint64_t left = end - cyc;  // instructions to go, this one included
         static const void* const btbl[] = {nullptr, &&B_LUI, &&B_AUIPC, &&B_JAL, &&B_JALR, &&B_BEQ, &&B_BNE, &&B_BLT, &&B_BGE, &&B_BLTU, &&B_BGEU, &&B_LB, &&B_LH, &&B_LW, &&B_LD, &&B_LBU, &&B_LHU, &&B_LWU, &&B_SB, &&B_SH, &&B_SW, &&B_SD, &&B_ADDI, &&B_SLLI, &&B_SLTI, &&B_SLTIU, &&B_XORI, &&B_SRLI, &&B_SRAI, &&B_ORI, &&B_ANDI, &&B_ADD, &&B_SUB, &&B_SLL, &&B_SLT, &&B_SLTU, &&B_XOR, &&B_SRL, &&B_SRA, &&B_OR, &&B_AND, &&B_MUL, &&B_ADDIW, &&B_SLLIW, &&B_SRLIW, &&B_SRAIW, &&B_ADDW, &&B_SUBW, &&B_SLLW, &&B_SRLW, &&B_SRAW, &&B_MULW};
-        if (!h.blocks) h.blocks.reset(new Hart::Block[Hart::BLOCKS]);
+        if (!h.blocks) {
+            h.blocks.reset((Hart::Block*)std::calloc(Hart::BLOCKS, sizeof(Hart::Block)));
+            if (!h.blocks) throw std::bad_alloc();
+        }
         Hart::Block* const blocks = h.blocks.get();
         const uint32_t gen = h.dcGen;
         Hart::Block* bk;
@@ -1774,7 +1853,7 @@ private:
             if (jit) {
                 jitRun(h, r, pc, left, cp, cb, span, sspan, th);
                 if (!left) goto out;
-                d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
+                d = DCE(pc);
                 DISPATCH;
             }
         }
@@ -1787,14 +1866,14 @@ private:
                 fpage = pc;
             }
             bk = &blocks[(pc >> 1) & (Hart::BLOCKS - 1)];
-            if (bk->pc != (pc | PG) || bk->gen != gen) {
+            if (bk->pc != (pc | PG) || bk->gen != gen || (PG && bk->poff != poff)) {
                 // Build it from the decoded-instruction cache.
                 unsigned n = 0;
                 uint64_t p = pc;
                 bool ctl = false;
                 while (n < Hart::BLOCK_OPS) {
-                    const Hart::Decoded& e = dc[(p >> 1) & (Hart::DC_SIZE - 1)];
-                    if (e.pc != (p | PG) || !e.kind || p - pc > 2 * 255 || (PG && (p ^ pc) >> 12)) break;
+                    const Hart::Decoded& e = *DCE(p);
+                    if (e.pc != (((p + poff) | PG) ^ mt) || !e.kind || p - pc > 2 * 255 || (PG && (p ^ pc) >> 12)) break;
                     Hart::BlockOp& q = bk->ops[n++];
                     q.h = btbl[e.kind]; q.rd = e.trd; q.rs1 = e.rs1; q.rs2 = e.rs2;
                     q.off = (uint8_t)((p - pc) >> 1); q.imm = e.imm;
@@ -1802,14 +1881,14 @@ private:
                     p = ax(p + e.len);
                     if (e.kind >= K_JAL && e.kind <= K_BGEU) { ctl = true; break; }
                 }
-                if (!n) { bk->pc = ~0ull; d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)]; DISPATCH; }
+                if (!n) { bk->pc = ~0ull; d = DCE(pc); DISPATCH; }
                 if (!ctl) bk->ops[n++] = Hart::BlockOp{&&B_END, 32, 0, 0, (uint8_t)((p - pc) >> 1), 0};
-                bk->pc = pc | PG; bk->end = p; bk->n = ctl ? n : n - 1; bk->gen = gen;
+                bk->pc = pc | PG; bk->end = p; bk->n = ctl ? n : n - 1; bk->gen = gen; bk->poff = poff;
             }
             op = bk->ops;
             BOP;
         }
-        d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
+        d = DCE(pc);
         DISPATCH;
     L_LUI: *o = (uint64_t)i; SEQ;
     L_AUIPC: *o = sx(pc + (uint64_t)i); SEQ;
@@ -1972,6 +2051,7 @@ private:
 #undef SEQ
 #undef NEXT
 #undef DISPATCH
+#undef DCE
     out:
         memcpy(h.x + 1, r + 1, sizeof h.x - sizeof h.x[0]);
         h.pc = pc;
@@ -2138,7 +2218,7 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
             interrupt(h);
         }
         if (h.wfi) { h.cycle = end; return Stop::Budget; }
-        if (!slow && !h.par && !irqDirty_) {
+        if (!slow && !h.par && !irqDirty_ && turboReady(h)) {
             if (h.priv == 3 && !h.pmpLock && !(h.mstatus & MSTATUS_MPRV)) {
                 if (rv64) turbo<true, false>(h, end); else turbo<false, false>(h, end);
                 if (h.cycle >= end) break;
@@ -2154,17 +2234,34 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
         // Fetch, from the decoded-instruction cache when it holds pc.
         uint32_t insn, raw;
         unsigned len;
-        Hart::Decoded& dce = h.dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
+        // Through the MMU the cache goes by physical address (so SFENCE.VMA
+        // and satp leave it alone): translate first, from the fetch page
+        // record when it holds the page. An instruction in the last halfword
+        // of a page might continue on another, so it is not kept.
         const bool fx = h.priv != 3 && h.paging();
-        if (dce.pc == (pc | fx)) {
-            insn = dce.insn; raw = dce.raw; len = dce.len;
+        uint64_t fa = pc;
+        bool recorded = false;
+        if (fx) {
             const Hart::FetchPage& fpe = h.fp[(pc >> 12) & (Hart::FP_SIZE - 1)];
-            if (fx && fpe.vpn == (pc >> 12) && fpe.priv == h.priv && (len == 2 || (pc & 0xfff) <= 0xffc)) {
-                // the page fetched from last: translated and executable
-            } else if (fx) {
+            if (fpe.vpn == (pc >> 12) && fpe.priv == h.priv) {
+                fa = fpe.pa | (pc & 0xfff);
+                recorded = true;
+            } else {
                 uint64_t tv;
                 uint32_t dummy = 0;
-                if (uint32_t c = fetchXlat(h, pc, dummy, tv, false, len)) { trap(h, c, tv, false); h.cycle++; continue; }
+                if (uint32_t c = fetchXlat(h, pc, dummy, tv, false, 2, &fa)) { trap(h, c, tv, false); h.cycle++; continue; }
+            }
+        }
+        const bool edge = fx && (pc & 0xfff) == 0xffe;
+        Hart::Decoded& dce = h.dc[(fa >> 1) & (Hart::DC_SIZE - 1)];
+        const uint64_t tag = (fa | fx) ^ h.mmuTag;
+        if (dce.pc == tag && !edge) {
+            insn = dce.insn; raw = dce.raw; len = dce.len;
+            if (fx) {
+                // a page only partly executable: the second halfword too
+                if (!recorded && len == 4 && !pmpAllows(h, fa + 2, 2, PMP_X, h.priv)) {
+                    trap(h, 1, h.ax(pc + 2), false); h.cycle++; continue;
+                }
             } else if ((h.priv != 3 || h.pmpLock) && !pmpAllows(h, pc, len, PMP_X, h.priv)) {
                 trap(h, 1, pc, false); h.cycle++; continue;
             }
@@ -2209,13 +2306,14 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
                 insn = rvc::expand(raw, rv64);
                 if (!insn) { trap(h, 2, raw, false); h.cycle++; continue; }
             }
-            dce.pc = pc | fx; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len; dce.xlat = fx;
+            dce.pc = edge ? ~0ull : tag; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len; dce.xlat = fx;
             dce.op = insn & 0x7f; dce.rd = (insn >> 7) & 31; dce.f3 = (insn >> 12) & 7;
             dce.rs1 = (insn >> 15) & 31; dce.rs2 = (insn >> 20) & 31; dce.f7 = (uint8_t)(insn >> 25);
             dce.kind = fastKind(insn, rv64, dce.imm);
             if (fx && len == 4 && (pc & 0xfff) > 0xffc) dce.kind = K_NONE;  // across two pages
             dce.trd = dce.rd ? dce.rd : 32;
             dce.step = (uint8_t)(len / 2 * sizeof(Hart::Decoded));
+            if (!edge) noteInsn(h, fa, raw, len);
         }
         if (slow && trace) {
             int w = rv64 ? 16 : 8;
@@ -2470,7 +2568,7 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
                 }
                 if (f3 != 0 && f3 != 1) ILLEGAL();
                 cls = C_FENCE;
-                if (f3 == 1) h.flushDecoded();
+                if (f3 == 1) fenceI(h);
                 break;
             case 0x2f: {                                               // A
                 uint32_t f5 = insn >> 27;
@@ -2832,7 +2930,6 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
                     if ((insn & 0xfe007fff) == 0x12000073) {           // SFENCE.VMA
                         if (h.priv == 0 || (h.priv == 1 && (h.mstatus & MSTATUS_TVM))) ILLEGAL();
                         h.flushTlb();
-                        h.flushDecoded();
                         break;
                     }
                     ILLEGAL();
