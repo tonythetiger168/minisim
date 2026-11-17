@@ -419,3 +419,28 @@ endif()
 if(NOT html2 MATCHES "function sch\\(")
   message(FATAL_ERROR "-html: no schematic view")
 endif()
+
+# The formal-assisted checks' shortcuts (whole-case item checks, independent
+# path conditions, the case-item cache) give exactly the plain search's
+# findings and witnesses.
+foreach(f fml_fast.sv rules/formal.sv)
+  if(f STREQUAL "fml_fast.sv")
+    set(top fml_fast)
+  else()
+    set(top fml)
+  endif()
+  run(${f} "-top;${top};-only;formal;-set;formal.fast=1")
+  set(fast "${out}")
+  run(${f} "-top;${top};-only;formal;-set;formal.fast=0")
+  if(NOT fast STREQUAL out OR NOT fast MATCHES "FML00")
+    message(FATAL_ERROR "formal.fast=1 and =0 differ on ${f}:\n${fast}\n---\n${out}")
+  endif()
+endforeach()
+run(fml_fast.sv "-top;fml_fast;-only;formal")
+foreach(want "fml_fast.sv:43:22: warning: [FML002] index can be 6 (when op = 3, sel = 6, b = 1)"
+             "fml_fast.sv:35:7: warning: [FML001]" "fml_fast.sv:65:15: warning: [FML001]")
+  string(FIND "${out}" "${want}" pos)
+  if(pos EQUAL -1)
+    message(FATAL_ERROR "fml_fast.sv: missing ${want}\n${out}")
+  endif()
+endforeach()

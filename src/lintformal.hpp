@@ -24,6 +24,9 @@
 #pragma once
 
 #include <deque>
+#include <functional>
+#include <set>
+#include <unordered_map>
 #include <optional>
 
 #include "lintir.hpp"
@@ -42,6 +45,8 @@ using namespace lintir;
 struct Options {
     unsigned maxBits = 16;     // free bits one question may enumerate
     unsigned maxRegBits = 8;   // registers this wide or narrower get reachable-value sets
+    bool fast = true;          // the shortcuts (independent parts, whole cases, the case cache); off: the
+                               // plain search, which gives the same findings (tests compare the two)
 };
 
 inline const std::vector<const char*>& ruleIds() {
@@ -164,10 +169,19 @@ struct Cone {
 // returns false to stop. Returns -1 when the question is too big or a value
 // could not be evaluated, else the number of combinations where all held
 // (capped by the early stop).
+// Which item of a case with constant items a selector value goes to, kept
+// across the questions of one block: >= 0 the first item that matches (the
+// item count: none), -(j + 1) an item that could not be evaluated at j.
+struct FirstCache {
+    std::unordered_map<const CaseStatement*, bool> constant;
+    std::unordered_map<const CaseStatement*, std::unordered_map<uint64_t, int32_t>> first;
+};
+
 struct Solver {
     const Model& m;
     const Symbol& scope;
     bool params = false;  // the last question read a parameter, here or in a cone
+    FirstCache* cache = nullptr;
 
     bool dry = false;  // only check the size, as if every register could take every value
     unsigned slack = 0;  // ...allowing this many more bits, since registers usually take fewer
@@ -203,43 +217,128 @@ struct Solver {
         if (dry) return 0;
         EvalContext ctx(ASTContext(*scope.getParentScope(), LookupLocation::max), EvalFlags::IsScript);
         ctx.pushEmptyFrame();
+        const size_t L = cone.leaves.size();
         std::vector<ConstantValue*> slot;
-        for (auto& l : cone.leaves) slot.push_back(ctx.createLocal(l.sym, SVInt(l.w, 0, l.sgn)));
+        for (auto& l : cone.leaves) slot.push_back(ctx.createLocal(l.sym, SVInt(l.w, l.dom ? (*l.dom)[0] : 0, l.sgn)));
         std::vector<ConstantValue*> dslot;
         for (auto& [v, e] : cone.derived) dslot.push_back(ctx.createLocal(v, nullptr));
-        std::vector<uint64_t> idx(cone.leaves.size(), 0);
-        long long hits = 0;
-        for (uint64_t n = 0; n < total; n++) {
-            for (size_t i = 0; i < cone.leaves.size(); i++) {
-                auto& l = cone.leaves[i];
-                uint64_t v = l.dom ? (*l.dom)[idx[i]] : idx[i];
-                *slot[i] = SVInt(l.w, v, l.sgn);
-            }
-            for (size_t i = 0; i < cone.derived.size(); i++) {
-                ConstantValue cv = cone.derived[i].second->eval(ctx);
-                if (cv.bad()) return -1;
-                const Type& t = cone.derived[i].first->getType();
-                *dslot[i] = cv.convertToInt(t.getBitWidth(), t.isSigned(), false);
-            }
-            bool all = true;
-            for (const Cond* c : conds) {
-                int h = holds(*c, ctx);
-                if (h < 0) return -1;
-                if (!h) {
-                    all = false;
-                    break;
+
+        // Independent parts. A condition that shares no signal (through the
+        // cone) with the question only has to be satisfiable once, so the
+        // parts are searched one after another, not as a product: the same
+        // answer, and the same first witness, in the sum of their sizes.
+        std::vector<int> comp(L);
+        for (size_t i = 0; i < L; i++) comp[i] = (int)i;
+        std::function<int(int)> find = [&](int x) { return comp[x] == x ? x : comp[x] = find(comp[x]); };
+        std::unordered_map<const ValueSymbol*, int> leafAt;
+        for (size_t i = 0; i < L; i++) leafAt[cone.leaves[i].sym] = (int)i;
+        auto leavesOf = [&](auto&& addSupport) {
+            Support su;
+            addSupport(su);
+            Cone c;
+            std::set<const ValueSymbol*> sn;
+            for (auto* v : su.vars) c.add(m, v, sn, 0);
+            std::vector<int> out;
+            for (auto& l : c.leaves)
+                if (auto it = leafAt.find(l.sym); it != leafAt.end()) out.push_back(it->second);
+            return out;
+        };
+        auto join = [&](const std::vector<int>& ls) {
+            for (size_t i = 1; i < ls.size(); i++) comp[find(ls[i])] = find(ls[0]);
+        };
+        std::vector<std::vector<int>> condLeaves;
+        for (const Cond* c : conds) {
+            condLeaves.push_back(leavesOf([&](Support& su) {
+                support(*c->e, su);
+                if (c->kind == Cond::Item)
+                    for (auto& it : c->cs->items)
+                        for (const Expression* x : it.expressions) support(*x, su);
+            }));
+            join(condLeaves.back());
+        }
+        std::vector<int> mainLeaves = leavesOf([&](Support& su) {
+            for (const Expression* x : extra) support(*x, su);
+        });
+        if (extra.empty() && !conds.empty()) mainLeaves = condLeaves.back();
+        join(mainLeaves);
+        int mainComp = mainLeaves.empty() ? -1 : find(mainLeaves[0]);
+        std::vector<int> parts;   // the other parts, in leaf order
+        for (size_t i = 0; i < L; i++) {
+            int r = find((int)i);
+            if (r != mainComp && std::find(parts.begin(), parts.end(), r) == parts.end()) parts.push_back(r);
+        }
+        if (!m.opt.fast) {   // one part: the plain product
+            for (size_t i = 0; i < L; i++) comp[i] = 0;
+            mainComp = L ? 0 : -1;
+            parts.clear();
+        }
+        if (mainComp < 0 && !parts.empty()) {   // nothing to ask about: the last part is the question
+            mainComp = parts.back();
+            parts.pop_back();
+        }
+        auto inPart = [&](int part, const std::vector<int>& ls) {
+            if (ls.empty()) return part == mainComp;   // a constant condition goes with the question
+            return find(ls[0]) == part;
+        };
+
+        // Every combination of the leaves of one part (the rest stay as they
+        // are); stop when `hit` returns false. -1 on a value that cannot be
+        // evaluated.
+        auto search = [&](int part, auto&& hit) -> long long {
+            std::vector<size_t> mine;
+            uint64_t n = 1;
+            for (size_t i = 0; i < L; i++)
+                if (find((int)i) == part) mine.push_back(i), n *= std::max<uint64_t>(1, cone.leaves[i].size());
+            std::vector<const Cond*> mineConds;
+            for (size_t k = 0; k < conds.size(); k++)
+                if (inPart(part, condLeaves[k])) mineConds.push_back(conds[k]);
+            std::vector<uint64_t> idx(mine.size(), 0);
+            long long hits = 0;
+            for (uint64_t c = 0; c < n; c++) {
+                for (size_t j = 0; j < mine.size(); j++) {
+                    auto& l = cone.leaves[mine[j]];
+                    *slot[mine[j]] = SVInt(l.w, l.dom ? (*l.dom)[idx[j]] : idx[j], l.sgn);
+                }
+                for (size_t i = 0; i < cone.derived.size(); i++) {
+                    ConstantValue cv = cone.derived[i].second->eval(ctx);
+                    if (cv.bad()) return -1;
+                    const Type& t = cone.derived[i].first->getType();
+                    *dslot[i] = cv.convertToInt(t.getBitWidth(), t.isSigned(), false);
+                }
+                bool all = true;
+                for (const Cond* cd : mineConds) {
+                    int h = holds(*cd, ctx);
+                    if (h < 0) return -1;
+                    if (!h) {
+                        all = false;
+                        break;
+                    }
+                }
+                if (all) {
+                    hits++;
+                    if (!hit()) return hits;
+                }
+                for (size_t j = 0; j < idx.size(); j++) {   // next combination
+                    if (++idx[j] < cone.leaves[mine[j]].size()) break;
+                    idx[j] = 0;
                 }
             }
-            if (all) {
-                hits++;
-                if (!each(ctx, cone)) return hits;
-            }
-            for (size_t i = 0; i < idx.size(); i++) {  // next combination
-                if (++idx[i] < cone.leaves[i].size()) break;
-                idx[i] = 0;
-            }
+            return hits;
+        };
+        for (int part : parts) {
+            long long r = search(part, [&] { return false; });   // satisfiable? keep the first combination
+            if (r <= 0) return r;
         }
-        return hits;
+        if (mainComp < 0) {   // no leaves at all: one combination
+            for (const Cond* cd : conds) {
+                int h = holds(*cd, ctx);
+                if (h < 0) return -1;
+                if (!h) return 0;
+            }
+            each(ctx, cone);
+            return 1;
+        }
+        return search(mainComp, [&] { return each(ctx, cone); });
     }
 
     static int truth(const ConstantValue& v) {
@@ -273,6 +372,42 @@ struct Solver {
         ConstantValue sel = c.e->eval(ctx);
         if (sel.bad()) return -1;
         size_t n = c.cs->items.size();
+        if (cache && m.opt.fast && sel.isInteger() && !sel.integer().hasUnknown() && sel.integer().getBitWidth() <= 64) {
+            auto [ci, fresh] = cache->constant.try_emplace(c.cs, false);
+            if (fresh) {
+                Support su;
+                for (auto& it : c.cs->items)
+                    for (const Expression* x : it.expressions) support(*x, su);
+                ci->second = su.ok && su.vars.empty();
+            }
+            if (ci->second) {
+                uint64_t key = *sel.integer().as<uint64_t>();
+                auto& tab = cache->first[c.cs];
+                auto it = tab.find(key);
+                int32_t f;
+                if (it != tab.end()) {
+                    f = it->second;
+                } else {
+                    f = (int32_t)n;
+                    for (size_t k = 0; k < n && f == (int32_t)n; k++)
+                        for (const Expression* x : c.cs->items[k].expressions) {
+                            int mm = matches(*c.cs, sel, *x, ctx);
+                            if (mm < 0) { f = -(int32_t)k - 1; break; }
+                            if (mm == 1) f = (int32_t)k;
+                        }
+                    tab.emplace(key, f);
+                }
+                size_t want = c.item;
+                if (f < 0) {
+                    size_t j = (size_t)(-f - 1);
+                    if (j <= want) return -1;   // reached before the item asked about
+                    return want < n ? 0 : 1;    // (unreachable for want == n: j < n)
+                }
+                if ((size_t)f < want) return 0;
+                if ((size_t)f == want) return 1;
+                return want < n ? 0 : 1;        // nothing up to the item matched
+            }
+        }
         for (size_t k = 0; k <= std::min(c.item, n - 1) && k < n; k++) {
             bool any = false;
             for (const Expression* x : c.cs->items[k].expressions) {
@@ -336,6 +471,7 @@ struct Walk {
     int loops = 0;
     bool inReset = false;
     std::set<const ValueSymbol*> loopRegs;  // assigned inside a loop: no reachable set
+    FirstCache fcache;   // case items by selector value, for every question of this block
 
     Walk(const Model& mm, const Rules& r, const Symbol& s) : m(mm), rules(r), scope(s) {}
 
@@ -397,11 +533,62 @@ struct Walk {
     // Returns true when the branch is dead and not because of a parameter.
     bool dead(const Cond& c) {
         Solver sv{m, scope};
+        sv.cache = &fcache;
         auto p = live();
         p.push_back(&c);
         if (anyParams(p)) return false;
         long long r = sv.run(p, {}, [](EvalContext&, const Cone&) { return false; });
         return r == 0 && !sv.params;
+    }
+
+    // For each item of a case, whether it is dead on the current path, as
+    // dead(Cond::Item k) would answer, in one enumeration: 1 dead, 0 not.
+    // Empty when the case cannot be answered as a whole.
+    std::vector<char> deadItems(const CaseStatement& cs) {
+        size_t n = cs.items.size();
+        if (!n) return {};
+        Cond first{Cond::Item, &cs.expr, true, &cs, 0};
+        auto p = live();
+        p.push_back(&first);
+        if (anyParams(p)) return std::vector<char>(n, 0);
+        p.pop_back();
+        std::vector<const Expression*> extra{&cs.expr};
+        for (auto& it : cs.items)
+            for (const Expression* x : it.expressions) extra.push_back(x);
+        Solver sv{m, scope};
+        sv.cache = &fcache;
+        std::vector<char> hit(n, 0);
+        size_t errFrom = n;   // items from errFrom on are not decided
+        long long r = sv.run(p, extra, [&](EvalContext& ctx, const Cone&) {
+            ConstantValue sel = cs.expr.eval(ctx);
+            if (sel.bad()) {
+                errFrom = 0;
+                return false;
+            }
+            for (size_t k = 0; k < n && k < errFrom; k++) {
+                bool any = false;
+                for (const Expression* x : cs.items[k].expressions) {
+                    int mm = Solver::matches(cs, sel, *x, ctx);
+                    if (mm < 0) {
+                        errFrom = k;
+                        break;
+                    }
+                    any |= mm == 1;
+                }
+                if (k >= errFrom) break;
+                if (any) {
+                    hit[k] = 1;
+                    break;
+                }
+            }
+            for (size_t k = 0; k < errFrom; k++)   // stop once every decidable item is hit
+                if (!hit[k]) return true;
+            return false;
+        });
+        std::vector<char> d(n, 0);
+        if (r < 0 || sv.params) return d;
+        for (size_t k = 0; k < errFrom; k++) d[k] = !hit[k];
+        return d;
     }
 
     // ---- expressions: selects, and ternaries as path conditions
@@ -514,6 +701,7 @@ struct Walk {
             up = part->getSelectionKind() == RangeSelectionKind::IndexedUp;
         }
         Solver sv{m, scope};
+        sv.cache = &fcache;
         auto p = live();
         if (anyParams(p)) return;
         std::string found;
@@ -587,10 +775,20 @@ struct Walk {
                     if (c.defaultCase) stmt(*c.defaultCase);
                     return;
                 }
+                // Which items can match, from one walk over the values for the
+                // whole case (dead(ic) item by item costs items^2 evaluations).
+                // Good while the path is the one it was computed on.
+                std::vector<char> deadItem;
+                std::vector<const Cond*> at;
+                if (out && rules.enabled("FML001") && m.opt.fast) {
+                    at = live();
+                    deadItem = deadItems(c);
+                }
                 for (size_t k = 0; k < c.items.size(); k++) {
                     for (auto* x : c.items[k].expressions) expr(*x);
                     Cond ic{Cond::Item, &c.expr, true, &c, k};
-                    if (out && rules.enabled("FML001") && dead(ic))
+                    if (out && rules.enabled("FML001") &&
+                        (live() == at && !deadItem.empty() ? deadItem[k] == 1 : dead(ic)))
                         out->push_back({"FML001", c.items[k].expressions[0]->sourceRange.start(),
                                         "this case item never matches here: the selector cannot take its value, "
                                         "or an earlier item takes it, so the branch is dead code"});

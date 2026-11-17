@@ -811,6 +811,7 @@ int main(int argc, char** argv) {
         lintformal::Options fo;
         fo.maxBits = (unsigned)std::clamp(std::atoi(cfg.param("formal.max_bits", "16").c_str()), 1, 30);
         fo.maxRegBits = (unsigned)std::clamp(std::atoi(cfg.param("formal.reg_bits", "8").c_str()), 1, 12);
+        fo.fast = cfg.param("formal.fast", "1") != "0";
         lintformal::run(*fe.comp, rep, fo, threads);
     }
     lap("formal-assisted checks");

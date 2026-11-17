@@ -284,6 +284,7 @@ Spec references are IEEE 1800-2023 clauses.
   of compiling it into each design: a small design's C++ build goes from
   21 s to 8 s and OpenTitan Ibex from 68 s to 50 s. `MSIM_NOKOBJ=1` turns it
   off.
+- mlint: the formal-assisted checks are about 6x faster (Ibex: 0.43 s to 0.07 s, the whole run 0.55 s to 0.2 s) with the same findings: a case's items are checked in one pass, independent path conditions are not multiplied in, and case-item matches are remembered per block. `-set formal.fast=0` gives the plain search, which the tests compare against.
 
 ### Fixed
 - msim: an event control in a class on a bit or part select of a virtual
