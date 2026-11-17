@@ -262,7 +262,8 @@ inline std::unordered_map<const slang::ast::Symbol*, LocalSlot>& localDyn() {
     return m;
 }
 // `ref` arguments (13.5.2): the formal's slot holds the actual's signal id.
-// kind as PropSlot (0 value, 1 unpacked array, 2 container), with the shape.
+// kind as PropSlot (0 value, 1 unpacked array, 2 container), with the shape;
+// 3 an event, by value or by ref: the slot names the actual's event (15.5.5).
 struct RefFormal { int kind = 0; std::shared_ptr<ArrShape> arr; DynObj dyn; };
 inline std::unordered_map<const slang::ast::Symbol*, RefFormal>& refFormals() {
     static std::unordered_map<const slang::ast::Symbol*, RefFormal> m;
@@ -950,12 +951,15 @@ struct Lowerer {
         }
         if (!ValueExpressionBase::isKind(x.kind)) unsupported("event expression");
         const Symbol* sym = &x.as<ValueExpressionBase>().symbol;
-        if (auto p = eventPtr().find(sym); p != eventPtr().end()) {   // maybe an alias (6.17): through its slot
+        int ptrSlot = -1;
+        if (auto p = eventPtr().find(sym); p != eventPtr().end()) ptrSlot = p->second;
+        else if (auto rf = refFormals().find(sym); rf != refFormals().end() && rf->second.kind == 3) ptrSlot = refSlot(sym);
+        if (ptrSlot >= 0) {   // maybe an alias (6.17) or an event argument: through its slot
             int first = -1;
             for (int k = 0; k < 2; k++) {
                 int tmp = fresh(64);
                 Instr i; i.k = IK::Assign; i.sig = tmp;
-                i.e = k ? bin(Op::Add, ref(p->second), konst(mk(1, 64))) : ref(p->second);
+                i.e = k ? bin(Op::Add, ref(ptrSlot), konst(mk(1, 64))) : ref(ptrSlot);
                 prog.emit(i);
                 int id = indThrough(tmp);
                 if (!k) first = id;
@@ -1059,15 +1063,20 @@ struct Lowerer {
         if (x.kind == ExpressionKind::NullLiteral) {   // a fresh event that is never triggered
             int c = fresh(32);
             if (fresh(64) != c + 1) unsupported("event signals that are not consecutive");
+            for (int k = 0; k < 2; k++) {   // not triggered
+                Instr i; i.k = IK::Assign; i.sig = c + k; i.e = konst(mk(0, k ? 64 : 32));
+                prog.emit(i);
+            }
             auto n = node(Op::AddrOf); n->sig = c;
             return n;
         }
-        if (ValueExpressionBase::isKind(x.kind))
-            if (auto p = eventPtr().find(&x.as<ValueExpressionBase>().symbol); p != eventPtr().end())
-                return ref(p->second);
-        if (classMember(x)) unsupported("assignment of an event property");
+        if (ValueExpressionBase::isKind(x.kind)) {
+            const Symbol* sym = &x.as<ValueExpressionBase>().symbol;
+            if (auto p = eventPtr().find(sym); p != eventPtr().end()) return ref(p->second);
+            if (auto rf = refFormals().find(sym); rf != refFormals().end() && rf->second.kind == 3) return ref(refSlot(sym));
+        }
         int es = eventSig(x);
-        if (isInd(es)) unsupported("assignment of an event array element through an index or handle");
+        if (isInd(es)) return ref(indSlotOf(es));   // h.e, e[i]: the address worked out above
         auto n = node(Op::AddrOf); n->sig = es;
         return n;
     }
@@ -1269,6 +1278,11 @@ struct Lowerer {
     std::vector<FrameLayout*> frames;
     ClassInfo* curClass = nullptr;   // the class whose method is being lowered
     E defaultSelf;                   // while lowering a method's default argument: the object it is called on
+    // In obj.randomize() with {...} from a method: the caller's object, and
+    // the class of the object being randomized. A method of the caller named
+    // there (or local::f(), 18.7.1) is called on the caller, virtually.
+    int callerSelf = -1;
+    ClassInfo* withCls = nullptr;
     // Containers reached through a handle (indirect ids): their shapes.
     mutable std::unordered_map<int, DynObj> indShape;
     static bool isInd(int s) { return isRel(s) && relMode(s) >= kRelIndSig; }
@@ -1277,6 +1291,11 @@ struct Lowerer {
         if (!isRel(slot)) return relSig(kRelIndSig, slot);
         if (relMode(slot) > 4) unsupported("reference through a slot more than 4 frames up");
         return relSig(kRelIndFrame + relMode(slot), relOff(slot));
+    }
+    // The slot an indirect id reads through (indThrough undone).
+    static int indSlotOf(int id) {
+        int m = relMode(id);
+        return m == kRelIndSig ? relOff(id) : relSig(m - kRelIndFrame, relOff(id));
     }
     int thisRel(int off) const {
         if (!curClass) unsupported("class property outside a method of its class");
@@ -2051,8 +2070,10 @@ struct Lowerer {
         // comments and spaces are trivia, not text.)
         if (sn.separator.kind == slang::parsing::TokenKind::Dot)
             return sn.left->kind != slang::syntax::SyntaxKind::ScopedName && sn.left->getFirstToken().rawText() == "super";
-        // Class::f() (8.23) names one class's body, so it is not dispatched virtually either
-        return sn.separator.kind == slang::parsing::TokenKind::DoubleColon;
+        // Class::f() (8.23) names one class's body, so it is not dispatched
+        // virtually either; local::f() (18.7.1) only picks the scope where
+        // f is looked up, and stays virtual.
+        return sn.separator.kind == slang::parsing::TokenKind::DoubleColon && sn.left->getFirstToken().rawText() != "local";
     }
     // Package UPF (IEEE 1801-2024 11.2.4), added by msim -upf: the functions
     // that change or read supplies run in the power-aware runtime
@@ -2299,6 +2320,12 @@ struct Lowerer {
             E self;
             if (!isStatic && call.thisClass()) self = exprH(*call.thisClass());
             else if (!isStatic && defaultSelf) self = defaultSelf;   // in a default argument: the callee's object
+            else if (!isStatic && callerSelf >= 0) {
+                bool inObj = false;
+                for (ClassInfo* c = withCls; c; c = c->base)
+                    if (sym->getParentScope() == static_cast<const slang::ast::Scope*>(c->ty)) inObj = true;
+                if (!inObj || (call.syntax && call.syntax->getFirstToken().rawText() == "local")) self = ref(callerSelf, false);
+            }
             if (!isStatic && !call.thisClass() && !curClass && !defaultSelf) unsupported("method call without an object");
             int vslot = -1;
             if (!isStatic && sym->isVirtual() && !superCall(call)) {
@@ -2329,7 +2356,7 @@ struct Lowerer {
                 continue;
             }
             if (formal.dir == ArgumentDirection::Ref) {
-                Instr i; i.k = IK::Assign; i.sig = formal.sig; i.e = addrOf(a);
+                Instr i; i.k = IK::Assign; i.sig = formal.sig; i.e = a.type->isEvent() ? eventAddr(a) : addrOf(a);
                 prog.emit(i);
                 continue;
             }
@@ -2662,7 +2689,7 @@ struct Lowerer {
         for (size_t n = 0; n < args.size(); n++) {
             const auto& formal = sub.args[n];
             const Expression& a = *args[n];
-            if (formal.dir == ArgumentDirection::Ref) { c.init.push_back({formal.sig, addrOf(a)}); continue; }
+            if (formal.dir == ArgumentDirection::Ref) { c.init.push_back({formal.sig, a.type->isEvent() ? eventAddr(a) : addrOf(a)}); continue; }
             if (formal.arr) {   // 7.7: the whole array, copied into the new frame
                 if (formal.dir == ArgumentDirection::Out) continue;
                 const Expression& src = formal.dir == ArgumentDirection::InOut ? a.as<AssignmentExpression>().left() : a;
@@ -2865,7 +2892,7 @@ struct Lowerer {
             r.arr->base = 0;
             return r;
         }
-        if (t.isEvent()) unsupported("ref event argument");
+        if (t.isEvent()) r.kind = 3;   // an event: the slot holds what eventAddr gives
         return r;
     }
     // h.member where h is a class handle: the property's PropSlot, or null
@@ -6758,8 +6785,8 @@ struct Lowerer {
             int sig;
             if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
             else if (s.expr.kind == ExpressionKind::ElementSelect && s.expr.type->isEvent()) sig = eventSig(s.expr);   // @(e[i])
-            else if (ValueExpressionBase::isKind(s.expr.kind) && eventPtr().count(&s.expr.as<ValueExpressionBase>().symbol))
-                sig = eventSig(s.expr);   // an event that may be an alias (6.17)
+            else if (ValueExpressionBase::isKind(s.expr.kind) && s.expr.type->isEvent())
+                sig = eventSig(s.expr);   // an event that may be an alias (6.17) or an argument
             else if (ValueExpressionBase::isKind(s.expr.kind) && !modportConn(s.expr)) {
                 sig = sigAt(&s.expr.as<ValueExpressionBase>().symbol);
             } else {
@@ -8841,6 +8868,15 @@ struct Lowerer {
             }
             curClass = wc;
         }
+        int savedCallerSelf = callerSelf;
+        ClassInfo* savedWithCls = withCls;
+        if (wc && info && info->inlineConstraints && savedCls) {
+            callerSelf = fresh(64);
+            Instr a; a.k = IK::Assign; a.sig = callerSelf; a.e = node(Op::This);
+            prog.emit(a);
+            withCls = wc;
+        }
+        struct RestoreCaller { int& s; ClassInfo*& c; int sv; ClassInfo* cv; ~RestoreCaller() { s = sv; c = cv; } } restoreCaller{callerSelf, withCls, savedCallerSelf, savedWithCls};
         for (size_t k = first; k < args.size(); k++) {
             const Expression& a = outArg(*args[k]);
             if (a.kind == ExpressionKind::NullLiteral) { rc->argsGiven = true; continue; }   // randomize(null): check only
@@ -8930,6 +8966,8 @@ struct Lowerer {
             rc->argsGiven = true;
         }
         if (info && info->inlineConstraints) constraintItems(*info->inlineConstraints, nullptr, rc->items, rc->before);
+        callerSelf = savedCallerSelf;
+        withCls = savedWithCls;
         curClass = savedCls;
         symOverride = std::move(savedOv);
         exprOverride.clear();
@@ -12206,7 +12244,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
                 sc->asSymbol().as<SubroutineSymbol>().flags.has(MethodFlags::DPIImport))
                 return;
         }
-        if (!inMethod && v.direction != ArgumentDirection::Ref) reg(v, false);   // a ref formal gets an address slot later
+        if (!inMethod && v.direction != ArgumentDirection::Ref && !v.getType().isEvent()) reg(v, false);   // a ref (or event) formal gets an address slot later
     }
     void handle(const slang::ast::ClassPropertySymbol& p) {
         if (p.lifetime == slang::ast::VariableLifetime::Static) reg(p, false);
@@ -15071,11 +15109,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 sub->retSgn = sym->getReturnType().isSigned();
             }
             for (const FormalArgumentSymbol* formal : sym->getArguments()) {
-                if (formal->direction == ArgumentDirection::Ref) {   // a slot for the actual's signal id
+                if (formal->direction == ArgumentDirection::Ref || formal->getType().isEvent()) {   // a slot for the actual's signal id
                     refFormals()[formal] = Lowerer::refFormalOf(formal->getType());
                     int off = sub->lay->add(64, make(0, 0, 64));
                     localMap()[formal] = {sub->lay, off};
-                    sub->args.push_back({off, formal->direction, 64, false});
+                    sub->args.push_back({off, ArgumentDirection::Ref, 64, false});
                     continue;
                 }
                 if (Lowerer::isDynType(formal->getType()) || formal->getType().isUnpackedArray()) {
@@ -15110,11 +15148,11 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             sub->retSgn = sym->getReturnType().isSigned();
         }
         for (const slang::ast::FormalArgumentSymbol* formal : sym->getArguments()) {
-            if (formal->direction == slang::ast::ArgumentDirection::Ref) {   // its signal holds the actual's id
+            if (formal->direction == slang::ast::ArgumentDirection::Ref || formal->getType().isEvent()) {   // its signal holds the actual's id
                 refFormals()[formal] = Lowerer::refFormalOf(formal->getType());
                 int sg = mkSig(std::string(sym->name) + "." + std::string(formal->name) + "$ref", 64, false);
                 sigmap[formal] = sg;
-                sub->args.push_back({sg, formal->direction, 64, false});
+                sub->args.push_back({sg, slang::ast::ArgumentDirection::Ref, 64, false});
                 continue;
             }
             if (Lowerer::isDynType(formal->getType()) || formal->getType().isUnpackedArray()) {
