@@ -541,8 +541,43 @@ struct Sim {
         void (*commit)(const void*, Val);   // ...and its write
         const void* ctx;
         int level;
+        bool onCycle = false;   // feeds itself through other ranks: see settleWrites
     };
     vector<Comb> combs;
+    // A rank on a cycle of ranks marks the ranks that read a signal only when
+    // the signal ends its run changed. A block that writes a default and then
+    // its value (`o = 0; if (c) o = b;`) changes o and back on every run; a
+    // reader woken by that change, writing its own default the same way, would
+    // wake the first block again forever at one time step. The intermediate
+    // values are not seen by any other process of the cycle (none runs in
+    // between), so only the final ones count.
+    bool combDefer = false;
+    vector<int> deferSigs;
+    vector<Val> deferOld;
+    vector<char> deferMark;
+    __attribute__((noinline)) void deferNote(int s) {
+        if ((size_t)s >= deferMark.size()) deferMark.resize(sigs.size(), 0);
+        if (deferMark[s]) return;
+        deferMark[s] = 1;
+        deferSigs.push_back(s);
+        deferOld.push_back(sigs[s].val);
+    }
+    void runDeferred(int r) {
+        const Comb& c = combs[r];
+        combDefer = true;
+        if (c.compute) c.commit(c.ctx, c.compute(c.ctx));
+        else c.fn(c.ctx);
+        combDefer = false;
+        for (size_t k = 0; k < deferSigs.size(); k++) {
+            int s = deferSigs[k];
+            deferMark[s] = 0;
+            if (sameVal(sigs[s].val, deferOld[k])) continue;
+            if ((size_t)s < combOf.size())
+                for (int q : combOf[s]) if (q != curComb) markComb(q);
+        }
+        deferSigs.clear();
+        deferOld.clear();
+    }
     vector<vector<int>> combOf;                      // signal -> ranks that read it
     vector<char> combPend;
     // The pending combinational processes, lowest rank first: one bit per
@@ -605,7 +640,8 @@ struct Sim {
                 for (int r : combBatch) {
                     uint64_t t = prof::Profiler::nowNs();
                     curComb = r;
-                    if (combs[r].compute) combs[r].commit(combs[r].ctx, combs[r].compute(combs[r].ctx));
+                    if (combs[r].onCycle) runDeferred(r);
+                    else if (combs[r].compute) combs[r].commit(combs[r].ctx, combs[r].compute(combs[r].ctx));
                     else combs[r].fn(combs[r].ctx);
                     curComb = -1;
                     prof::P().charge(prof::P().combEnt[r], prof::Profiler::nowNs() - t);
@@ -619,7 +655,8 @@ struct Sim {
             for (size_t k = 0; k < combBatch.size(); k++) {
                 int r = combBatch[k];
                 curComb = r;
-                if (combs[r].compute) combs[r].commit(combs[r].ctx, combVals[k]);
+                if (combs[r].onCycle && !combs[r].compute) runDeferred(r);
+                else if (combs[r].compute) combs[r].commit(combs[r].ctx, combVals[k]);
                 else combs[r].fn(combs[r].ctx);
                 curComb = -1;
             }
@@ -907,10 +944,11 @@ struct Sim {
     }
     void bitEdge(int s, uint64_t n) {
         Sig& g = sigs[s];
+        if (__builtin_expect(combDefer, 0)) deferNote(s);
         g.val.v = n;
         g.val.sgn = false;
         const bool pos = n == 1, neg = !pos;
-        if ((size_t)s < combOf.size())
+        if ((size_t)s < combOf.size() && !combDefer)
             for (int r : combOf[s]) if (r != curComb) markComb(r);
         if ((size_t)s < seqOf.size())
             for (auto& [id, e] : seqOf[s])
@@ -2924,6 +2962,7 @@ struct Sim {
             if (tlPart) { setLocal(s, nv); return; }
             Val& cur = g.val;   // no limbs: compare and copy the words, as == and = would
             if (cur.hi.empty() ? nv.v == (cur.v & m & ~cur.x) && nv.x == (cur.x & m) && nv.z == (cur.z & m) : nv == cur) return;   // the initial x fills the whole word
+            if (__builtin_expect(combDefer, 0)) deferNote(s);
             o = bit0(cur); n = bit0(nv);
             if (g_cov) covToggle(s, cur, nv);
             if (cur.hi.empty()) {
@@ -2934,6 +2973,7 @@ struct Sim {
             nv = maskWidth(nv, g.w);
             if (tlPart) { setLocal(s, nv); return; }
             if (nv == g.val) return;
+            if (__builtin_expect(combDefer, 0)) deferNote(s);
             o = bit0(g.val); n = bit0(nv);
             if (g_cov) covToggle(s, g.val, nv);
             g.val = nv;
@@ -2973,7 +3013,7 @@ struct Sim {
         }
         ws.erase(ws.begin() + (ptrdiff_t)keep, ws.end());
         for (size_t j = 0; j < nLate; j++) active.push_back(lateBuf[j]);
-        if ((size_t)s < combOf.size())
+        if ((size_t)s < combOf.size() && !combDefer)
             for (int r : combOf[s])
                 if (r != curComb) {
 #ifdef MSIM_FWSTAT
