@@ -372,4 +372,52 @@ inline uint16_t hFromInt(uint64_t x, bool sign, unsigned bits, unsigned rm, uint
     }, rm, fl);
 }
 
+// Zfbfmin, Zvfbfmin, Zvfbfwma: BFloat16, single precision's sign and 8-bit
+// exponent with a 7-bit fraction. Widening to single is exact (a signaling
+// NaN raises NV, any NaN becomes the canonical one); narrowing rounds by rm
+// with RISC-V's tininess after rounding, as d2h does for half.
+constexpr uint16_t QNANBF = 0x7fc0;
+inline uint16_t unboxBf(uint64_t r) { return (r >> 16) == 0xffffffffffffull ? (uint16_t)r : QNANBF; }
+inline uint32_t bfToS(uint16_t b, uint32_t& fl) {
+    const uint32_t u = (uint32_t)b << 16;
+    if (snan32(u)) fl |= NV;
+    return std::isnan(f32(u)) ? QNAN32 : u;
+}
+inline uint16_t sToBf(uint32_t u, unsigned rm, uint32_t& fl) {
+    const bool neg = u >> 31;
+    const uint16_t s = neg ? 0x8000 : 0;
+    const int e = (int)((u >> 23) & 0xff);
+    uint64_t m = u & 0x7fffff;
+    if (e == 0xff) {
+        if (!m) return s | 0x7f80;
+        if (!(m >> 22)) fl |= NV;
+        return QNANBF;
+    }
+    if (e == 0 && m == 0) return s;
+    int E = e - 127;                        // the exponent of the leading bit
+    if (e == 0) {                           // a single subnormal: normalize
+        E = -126;
+        while (!(m >> 23)) { m <<= 1; E--; }
+    } else m |= 1u << 23;
+    bool nx;
+    if (E >= -126) {
+        uint64_t q = shiftRound(m, 16, rm, neg, nx);
+        if (q >> 8) { q >>= 1; E++; }
+        if (E > 127) {                      // overflow
+            fl |= OF | NX;
+            bool toInf = rm == RNE || rm == RMM || (rm == RDN && neg) || (rm == RUP && !neg);
+            return s | (toInf ? 0x7f80 : 0x7f7f);
+        }
+        if (nx) fl |= NX;
+        return s | (uint16_t)((E + 127) << 7) | (uint16_t)(q & 0x7f);
+    }
+    uint64_t q = shiftRound(m, (unsigned)(16 + (-126 - E)), rm, neg, nx);  // subnormal; 0x80 is the least normal
+    if (nx) {
+        bool t;
+        bool tiny = !(E == -127 && (shiftRound(m, 16, rm, neg, t) >> 8));  // tininess after rounding
+        fl |= NX | (tiny ? (uint32_t)UF : 0u);
+    }
+    return s | (uint16_t)q;
+}
+
 }  // namespace vp::fpu

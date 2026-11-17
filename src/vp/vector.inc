@@ -352,7 +352,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
         // Conversions accept integer SEWs too; the rest need an FP SEW.
         if (f6 != 0x12 && !fpSew) return VILL;
         if ((widening || f6 == 0x31 || f6 == 0x33) && f6 != 0x12 && sew == 64) return VILL;
-        const uint64_t fsc = vf ? fscal(sew) : 0;
+        const uint64_t fsc = !vf ? 0 : f6 == 0x3b ? fpu::unboxBf(h.f[rs1]) : fscal(sew);  // vfwmaccbf16.vf: a BFloat16
         auto op1 = [&](uint64_t i) -> uint64_t { return vf ? fsc : vget(h, rs1, i, sB); };
 
         // Reductions: vd[0] = op over active vs2[i], starting from vs1[0].
@@ -448,7 +448,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
             }
             const unsigned dregs = t.lmul + 1 > 0 ? 1u << (t.lmul + 1) : 1u;
             if (k < 16) {                                              // widening: SEW -> 2*SEW
-                if (k == 13 || t.lmul + 1 > 3) return VILL;
+                if (t.lmul + 1 > 3 || (k == 13 && sew != 16)) return VILL;  // 13: vfwcvtbf16.f.f.v (Zvfbfmin)
                 // from a float: half or single; from an integer: 8, 16 or 32 bits
                 if ((k == 10 || k == 11) ? (sew > 32) : (sew != 16 && sew != 32)) return VILL;
                 if (!aligned(rd, dregs) || !aligned(rs2, lregs)) return VILL;
@@ -457,6 +457,10 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                 for (uint64_t i = h.vstart; i < vl; i++) {
                     if (!active(i)) continue;
                     uint64_t a = vget(h, rs2, i, sB), r;
+                    if (k == 13) {                                    // from BFloat16, exact
+                        vset(h, rd, i, 4, fpu::bfToS((uint16_t)a, fl));
+                        continue;
+                    }
                     if (sew <= 16 && k != 10 && k != 11) {                // from half
                         r = k == 12 ? widen(a) : fpu::toInt<double>(fpu::h2d((uint16_t)a), rmode, k & 1, 32, fl);
                         vset(h, rd, i, 2 * sB, r & 0xffffffffu);
@@ -482,8 +486,8 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                 }
                 return fdone();
             }
-            // narrowing: 2*SEW -> SEW
-            if (k > 23 || t.lmul + 1 > 3) return VILL;
+            // narrowing: 2*SEW -> SEW; 29 is vfncvtbf16.f.f.w (Zvfbfmin), single to BFloat16
+            if ((k > 23 && k != 29) || t.lmul + 1 > 3 || (k == 29 && sew != 16)) return VILL;
             // to an integer: 8, 16 or 32 bits; to a float: half or single
             if ((k == 16 || k == 17 || k == 22 || k == 23) ? (sew > 32) : (sew != 16 && sew != 32)) return VILL;
             if (!aligned(rd, lregs) || !aligned(rs2, dregs)) return VILL;
@@ -495,6 +499,10 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                 if (sew == 8) {                                       // half to an 8-bit integer
                     r = fpu::toInt<double>(fpu::h2d((uint16_t)a), rmode, k & 1, 8, fl);
                     vset(h, rd, i, 1, r & 0xff);
+                    continue;
+                }
+                if (k == 29) {
+                    vset(h, rd, i, 2, fpu::sToBf((uint32_t)a, rmode, fl));
                     continue;
                 }
                 if (sew == 16 && k >= 18 && k <= 21) {                // to half
@@ -550,6 +558,8 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
         // Element-wise binary, fused and widening operations.
         const bool wideDst = f6 >= 0x30;
         const bool wideSrc2 = f6 == 0x34 || f6 == 0x36;               // vfwadd.w, vfwsub.w
+        const bool bf = f6 == 0x3b;                                    // vfwmaccbf16 (Zvfbfwma): BFloat16 sources
+        if (bf && sew != 16) return VILL;
         const unsigned dregs = wideDst ? (t.lmul + 1 > 0 ? 1u << (t.lmul + 1) : 1u) : lregs;
         if (wideDst && t.lmul + 1 > 3) return VILL;
         if (!aligned(rd, dregs) || !aligned(rs2, wideSrc2 ? dregs : lregs) || (!vf && !aligned(rs1, lregs))) return VILL;
@@ -562,7 +572,10 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
         for (uint64_t i = h.vstart; i < vl; i++) {
             if (!active(i)) continue;
             uint64_t a = vget(h, rs2, i, wideSrc2 ? 2 * sB : sB), b = op1(i), d = vget(h, rd, i, ob / 8), r;
-            if (wideDst) {
+            if (bf) {
+                a = fpu::bfToS((uint16_t)a, fl);
+                b = fpu::bfToS((uint16_t)b, fl);
+            } else if (wideDst) {
                 if (!wideSrc2) a = widen(a);
                 b = widen(b);
             }
@@ -584,7 +597,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                 case 0x2a: r = ar(fpu::Op::Msub, b, d, a, ob); break;    // vfmsub
                 case 0x2b: r = ar(fpu::Op::Nmsub, b, d, a, ob); break;   // vfnmsub
                 // vd = +-(vs1 * vs2) +- vd
-                case 0x2c: case 0x3c: r = ar(fpu::Op::Madd, b, a, d, ob); break;   // vfmacc
+                case 0x2c: case 0x3b: case 0x3c: r = ar(fpu::Op::Madd, b, a, d, ob); break;  // vfmacc, vfwmaccbf16
                 case 0x2d: case 0x3d: r = ar(fpu::Op::Nmadd, b, a, d, ob); break;  // vfnmacc
                 case 0x2e: case 0x3e: r = ar(fpu::Op::Msub, b, a, d, ob); break;   // vfmsac
                 case 0x2f: case 0x3f: r = ar(fpu::Op::Nmsub, b, a, d, ob); break;  // vfnmsac
