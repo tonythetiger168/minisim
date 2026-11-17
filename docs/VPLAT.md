@@ -156,6 +156,18 @@ therefore does not depend on the thread count or on the operating system's
 scheduler: the console, the commit log and the profile are the same, byte
 for byte, on 1 thread and on 64. The test suite checks exactly that.
 
+**`-serial`** (or `"serial": true` in the platform file) runs the harts
+another way: they take turns on one thread, each running to the end of the
+quantum, and store to memory directly, with no write buffers and no
+ordered phase. That is another interleaving than the parallel rounds give
+(each hart sees the others' stores of earlier turns at once), still the
+same on every run. Every hart then runs on the fast loop and the
+translator, where a write buffer would hold them to the general path, so
+an SMP operating system runs about as fast as on one hart: Linux on 2 harts
+boots to the BusyBox shell in about 2 s with `-serial` against 20 s in
+rounds. A hart's LR reservation ends with its turn (an SC after the other
+harts ran fails, and the loop around it tries again).
+
 ## The platform file
 
 JSON, with `//` and `/* */` comments. Numbers may be written as strings, in
@@ -431,6 +443,7 @@ for it.
 | `-harts N` | override the platform's hart count |
 | `-threads N`, `-j N` | threads for the harts (default: every CPU) |
 | `-quantum N` | cycles between synchronisations (default 1000) |
+| `-serial` | harts take turns on one thread, no write buffers (see above) |
 | `-mhz F` | hart clock |
 | `-max-cycles N` | stop after N cycles, exit code 4 |
 | `-input TEXT` | what the first UART receives |
@@ -483,9 +496,12 @@ As the ISA allows, a hart sees a store to code only after
 it executes `FENCE.I`. The hart keeps a copy of each page it decoded
 instructions from (up to 512 pages), and `FENCE.I` drops only what came
 from pages that differ from their copy, however they were changed (a store
-on any path, DMA, another hart); Linux runs about 4,600 of them while it
-boots, and they drop about 100 pages in all. Loading a program, a debugger
-write and `-restore` empty the cache. With paging on, the page that instructions were last
+on any path, DMA, another hart). Those pages are also read-only on the host
+(Linux and macOS): the first store to one faults and marks it written, so
+`FENCE.I` compares only pages written since it last looked
+(`MVPLAT_NO_WTRACK=1` compares them all). Linux runs about 4,600 `FENCE.I`
+while it boots, and they drop about 100 pages in all. Loading a program, a
+debugger write and `-restore` empty the cache. With paging on, the page that instructions were last
 fetched from stays translated and PMP-checked until the next `SFENCE.VMA`,
 `satp` or PMP write or change of privilege. Loads and stores with paging on
 keep the same for the last 256 pages of plain memory each read and wrote

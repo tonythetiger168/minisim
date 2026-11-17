@@ -83,10 +83,10 @@ around each barrier (RVWMO), so CVA6 cannot share a mesh with FemtoRV32,
 which does not decode FENCE.
 
 On Verilator 5.054 1x1, 2x2, 4x4 and a 3x3 mix of CVA6, mcrv and PicoRV32
-print PASS. msim does not elaborate it yet:
-`core/cva6_mmu/cva6_mmu.sv:405` selects `[31:34]` in a branch that is dead for
-RV32, which slang reports as an error (Verilator only warns). Turning the MMU
-off avoids that file but is not an option: with `MmuPresent = 0` CVA6 checks
+print PASS. msim (since #690 fixed the reversed range at
+`core/cva6_mmu/cva6_mmu.sv:405`) prints the same checksums: 1x1 in 6 s and
+2x2 in 42 s on the interpreter (`msim -f cva6dir/cva6.f mc.sv -top mc_tb`).
+Keep the MMU in the config: with `MmuPresent = 0` CVA6 checks
 non-idempotence against the previous access's address, issued the
 fetch-and-increment load speculatively and then replayed it, and the
 barrier hung.
