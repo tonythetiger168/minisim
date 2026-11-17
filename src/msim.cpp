@@ -2121,6 +2121,14 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         fstC = " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fd);
         fstL = objs + " -lz -pthread";
     }
+    // DPI-C imports called from simv: svdpi.h for the svdpi_bits.inc
+    // functions in simv, exported (-rdynamic) to the user's libraries.
+    if (!compileDpiLibs().empty()) {
+        std::string d = " -I" + shq(dpiIncludeDir());
+        build += d + " -rdynamic";
+        fstC += d;
+        fstL += " -rdynamic";
+    }
     // Build cache: the same generated source, compiler command and kernel
     // sources as the simv already in `dir` reuse it. A rebuild of a large
     // design takes minutes; a regression runs the same design many times.
@@ -3627,7 +3635,7 @@ static int msimMain(int argc, char** argv) {
     // and functions they register are known to it. The C files are built now
     // for that, unless -dpiheader asks for prototypes they may include.
     std::string userSo, earlyDir;
-    bool earlyTmp = false;
+    bool earlyTmp = false, keepEarly = false;   // keepEarly: simv (-compile) loads the library from there
     if (!cFiles.empty() && dpiHeader.empty()) {
         earlyDir = buildDir;
         if (!buildDirGiven) {
@@ -3908,9 +3916,19 @@ static int msimMain(int argc, char** argv) {
         for (auto& s : soFiles) libs.push_back(s.find('/') == std::string::npos ? "./" + s : s);
         std::string err;
         bool ok = dpi::setup(lowered, libs, err);
-        if (tmpDir) { std::error_code ec; std::filesystem::remove_all(dpiDir, ec); }   // the libraries stay mapped
+        // -compile: simv calls the import functions itself (codegen.hpp
+        // dpiCall) and loads these libraries, so they stay on disk.
+        // Exports (C calling SV) are not compiled yet.
+        if (compiled && !dpi::st().exports.empty()) {
+            std::cerr << "msim: -compile: DPI-C exports are not compiled yet; using the interpreter\n";
+            compiled = false;
+        }
+        if (compiled) {
+            for (auto& l : libs) compileDpiLibs().push_back(std::filesystem::absolute(l).string());
+            keepEarly = true;
+        }
+        if (tmpDir && !compiled) { std::error_code ec; std::filesystem::remove_all(dpiDir, ec); }   // the libraries stay mapped
         if (!ok) { std::cerr << "msim: DPI: " << err << "\n"; return 1; }
-        compiled = false;   // -compile does not run DPI calls yet
     }
     if (compiled && interactiveMode) {
         std::cerr << "msim: -compile: the interactive mode is not compiled yet; using the interpreter\n";
@@ -3920,7 +3938,7 @@ static int msimMain(int argc, char** argv) {
         std::cerr << "msim: -compile: specify path delays and SDF annotation are not compiled yet; using the interpreter\n";
         compiled = false;
     }
-    if (earlyTmp) { std::error_code ec; std::filesystem::remove_all(earlyDir, ec); }   // the library stays mapped
+    if (earlyTmp && !keepEarly) { std::error_code ec; std::filesystem::remove_all(earlyDir, ec); }   // the library stays mapped
 
     // A context import may call VPI (35.5.3), as UVM's HDL backdoor does:
     // VPI's object model is then set up as for a VPI library.

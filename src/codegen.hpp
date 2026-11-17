@@ -61,6 +61,10 @@ struct CodegenSig {
     bool zeroWide = false;   // a wider one that is all 0 (-x-initial 0)
 };
 
+// msim -compile: the DPI-C libraries simv loads (the user's C files built
+// into one, and -sv_lib), in msim's order (msim.cpp).
+inline std::vector<std::string>& compileDpiLibs() { static std::vector<std::string> v; return v; }
+
 struct CodegenProc {
     const Prog* prog = nullptr;
     std::string kind;
@@ -666,6 +670,7 @@ public:
                  "    return std::fclose(f) == 0;\n"
                  "}\n\n";
         if (upf) o << "#define UPF_RT_NO_DESIGN\n#include \"upf_rt.inc\"\n\n";   // msim -upf: the power-aware runtime
+        if (!compileDpiLibs().empty()) o << "#include \"svdpi.h\"\nextern \"C\" {\n#include \"svdpi_bits.inc\"\n}\n\n";
         o << "int main(int argc, char** argv) {\n"
              "    uint64_t maxTime = ~0ULL;\n"
              "    const char* covOut = nullptr;\n"
@@ -674,6 +679,7 @@ public:
              "    timeFmt().tickExp = timeFmt().units = " << precExp << ";\n"
              "    S.timescale = " << quote(timescale) << ";\n"
              "    S.threads = defaultThreads();\n"
+          << [] { std::string l; for (auto& p : compileDpiLibs()) l += "    cdpiLibs().push_back(" + quote(p) + ");\n"; return l; }() <<
              "    for (int i = 1; i < argc; i++) {\n"
              "        if (!std::strcmp(argv[i], \"-maxtime\") && i + 1 < argc) maxTime = std::strtoull(argv[++i], nullptr, 10);\n"
              "        else if (!std::strcmp(argv[i], \"-vcd\") && i + 1 < argc) S.vcdPath = argv[++i];\n"
@@ -5540,6 +5546,62 @@ private:
         if (i.arr) rel |= isRel(i.arr->base);
         if (rel) throw CodegenUnsupported("automatic variables (frames)");
     }
+    // A DPI-C import function call (35.5): the C function itself, found in
+    // the user's libraries when simv starts (Sim cdpiSym), with the
+    // arguments in their C layout (dpiconv.hpp) and the outputs and result
+    // written back to the formals' signals, as the interpreter does
+    // (dpi.inc invoke). Import tasks, context imports (svGetScope and the
+    // other scope functions are msim's own), and array or struct arguments
+    // are not compiled yet.
+    std::string dpiCall(const Instr& i) {
+        const DpiFunc& f = *i.dpi;
+        if (f.task) throw CodegenUnsupported("a DPI-C import task");
+        if (f.context) throw CodegenUnsupported("a DPI-C context import");
+        auto ctype = [](DpiType t) -> std::string {
+            switch (t) {
+                case DT_VOID: return "void";
+                case DT_BYTE: return "int8_t";
+                case DT_SHORT: return "int16_t";
+                case DT_INT: return "int32_t";
+                case DT_LONG: return "int64_t";
+                case DT_REAL: return "double";
+                case DT_SHORTREAL: return "float";
+                case DT_CHANDLE: return "void*";
+                case DT_STRING: return "const char*";
+                case DT_BIT: case DT_LOGIC: return "uint8_t";
+                case DT_BITVEC: return "uint32_t";
+                case DT_LOGICVEC: return "dpi::LogicVec";
+                default: throw CodegenUnsupported("a DPI-C argument of this type");
+            }
+        };
+        std::string sig = ctype(f.ret) + " (*)(", pre, call, post;
+        for (size_t k = 0; k < f.args.size(); k++) {
+            const DpiArg& a = f.args[k];
+            if (a.uarr || a.t == DT_STRUCT) throw CodegenUnsupported("a DPI-C array or struct argument");
+            if (a.sig < 0 || isPriv(a.sig)) throw CodegenUnsupported("a DPI-C argument without a signal");
+            const bool vec = a.t == DT_BITVEC || a.t == DT_LOGICVEC;
+            const std::string ct = ctype(a.t), K = std::to_string(k), sg = std::to_string(a.sig);
+            sig += std::string(k ? ", " : "") + (vec ? (a.dir == 0 ? "const " : "") + ct + "*" : a.dir == 0 ? ct : ct + "*");
+            pre += vec ? " " + ct + " a" + K + "[" + std::to_string((a.w + 31) / 32) + "] = {};"
+                       : " " + ct + " a" + K + "{};";
+            if (a.dir != 1) pre += " dpi::toC(" + std::string(vec ? "a" : "&a") + K + ", (DpiType)" + std::to_string((int)a.t) + ", " +
+                                   std::to_string(a.w) + ", S.sigs[" + sg + "].val, ds);";
+            call += std::string(k ? ", " : "") + (vec || a.dir == 0 ? "a" : "&a") + K;
+            if (a.dir != 0)
+                post += " S.set(" + sg + ", dpi::fromC(" + std::string(vec ? "a" : "&a") + K + ", (DpiType)" + std::to_string((int)a.t) + ", " +
+                        std::to_string(a.w) + ", " + (a.sgn ? "true" : "false") + "));";
+        }
+        sig += ")";
+        std::string o = " { std::deque<std::string> ds; using F = " + sig + "; static const F fn = (F)cdpiSym(" + quote(f.cName) + ");";
+        o += pre;
+        if (f.ret != DT_VOID && f.retSig >= 0) {
+            o += " " + ctype(f.ret) + " r = fn(" + call + ");" + post;
+            o += " S.set(" + std::to_string(f.retSig) + ", dpi::fromC(&r, (DpiType)" + std::to_string((int)f.ret) + ", " + std::to_string(f.retW) +
+                 ", " + (f.retSgn ? "true" : "false") + "));";
+        } else o += " fn(" + call + ");" + post;
+        o += " if (S.finished) co_return; }\n";
+        return o;
+    }
     static void reach(const Prog* p, std::vector<const Prog*>& out) {
         for (const Prog* q : out)
             if (q == p) return;
@@ -5730,6 +5792,7 @@ private:
                         o << " rs.push_back(" << retLabels.size() - 1 << "); goto " << L(idx(i.callee), 0) << ";\n";
                         break;
                     case IK::Ret: o << " goto ret;\n"; break;
+                    case IK::Dpi: o << dpiCall(i); break;
                     default: throw CodegenUnsupported("instruction " + std::to_string((int)i.k));
                 }
             }
