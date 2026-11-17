@@ -1341,7 +1341,16 @@ struct Lowerer {
         if (s < 0) unsupported("reference to a variable with no signal");
         return s;
     }
+    // with {...}: the caller's array and container properties, through a
+    // slot holding their address in the caller's object (18.7)
+    std::unordered_map<const slang::ast::Symbol*, std::pair<int, std::shared_ptr<ArrShape>>> arrOverride;
+    std::unordered_map<const slang::ast::Symbol*, std::pair<int, DynObj>> dynOverride;
     std::shared_ptr<const ArrShape> arrFind(const slang::ast::Symbol* sym) const {
+        if (auto ov = arrOverride.find(sym); ov != arrOverride.end()) {
+            auto a = std::make_shared<ArrShape>(*ov->second.second);
+            a->base = indThrough(ov->second.first);
+            return a;
+        }
         if (auto rf = refFormals().find(sym); rf != refFormals().end()) {
             if (rf->second.kind != 1) return nullptr;
             auto a = std::make_shared<ArrShape>(*rf->second.arr);
@@ -1362,6 +1371,11 @@ struct Lowerer {
         return it == arrMap().end() ? nullptr : it->second;
     }
     int dynFind(const slang::ast::Symbol* sym) const {
+        if (auto ov = dynOverride.find(sym); ov != dynOverride.end()) {
+            int d = indThrough(ov->second.first);
+            indShape[d] = ov->second.second;
+            return d;
+        }
         if (auto rf = refFormals().find(sym); rf != refFormals().end()) {
             if (rf->second.kind != 2) return -1;
             int d = indThrough(refSlot(sym));
@@ -5810,10 +5824,13 @@ struct Lowerer {
                 if (n == s) {
                     if (!call.type->isIntegral()) unsupported("reduction with a non-integral with clause");
                     int ph = fresh(itSym ? std::max(1, storeW(itSym->getType())) : 64);
+                    int phx = o.kind == 2 ? -1 : fresh(32);   // item.index (7.12.4): the element's position
                     if (itSym) symOverride[itSym] = ph;
+                    if (itSym && phx >= 0) iterIndex[itSym] = phx;
                     E body = expr(*withE);
-                    if (itSym) symOverride.erase(itSym);
+                    if (itSym) { symOverride.erase(itSym); iterIndex.erase(itSym); }
                     auto x = node(Op::DynReduce, {resize(body, (int)call.type->getBitWidth(), withE->type->isSigned(), false)});
+                    if (phx >= 0) x->kids.push_back(ref(phx, true));
                     x->sig = d;
                     x->hi = id;
                     x->lo = ph;
@@ -6299,6 +6316,9 @@ struct Lowerer {
                 }
                 if (int ix = iterIndexSig(call); ix >= 0)   // item.index in a with clause (7.12.4)
                     return sized(ref(ix, e.type->isSigned()), storeW(*e.type), e.type->isSigned(), ctx);
+                if (n == "index" && call.arguments().size() == 1 && peel(*call.arguments()[0]).kind == ExpressionKind::NamedValue)
+                    if (auto xb = exprIndexBind.find(&peel(*call.arguments()[0]).as<NamedValueExpression>().symbol); xb != exprIndexBind.end())
+                        return sized(konst(make((uint64_t)xb->second, 0, 32, 0, true)), 32, true, ctx);
                 if ((n == "$rtoi" || n == "$realtobits") && call.arguments().size() == 1) {
                     E r = realOf(*call.arguments()[0]);
                     int w = (int)e.type->getBitWidth();
@@ -7972,7 +7992,29 @@ struct Lowerer {
         if (n == "$shortrealtobits" && args.size() == 1) return sysFnNode(SF_SR2BITS, {realOf(*args[0])});
         if (n == "$clog2" && args.size() == 1) return sysFnNode(SF_CLOG2, {a(0)});
         if (n == "$countones" && args.size() == 1) return sysFnNode(SF_COUNTBITS, {a(0)}, 2);
-        if (n == "$countbits" && args.size() >= 2) return sysFnNode(SF_COUNTBITS, {a(0)}, countCtl(args.subspan(1)));
+        if (n == "$countbits" && args.size() >= 2) {
+            bool allConst = true;
+            for (size_t k = 1; k < args.size(); k++) allConst &= tryConst(peel(*args[k])).isInteger();
+            if (allConst) return sysFnNode(SF_COUNTBITS, {a(0)}, countCtl(args.subspan(1)));
+            // A control bit known only at run time (20.9: its LSB counts):
+            // the count of each value that some control matches, added up.
+            int tmp = -1;
+            E v0 = a(0);
+            if (stmtDepth) { tmp = fresh(std::max(1, (int)args[0]->type->getBitWidth())); Instr t; t.k = IK::Assign; t.sig = tmp; t.e = v0; prog.emit(t); v0 = ref(tmp); }
+            static const Val vals[4] = {make(0, 0, 1), make(1, 0, 1), make(0, 1, 1), make(0, 1, 1, 1)};
+            E sum;
+            for (int b = 0; b < 4; b++) {
+                E any;
+                for (size_t k = 1; k < args.size(); k++) {
+                    E lsb = slice(expr(*args[k]), 0, 0);
+                    E m = bin(Op::CaseEq, lsb, konst(vals[b]));
+                    any = any ? bin(Op::LogOr, any, m) : m;
+                }
+                E cnt = mux(any, sysFnNode(SF_COUNTBITS, {v0}, 1 << b), konst(make(0, 0, 32, 0, true)));
+                sum = sum ? bin(Op::Add, sum, cnt) : cnt;
+            }
+            return sum;
+        }
         if ((n == "$onehot" || n == "$onehot0") && args.size() == 1) {
             E c = sysFnNode(SF_COUNTBITS, {a(0)}, 2);
             return bin(n == "$onehot" ? Op::Eq : Op::Le, c, konst(make(1, 0, 32, 0, true)));
@@ -8504,6 +8546,7 @@ struct Lowerer {
     std::unordered_map<const slang::ast::Expression*, int> exprOverride;
     using BeforeList = std::vector<std::pair<std::vector<E>, std::vector<E>>>;
     std::unordered_map<const slang::ast::Symbol*, E> exprBind;
+    std::unordered_map<const slang::ast::Symbol*, int64_t> exprIndexBind;   // item.index there
     // a.sum(), a.sum() with (expr) ... of a fixed-size array (7.12.3): the
     // elements folded, at the result's width.
     E fixedReduce(const slang::ast::CallExpression& call, std::string_view n) {
@@ -8518,12 +8561,18 @@ struct Lowerer {
         needWidth(w);
         Op op = n == "sum" ? Op::Add : n == "product" ? Op::Mul : n == "and" ? Op::And : n == "or" ? Op::Or : Op::Xor;
         E acc;
-        for (E x : el) {
+        const auto& fr = arr.type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
+        bool oneDim = (int64_t)el.size() == (int64_t)fr.width();
+        for (size_t k = 0; k < el.size(); k++) {
+            E x = el[k];
             E t;
             if (iter) {
                 exprBind[iv] = x;
+                // item.index: the declared index, left to right
+                if (oneDim) exprIndexBind[iv] = fr.left + (fr.left <= fr.right ? (int64_t)k : -(int64_t)k);
                 t = expr(*iter, ExprCtx{w, sg, sg, true});
                 exprBind.erase(iv);
+                exprIndexBind.erase(iv);
             } else t = resize(x, w, et.isSigned(), sg);
             acc = acc ? bin(op, acc, t) : t;
         }
@@ -8896,13 +8945,22 @@ struct Lowerer {
                 }
                 for (const Symbol* sym : v.found) {
                     auto pm = propMap().find(sym);
-                    if (pm == propMap().end() || symOverride.count(sym)) continue;
+                    if (pm == propMap().end() || symOverride.count(sym) || dynOverride.count(sym) || arrOverride.count(sym)) continue;
                     const Scope* sc = sym->getParentScope();
                     bool inObj = false;
                     for (ClassInfo* c = wc; c; c = c->base)
                         if (sc == static_cast<const Scope*>(c->ty)) inObj = true;
                     if (inObj) continue;
-                    if (pm->second.kind != 0) unsupported("an array or container of the caller in with {...}");
+                    if (pm->second.kind != 0) {   // the caller's array or container: through its address
+                        int t = fresh(64);
+                        auto ad = node(Op::Addr, {node(Op::This)});
+                        ad->sig = pm->second.kind == 1 ? pm->second.arr->base : pm->second.off;
+                        Instr a; a.k = IK::Assign; a.sig = t; a.e = ad;
+                        prog.emit(a);
+                        if (pm->second.kind == 1) arrOverride[sym] = {t, pm->second.arr};
+                        else dynOverride[sym] = {t, dynShapeOf(sym->as<ValueSymbol>().getType())};
+                        continue;
+                    }
                     int t = fresh(storeW(sym->as<ValueSymbol>().getType()));
                     Instr a; a.k = IK::Assign; a.sig = t;
                     a.e = ref(thisRel(pm->second.off));
@@ -9015,6 +9073,8 @@ struct Lowerer {
         curClass = savedCls;
         symOverride = std::move(savedOv);
         exprOverride.clear();
+        arrOverride.clear();
+        dynOverride.clear();
         i.sig = fresh(32);
         i.rc = rc;
         prog.emit(i);

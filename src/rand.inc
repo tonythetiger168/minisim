@@ -1555,7 +1555,9 @@ struct Rewrite {
                     el = konst(d.kind == 2 ? std::next(d.map.begin(), (long)k)->second : d.vec[(size_t)k]);
                 }
                 items.push_back({e->lo, el});
+                if (e->kids.size() > 1) items.push_back({e->kids[1]->sig, konst(make((uint64_t)k, 0, 32, 0, true))});   // item.index
                 E x = (*this)(e->kids[0]);
+                if (e->kids.size() > 1) items.pop_back();
                 items.pop_back();
                 acc = acc ? bin(ops[e->hi], acc, x) : x;
             }
