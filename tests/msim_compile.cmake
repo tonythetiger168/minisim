@@ -169,6 +169,10 @@ foreach(c IN LISTS CASES)
     if(NOT gen MATCHES "{ P[0-9]+\\.v = [^;]*; }")
       message(FATAL_ERROR "${c}: no 2-state clocked write stores the value word alone")
     endif()
+    # ... and the commit list stores value words alone while pclean holds.
+    if(NOT gen MATCHES "if \\(C0TWO\\)")
+      message(FATAL_ERROR "${c}: the commit list has no value-only path")
+    endif()
   endif()
   # A cycle of comb blocks runs as one merged block, a function per member
   # (msim.cpp mergeCombCycles), and the clocked block stays in the cycle
