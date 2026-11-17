@@ -75,6 +75,8 @@ set(CASES
   "-x-assign 0 -x-initial 0 examples/clkgate.sv"
   "examples/constsel.sv"
   "-x-assign 0 -x-initial 0 examples/constsel.sv"
+  "examples/deadseq.sv"
+  "-x-assign 0 -x-initial 0 examples/deadseq.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
   "examples/islands.sv"
@@ -140,6 +142,13 @@ foreach(c IN LISTS CASES)
     list(LENGTH hits nh)
     if(nh LESS 48)
       message(FATAL_ERROR "${c}: only ${nh} signals private to the cycle domain (expected 48)")
+    endif()
+  endif()
+  # u0's debug registers: written only while a waveform watches (deadSeq).
+  if(c STREQUAL "examples/deadseq.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(NOT gen MATCHES "__builtin_expect\\(S\\.observed, 0\\)")
+      message(FATAL_ERROR "${c}: the clocked writes nothing reads still run every cycle")
     endif()
   endif()
   # Instances of one module share one copy of its code (codegen.hpp
