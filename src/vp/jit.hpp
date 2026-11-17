@@ -43,6 +43,9 @@ struct JitCtx {
     void* dl;          // 88: with paging: the hart's load page cache (Hart::dl)
     void* ds;          // 96: and its store page cache (Hart::ds)
     uint64_t dctx;     // 104: the key their tags have to carry (Machine::dataCtx << 52)
+    uint8_t* resv;     // 112: with paging: the hart's LR reservation (Hart::resv)
+    uint64_t* resvAddr;  // 120: and its address
+    uint64_t* mstatus;   // 128: the hart's mstatus (CSRRCI on sstatus)
 };
 
 struct Jit {

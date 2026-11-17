@@ -1265,7 +1265,32 @@ private:
     // drop them all.
     static constexpr unsigned JIT_OPS = 64;
     // Classes only the translator has (after the fast loop's): the rest of M.
-    enum : uint8_t { J_MULH = K_MULW + 1, J_MULHSU, J_MULHU, J_DIV, J_DIVU, J_REM, J_REMU, J_DIVW, J_DIVUW, J_REMW, J_REMUW, J_FENCE, J_AMO, J_CBOZ };
+    enum : uint8_t { J_MULH = K_MULW + 1, J_MULHSU, J_MULHU, J_DIV, J_DIVU, J_REM, J_REMU, J_DIVW, J_DIVUW, J_REMW, J_REMUW, J_FENCE, J_AMO, J_CBOZ,
+                     J_ZU, J_ZB, J_SSC };
+    // Zbb (RV64): J_ZU reads rs1, J_ZB rs1 and rs2; the operation in imm
+    // (and a rotate's amount in imm >> 8).
+    enum : uint8_t { Z_CLZ = 1, Z_CTZ, Z_CPOP, Z_CLZW, Z_CTZW, Z_CPOPW, Z_SEXTB, Z_SEXTH, Z_ZEXTH, Z_ORCB, Z_REV8, Z_RORI, Z_RORIW,
+                     Z_ANDN, Z_ORN, Z_XNOR, Z_MIN, Z_MINU, Z_MAX, Z_MAXU, Z_ROL, Z_ROR, Z_ROLW, Z_RORW };
+    static int32_t zbbOp(uint32_t insn) {
+        const unsigned op = insn & 0x7f, f3 = (insn >> 12) & 7, f7 = insn >> 25, i12 = insn >> 20;
+        static const bool pop = __builtin_cpu_supports("popcnt");
+        if (op == 0x13 && f3 == 1)
+            return i12 == 0x600 ? Z_CLZ : i12 == 0x601 ? Z_CTZ : i12 == 0x602 && pop ? Z_CPOP : i12 == 0x604 ? Z_SEXTB : i12 == 0x605 ? Z_SEXTH : 0;
+        if (op == 0x13 && f3 == 5) {
+            if (i12 == 0x287) return Z_ORCB;
+            if (i12 == 0x6b8) return Z_REV8;
+            if ((insn >> 26) == 0x18) return Z_RORI | (int32_t)((i12 & 63) << 8);
+            return 0;
+        }
+        if (op == 0x1b && f3 == 1) return i12 == 0x600 ? Z_CLZW : i12 == 0x601 ? Z_CTZW : i12 == 0x602 && pop ? Z_CPOPW : 0;
+        if (op == 0x1b && f3 == 5 && f7 == 0x30) return Z_RORIW | (int32_t)((i12 & 31) << 8);
+        if (op == 0x33 && f7 == 0x20) return f3 == 7 ? Z_ANDN : f3 == 6 ? Z_ORN : f3 == 4 ? Z_XNOR : 0;
+        if (op == 0x33 && f7 == 0x05) return f3 == 4 ? Z_MIN : f3 == 5 ? Z_MINU : f3 == 6 ? Z_MAX : f3 == 7 ? Z_MAXU : 0;
+        if (op == 0x33 && f7 == 0x30) return f3 == 1 ? Z_ROL : f3 == 5 ? Z_ROR : 0;
+        if (op == 0x3b && f7 == 0x04 && f3 == 4 && ((insn >> 20) & 31) == 0) return Z_ZEXTH;
+        if (op == 0x3b && f7 == 0x30) return f3 == 1 ? Z_ROLW : f3 == 5 ? Z_RORW : 0;
+        return 0;
+    }
     // pg: with paging on, where AMOs (but LR and SC; one hart only) and
     // CBO.ZERO go through the store page cache.
     static uint8_t jitKind(uint32_t insn, bool pg) {
@@ -1278,9 +1303,12 @@ private:
             switch (insn >> 27) {
                 case 0x00: case 0x01: case 0x04: case 0x08: case 0x0c: case 0x10: case 0x14: case 0x18: case 0x1c:
                     return J_AMO;
+                case 0x02: return ((insn >> 20) & 31) ? (uint8_t)K_NONE : (uint8_t)J_AMO;  // LR
+                case 0x03: return J_AMO;                                // SC
                 default: return K_NONE;
             }
         }
+        if (const int32_t z = zbbOp(insn)) return (z & 0xff) < Z_ANDN ? J_ZU : J_ZB;
         if (f7 != 1) return K_NONE;
         if (op == 0x33 && f3) return (uint8_t)(J_MULH + f3 - 1);
         if (op == 0x3b && f3 >= 4) return (uint8_t)(J_DIVW + f3 - 4);
@@ -1367,6 +1395,13 @@ private:
                 if (k == J_AMO && harts.size() > 1 && !serial) k = K_NONE;  // AMOs break other harts' reservations
                 if (k == J_AMO) imm = (int32_t)((insn >> 27) | ((insn >> 12) & 7) << 8);  // funct5, width
                 else if (k == J_CBOZ) imm = 0;
+                else if (k == J_ZU || k == J_ZB) imm = zbbOp(insn);
+                // CSRRCI on sstatus in supervisor mode: clears SIE at most
+                // (bits 0 to 4), which never lets an interrupt in
+                if (!k && pg && h.priv == 1 && (insn & 0x707f) == 0x7073 && (insn >> 20) == 0x100) {
+                    k = J_SSC;
+                    imm = (int32_t)((insn >> 15) & 31);
+                }
             }
             if (!k) { toInterp = true; break; }
             // (a shared block: any hart may run it, so FENCE.I on any has to look at its page)
@@ -1415,8 +1450,9 @@ private:
         auto uses = [](uint8_t k, bool& r1, bool& r2, bool& wd) {
             r1 = k != K_LUI && k != K_AUIPC && k != K_JAL;
             r2 = (k >= K_BEQ && k <= K_BGEU) || (k >= K_SB && k <= K_SD) || (k >= K_ADD && k <= K_MUL) ||
-                 (k >= K_ADDW && k <= K_MULW) || (k >= J_MULH && k <= J_REMUW) || k == J_AMO;
+                 (k >= K_ADDW && k <= K_MULW) || (k >= J_MULH && k <= J_REMUW) || k == J_AMO || k == J_ZB;
             wd = !(k >= K_BEQ && k <= K_BGEU) && !(k >= K_SB && k <= K_SD) && k != J_FENCE && k != J_CBOZ;
+            if (k == J_SSC) r1 = r2 = false;
         };
         // The block's busiest guest registers live in host registers from its
         // start (those it reads before writing are loaded) to each exit
@@ -1739,6 +1775,40 @@ private:
                 case J_AMO: {  // rd = old value; memory = op(old, rs2)
                     const unsigned f5 = (unsigned)imm & 0xff;
                     const bool w = ((unsigned)imm >> 8) == 3;
+                    if (f5 == 0x02) {  // LR: the reservation, then the load
+                        addr();
+                        J.ldCtx(R::R11, 120);
+                        J.rex(true, R::RAX, R::R11); J.b(0x89); J.mem(R::RAX, R::R11, 0);    // resvAddr = a
+                        J.ldCtx(R::R11, 112);
+                        J.rex(false, 0, R::R11); J.b(0xc6); J.mem(0, R::R11, 0); J.b(1);    // resv = 1
+                        pageOf(88, w ? 8 : 4, true);
+                        J.rex(w, R::RCX, R::RAX); J.b(0x8b); J.mem(R::RCX, R::RAX, 0);
+                        if (!w) J.movsxd(R::RCX, R::RCX);
+                        put(o.rd, R::RCX);
+                        break;
+                    }
+                    if (f5 == 0x03) {  // SC: stores when the reservation is for a
+                        addr();
+                        J.ldCtx(R::R11, 120);
+                        J.rex(true, R::RAX, R::R11); J.b(0x3b); J.mem(R::RAX, R::R11, 0);    // cmp rax, resvAddr
+                        uint8_t* f1 = J.jcc(R::CC_NE);
+                        J.ldCtx(R::R11, 112);
+                        J.rex(false, 7, R::R11); J.b(0x80); J.mem(7, R::R11, 0); J.b(0);    // cmp byte resv, 0
+                        uint8_t* f2 = J.jcc(R::CC_E);
+                        pageOf(96, w ? 8 : 4, true);
+                        ld(R::RCX, o.rs2, w);
+                        J.rex(w, R::RCX, R::RAX); J.b(0x89); J.mem(R::RCX, R::RAX, 0);
+                        J.aluRR(R::A_XOR, R::RAX, R::RAX, false);
+                        uint8_t* done = J.jmp();
+                        Jit::fix(f1, J.p);
+                        Jit::fix(f2, J.p);
+                        J.movI(R::RAX, 1);
+                        Jit::fix(done, J.p);
+                        J.ldCtx(R::R11, 112);
+                        J.rex(false, 0, R::R11); J.b(0xc6); J.mem(0, R::R11, 0); J.b(0);    // resv = 0
+                        put(o.rd);
+                        break;
+                    }
                     pageOf(96, w ? 8 : 4, true);
                     ld(R::RCX, o.rs2, w);
                     int res = R::RCX;
@@ -1761,6 +1831,92 @@ private:
                     }
                     if (!w) J.movsxd(res, res);
                     put(o.rd, res);
+                    break;
+                }
+                case J_SSC: {  // rd = sstatus; mstatus &= ~(uimm & SSTATUS_MASK)
+                    J.ldCtx(R::R11, 128);
+                    J.rex(true, R::RAX, R::R11); J.b(0x8b); J.mem(R::RAX, R::R11, 0);       // rax = mstatus
+                    J.movI(R::RCX, SSTATUS_MASK);
+                    J.aluRR(R::A_AND, R::RCX, R::RAX);
+                    // SD: FS or VS dirty
+                    J.movRR(R::R11, R::RAX);
+                    J.aluI(R::A_AND, R::R11, (int32_t)MSTATUS_FS);
+                    J.aluI(R::A_CMP, R::R11, (int32_t)MSTATUS_FS);
+                    uint8_t* sd1 = J.jcc(R::CC_E);
+                    J.movRR(R::R11, R::RAX);
+                    J.aluI(R::A_AND, R::R11, (int32_t)MSTATUS_VS);
+                    J.aluI(R::A_CMP, R::R11, (int32_t)MSTATUS_VS);
+                    uint8_t* nosd = J.jcc(R::CC_NE);
+                    Jit::fix(sd1, J.p);
+                    J.rex(true, 0, R::RCX); J.b(0x0f); J.b(0xba); J.modrr(5, R::RCX); J.b(63);  // bts rcx, 63
+                    Jit::fix(nosd, J.p);
+                    J.movI(R::R11, 2ull << 32);  // UXL: 64
+                    J.aluRR(R::A_OR, R::RCX, R::R11);
+                    if (const uint32_t m = (uint32_t)imm & SSTATUS_MASK) {
+                        J.aluI(R::A_AND, R::RAX, (int32_t)~m);
+                        J.ldCtx(R::R11, 128);
+                        J.rex(true, R::RAX, R::R11); J.b(0x89); J.mem(R::RAX, R::R11, 0);
+                    }
+                    put(o.rd, R::RCX);
+                    break;
+                }
+                case J_ZU: case J_ZB: {
+                    const unsigned z = (unsigned)imm & 0xff;
+                    const bool w = !(z == Z_CLZW || z == Z_CTZW || z == Z_CPOPW || z == Z_RORIW || z == Z_ROLW || z == Z_RORW);
+                    auto cmov = [&](uint8_t cc, int dst, int src) { J.rex(true, dst, src); J.b(0x0f); J.b((uint8_t)(0x40 + cc)); J.modrr(dst, src); };
+                    if (o.kind == J_ZB) ld(R::RCX, o.rs2);
+                    ld(R::RAX, o.rs1, w);
+                    switch (z) {
+                        case Z_CLZ: case Z_CLZW:  // (w - 1) - bsr, -1 for zero
+                            J.movI(R::RCX, ~0ull);
+                            J.rex(w, R::RAX, R::RAX); J.b(0x0f); J.b(0xbd); J.modrr(R::RAX, R::RAX);
+                            cmov(0x4, R::RAX, R::RCX);
+                            J.rex(true, 0, R::RAX); J.b(0xf7); J.modrr(3, R::RAX);  // neg
+                            J.aluI(R::A_ADD, R::RAX, w ? 63 : 31);
+                            break;
+                        case Z_CTZ: case Z_CTZW:  // bsf, w for zero
+                            J.movI(R::RCX, w ? 64 : 32);
+                            J.rex(w, R::RAX, R::RAX); J.b(0x0f); J.b(0xbc); J.modrr(R::RAX, R::RAX);
+                            cmov(0x4, R::RAX, R::RCX);
+                            break;
+                        case Z_CPOP: case Z_CPOPW:
+                            J.b(0xf3); J.rex(w, R::RAX, R::RAX); J.b(0x0f); J.b(0xb8); J.modrr(R::RAX, R::RAX);
+                            break;
+                        case Z_SEXTB: J.rex(true, R::RAX, R::RAX); J.b(0x0f); J.b(0xbe); J.modrr(R::RAX, R::RAX); break;
+                        case Z_SEXTH: J.rex(true, R::RAX, R::RAX); J.b(0x0f); J.b(0xbf); J.modrr(R::RAX, R::RAX); break;
+                        case Z_ZEXTH: J.b(0x0f); J.b(0xb7); J.modrr(R::RAX, R::RAX); break;
+                        case Z_ORCB:  // bit 7 of ((x & 0x7f..) + 0x7f..) | x: the byte is not zero
+                            J.movI(R::RCX, 0x7f7f7f7f7f7f7f7full);
+                            J.aluRR(R::A_AND, R::RAX, R::RCX);
+                            J.aluRR(R::A_ADD, R::RAX, R::RCX);
+                            with(R::A_OR, R::RAX, o.rs1);
+                            J.shiftI(5, R::RAX, 7);
+                            J.movI(R::RCX, 0x0101010101010101ull);
+                            J.aluRR(R::A_AND, R::RAX, R::RCX);
+                            J.rex(true, R::RAX, R::RAX); J.b(0x69); J.modrr(R::RAX, R::RAX); J.d32(0xff);  // imul rax, rax, 255
+                            break;
+                        case Z_REV8: J.rex(true, 0, R::RAX); J.b(0x0f); J.b(0xc8); break;  // bswap rax
+                        case Z_RORI: case Z_RORIW:
+                            if (imm >> 8) J.shiftI(1, R::RAX, (unsigned)imm >> 8, w);
+                            break;
+                        case Z_ANDN: case Z_ORN:
+                            J.rex(true, 0, R::RCX); J.b(0xf7); J.modrr(2, R::RCX);  // not rcx
+                            J.aluRR(z == Z_ANDN ? R::A_AND : R::A_OR, R::RAX, R::RCX);
+                            break;
+                        case Z_XNOR:
+                            J.aluRR(R::A_XOR, R::RAX, R::RCX);
+                            J.rex(true, 0, R::RAX); J.b(0xf7); J.modrr(2, R::RAX);
+                            break;
+                        case Z_MIN: case Z_MINU: case Z_MAX: case Z_MAXU:
+                            J.aluRR(R::A_CMP, R::RAX, R::RCX);
+                            cmov(z == Z_MIN ? 0xf : z == Z_MINU ? 0x7 : z == Z_MAX ? 0xc : 0x2, R::RAX, R::RCX);
+                            break;
+                        case Z_ROL: case Z_ROLW: J.shiftCl(0, R::RAX, w); break;
+                        case Z_ROR: case Z_RORW: J.shiftCl(1, R::RAX, w); break;
+                        default: break;
+                    }
+                    if (!w) J.movsxd(R::RAX, R::RAX);
+                    put(o.rd);
                     break;
                 }
                 case J_CBOZ:  // 64 zero bytes at rs1 & ~63
@@ -1976,7 +2132,8 @@ private:
             V.pgPriv = h.priv;
         }
         static_assert(sizeof(Hart::DataPage) == 16 && offsetof(Hart::DataPage, tag) == 0, "the translator's page cache lookup");
-        JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, V.jtPg, h.dl, h.ds, (uint64_t)dataCtx(h) << 52};
+        JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, V.jtPg, h.dl, h.ds, (uint64_t)dataCtx(h) << 52,
+                 (uint8_t*)&h.resv, &h.resvAddr, &h.mstatus};
         auto look = [&](uint64_t v, bool stepv) -> uint8_t* {
             if (!stepv) {
                 const Jit::JtEntry& t = V.jtPg[(v >> 1) & (Jit::JT - 1)];
