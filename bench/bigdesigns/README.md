@@ -12,7 +12,7 @@ needs. Results and the msim issues found are tracked in the project report
 | `c910.sh` | T-Head OpenC910 with its smart_run testbench | Apache-2.0 |
 | `cva6.sh elab / run` | CVA6 (Ariane) core, and the corev_apu UVM testbench | Solderpad 0.51 |
 | `nvdla.sh` | NVDLA nv_full | NVIDIA Open NVDLA License |
-| `openpiton.sh X Y` | OpenPiton X×Y mesh (OpenSPARC T1 tiles) | BSD; T1 core GPL-2.0 |
+| `openpiton.sh X Y` | OpenPiton X×Y mesh (OpenSPARC T1 tiles), `chip` | BSD; T1 core GPL-2.0 |
 | `opentitan.sh` | OpenTitan Earl Grey `chip_sim_tb` | Apache-2.0 |
 
 Helpers: `tm` prints wall time and peak memory of a command; `flatten_flist.py` expands
@@ -22,7 +22,7 @@ XiangShan's Verilator-only DiffTest harness with RAM, flash and trap handling in
 `cva6/elf_dpi.c` replaces CVA6's Spike-based ELF loader.
 
 Needs: clang + lld (RISC-V bare-metal programs), a JDK and mill 0.12.17 for XiangShan,
-`csh` and `libbit-vector-perl` for OpenPiton, `libyaml-perl libio-tee-perl
+`csh`, `libbit-vector-perl` and `libc6-i386` for OpenPiton, `libyaml-perl libio-tee-perl
 libcapture-tiny-perl` for NVDLA, Python venv for OpenTitan's fusesoc. On a 16 GB machine
 run one design at a time: XiangShan alone takes about 10 GB in msim.
 
