@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: a dynamic translator to x86-64 for RV64 machine-mode code (RV64I,
+  M, C): register allocation per block, direct block linking, an
+  indirect-jump table, exact instruction counts (a counting copy of a block
+  finishes the quantum); `-nojit` turns it off. One hart with no timed
+  device runs up to 64 quanta at once. CoreMark 3.6 s to 0.40 s, Dhrystone
+  2.1 s to 0.28 s, every Embench program ahead of QEMU 8.2.
+  `tests/vplat/jit.c`.
 - mvplat: BFloat16, Zfbfmin (FCVT.BF16.S, FCVT.S.BF16), Zvfbfmin
   (`vfncvtbf16.f.f.w`, `vfwcvtbf16.f.f.v`) and Zvfbfwma (`vfwmaccbf16`);
   all three in the device tree. `tests/vplat/bf16.c`.
