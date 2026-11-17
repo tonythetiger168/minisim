@@ -672,6 +672,7 @@ public:
     static void pmpDecode(Hart& h) {
         h.pmpN = 0;
         h.fpVpn = ~0ull;
+        h.flushFetchPages();
         h.flushDataPages();
         h.pmpLock = false;
         for (unsigned i = 0; i < 16; i++) {
@@ -1073,6 +1074,7 @@ public:
                 h.fpVpn = pc >> 12;
                 h.fpPa = pa & ~0xfffull;
                 h.fpPriv = h.priv;
+                h.fp[(pc >> 12) & (Hart::FP_SIZE - 1)] = {pc >> 12, h.priv};
             }
         }
         Acc r;
@@ -1214,7 +1216,10 @@ private:
         }
         return K_NONE;
     }
-    template <bool RV64> void turbo(Hart& h, uint64_t end) {
+    // PG: a hart in supervisor or user mode with paging on. Instructions
+    // come from pages in the fetch page record, loads and stores go through
+    // the data page caches; anything else leaves.
+    template <bool RV64, bool PG> void turbo(Hart& h, uint64_t end) {
         // A copy of the registers with a sink, r[32], that writes to x0 go to.
         uint64_t r[33];
         memcpy(r, h.x, sizeof h.x);
@@ -1233,10 +1238,32 @@ private:
         auto ax = [](uint64_t v) { return RV64 ? v : (uint64_t)(uint32_t)v; };
         auto w = [](uint64_t v) { return (uint64_t)(int64_t)(int32_t)(uint32_t)v; };
         constexpr unsigned SM = RV64 ? 63 : 31;
-        auto inMem = [&](uint64_t ad, unsigned) { return ad - cb < span; };
-        auto okStore = [&](uint64_t ad, unsigned n) {
-            return ad - cb < sspan && !(th && ad - th + n - 1 < 8 + n - 1);
+        const uint32_t ctx = PG ? dataCtx(h) : 0;
+        const unsigned priv = h.priv;
+        // Where a load or store of n bytes at ad goes in host memory, or null.
+        auto ldp = [&](uint64_t ad, unsigned n) -> uint8_t* {
+            if constexpr (PG) {
+                const Hart::DataPage& e = h.dl[(ad >> 12) & (Hart::DP_SIZE - 1)];
+                return e.vpn == ad >> 12 && e.ctx == ctx && (ad & 0xfff) <= 4096 - n ? e.host + (ad & 0xfff) : nullptr;
+            } else {
+                (void)n;
+                return ad - cb < span ? cp + (ad - cb) : nullptr;
+            }
         };
+        auto stp = [&](uint64_t ad, unsigned n) -> uint8_t* {
+            if constexpr (PG) {
+                const Hart::DataPage& e = h.ds[(ad >> 12) & (Hart::DP_SIZE - 1)];
+                return e.vpn == ad >> 12 && e.ctx == ctx && (ad & 0xfff) <= 4096 - n ? e.host + (ad & 0xfff) : nullptr;
+            } else {
+                return ad - cb < sspan && !(th && ad - th + n - 1 < 8 + n - 1) ? cp + (ad - cb) : nullptr;
+            }
+        };
+        // Is the page holding pc one instructions may come from?
+        auto fetchOk = [&](uint64_t a) {
+            const Hart::FetchPage& e = h.fp[(a >> 12) & (Hart::FP_SIZE - 1)];
+            return e.vpn == a >> 12 && e.priv == priv;
+        };
+        uint64_t fpage = PG ? ~0ull : 0;  // the page last found in the record
         // Each handler fetches the next instruction and jumps to its handler
         // itself (computed goto).
         static void* const tbl[] = {&&out, &&L_LUI, &&L_AUIPC, &&L_JAL, &&L_JALR, &&L_BEQ, &&L_BNE, &&L_BLT, &&L_BGE, &&L_BLTU, &&L_BGEU, &&L_LB, &&L_LH, &&L_LW, &&L_LD, &&L_LBU, &&L_LHU, &&L_LWU, &&L_SB, &&L_SH, &&L_SW, &&L_SD, &&L_ADDI, &&L_SLLI, &&L_SLTI, &&L_SLTIU, &&L_XORI, &&L_SRLI, &&L_SRAI, &&L_ORI, &&L_ANDI, &&L_ADD, &&L_SUB, &&L_SLL, &&L_SLT, &&L_SLTU, &&L_XOR, &&L_SRL, &&L_SRA, &&L_OR, &&L_AND, &&L_MUL, &&L_ADDIW, &&L_SLLIW, &&L_SRLIW, &&L_SRAIW, &&L_ADDW, &&L_SUBW, &&L_SLLW, &&L_SRLW, &&L_SRAW, &&L_MULW};
@@ -1246,7 +1273,11 @@ private:
         uint64_t* o;
 #define DISPATCH                                                         \
         do {                                                             \
-            if (d->pc != pc) goto out;                                   \
+            if (d->pc != (pc | PG)) goto out;                            \
+            if (PG && (pc ^ fpage) >> 12) {                              \
+                if (!fetchOk(pc)) goto out;                              \
+                fpage = pc;                                              \
+            }                                                            \
             npc = ax(pc + d->len);                                       \
             a = r[d->rs1]; b = r[d->rs2]; i = d->imm; o = &r[d->trd];    \
             goto *tbl[d->kind];                                          \
@@ -1275,7 +1306,7 @@ private:
 #define BNEXT do { op++; BOP; } while (0)
         // The block's last op went to npc.
 #define BEND do { left -= bk->n; pc = npc; if (!left) goto out; goto blockTry; } while (0)
-#define BPC (ax(bk->pc + 2 * (uint64_t)op->off))
+#define BPC (ax((bk->pc & ~1ull) + 2 * (uint64_t)op->off))
         if (cyc >= end) return;
         uint64_t left = end - cyc;  // instructions to go, this one included
         static const void* const btbl[] = {nullptr, &&B_LUI, &&B_AUIPC, &&B_JAL, &&B_JALR, &&B_BEQ, &&B_BNE, &&B_BLT, &&B_BGE, &&B_BLTU, &&B_BGEU, &&B_LB, &&B_LH, &&B_LW, &&B_LD, &&B_LBU, &&B_LHU, &&B_LWU, &&B_SB, &&B_SH, &&B_SW, &&B_SD, &&B_ADDI, &&B_SLLI, &&B_SLTI, &&B_SLTIU, &&B_XORI, &&B_SRLI, &&B_SRAI, &&B_ORI, &&B_ANDI, &&B_ADD, &&B_SUB, &&B_SLL, &&B_SLT, &&B_SLTU, &&B_XOR, &&B_SRL, &&B_SRA, &&B_OR, &&B_AND, &&B_MUL, &&B_ADDIW, &&B_SLLIW, &&B_SRLIW, &&B_SRAIW, &&B_ADDW, &&B_SUBW, &&B_SLLW, &&B_SRLW, &&B_SRAW, &&B_MULW};
@@ -1288,15 +1319,19 @@ private:
         // At a jump target: run a whole block when enough of the budget is
         // left for its longest, else one instruction at a time.
         if (left > Hart::BLOCK_OPS) {
+            if (PG && (pc ^ fpage) >> 12) {
+                if (!fetchOk(pc)) goto out;
+                fpage = pc;
+            }
             bk = &blocks[(pc >> 1) & (Hart::BLOCKS - 1)];
-            if (bk->pc != pc || bk->gen != gen) {
+            if (bk->pc != (pc | PG) || bk->gen != gen) {
                 // Build it from the decoded-instruction cache.
                 unsigned n = 0;
                 uint64_t p = pc;
                 bool ctl = false;
                 while (n < Hart::BLOCK_OPS) {
                     const Hart::Decoded& e = dc[(p >> 1) & (Hart::DC_SIZE - 1)];
-                    if (e.pc != p || !e.kind || p - pc > 2 * 255) break;
+                    if (e.pc != (p | PG) || !e.kind || p - pc > 2 * 255 || (PG && (p ^ pc) >> 12)) break;
                     Hart::BlockOp& q = bk->ops[n++];
                     q.h = btbl[e.kind]; q.rd = e.trd; q.rs1 = e.rs1; q.rs2 = e.rs2;
                     q.off = (uint8_t)((p - pc) >> 1); q.imm = e.imm;
@@ -1304,9 +1339,9 @@ private:
                     p = ax(p + e.len);
                     if (e.kind >= K_JAL && e.kind <= K_BGEU) { ctl = true; break; }
                 }
-                if (!n) { bk->pc = 1; d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)]; DISPATCH; }
+                if (!n) { bk->pc = ~0ull; d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)]; DISPATCH; }
                 if (!ctl) bk->ops[n++] = Hart::BlockOp{&&B_END, 32, 0, 0, (uint8_t)((p - pc) >> 1), 0};
-                bk->pc = pc; bk->end = p; bk->n = ctl ? n : n - 1; bk->gen = gen;
+                bk->pc = pc | PG; bk->end = p; bk->n = ctl ? n : n - 1; bk->gen = gen;
             }
             op = bk->ops;
             BOP;
@@ -1326,9 +1361,10 @@ private:
 #define TLOAD(L, T, N)                                                   \
     L: {                                                                 \
         const uint64_t ad = ax(a + i);                                   \
-        if (!inMem(ad, N)) goto out;                                     \
+        const uint8_t* const hp = ldp(ad, N);                            \
+        if (!hp) goto out;                                                \
         T v;                                                             \
-        memcpy(&v, cp + (ad - cb), N);                                   \
+        memcpy(&v, hp, N);                                               \
         *o = sx((uint64_t)v);                                            \
         SEQ;                                                             \
     }
@@ -1343,9 +1379,10 @@ private:
 #define TSTORE(L, T, N)                                                  \
     L: {                                                                 \
         const uint64_t ad = ax(a + i);                                   \
-        if (!okStore(ad, N)) goto out;                                   \
+        uint8_t* const hp = stp(ad, N);                                  \
+        if (!hp) goto out;                                                \
         const T v = (T)b;                                                \
-        memcpy(cp + (ad - cb), &v, N);                                   \
+        memcpy(hp, &v, N);                                               \
         SEQ;                                                             \
     }
     TSTORE(L_SB, uint8_t, 1)
@@ -1398,9 +1435,10 @@ private:
 #define BLOAD(L, T, N)                                                   \
     L: {                                                                 \
         const uint64_t ad = ax(A1 + IM);                                 \
-        if (!inMem(ad, N)) goto bout;                                    \
+        const uint8_t* const hp = ldp(ad, N);                            \
+        if (!hp) goto bout;                                                \
         T v;                                                             \
-        memcpy(&v, cp + (ad - cb), N);                                   \
+        memcpy(&v, hp, N);                                               \
         r[op->rd] = sx((uint64_t)v);                                     \
         BNEXT;                                                           \
     }
@@ -1415,9 +1453,10 @@ private:
 #define BSTORE(L, T, N)                                                  \
     L: {                                                                 \
         const uint64_t ad = ax(A1 + IM);                                 \
-        if (!okStore(ad, N)) goto bout;                                  \
+        uint8_t* const hp = stp(ad, N);                                  \
+        if (!hp) goto bout;                                                \
         const T v = (T)B2;                                               \
-        memcpy(cp + (ad - cb), &v, N);                                   \
+        memcpy(hp, &v, N);                                               \
         BNEXT;                                                           \
     }
     BSTORE(B_SB, uint8_t, 1)
@@ -1626,9 +1665,14 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             interrupt(h);
         }
         if (h.wfi) { h.cycle = end; return Stop::Budget; }
-        if (!slow && !h.par && h.priv == 3 && !h.pmpLock && !(h.mstatus & MSTATUS_MPRV) && !irqDirty_) {
-            if (rv64) turbo<true>(h, end); else turbo<false>(h, end);
-            if (h.cycle >= end) break;
+        if (!slow && !h.par && !irqDirty_) {
+            if (h.priv == 3 && !h.pmpLock && !(h.mstatus & MSTATUS_MPRV)) {
+                if (rv64) turbo<true, false>(h, end); else turbo<false, false>(h, end);
+                if (h.cycle >= end) break;
+            } else if (h.priv != 3 && h.paging()) {
+                if (rv64) turbo<true, true>(h, end); else turbo<false, true>(h, end);
+                if (h.cycle >= end) break;
+            }
         }
         uint64_t pc = h.pc;
         if (slow && !breakpoints.empty() && !h.skipBp && breakpoints.count(pc)) return Stop::Break;
@@ -1639,9 +1683,10 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
         unsigned len;
         Hart::Decoded& dce = h.dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
         const bool fx = h.priv != 3 && h.paging();
-        if (dce.pc == pc && dce.xlat == fx) {
+        if (dce.pc == (pc | fx)) {
             insn = dce.insn; raw = dce.raw; len = dce.len;
-            if (fx && (pc >> 12) == h.fpVpn && h.priv == h.fpPriv && (len == 2 || (pc & 0xfff) <= 0xffc)) {
+            const Hart::FetchPage& fpe = h.fp[(pc >> 12) & (Hart::FP_SIZE - 1)];
+            if (fx && fpe.vpn == (pc >> 12) && fpe.priv == h.priv && (len == 2 || (pc & 0xfff) <= 0xffc)) {
                 // the page fetched from last: translated and executable
             } else if (fx) {
                 uint64_t tv;
@@ -1691,10 +1736,11 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 insn = rvc::expand(raw, rv64);
                 if (!insn) { trap(h, 2, raw, false); h.cycle++; continue; }
             }
-            dce.pc = pc; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len; dce.xlat = fx;
+            dce.pc = pc | fx; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len; dce.xlat = fx;
             dce.op = insn & 0x7f; dce.rd = (insn >> 7) & 31; dce.f3 = (insn >> 12) & 7;
             dce.rs1 = (insn >> 15) & 31; dce.rs2 = (insn >> 20) & 31; dce.f7 = (uint8_t)(insn >> 25);
-            dce.kind = fx ? (uint8_t)K_NONE : fastKind(insn, rv64, dce.imm);  // the fast loop runs bare only
+            dce.kind = fastKind(insn, rv64, dce.imm);
+            if (fx && len == 4 && (pc & 0xfff) > 0xffc) dce.kind = K_NONE;  // across two pages
             dce.trd = dce.rd ? dce.rd : 32;
             dce.step = (uint8_t)(len / 2 * sizeof(Hart::Decoded));
         }
