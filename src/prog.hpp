@@ -580,6 +580,10 @@ struct Prog {
     // case's violation check): the ProcCtl its reports are queued under.
     // Each evaluation is a flush point (16.4.2), as the wait of the process is.
     mutable std::shared_ptr<void> combCtl;
+    // msim -compile, a cycle of combinational blocks merged into one
+    // (msim.cpp: mergeCombCycles): code [s, e) of each block. Jumps in one
+    // stay in it or go to e; codegen gives each its own function.
+    std::vector<std::pair<size_t, size_t>> segs;
     // A subroutine's own variables (arguments, result, locals) when they are
     // static signals. A process that calls it is not sensitive to them
     // (9.2.2.2.1: not what is declared within a called function; 10.3.2: the

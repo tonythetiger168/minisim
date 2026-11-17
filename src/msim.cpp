@@ -657,6 +657,8 @@ static void xInitialZero() {
 // process (bench/gen_soc.py: 512 such processes were coroutines). The loop
 // variable is automatic and local to the loop (12.7.1); it is kept out of
 // the waveform, which never shows automatic variables (21.7.1.2).
+// Blocking writes of the body (a variable declared in the loop: logic t;
+// t = ...) are copied with it.
 //
 // With comb set, the same is done in combinational processes (always_comb,
 // always @*: body; wait; goto 0), before splitCombBlocks: a loop that sets
@@ -745,7 +747,7 @@ static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
             for (size_t b = top + 1; b < step && ok; b++) {
                 const Instr& x = code[b];
                 if (x.k == IK::Nba) ok = x.sig != var && x.drv < 0 && x.dyn < 0 && !x.nbaLater && !x.de && !x.delay;
-                else if (x.k == IK::Assign && comb)   // a blocking write of the block's own (not a driver, not of i)
+                else if (x.k == IK::Assign)   // a blocking write of the block's own (not a driver, not of i)
                     ok = x.sig != var && x.drv < 0 && x.dyn < 0 && x.dsrc < 0 && !x.de && !x.delay && x.dly.empty() && x.gate < 0 && !x.udp;
                 else if (x.k == IK::Jmp || x.k == IK::JmpIfNot)
                     ok = x.target > b && x.target <= E && x.xt == Instr::NOX;   // forward, inside or to the end
@@ -1625,6 +1627,175 @@ static bool upfPinned(const Prog& q) {
         if (i.k == IK::Call || i.k == IK::Fork) return true;   // the callee may run UPF code
     }
     return false;
+}
+
+// msim -compile: combinational processes that feed each other (a cycle of
+// whole-block dependencies, such as routers whose ready outputs depend on
+// the ready inputs that their neighbours compute) keep the design out of the
+// cycle domain and the partitions. Each such cycle becomes one process that
+// runs its members in turn until the signals fed back to an earlier member
+// stop changing, as the interpreter's levelized schedule does (it re-runs a
+// cycle's ranks until they are stable) and as Verilator does for UNOPTFLAT
+// logic. The loop stops after kCycleLimit passes. MSIM_NOCYCMERGE turns it off;
+// MSIM_WHYCYCMERGE reports each merged cycle.
+static void mergeCombCycles(LowerResult& lowered) {
+    static constexpr uint64_t kCycleLimit = 1000;
+    const bool dbg = std::getenv("MSIM_WHYCYCMERGE") != nullptr;
+    std::vector<CombShape> shapes;
+    std::vector<size_t> procOf;
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        CombShape c;
+        if (lowered.procs[i].program < 0 && !lowered.procs[i].reactive && !upfPinned(lowered.procs[i].prog) && combShape(lowered.procs[i].prog, c)) {
+            shapes.push_back(c);
+            procOf.push_back(i);
+        }
+    }
+    std::vector<int> cyc;
+    bool cyclic = false;
+    g_combCycles = &cyc;
+    combSchedule(shapes, nullptr, &cyclic);
+    g_combCycles = nullptr;
+    if (!cyclic) return;
+    std::map<int, std::vector<size_t>> comps;   // cycle -> indices into shapes
+    for (size_t a = 0; a < cyc.size(); a++)
+        if (cyc[a] >= 0) comps[cyc[a]].push_back(a);
+    // a feeds b through signal o: b reads bits of o that a writes (as combSchedule).
+    auto feeds = [&](size_t a, size_t b, std::set<int>* through) {
+        bool any = false;
+        for (int o : shapes[a].outs) {
+            bool reads = false, hit = false;
+            for (auto& r : shapes[b].rbits) {
+                if (r.sig != o) continue;
+                reads = true;
+                for (auto& w : shapes[a].wbits)
+                    if (w.sig == o && (w.lo < 0 || r.lo < 0 || (w.lo <= r.hi && r.lo <= w.hi))) hit = true;
+            }
+            if (!reads) for (int x : shapes[b].ins) if (x == o) hit = true;   // waits on it, reads it in a call
+            if (hit) { any = true; if (through) through->insert(o); }
+        }
+        return any;
+    };
+    std::vector<char> drop(lowered.procs.size(), 0);
+    static int serial = 0;
+    size_t nMerged = 0;
+    for (auto& [id, mem] : comps) {
+        if (mem.size() < 2) continue;
+        size_t m = mem.size();
+        std::vector<std::vector<size_t>> out(m), in(m);
+        for (size_t x = 0; x < m; x++)
+            for (size_t y = 0; y < m; y++)
+                if (x != y && feeds(mem[x], mem[y], nullptr)) { out[x].push_back(y); in[y].push_back(x); }
+        // Order with few back edges (Eades, Lin and Smyth): sinks to the end,
+        // sources to the front, otherwise the node with most out minus in.
+        std::vector<char> done(m, 0);
+        std::vector<size_t> head, tail;
+        auto deg = [&](size_t v, bool o) { size_t d = 0; for (size_t w : (o ? out[v] : in[v])) d += !done[w]; return d; };
+        for (size_t left = m; left > 0;) {
+            bool moved = true;
+            while (moved) {
+                moved = false;
+                for (size_t v = 0; v < m; v++)
+                    if (!done[v] && deg(v, true) == 0) { tail.push_back(v); done[v] = 1; left--; moved = true; }
+                for (size_t v = 0; v < m; v++)
+                    if (!done[v] && deg(v, false) == 0) { head.push_back(v); done[v] = 1; left--; moved = true; }
+            }
+            if (!left) break;
+            size_t best = m; long bd = 0;
+            for (size_t v = 0; v < m; v++)
+                if (!done[v]) { long d = (long)deg(v, true) - (long)deg(v, false); if (best == m || d > bd) { best = v; bd = d; } }
+            head.push_back(best); done[best] = 1; left--;
+        }
+        std::vector<size_t> ord = head;
+        ord.insert(ord.end(), tail.rbegin(), tail.rend());
+        std::vector<size_t> pos(m);
+        for (size_t k = 0; k < m; k++) pos[ord[k]] = k;
+        // The signals a later (or the same) member writes for an earlier one.
+        std::set<int> fb;
+        for (size_t x = 0; x < m; x++)
+            for (size_t y : out[x])
+                if (pos[y] <= pos[x]) feeds(mem[x], mem[y], &fb);
+        if (fb.empty()) continue;
+        Prog merged = lowered.procs[procOf[mem[ord[0]]]].prog;
+        merged.code.clear();
+        auto tmpSig = [&](const std::string& base, int w) {
+            std::string nm = base;
+            nm = nm.substr(nm.rfind('.') == std::string::npos ? 0 : nm.rfind('.') + 1);
+            for (char& ch : nm) if (!std::isalnum((unsigned char)ch)) ch = '_';
+            int t = S.sig("_tfk" + std::to_string(serial++) + "_" + nm, w, false);
+            S.sigs[(size_t)t].hide = true;
+            return t;
+        };
+        auto assign = [&](int sig, E e) { Instr a; a.k = IK::Assign; a.sig = sig; a.e = std::move(e); a.tmp = true; return a; };
+        const int cnt = tmpSig("passes", 32);
+        merged.code.push_back(assign(cnt, konst(make(0, 0, 32))));
+        const size_t top = merged.code.size();
+        std::vector<std::pair<int, int>> olds;   // signal, its value at the top of the pass
+        for (int f : fb) {
+            int o = tmpSig(S.sigs[(size_t)f].name, S.sigs[(size_t)f].w);
+            olds.push_back({f, o});
+            merged.code.push_back(assign(o, ref(f)));
+        }
+        std::set<std::pair<int, Edge>> evs;
+        for (size_t k = 0; k < m; k++) {
+            const Prog& q = lowered.procs[procOf[mem[ord[k]]]].prog;
+            const size_t n = q.code.size(), at = merged.code.size(), end = at + (n - 2);
+            merged.segs.push_back({at, end});
+            for (size_t i = 0; i + 2 < n; i++) {
+                Instr c = q.code[i];
+                if (c.k == IK::Jmp || c.k == IK::JmpIfNot) {
+                    c.target = c.target >= n - 2 ? end : at + c.target;
+                    if (c.xt != Instr::NOX) c.xt = c.xt >= n - 2 ? end : at + c.xt;
+                }
+                merged.code.push_back(std::move(c));
+            }
+            const Instr& w = q.code[n - 2];
+            if (w.events.empty()) evs.insert({w.sig, w.edge});
+            else for (auto& e : w.events) evs.insert(e);
+        }
+        merged.code.push_back(assign(cnt, bin(Op::Add, ref(cnt), konst(make(1, 0, 32)))));
+        E changed;
+        for (auto& [f, o] : olds) {
+            E ne = un(Op::LogNot, bin(Op::CaseEq, ref(o), ref(f)));
+            changed = changed ? bin(Op::LogOr, changed, ne) : ne;
+        }
+        Instr again;
+        again.k = IK::JmpIfNot;
+        again.e = bin(Op::LogAnd, changed, bin(Op::Lt, ref(cnt), konst(make(kCycleLimit, 0, 32))));
+        again.target = merged.code.size() + 2;   // the wait
+        merged.code.push_back(again);
+        Instr back;
+        back.k = IK::Jmp;
+        back.target = top;
+        merged.code.push_back(back);
+        Instr wt;
+        wt.k = IK::WaitEdge;
+        wt.edge = ANY;
+        for (auto& e : evs) wt.events.push_back(e);
+        if (wt.events.size() == 1) { wt.sig = wt.events[0].first; wt.edge = wt.events[0].second; wt.events.clear(); }
+        merged.code.push_back(wt);
+        Instr j0;
+        j0.k = IK::Jmp;
+        j0.target = 0;
+        merged.code.push_back(j0);
+        CombShape chk;
+        if (!combShape(merged, chk)) { if (dbg) std::cerr << "cycle " << id << ": merged block is not a comb shape, left as it is\n"; continue; }
+        if (dbg) {
+            std::cerr << "cycle " << id << ": " << m << " blocks merged, " << fb.size() << " signals fed back:";
+            size_t k = 0;
+            for (int f : fb) { if (k++ == 8) { std::cerr << " ..."; break; } std::cerr << " " << S.sigs[(size_t)f].name; }
+            std::cerr << "\n";
+        }
+        lowered.procs[procOf[mem[ord[0]]]].prog = std::move(merged);
+        lowered.procs[procOf[mem[ord[0]]]].loops = true;
+        for (size_t k = 1; k < m; k++) drop[procOf[mem[ord[k]]]] = 1;
+        nMerged++;
+    }
+    if (!nMerged) return;
+    std::vector<LoweredProc> keep;
+    keep.reserve(lowered.procs.size());
+    for (size_t i = 0; i < lowered.procs.size(); i++)
+        if (!drop[i]) keep.push_back(std::move(lowered.procs[i]));
+    lowered.procs = std::move(keep);
 }
 
 static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
@@ -3784,6 +3955,8 @@ static int msimMain(int argc, char** argv) {
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOSEQTMP")) localizeSeqBlocking(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCYCMERGE"))
+        mergeCombCycles(lowered);
     Plan pl = plan(lowered, staticComb, staticSeq);
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
