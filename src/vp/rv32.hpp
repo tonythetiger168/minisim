@@ -281,7 +281,7 @@ struct Hart {
         int wr;         // its WriteWatch region (-1: none, compare; -2: read-only memory)
         uint32_t seen;  // the region's write count for the page when last compared
     };
-    static constexpr size_t CODE_PAGES = 512;
+    static constexpr size_t CODE_PAGES = 2048;
     std::unordered_map<uint64_t, CodePage> codePages;
     bool codeUntracked = false;
     uint64_t fenceFull = 0, fencePart = 0, fencePages = 0;

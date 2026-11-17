@@ -1291,6 +1291,31 @@ private:
         if (!jits_[h.id]) jits_[h.id].reset(new Jit);
         return jits_[h.id]->failed ? nullptr : jits_[h.id].get();
     }
+    // The translator for the hart's paged code: its own, or with -serial and
+    // more than one hart one for all (they run on one thread, and the
+    // kernel's code is the same for each).
+    Jit* jitForPg(Hart& h) {
+        Jit* v = jitFor(h);
+        if (!v || !serial || harts.size() < 2) return v;
+        if (!pgShared_) {
+            pgShared_.reset(new Jit);
+            if (pgShared_->failed) return nullptr;
+        }
+        if (std::find(pgShared_->views.begin(), pgShared_->views.end(), v) == pgShared_->views.end())
+            pgShared_->views.push_back(v);
+        return pgShared_.get();
+    }
+    // Bring the hart's translators up to date with what FENCE.I found.
+    void jitSync(Hart& h, Jit& v) {
+        Jit* s = serial && harts.size() > 1 ? pgShared_.get() : nullptr;
+        if (v.gen != h.codeGen) { v.flush(); v.gen = h.codeGen; }
+        if (s && v.pgGen != h.codeGen) { s->flush(); v.pgGen = h.codeGen; }
+        if (!h.codeChanged.empty()) {
+            v.dropPages(h.codeChanged);
+            if (s) s->dropPages(h.codeChanged);
+            h.codeChanged.clear();
+        }
+    }
     // Translate the block at pc0 (in the hart's cached region). Null when
     // its first instruction cannot be fetched from there.
     // step: the version for the end of the budget, which counts each
@@ -1344,7 +1369,10 @@ private:
                 else if (k == J_CBOZ) imm = 0;
             }
             if (!k) { toInterp = true; break; }
-            noteInsn(h, pg ? (pa0 & ~0xfffull) | (p & 0xfff) : p, len == 4 ? raw : raw & 0xffff, len);
+            // (a shared block: any hart may run it, so FENCE.I on any has to look at its page)
+            if (pg && &J == pgShared_.get())
+                for (auto& o : harts) noteInsn(*o, (pa0 & ~0xfffull) | (p & 0xfff), len == 4 ? raw : raw & 0xffff, len);
+            else noteInsn(h, pg ? (pa0 & ~0xfffull) | (p & 0xfff) : p, len == 4 ? raw : raw & 0xffff, len);
             ops[n++] = Op{p, k, (uint8_t)((insn >> 7) & 31), (uint8_t)((insn >> 15) & 31), (uint8_t)((insn >> 20) & 31),
                           (uint8_t)len, imm};
             p += len;
@@ -1893,8 +1921,7 @@ private:
             Hart::Decoded& last = h.dc[(((pg << 12) - 2) >> 1) & (Hart::DC_SIZE - 1)];
             if (((last.pc ^ h.mmuTag) >> 1) == (((pg << 12) - 2) >> 1)) last.pc = ~0ull;
             h.fencePages++;
-            if (h.codeChanged.size() < 64) h.codeChanged.push_back(pg);
-            else h.codeGen++;  // too many: drop every translation
+            h.codeChanged.push_back(pg);  // (at most CODE_PAGES)
             any = true;
             it = h.codePages.erase(it);
         }
@@ -1906,8 +1933,7 @@ private:
         Jit* jp = jitFor(h);
         if (!jp) { jit = false; return; }
         Jit& J = *jp;
-        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; h.codeChanged.clear(); }
-        if (!h.codeChanged.empty()) { J.dropPages(h.codeChanged); h.codeChanged.clear(); }
+        jitSync(h, J);
         JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt, nullptr, nullptr, 0};
         uint8_t* code = J.find(pc);
         if (!code && !(code = jitCompile(J, h, pc))) return;
@@ -1938,21 +1964,22 @@ private:
     // translated and allowed), each translated from the physical address
     // the pc has now; loads and stores go through the data page caches.
     void jitRunPg(Hart& h, uint64_t* r, uint64_t& pc, uint64_t& left) {
-        Jit* jp = jitFor(h);
+        Jit* vp_ = jitFor(h);
+        Jit* jp = vp_ ? jitForPg(h) : nullptr;
         if (!jp) { jit = false; return; }
-        Jit& J = *jp;
-        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; h.codeChanged.clear(); }
-        if (!h.codeChanged.empty()) { J.dropPages(h.codeChanged); h.codeChanged.clear(); }
-        if (J.pgFpGen != h.fpGen || J.pgPriv != h.priv) {
-            Jit::clearJt(J.jtPg, J.jtPgUsed);
-            J.pgFpGen = h.fpGen;
-            J.pgPriv = h.priv;
+        Jit& J = *jp;   // blocks
+        Jit& V = *vp_;  // this hart's indirect-jump table
+        jitSync(h, V);
+        if (V.pgFpGen != h.fpGen || V.pgPriv != h.priv) {
+            Jit::clearJt(V.jtPg, V.jtPgUsed);
+            V.pgFpGen = h.fpGen;
+            V.pgPriv = h.priv;
         }
         static_assert(sizeof(Hart::DataPage) == 16 && offsetof(Hart::DataPage, tag) == 0, "the translator's page cache lookup");
-        JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, J.jtPg, h.dl, h.ds, (uint64_t)dataCtx(h) << 52};
+        JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, V.jtPg, h.dl, h.ds, (uint64_t)dataCtx(h) << 52};
         auto look = [&](uint64_t v, bool stepv) -> uint8_t* {
             if (!stepv) {
-                const Jit::JtEntry& t = J.jtPg[(v >> 1) & (Jit::JT - 1)];
+                const Jit::JtEntry& t = V.jtPg[(v >> 1) & (Jit::JT - 1)];
                 if (t.pc == v) return t.code;
             }
             const Hart::FetchPage& e = h.fp[(v >> 12) & (Hart::FP_SIZE - 1)];
@@ -1962,7 +1989,7 @@ private:
             uint8_t* code = nullptr;
             if (it != J.pg.end() && it->second.pa == pa) code = stepv ? it->second.step : it->second.code;
             if (!code) code = jitCompile(J, h, v, stepv, true, pa);
-            if (code && !stepv) J.setJtPg(v, code);
+            if (code && !stepv) V.setJtPg(v, code);
             return code;
         };
         uint8_t* code = look(pc, false);
@@ -2354,6 +2381,7 @@ private:
     bool merge_ = false;            // run() merged quanta (one hart, nothing timed)
     uint64_t cut_ = UINT64_MAX;     // where merged quanta end after a device access
     std::vector<std::unique_ptr<Jit>> jits_;  // by hart id, made on first use
+    std::unique_ptr<Jit> pgShared_;           // -serial: paged code, for every hart (jitForPg)
     bool irqDirty_ = false;
     uint64_t gcycle_ = 0;
     uint64_t consoleBytes_ = 0;

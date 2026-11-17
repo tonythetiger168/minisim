@@ -72,7 +72,8 @@ void usage() {
         "  -platform FILE     the platform in JSON (default: the built-in virt32 board)\n"
         "  -harts N           number of harts (overrides the platform)\n"
         "  -threads N         threads for the harts (default: every CPU; -j N too)\n"
-        "  -quantum N         cycles each hart runs between synchronisations (default 1000)\n"
+        "  -quantum N         cycles each hart runs between synchronisations (default 1000;\n"
+        "                     10000 with -serial)\n"
         "  -mhz F             hart clock in MHz (default 100)\n"
         "  -max-cycles N      stop after N cycles (exit code 4)\n"
         "  -input TEXT        characters the first UART receives\n"
@@ -173,11 +174,13 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     m.cycle_ps = std::max<uint64_t>(1, (uint64_t)(1e6 / mhz + 0.5));
     double mt = pl.get("mtime_hz") ? pl.get("mtime_hz")->num() : 1e7;
     m.tick_ps = std::max<uint64_t>(1, (uint64_t)(1e12 / mt + 0.5));
-    m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : 1000;
-    if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
     if (o.nojit) m.jit = false;
     if (pl.get("serial")) m.serial = pl.get("serial")->u64() != 0;
     if (o.serial) m.serial = true;
+    // Taking turns costs a switch per quantum per hart (no thread waits for
+    // another), so -serial goes 10 times as far between them by default.
+    m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : m.serial ? 10000 : 1000;
+    if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
     if (!m.quantum) throw std::runtime_error("the quantum must be at least one cycle");
     uint64_t reset = pl.get("reset") ? pl.get("reset")->u64() : 0x80000000u;
     m.addHarts(nh, reset);

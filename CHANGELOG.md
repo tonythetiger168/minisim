@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: with `-serial` the harts share one translation of paged code
+  (each keeps its own indirect-jump table), FENCE.I keeps up to 2048 code
+  pages per hart and drops translations page by page however many changed,
+  and the quantum defaults to 10000 cycles. Linux on 2 harts: about 2.0 s
+  to 1.4 s, level with QEMU 8.2.
 - mvplat: the pages code was decoded from are read-only on the host (Linux,
   macOS); the first store to one marks it written, so `FENCE.I` compares
   only pages written since it last looked (`src/vp/wtrack.hpp`;
