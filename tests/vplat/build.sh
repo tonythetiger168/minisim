@@ -34,6 +34,8 @@ for x in 32 64; do
     crt0.S zvbb.c -o "$out/zvbb$x.elf"
   $V -march=rv${x}gcv_zfh_zvfh -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fuse-ld=lld -Wl,-T,link.ld \
     -Wl,--build-id=none -static crt0.S zvfh.c -o "$out/zvfh$x.elf"
+  $V -march=rv${x}gcv -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fuse-ld=lld -Wl,-T,link.ld \
+    -Wl,--build-id=none -static crt0.S bf16.c -o "$out/bf16$x.elf"
   $V -march=rv${x}gcv_zvkned_zvknhb_zvkg_zvbc_zvksed_zvksh -fno-vectorize -fno-slp-vectorize -fuse-ld=lld -Wl,-T,link.ld \
     -Wl,--build-id=none -static crt0.S zvk.c -o "$out/zvk$x.elf"
 done
