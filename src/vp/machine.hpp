@@ -31,6 +31,7 @@
 #include "devices.hpp"
 #include "elf.hpp"
 #include "fpu.hpp"
+#include "jit.hpp"
 #include "parallel.hpp"
 #include "rv32.hpp"
 
@@ -77,6 +78,8 @@ public:
     // -trace and -profile.
     FILE* trace = nullptr;
     bool profile = false;
+    // The dynamic translator (x86-64 hosts): on unless -nojit.
+    bool jit = true;
 
     // Debugger state.
     std::set<uint64_t> breakpoints;
@@ -223,6 +226,13 @@ public:
         while (!exit_) {
             uint64_t end = gcycle_ + quantum;
             uint64_t ev = nextEventCycle();
+            // One hart and no device that keeps time of its own: nothing
+            // happens at quantum boundaries until the hart touches a device,
+            // so run up to 64 quanta at once, cut back to the boundary after
+            // the first device access (devRead, devWrite).
+            merge_ = harts.size() == 1 && !dbg && !cosim && !anyLive();
+            if (merge_) end = gcycle_ + quantum * 64;
+            cut_ = UINT64_MAX;
             if (ev > gcycle_ && ev < end) end = ev;
             bool allWfi = true;
             for (auto& h : harts) allWfi = allWfi && h->wfi;
@@ -244,9 +254,12 @@ public:
             if (harts.size() == 1) runOne(*harts[0], end);
             else runRound(end);
             if (exit_) break;
+            if (cut_ < end) end = cut_;
             gcycle_ = end;
             for (auto& d : bus.devices()) d->advance(nowPs());
-            updateIrqs();
+            // The lines only change through irqChanged/setIrq (dirty) or as
+            // time reaches an event, which ends the quantum.
+            if (irqDirty_ || (ev != UINT64_MAX && ev <= end)) updateIrqs();
             if (dbg && dbg->interrupted()) {
                 for (auto& h : harts) h->stopSig = 2;
                 dbg->stopped(0);
@@ -886,6 +899,7 @@ public:
             return ramRead(h, a, n, v);
         }
         if (h.par) return Acc::Pending;
+        if (merge_) cutAfter(h);
         uint64_t t = 0;
         Who w{h.id, h.cycle, true};
         Acc r = d->read(a - d->base, n, t, w);
@@ -901,11 +915,17 @@ public:
             return ramWrite(h, a, n, v);
         }
         if (h.par) return Acc::Pending;
+        if (merge_) cutAfter(h);
         Who w{h.id, h.cycle, true};
         if (n < 8) v &= (1ull << (8 * n)) - 1;
         Acc r = d->write(a - d->base, n, v, w);
         if (r == Acc::Ok) d->nwrite++;
         return r;
+    }
+    // A device was touched in merged quanta: stop at the end of this quantum.
+    void cutAfter(const Hart& h) {
+        const uint64_t b = gcycle_ + ((h.cycle - gcycle_) / quantum + 1) * quantum;
+        if (b < cut_) cut_ = b;
     }
     // Plain memory, through the hart's write buffer in a parallel round.
     Acc ramRead(Hart& h, uint64_t a, unsigned n, uint64_t& v) {
@@ -1226,6 +1246,429 @@ private:
         }
         return K_NONE;
     }
+    // ---- The dynamic translator. A block of the fast loop's instructions
+    // (bare RV64 machine mode for now) becomes x86-64 code; see jit.hpp for
+    // the register conventions. Blocks are linked to the blocks they jump to
+    // directly once those exist, and an indirect jump looks its target up in
+    // a table; anything else leaves for the fast loop, which runs the
+    // instruction a block could not. Translations hold for one generation of
+    // the decoded-instruction cache, so FENCE.I, SFENCE.VMA and a new program
+    // drop them all.
+    static constexpr unsigned JIT_OPS = 64;
+    // Classes only the translator has (after the fast loop's): the rest of M.
+    enum : uint8_t { J_MULH = K_MULW + 1, J_MULHSU, J_MULHU, J_DIV, J_DIVU, J_REM, J_REMU, J_DIVW, J_DIVUW, J_REMW, J_REMUW };
+    static uint8_t jitKind(uint32_t insn) {
+        const unsigned op = insn & 0x7f, f3 = (insn >> 12) & 7, f7 = insn >> 25;
+        if (f7 != 1) return K_NONE;
+        if (op == 0x33 && f3) return (uint8_t)(J_MULH + f3 - 1);
+        if (op == 0x3b && f3 >= 4) return (uint8_t)(J_DIVW + f3 - 4);
+        return K_NONE;
+    }
+    Jit* jitFor(Hart& h) {
+        if (jits_.size() <= h.id) jits_.resize(h.id + 1);
+        if (!jits_[h.id]) jits_[h.id].reset(new Jit);
+        return jits_[h.id]->failed ? nullptr : jits_[h.id].get();
+    }
+    // Translate the block at pc0 (in the hart's cached region). Null when
+    // its first instruction cannot be fetched from there.
+    // step: the version for the end of the budget, which counts each
+    // instruction and leaves when the budget runs out.
+    uint8_t* jitCompile(Jit& J, Hart& h, uint64_t pc0, bool step = false) {
+        const uint64_t cb = h.cBase, region = h.cEnd > cb ? h.cEnd - cb : 0;
+        const uint8_t* const cp = h.cPtr;
+        struct Op { uint64_t pc; uint8_t kind, rd, rs1, rs2, len; int32_t imm; };
+        Op ops[JIT_OPS];
+        unsigned n = 0;
+        uint64_t p = pc0;
+        bool ctl = false, toInterp = false;
+        while (n < JIT_OPS) {
+            const uint64_t off = p - cb;
+            if (off >= region || region - off < 2) { toInterp = true; break; }
+            uint32_t raw = 0, insn;
+            memcpy(&raw, cp + off, region - off >= 4 ? 4 : 2);
+            unsigned len;
+            if ((raw & 3) == 3) {
+                if (region - off < 4) { toInterp = true; break; }
+                insn = raw; len = 4;
+            } else {
+                insn = rvc::expand(raw & 0xffff, true); len = 2;
+                if (!insn) { toInterp = true; break; }
+            }
+            int32_t imm;
+            uint8_t k = fastKind(insn, true, imm);
+            if (!k) k = jitKind(insn);
+            if (!k) { toInterp = true; break; }
+            ops[n++] = Op{p, k, (uint8_t)((insn >> 7) & 31), (uint8_t)((insn >> 15) & 31), (uint8_t)((insn >> 20) & 31),
+                          (uint8_t)len, imm};
+            p += len;
+            if (k >= K_JAL && k <= K_BGEU) { ctl = true; break; }
+        }
+        if (!n && p - cb >= region) return nullptr;
+        if (J.used + 16384 > Jit::BUF) J.flush();
+        using R = Jit;
+        J.p = J.buf + J.used;
+        uint8_t* const entry = J.p;
+        auto toEpi = [&] { Jit::fix(J.jmp(), J.epi); };
+        auto leave = [&](uint64_t pc, int32_t why = 1) {  // to the fast loop at pc (2: to the step version)
+            J.movI(R::RAX, pc);
+            J.movCtxI(72, why);
+            J.aluRR(R::A_XOR, R::RDX, R::RDX, false);
+            toEpi();
+        };
+        auto keep = [&] {
+            J.used = (size_t)(J.p - J.buf);
+            if (step) J.steps[pc0] = entry; else J.add(pc0, entry);
+            return entry;
+        };
+        if (!n) {  // the fast loop takes it from here
+            leave(pc0);
+            return keep();
+        }
+        // Which registers each op reads (rs1, rs2) and writes (rd).
+        auto uses = [](uint8_t k, bool& r1, bool& r2, bool& wd) {
+            r1 = k != K_LUI && k != K_AUIPC && k != K_JAL;
+            r2 = (k >= K_BEQ && k <= K_BGEU) || (k >= K_SB && k <= K_SD) || (k >= K_ADD && k <= K_MUL) ||
+                 (k >= K_ADDW && k <= K_MULW) || k >= J_MULH;
+            wd = !(k >= K_BEQ && k <= K_BGEU) && !(k >= K_SB && k <= K_SD);
+        };
+        // The block's busiest guest registers live in host registers from its
+        // start (those it reads before writing are loaded) to each exit
+        // (those it wrote are stored back).
+        static const int pool[] = {R::RSI, R::RDI, R::R8, R::R9, R::R10, R::R11, R::RDX};
+        int hr[33];
+        for (int& x : hr) x = -1;
+        uint32_t liveIn = 0;
+        {
+            unsigned cnt[32] = {};
+            uint32_t written = 0;
+            for (unsigned k = 0; k < n; k++) {
+                bool r1, r2, wd;
+                uses(ops[k].kind, r1, r2, wd);
+                auto rd_ = [&](unsigned g) { if (!g) return; cnt[g]++; if (!(written >> g & 1)) liveIn |= 1u << g; };
+                if (r1) rd_(ops[k].rs1);
+                if (r2) rd_(ops[k].rs2);
+                if (wd && ops[k].rd) { cnt[ops[k].rd]++; written |= 1u << ops[k].rd; }
+            }
+            bool rdxUsed = false;  // MULH* and the divisions need rdx
+            for (unsigned k = 0; k < n; k++) rdxUsed |= ops[k].kind >= J_MULH;
+            for (unsigned i = 0; i < sizeof pool / sizeof pool[0] - rdxUsed; i++) {
+                unsigned best = 0;
+                for (unsigned g = 1; g < 32; g++)
+                    if (hr[g] < 0 && cnt[g] > cnt[best]) best = g;
+                if (!best || cnt[best] < 2) break;
+                hr[best] = pool[i];
+            }
+        }
+        uint32_t dirty = 0;
+        struct Bail { uint8_t* rel; unsigned k; uint32_t dirty; };
+        struct Link { uint8_t* rel; uint64_t to; };
+        Bail bails[JIT_OPS * 2], stops[JIT_OPS];
+        Link links[2];
+        unsigned nb = 0, nl = 0, ns = 0;
+        uint8_t* budget = nullptr;
+        if (!step) {
+            J.aluI(R::A_CMP, R::R12, (int32_t)n);
+            budget = J.jcc(R::CC_B);
+            J.aluI(R::A_SUB, R::R12, (int32_t)n);
+        }
+        for (unsigned g = 1; g < 32; g++)
+            if (hr[g] >= 0 && (liveIn >> g & 1)) J.ldg(hr[g], g);
+        auto writeback = [&](uint32_t m) {
+            for (unsigned g = 1; g < 32; g++)
+                if (m >> g & 1) J.stg(g, hr[g]);
+        };
+        // Operands: reg = x[g]; reg op= x[g]; x[rd] = reg.
+        auto ld = [&](int reg, unsigned g, bool w = true) {
+            if (!g) J.aluRR(R::A_XOR, reg, reg, false);
+            else if (hr[g] >= 0) J.movRR(reg, hr[g], w);
+            else J.ldg(reg, g, w);
+        };
+        auto with = [&](Jit::Alu a, int reg, unsigned g, bool w = true) {
+            if (!g) J.aluI(a, reg, 0, w);
+            else if (hr[g] >= 0) J.aluRR(a, reg, hr[g], w);
+            else J.aluG(a, reg, g, w);
+        };
+        auto mulWith = [&](int reg, unsigned g, bool w) {
+            if (!g) J.aluRR(R::A_XOR, reg, reg, false);
+            else if (hr[g] >= 0) { J.rex(w, reg, hr[g]); J.b(0x0f); J.b(0xaf); J.modrr(reg, hr[g]); }
+            else J.imulG(reg, g, w);
+        };
+        auto put = [&](unsigned rd, int reg = R::RAX) {
+            if (!rd) return;
+            if (hr[rd] >= 0) { J.movRR(hr[rd], reg); dirty |= 1u << rd; }
+            else J.stg(rd, reg);
+        };
+        auto chain = [&](uint64_t to) { links[nl++] = Link{J.jmp(), to}; };
+        for (unsigned k = 0; k < n; k++) {
+            const Op& o = ops[k];
+            const int32_t imm = o.imm;
+            const uint64_t next = o.pc + o.len;
+            auto addr = [&] {  // rax = rs1 + imm
+                ld(R::RAX, o.rs1);
+                if (imm) J.aluI(R::A_ADD, R::RAX, imm);
+            };
+            auto shift = [&](int ext, bool w) {
+                ld(R::RCX, o.rs2, w);
+                ld(R::RAX, o.rs1, w);
+                J.shiftCl(ext, R::RAX, w);
+                if (!w) J.movsxd(R::RAX, R::RAX);
+                put(o.rd);
+            };
+            auto set = [&](Jit::Cc c, bool reg) {
+                J.aluRR(R::A_XOR, R::RCX, R::RCX, false);
+                ld(R::RAX, o.rs1);
+                if (reg) with(R::A_CMP, R::RAX, o.rs2); else J.aluI(R::A_CMP, R::RAX, imm);
+                J.setcc(c, R::RCX);
+                put(o.rd, R::RCX);
+            };
+            auto alu = [&](Jit::Alu a, bool w) {
+                ld(R::RAX, o.rs1, w);
+                with(a, R::RAX, o.rs2, w);
+                if (!w) J.movsxd(R::RAX, R::RAX);
+                put(o.rd);
+            };
+            auto alui = [&](Jit::Alu a) {
+                ld(R::RAX, o.rs1);
+                J.aluI(a, R::RAX, imm);
+                put(o.rd);
+            };
+            auto shifti = [&](int ext, bool w) {
+                ld(R::RAX, o.rs1, w);
+                if (imm) J.shiftI(ext, R::RAX, (unsigned)imm, w);
+                if (!w) J.movsxd(R::RAX, R::RAX);
+                put(o.rd);
+            };
+            auto bail = [&](Jit::Cc c) { bails[nb++] = Bail{J.jcc(c), k, dirty}; };
+            // Loads and stores: ad - cb in rax, checked against the span.
+            auto load = [&](std::initializer_list<uint8_t> opc, bool w) {
+                addr();
+                J.aluRR(R::A_SUB, R::RAX, R::R14);
+                J.aluRR(R::A_CMP, R::RAX, R::R15);
+                bail(R::CC_AE);
+                J.rex(w, R::RAX, R::R13, R::RAX);
+                for (uint8_t c : opc) J.b(c);
+                J.memIdx(R::RAX, R::R13, R::RAX);
+                put(o.rd);
+            };
+            auto store = [&](unsigned nbytes) {
+                addr();
+                J.movRR(R::RCX, R::RAX);                  // tohost: ad + n - 1 - th < 7 + n leaves
+                J.aluC(R::A_SUB, R::RCX, 64);
+                if (nbytes > 1) J.aluI(R::A_ADD, R::RCX, (int32_t)nbytes - 1);
+                J.aluI(R::A_CMP, R::RCX, (int32_t)(7 + nbytes));
+                bail(R::CC_B);
+                J.aluRR(R::A_SUB, R::RAX, R::R14);
+                J.aluC(R::A_CMP, R::RAX, 56);
+                bail(R::CC_AE);
+                ld(R::RCX, o.rs2);
+                if (nbytes == 2) J.b(0x66);
+                J.rex(nbytes == 8, R::RCX, R::R13, R::RAX);
+                J.b(nbytes == 1 ? 0x88 : 0x89);
+                J.memIdx(R::RCX, R::R13, R::RAX);
+            };
+            const bool term = o.kind >= K_JAL && o.kind <= K_BGEU;
+            if (step && term) J.aluI(R::A_SUB, R::R12, 1);
+            switch (o.kind) {
+                case K_LUI: J.movI(R::RAX, (uint64_t)(int64_t)imm); put(o.rd); break;
+                case K_AUIPC: J.movI(R::RAX, o.pc + (uint64_t)(int64_t)imm); put(o.rd); break;
+                case K_JAL:
+                    if (o.rd) { J.movI(R::RAX, next); put(o.rd); }
+                    writeback(dirty);
+                    chain(o.pc + (uint64_t)(int64_t)imm);
+                    break;
+                case K_JALR: {
+                    addr();
+                    J.aluI(R::A_AND, R::RAX, -2);
+                    if (o.rd) { J.movI(R::RCX, next); put(o.rd, R::RCX); }
+                    writeback(dirty);
+                    // Look the target up: jt[(pc >> 1) & (JT - 1)].
+                    J.movRR(R::RCX, R::RAX, false);
+                    J.shiftI(5, R::RCX, 1, false);
+                    J.aluI(R::A_AND, R::RCX, (int32_t)(Jit::JT - 1), false);
+                    J.shiftI(4, R::RCX, 4);
+                    J.aluC(R::A_ADD, R::RCX, 80);
+                    J.rex(true, R::RAX, R::RCX); J.b(0x3b); J.mem(R::RAX, R::RCX, 0);  // cmp rax, [rcx]
+                    uint8_t* miss = J.jcc(R::CC_NE);
+                    J.rex(false, 4, R::RCX); J.b(0xff); J.mem(4, R::RCX, 8);           // jmp [rcx + 8]
+                    Jit::fix(miss, J.p);
+                    J.aluRR(R::A_XOR, R::RDX, R::RDX, false);
+                    toEpi();
+                    break;
+                }
+                case K_BEQ: case K_BNE: case K_BLT: case K_BGE: case K_BLTU: case K_BGEU: {
+                    static const Jit::Cc cc[6] = {R::CC_E, R::CC_NE, R::CC_L, R::CC_GE, R::CC_B, R::CC_AE};
+                    writeback(dirty);
+                    ld(R::RAX, o.rs1);
+                    with(R::A_CMP, R::RAX, o.rs2);
+                    links[nl++] = Link{J.jcc(cc[o.kind - K_BEQ]), o.pc + (uint64_t)(int64_t)imm};
+                    chain(next);
+                    break;
+                }
+                case K_LB: load({0x0f, 0xbe}, true); break;
+                case K_LH: load({0x0f, 0xbf}, true); break;
+                case K_LW: load({0x63}, true); break;
+                case K_LD: load({0x8b}, true); break;
+                case K_LBU: load({0x0f, 0xb6}, false); break;
+                case K_LHU: load({0x0f, 0xb7}, false); break;
+                case K_LWU: load({0x8b}, false); break;
+                case K_SB: store(1); break;
+                case K_SH: store(2); break;
+                case K_SW: store(4); break;
+                case K_SD: store(8); break;
+                case K_ADDI:
+                    if (!o.rs1) J.movI(R::RAX, (uint64_t)(int64_t)imm);
+                    else { ld(R::RAX, o.rs1); if (imm) J.aluI(R::A_ADD, R::RAX, imm); }
+                    put(o.rd);
+                    break;
+                case K_SLLI: shifti(4, true); break;
+                case K_SRLI: shifti(5, true); break;
+                case K_SRAI: shifti(7, true); break;
+                case K_SLTI: set(R::CC_L, false); break;
+                case K_SLTIU: set(R::CC_B, false); break;
+                case K_XORI: alui(R::A_XOR); break;
+                case K_ORI: alui(R::A_OR); break;
+                case K_ANDI: alui(R::A_AND); break;
+                case K_ADD: alu(R::A_ADD, true); break;
+                case K_SUB: alu(R::A_SUB, true); break;
+                case K_XOR: alu(R::A_XOR, true); break;
+                case K_OR: alu(R::A_OR, true); break;
+                case K_AND: alu(R::A_AND, true); break;
+                case K_SLL: shift(4, true); break;
+                case K_SRL: shift(5, true); break;
+                case K_SRA: shift(7, true); break;
+                case K_SLT: set(R::CC_L, true); break;
+                case K_SLTU: set(R::CC_B, true); break;
+                case K_MUL: ld(R::RAX, o.rs1); mulWith(R::RAX, o.rs2, true); put(o.rd); break;
+                case K_ADDIW:
+                    ld(R::RAX, o.rs1, false);
+                    if (imm) J.aluI(R::A_ADD, R::RAX, imm, false);
+                    J.movsxd(R::RAX, R::RAX);
+                    put(o.rd);
+                    break;
+                case K_SLLIW: shifti(4, false); break;
+                case K_SRLIW: shifti(5, false); break;
+                case K_SRAIW: shifti(7, false); break;
+                case K_ADDW: alu(R::A_ADD, false); break;
+                case K_SUBW: alu(R::A_SUB, false); break;
+                case K_SLLW: shift(4, false); break;
+                case K_SRLW: shift(5, false); break;
+                case K_SRAW: shift(7, false); break;
+                case K_MULW:
+                    ld(R::RAX, o.rs1, false);
+                    mulWith(R::RAX, o.rs2, false);
+                    J.movsxd(R::RAX, R::RAX);
+                    put(o.rd);
+                    break;
+                case J_MULH: case J_MULHU: case J_MULHSU:
+                    ld(R::RAX, o.rs1);
+                    ld(R::RCX, o.rs2);
+                    J.rex(true, 0, R::RCX); J.b(0xf7); J.modrr(o.kind == J_MULH ? 5 : 4, R::RCX);  // (i)mul rcx
+                    if (o.kind == J_MULHSU) {  // signed rs1: take rs2 off the unsigned high half when rs1 < 0
+                        ld(R::RAX, o.rs1);
+                        J.shiftI(7, R::RAX, 63);
+                        J.aluRR(R::A_AND, R::RAX, R::RCX);
+                        J.aluRR(R::A_SUB, R::RDX, R::RAX);
+                    }
+                    put(o.rd, R::RDX);
+                    break;
+                case J_DIV: case J_DIVU: case J_REM: case J_REMU: case J_DIVW: case J_DIVUW: case J_REMW: case J_REMUW: {
+                    const bool w = o.kind <= J_REMU;
+                    const unsigned v = (o.kind - J_DIV) & 3;  // 0 div, 1 divu, 2 rem, 3 remu
+                    const bool sgn = !(v & 1), rem = v >= 2;
+                    ld(R::RCX, o.rs2, w);
+                    ld(R::RAX, o.rs1, w);
+                    J.rex(w, R::RCX, R::RCX); J.b(0x85); J.modrr(R::RCX, R::RCX);  // test rcx, rcx
+                    uint8_t* zero = J.jcc(R::CC_E);
+                    uint8_t* done1 = nullptr;
+                    if (sgn) {  // by -1: the negation (wrapping) or 0, which idiv would trap on
+                        J.aluI(R::A_CMP, R::RCX, -1, w);
+                        uint8_t* go = J.jcc(R::CC_NE);
+                        if (rem) J.aluRR(R::A_XOR, R::RAX, R::RAX, false);
+                        else { J.rex(w, 0, R::RAX); J.b(0xf7); J.modrr(3, R::RAX); }  // neg
+                        done1 = J.jmp();
+                        Jit::fix(go, J.p);
+                        if (w) J.b(0x48);
+                        J.b(0x99);  // cqo / cdq
+                    } else J.aluRR(R::A_XOR, R::RDX, R::RDX, false);
+                    J.rex(w, 0, R::RCX); J.b(0xf7); J.modrr(sgn ? 7 : 6, R::RCX);  // (i)div rcx
+                    if (rem) J.movRR(R::RAX, R::RDX);
+                    uint8_t* done2 = J.jmp();
+                    Jit::fix(zero, J.p);  // by zero: all ones, or the dividend
+                    if (!rem) J.movI(R::RAX, ~0ull);
+                    Jit::fix(done2, J.p);
+                    if (done1) Jit::fix(done1, J.p);
+                    if (!w) J.movsxd(R::RAX, R::RAX);
+                    put(o.rd);
+                    break;
+                }
+                default: break;
+            }
+            if (step && !term) {
+                J.aluI(R::A_SUB, R::R12, 1);
+                stops[ns++] = Bail{J.jcc(R::CC_E), k + 1, dirty};
+            }
+        }
+        if (!ctl) {
+            writeback(dirty);
+            if (toInterp) leave(p);
+            else chain(p);
+        }
+        // Out of line: the exits.
+        if (budget) {
+            Jit::fix(budget, J.p);
+            leave(pc0, 2);
+        }
+        for (unsigned i = 0; i < nb; i++) {
+            Jit::fix(bails[i].rel, J.p);
+            writeback(bails[i].dirty);
+            if (!step) J.aluI(R::A_ADD, R::R12, (int32_t)(n - bails[i].k));
+            leave(ops[bails[i].k].pc);
+        }
+        for (unsigned i = 0; i < ns; i++) {  // the budget ran out
+            Jit::fix(stops[i].rel, J.p);
+            writeback(stops[i].dirty);
+            leave(stops[i].k < n ? ops[stops[i].k].pc : p);
+        }
+        for (unsigned i = 0; i < nl; i++) {
+            Jit::fix(links[i].rel, J.p);
+            J.movI(R::RAX, links[i].to);
+            J.movI(R::RDX, (uint64_t)(uintptr_t)links[i].rel);
+            toEpi();
+        }
+        return keep();
+    }
+    // Run translated code from pc until something needs the fast loop.
+    void jitRun(Hart& h, uint64_t* r, uint64_t& pc, uint64_t& left, uint8_t* cp, uint64_t cb, uint64_t span,
+                uint64_t sspan, uint64_t th) {
+        Jit* jp = jitFor(h);
+        if (!jp) { jit = false; return; }
+        Jit& J = *jp;
+        if (J.gen != h.dcGen) { J.flush(); J.gen = h.dcGen; }
+        JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt};
+        uint8_t* code = J.find(pc);
+        if (!code && !(code = jitCompile(J, h, pc))) return;
+        for (;;) {
+            c.reason = 0;
+            c.link = 0;
+            J.enter(&c, code);
+            if (c.reason == 2) {  // the block is longer than the budget left
+                if (!c.left) break;
+                auto it = J.steps.find(c.pc);
+                uint8_t* sc = it != J.steps.end() ? it->second : jitCompile(J, h, c.pc, true);
+                if (!sc) break;
+                c.reason = 0;
+                c.link = 0;
+                J.enter(&c, sc);
+            }
+            if (c.reason) break;
+            const uint64_t fl = J.flushes;
+            code = J.find(c.pc);
+            if (!code && !(code = jitCompile(J, h, c.pc))) break;
+            if (c.link && J.flushes == fl) Jit::patch(c.link, code);
+        }
+        pc = c.pc;
+        left = c.left;
+    }
     // PG: a hart in supervisor or user mode with paging on. Instructions
     // come from pages in the fetch page record, loads and stores go through
     // the data page caches; anything else leaves.
@@ -1326,6 +1769,16 @@ private:
         Hart::Block* bk;
         const Hart::BlockOp* op;
     blockTry:
+#if MVPLAT_JIT
+        if constexpr (RV64 && !PG) {
+            if (jit) {
+                jitRun(h, r, pc, left, cp, cb, span, sspan, th);
+                if (!left) goto out;
+                d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
+                DISPATCH;
+            }
+        }
+#endif
         // At a jump target: run a whole block when enough of the budget is
         // left for its longest, else one instruction at a time.
         if (left > Hart::BLOCK_OPS) {
@@ -1555,12 +2008,20 @@ private:
 
     bool exit_ = false;
     int exitCode_ = 0;
+    bool merge_ = false;            // run() merged quanta (one hart, nothing timed)
+    uint64_t cut_ = UINT64_MAX;     // where merged quanta end after a device access
+    std::vector<std::unique_ptr<Jit>> jits_;  // by hart id, made on first use
     bool irqDirty_ = false;
     uint64_t gcycle_ = 0;
     uint64_t consoleBytes_ = 0;
     std::unique_ptr<par::Pool> pool_;
     std::chrono::steady_clock::time_point wall0_, wall1_;
 
+    bool anyLive() const {
+        for (auto& d : bus.devices())
+            if (d->live()) return true;
+        return false;
+    }
     bool hasTimedDevice() const {
         for (auto& d : bus.devices())
             if (d->live() || d->nextEventPs(nowPs()) != UINT64_MAX) return true;
@@ -1588,8 +2049,8 @@ private:
 
     // One hart: everything is ordered, so nothing waits except the RTL.
     void runOne(Hart& h, uint64_t end) {
-        while (h.cycle < end && !exit_) {
-            if (h.wfi) { h.cycle = end; break; }
+        while (h.cycle < end && h.cycle < cut_ && !exit_) {
+            if (h.wfi) { h.cycle = std::min(end, cut_); break; }
             Stop s = exec(h, end);
             flushTrace();
             if (irqDirty_) updateIrqs();
@@ -1665,11 +2126,13 @@ private:
 };
 
 // ------------------------------------------------------------------ exec
-inline Stop Machine::exec(Hart& h, uint64_t end) {
+inline Stop Machine::exec(Hart& h, uint64_t endq) {
     const bool slow = trace || profile || !breakpoints.empty() || h.stepping || !watches.empty();
     uint64_t* x = h.x;
     const bool rv64 = h.rv64;
-    while (h.cycle < end) {
+    for (;;) {
+        const uint64_t end = endq < cut_ ? endq : cut_;
+        if (h.cycle >= end) break;
         if (exit_) return Stop::Exit;
         if (h.mip & h.mie) {
             interrupt(h);

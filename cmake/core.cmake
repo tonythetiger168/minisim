@@ -119,6 +119,7 @@ set(MINISIM_CORE_VP_HEADERS
     ext.hpp
     fdt.hpp
     fpu.hpp
+    jit.hpp
     json.hpp
     machine.hpp
     rv32.hpp
