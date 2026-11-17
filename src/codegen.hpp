@@ -505,7 +505,7 @@ public:
                     while (a < n.size() && std::isalpha((unsigned char)n[a])) a++;
                     std::string pre = n.substr(0, a);
                     if (a == n.size() || !std::isdigit((unsigned char)n[a])) return std::string();
-                    static const char* ok[] = {"proc", "ds", "dsT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
+                    static const char* ok[] = {"proc", "ds", "dsT", "cyA", "cyB", "cyAT", "cyBT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
                     for (const char* k : ok) if (pre == k) return pre + (n.size() > 2 && n.compare(n.size() - 2, 2, "_2") == 0 ? "2" : "");
                     return std::string();
                 };
@@ -2564,16 +2564,34 @@ private:
         domRoot_.resize(sigs.size());
         for (size_t x = 0; x < sigs.size(); x++) domRoot_[x] = find((int)x);
         std::vector<std::vector<int>> groups;
-        std::set<int> fixedNba;   // fixed NBA targets of every clocked process
-        for (auto& pr : procs)
-            if (pr.seq && pr.combRank < 0)
-                for (auto& in : pr.prog->code) if (in.k == IK::Nba && !in.arr && in.aidx.empty()) fixedNba.insert(in.sig);
+        // Fixed NBA targets of every clocked process: the process that writes
+        // it (-2: more than one).
+        std::map<int, int> fixedNba;
+        viaK_.clear();
+        for (size_t i = 0; i < procs.size(); i++)
+            if (procs[i].seq && procs[i].combRank < 0)
+                for (auto& in : procs[i].prog->code)
+                    if (in.k == IK::Nba && !in.arr && in.aidx.empty() && !in.bidx) {
+                        auto [it, fresh] = fixedNba.emplace(in.sig, (int)i);
+                        if (!fresh && it->second != (int)i) it->second = -2;
+                    }
+        // An element (or vector) the same process also writes at a run-time
+        // index: its fixed NBAs go through the kernel's list too, in program
+        // order with the others (viaK_). Another process's fixed NBA to it: no.
+        auto clashAt = [&](int sg, size_t i, std::vector<int>& via) {
+            auto it = fixedNba.find(sg);
+            if (it == fixedNba.end()) return false;
+            if (it->second != (int)i || std::getenv("MSIM_NOVIAK")) return true;
+            via.push_back(sg);
+            return false;
+        };
         for (size_t i = 0; i < procs.size(); i++) {
             if (!procs[i].seq || procs[i].combRank >= 0) continue;
             bool forward = true;
             const char* why = "";
             int whyLine = 0;
             const auto& code = procs[i].prog->code;
+            std::vector<int> via;
             for (size_t pc = 1; pc + 1 < code.size(); pc++) {
                 if ((code[pc].k == IK::Jmp || code[pc].k == IK::JmpIfNot) && code[pc].target <= pc) { forward = false; why = "loop"; whyLine = code[pc].line; }
                 if (code[pc].k == IK::JmpIfNot && code[pc].xt != Instr::NOX) { forward = false; why = "three-way jump"; whyLine = code[pc].line; }   // a three-way jump: an ordinary clocked function
@@ -2585,13 +2603,19 @@ private:
                 // An array element chosen at run time: its write goes to the
                 // kernel's NBA list (dseq's nb, before the slots commit), when
                 // no fixed slot of the domain writes an element of that array.
-                if (code[pc].k == IK::Nba && code[pc].arr && !code[pc].bidx && code[pc].drv < 0 && code[pc].dyn < 0 && !code[pc].nbaLater &&
+                if (code[pc].k == IK::Nba && code[pc].arr && code[pc].drv < 0 && code[pc].dyn < 0 && !code[pc].nbaLater &&
                     !code[pc].de && !code[pc].delay && !std::getenv("MSIM_NODOMARR")) {
                     bool clash = false;
-                    for (int64_t k = 0; k < code[pc].arr->count; k++) clash |= fixedNba.count((int)(code[pc].arr->base + k)) > 0;
-                    if (clash) { forward = false; why = "array also written at a fixed index"; whyLine = code[pc].line; }
+                    for (int64_t k = 0; k < code[pc].arr->count; k++) clash |= clashAt((int)(code[pc].arr->base + k), i, via);
+                    if (clash) { forward = false; why = "array also written at a fixed index by another process"; whyLine = code[pc].line; }
+                } else if (code[pc].k == IK::Nba && code[pc].bidx && code[pc].drv < 0 && code[pc].dyn < 0 && !code[pc].nbaLater &&
+                           !code[pc].de && !code[pc].delay && !std::getenv("MSIM_NODOMARR")) {
+                    // Bits of a vector chosen at run time (q[i][k] <= ... of a packed array): the
+                    // same way, the vector staying in S.sigs (the private signal choice leaves it there).
+                    if (clashAt(code[pc].sig, i, via)) { forward = false; why = "vector also written at fixed bits by another process"; whyLine = code[pc].line; }
                 } else if (!tmpw && (code[pc].arr || code[pc].bidx)) { forward = false; why = "run-time index"; whyLine = code[pc].line; }   // no fixed slot: an ordinary clocked function
             }
+            if (forward) viaK_.insert(via.begin(), via.end());
             if (!forward) {
                 if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "not in the domain (%s, line %d): %s line %d\n", why, whyLine, procs[i].kind.c_str(), code.empty() ? 0 : code[0].line);
                 continue;
@@ -2789,6 +2813,26 @@ private:
     static constexpr long long kSlotRef = 1LL << 40, kAIRef = 2LL << 40, kCCRef = 3LL << 40;
     // -1: a signal outside the instance `key` (a top-level clock, say): the
     // same number in every copy. 5: an array shape (refToks makes them negative).
+    // The instance a signal belongs to, for sharing one copy of the code
+    // between instances of a module: the first name component (u3 of
+    // u3.cpu.pc), or, when the scope has generate or instance array indexes
+    // (soc.row[1].col[2].t.pc), the path down to the last of them, so that
+    // the tiles of a mesh are instances of their own. MSIM_SHAREKEY0: always
+    // the first component.
+    static std::string instKey(const std::string& m) {
+        static const bool first = std::getenv("MSIM_SHAREKEY0") != nullptr;
+        const size_t d = m.find('.');
+        if (d == std::string::npos) return "";
+        const size_t last = m.rfind('.');
+        size_t end = std::string::npos;
+        for (size_t at = 0; !first && at < last;) {
+            size_t nx = m.find('.', at);
+            if (nx == std::string::npos || nx > last) nx = last;
+            if (m.find('[', at) < nx) end = nx;
+            at = nx + 1;
+        }
+        return end == std::string::npos ? m.substr(0, d) : m.substr(0, end);
+    }
     int refCls(long long n, const std::string& key) const {
         if (n < 0) return 5;
         if (n >= kCCRef) return 8;
@@ -2926,15 +2970,14 @@ private:
             if (r < 0) refScan(text[j], [&](size_t, size_t, size_t, long long n, int kind) { if (r < 0 && kind <= 1 && good(n)) r = (int)n; });
             return keySig[j] = r;
         };
-        auto key = [&](size_t j) -> std::string {   // the instance: the first name component
+        auto key = [&](size_t j) -> std::string {   // the instance (instKey)
             int sg = ksig(j);
             if (sg < 0) return "";
-            const std::string& n = sigName_[sg];
-            return n.substr(0, n.find('.'));
+            return instKey(sigName_[sg]);
         };
         auto rest = [&](size_t j) {
             const std::string& n = sigName_[ksig(j)];
-            return n.substr(n.find('.') + 1);
+            return n.substr(instKey(n).size() + 1);
         };
         for (size_t a = 0; a < js.size();) {
             size_t b = a;
@@ -3118,7 +3161,7 @@ private:
                 if ((in.k == IK::Nba || in.k == IK::Assign) && in.sig >= 0 && (size_t)in.sig < sigName_.size()) {
                     const std::string& m = sigName_[in.sig];
                     size_t d = m.find('.');
-                    if (d != std::string::npos && m[0] != '_' && m[0] != '$') return m.substr(0, d);
+                    if (d != std::string::npos && m[0] != '_' && m[0] != '$') return instKey(m);
                 }
             return "";
         };
@@ -3272,7 +3315,8 @@ private:
                 for (auto& in : procs[i].prog->code)
                     if (in.k == IK::Nba && in.sig >= 0 && (size_t)in.sig < ns) {
                         // A part of a narrow one: the commit merges it (commitStmts).
-                        if (in.hi < 0 || sigs[in.sig].w > 64 || !std::getenv("MSIM_NOPRIVPART")) cand[in.sig] = 1; else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
+                        if (in.bidx && !in.arr) (bad[in.sig] = 1, whyL[in.sig] = __LINE__);   // bits chosen at run time: through the kernel
+                        else if (in.hi < 0 || sigs[in.sig].w > 64 || !std::getenv("MSIM_NOPRIVPART")) cand[in.sig] = 1; else (bad[in.sig] = 1, whyL[in.sig] = __LINE__);
                     } else if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns) {
                         // A temporary of this process (a decoder's locals): private
                         // when it is written whole, by this process only. Two
@@ -3397,6 +3441,11 @@ private:
     std::string privInit_;       // run(): sets the private signals' first X / Z (PINIT)
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
     std::map<int, std::vector<int>> snap_;   // emitCycle: per domain process, the registers it reads from a snapshot (sorted)
+    const bool noCySplit_ = std::getenv("MSIM_NOCYSPLIT") != nullptr;   // a merged comb cycle in one function
+    const bool noShareCy_ = std::getenv("MSIM_NOSHARE") != nullptr;   // the members of a merged cycle: one copy per module
+    int cySerial_ = 0;
+    std::map<std::string, std::vector<std::tuple<int, std::string, std::string>>> cyTmpl_;   // shape -> (id, instance, text)
+    std::set<int> viaK_;         // domain NBA targets also written at a run-time index: all through DNB (see the domain choice)
     bool dAhead_ = false;        // emitCycle: a direct NBA some comb process reads (DAHEAD, see directNba)
     // Of those, the clocks themselves, and their own smaller cone (combConeK):
     // a clock edge runs only that. The others (a debug request, an enable
@@ -4193,7 +4242,7 @@ private:
                 noteRefs(i.e);
                 switch (i.k) {
                     case IK::Nba: {
-                        if (i.arr && !i.bidx) {   // an element chosen at run time: through the kernel (see above)
+                        if (i.arr || i.bidx) {   // an element or bits chosen at run time: through the kernel (see above)
                             for (auto& a : i.aidx) noteRefs(a);
                             std::string t = dynTarget(i, fast(i.e), " DNB->push_back({s, v, hi, lo});");
                             fns << t;
@@ -4202,6 +4251,12 @@ private:
                             break;
                         }
                         if (i.arr || !i.aidx.empty() || i.bidx) throw CodegenUnsupported("array or variable-index write");
+                        if (viaK_.count(i.sig)) {   // also written at a run-time index: the same list, in order
+                            std::string t = " DNB->push_back({" + std::to_string(i.sig) + ", " + fast(i.e) + ", " + std::to_string(i.hi) + ", " + std::to_string(i.lo) + "});\n";
+                            fns << t;
+                            fns2 << t;
+                            break;
+                        }
                         if (i.hi < 0 && direct[i.sig]) {   // stored here: nobody reads it before the commit (above)
                             std::string g, u, sl;
                             const std::string slow = pw(i.sig, "@V@") + " if (P" + std::to_string(i.sig) + ".x | P" + std::to_string(i.sig) + ".z) pclean = false;";
@@ -4476,8 +4531,9 @@ private:
             const Prog& cp = *procs[i].prog;
             if (combBranches(cp)) {
                 std::string c4 = "    {\n", c2 = "    {\n";
-                auto L4 = [&](size_t pc) { return "cb" + std::to_string(i) + "_" + std::to_string(pc); };
-                auto L2 = [&](size_t pc) { return "cq" + std::to_string(i) + "_" + std::to_string(pc); };
+                size_t lbase = 0;   // a merged block's member: its labels count from its start
+                auto L4 = [&](size_t pc) { return "cb" + std::to_string(i) + "_" + std::to_string(pc - lbase); };
+                auto L2 = [&](size_t pc) { return "cq" + std::to_string(i) + "_" + std::to_string(pc - lbase); };
                 if (deadProc[i]) {
                     size_t pc = 0;
                     for (; pc < cp.code.size(); pc++) {
@@ -4540,7 +4596,8 @@ private:
                 unitConds.emplace_back();
                 size_t pc = 0;
                 std::vector<char> inChain(cp.code.size() + 1, 0);
-                for (; pc < cp.code.size(); pc++) {
+                // One instruction of the block into c4 / c2; false at its end (the wait).
+                auto one = [&](size_t pc, std::string& c4, std::string& c2) {
                     const Instr& in = cp.code[pc];
                     if (in.k == IK::JmpIfNot) {
                         // A case chain: one switch, then its tests as they were (not reached).
@@ -4557,26 +4614,94 @@ private:
                         // Every signal read is known here (twoNow, and no bail so far).
                         if (sp) c2 += pre2 + " if (!(" + u + ")) goto " + L2(in.target) + ";\n";
                         else c2 += pre2 + jmpIfNot(in, sl, "goto " + L2(in.target) + ";", in.xt == Instr::NOX ? "" : "goto " + L2(in.xt) + ";");
-                        continue;
+                        return true;
                     }
                     if (in.k == IK::Jmp) {
                         c4 += L4(pc) + ": goto " + L4(in.target) + ";\n";
                         c2 += L2(pc) + ": goto " + L2(in.target) + ";\n";
-                        continue;
+                        return true;
                     }
                     if (in.k == IK::Assert) {
                         std::string a = combAssert(i, in);
                         c4 += L4(pc) + ":" + a;
                         c2 += L2(pc) + ":" + a;
-                        continue;
+                        return true;
                     }
-                    if (in.k != IK::Assign) break;
+                    if (in.k != IK::Assign) return false;
                     noteRefs(in.e);
                     noteRefs(in.bidx);
                     combIns.push_back(&in);
                     unitIns.back().push_back(&in);
                     c4 += L4(pc) + ":" + fassign(in);
                     c2 += L2(pc) + ":" + stmt2(in);
+                    return true;
+                };
+                // A merged cycle of blocks (mergeCombCycles): each block in a
+                // function of its own, so that the compiler never sees one
+                // function of thousands of statements. The 2-state copy says
+                // when it gives up (@BAIL@ of the caller).
+                size_t sg = 0;
+                for (; pc < cp.code.size(); pc++) {
+                    while (sg < cp.segs.size() && cp.segs[sg].first < pc) sg++;
+                    if (sg < cp.segs.size() && cp.segs[sg].first == pc && cp.segs[sg].second > pc && !noCySplit_) {
+                        const size_t e = cp.segs[sg].second;
+                        std::string h4, h2;
+                        lbase = pc;
+                        for (size_t q = pc; q < e; q++) one(q, h4, h2);
+                        h4 += L4(e) + ": ;\n";
+                        h2 += L2(e) + ": return false;\n";
+                        lbase = 0;
+                        for (size_t at; (at = h2.find("@BAIL@")) != std::string::npos;) h2.replace(at, 6, "return true;");
+                        // Members of other instances of one module share one copy
+                        // (the same text but for signal numbers moved by D, as shareChunks).
+                        std::string key;
+                        for (size_t q = pc; q < e && key.empty(); q++) {
+                            const Instr& in = cp.code[q];
+                            if (in.k == IK::Assign && !in.tmp && in.sig >= 0 && (size_t)in.sig < sigName_.size()) {
+                                const std::string& m = sigName_[in.sig];
+                                if (!m.empty() && m[0] != '_' && m[0] != '$') key = instKey(m);
+                            }
+                        }
+                        const std::string both = h4 + "\x01" + h2;
+                        int id = -1;
+                        std::array<long long, kRefCls> D{};
+                        if (!key.empty() && !noShareCy_) {
+                            RefToks rt = refToks(both);
+                            std::string shape;
+                            for (auto& pcs : rt.piece) shape += pcs + "\x02";
+                            auto& lst = cyTmpl_[shape];
+                            for (auto& [tid, tk, tt] : lst) {
+                                std::array<long long, kRefCls> Dx{};
+                                bool set[kRefCls] = {};
+                                if (refMatch(tt, both, tk, key, Dx.data(), set)) { id = tid; D = Dx; break; }
+                            }
+                            if (id < 0) {
+                                id = cySerial_++;
+                                lst.push_back({id, key, both});
+                                o << "static void cyAT" << id << "(" << dParams() << ") {\n    const bool obs = S.observed; (void)obs;" << dUnused() << "\n"
+                                  << refParam(h4, key) << "}\n";
+                                o << "static bool cyBT" << id << "(" << dParams() << ") {\n    const bool obs = S.observed; (void)obs;" << dUnused() << "\n"
+                                  << refParam(h2, key) << "}\n";
+                            } else shareSaved_ += h4.size();
+                        }
+                        std::string f;
+                        if (id >= 0) {
+                            std::string args;
+                            for (int c = 0; c < kRefCls; c++) args += (c ? ", " : "") + std::to_string(D[c]);
+                            c4 += L4(pc) + ": cyAT" + std::to_string(id) + "(" + args + "); goto " + L4(e) + ";\n";
+                            c2 += L2(pc) + ": if (cyBT" + std::to_string(id) + "(" + args + ")) { @BAIL@ } goto " + L2(e) + ";\n";
+                        } else {
+                            f = std::to_string(i) + "_" + std::to_string(sg);
+                            o << "static void cyA" << f << "() {\n    const bool obs = S.observed; (void)obs;\n" << h4 << "}\n";
+                            o << "static bool cyB" << f << "() {\n    const bool obs = S.observed; (void)obs;\n" << h2 << "}\n";
+                            c4 += L4(pc) + ": cyA" + f + "(); goto " + L4(e) + ";\n";
+                            c2 += L2(pc) + ": if (cyB" + f + "()) { @BAIL@ } goto " + L2(e) + ";\n";
+                        }
+                        shareTotal_ += h4.size();
+                        pc = e - 1;
+                        continue;
+                    }
+                    if (!one(pc, c4, c2)) break;
                 }
                 combStmts.push_back(c4 + L4(pc) + ": ;\n    }\n");
                 combStmts2.push_back(c2 + L2(pc) + ": ;\n    }\n");
@@ -4722,10 +4847,11 @@ private:
         std::map<int, std::vector<std::pair<int, int>>> dynArr;   // process -> (first element, count)
         for (int n : dom)
             for (auto& in : procs[n].prog->code)
-                if (in.k == IK::Nba && in.arr && !in.bidx) {
-                    dynArr[n].push_back({(int)in.arr->base, (int)in.arr->count});
-                    for (int64_t k = 0; k < in.arr->count; k++) {
-                        int sg = (int)(in.arr->base + k);
+                if (in.k == IK::Nba && (in.arr || in.bidx)) {
+                    const int b0 = in.arr ? (int)in.arr->base : in.sig, cnt = in.arr ? (int)in.arr->count : 1;
+                    dynArr[n].push_back({b0, cnt});
+                    for (int64_t k = 0; k < cnt; k++) {
+                        int sg = (int)(b0 + k);
                         if ((size_t)sg >= written.size()) continue;
                         written[sg] = 1;
                         if (isPriv(sg) || !localOk(sg)) noPar("array NBA target", sg);
