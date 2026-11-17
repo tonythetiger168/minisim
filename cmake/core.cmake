@@ -22,6 +22,8 @@ set(MINISIM_CORE_HEADERS
     cover.hpp
     cover_rt.inc
     cpu.hpp
+    dpiconv.hpp
+    svdpi_bits.inc
     exec.inc
     expr.hpp
     fsm_extract.hpp
