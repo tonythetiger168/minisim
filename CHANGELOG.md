@@ -269,6 +269,12 @@ Spec references are IEEE 1800-2023 clauses.
   Vivado 2026.1 xsim and synthesis opened msim's version 2 output.
 
 ### Changed
+- mvplat: a fast loop for a hart in machine mode with nothing to trace,
+  watch or buffer runs the common integer, branch, load and store
+  instructions straight from the decoded-instruction cache (computed-goto
+  dispatch, straight-line code steps to the next cache entry without a
+  lookup, a one-compare memory check). A 2.1 G-instruction RV64IMAC
+  program runs in 5.2 s instead of 15.5 s (400 MIPS instead of 136).
 - msim: VHDL processes with a sensitivity list run in the static schedule
   (one design-wide first run instead of a `#0` in each process), and a block
   woken by any change that schedules nonblocking assignments may keep its
