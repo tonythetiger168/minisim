@@ -14428,7 +14428,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             // and does not itself write, changes (9.2.2.2.1)
             auto rs = combReadSet(lw.prog);
             if (rs.empty()) loops = false;
-            else lw.prog.emit(waitInstr(rs));
+            else {
+                lw.prog.emit(waitInstr(rs));
+                if (p.procedureKind == ProceduralBlockKind::AlwaysComb) lw.prog.settleWait = (int)lw.prog.code.size() - 1;
+            }
         }
         if (loops) { Instr j; j.k = IK::Jmp; j.target = 0; lw.prog.emit(j); }  // repeat forever
         if (loops && p.procedureKind == ProceduralBlockKind::Always && !lw.prog.code.empty() &&
