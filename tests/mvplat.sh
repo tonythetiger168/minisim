@@ -83,7 +83,7 @@ for x in 32 64; do
   done
 done
 "$MVPLAT" "$E/jit64.elf" -q > jit.out 2>&1; rc=$?
-expect "translator, RV64: M-extension corner cases, translated" 0 jit.out "checks passed, all"
+expect "translator, RV64: M-extension corner cases, translated; machine mode and supervisor mode with Sv39" 0 jit.out "checks passed, all"
 "$MVPLAT" "$E/jit64.elf" -q -nojit > jit_nojit.out 2>&1
 "$MVPLAT" "$E/jit64.elf" -q -quantum 7 > jit_q7.out 2>&1
 "$MVPLAT" "$E/jit64.elf" > jit_count.out 2>&1

@@ -201,7 +201,8 @@ struct Hart {
     struct FetchPage { uint64_t vpn = ~0ull; unsigned priv = 0; uint64_t pa = 0; };
     static constexpr unsigned FP_SIZE = 256;
     FetchPage fp[FP_SIZE];
-    void flushFetchPages() { for (auto& e : fp) e.vpn = ~0ull; }
+    uint32_t fpGen = 0;  // counts the flushes below
+    void flushFetchPages() { for (auto& e : fp) e.vpn = ~0ull; fpGen++; }
     // The active PMP entries, decoded from the CSRs in priority order
     // (Machine::pmpDecode). pmpLock: some entry binds machine mode too.
     struct PmpRegion { uint64_t lo, hi; uint8_t cfg; };

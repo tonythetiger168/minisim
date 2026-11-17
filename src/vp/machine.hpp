@@ -18,6 +18,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <fstream>
 #include <sstream>
 #include <cstdio>
@@ -1257,9 +1258,22 @@ private:
     // drop them all.
     static constexpr unsigned JIT_OPS = 64;
     // Classes only the translator has (after the fast loop's): the rest of M.
-    enum : uint8_t { J_MULH = K_MULW + 1, J_MULHSU, J_MULHU, J_DIV, J_DIVU, J_REM, J_REMU, J_DIVW, J_DIVUW, J_REMW, J_REMUW };
-    static uint8_t jitKind(uint32_t insn) {
+    enum : uint8_t { J_MULH = K_MULW + 1, J_MULHSU, J_MULHU, J_DIV, J_DIVU, J_REM, J_REMU, J_DIVW, J_DIVUW, J_REMW, J_REMUW, J_FENCE, J_AMO, J_CBOZ };
+    // pg: with paging on, where AMOs (but LR and SC; one hart only) and
+    // CBO.ZERO go through the store page cache.
+    static uint8_t jitKind(uint32_t insn, bool pg) {
         const unsigned op = insn & 0x7f, f3 = (insn >> 12) & 7, f7 = insn >> 25;
+        // FENCE (and FENCE.TSO, PAUSE): nothing to order with one hart
+        // running alone, which is when translated code runs
+        if (op == 0x0f && f3 == 0) return J_FENCE;
+        if (pg && op == 0x0f && f3 == 2 && (insn >> 20) == 4 && !((insn >> 7) & 31)) return J_CBOZ;
+        if (pg && op == 0x2f && (f3 == 2 || f3 == 3)) {
+            switch (insn >> 27) {
+                case 0x00: case 0x01: case 0x04: case 0x08: case 0x0c: case 0x10: case 0x14: case 0x18: case 0x1c:
+                    return J_AMO;
+                default: return K_NONE;
+            }
+        }
         if (f7 != 1) return K_NONE;
         if (op == 0x33 && f3) return (uint8_t)(J_MULH + f3 - 1);
         if (op == 0x3b && f3 >= 4) return (uint8_t)(J_DIVW + f3 - 4);
@@ -1274,22 +1288,41 @@ private:
     // its first instruction cannot be fetched from there.
     // step: the version for the end of the budget, which counts each
     // instruction and leaves when the budget runs out.
-    uint8_t* jitCompile(Jit& J, Hart& h, uint64_t pc0, bool step = false) {
+    // pg: supervisor or user code with paging on, at physical address pa0;
+    // the block stays in pc0's page.
+    uint8_t* jitCompile(Jit& J, Hart& h, uint64_t pc0, bool step = false, bool pg = false, uint64_t pa0 = 0) {
         const uint64_t cb = h.cBase, region = h.cEnd > cb ? h.cEnd - cb : 0;
         const uint8_t* const cp = h.cPtr;
+        const uint8_t* hp = nullptr;  // pg: the page in host memory
+        if (pg) {
+            const uint64_t pp = pa0 & ~0xfffull;
+            Device* d = bus.find(pp);
+            if (!d || !d->memory() || pp + 4096 > d->base + d->size) return nullptr;
+            hp = d->memory() + (pp - d->base);
+        }
         struct Op { uint64_t pc; uint8_t kind, rd, rs1, rs2, len; int32_t imm; };
         Op ops[JIT_OPS];
         unsigned n = 0;
         uint64_t p = pc0;
         bool ctl = false, toInterp = false;
         while (n < JIT_OPS) {
-            const uint64_t off = p - cb;
-            if (off >= region || region - off < 2) { toInterp = true; break; }
+            const uint8_t* src;
+            uint64_t avail;
+            if (pg) {
+                if ((p ^ pc0) >> 12) break;  // the next page: looked up
+                src = hp + (p & 0xfff);
+                avail = 4096 - (p & 0xfff);
+            } else {
+                const uint64_t off = p - cb;
+                if (off >= region || region - off < 2) { toInterp = true; break; }
+                src = cp + off;
+                avail = region - off;
+            }
             uint32_t raw = 0, insn;
-            memcpy(&raw, cp + off, region - off >= 4 ? 4 : 2);
+            memcpy(&raw, src, avail >= 4 ? 4 : 2);
             unsigned len;
             if ((raw & 3) == 3) {
-                if (region - off < 4) { toInterp = true; break; }
+                if (avail < 4) { toInterp = true; break; }
                 insn = raw; len = 4;
             } else {
                 insn = rvc::expand(raw & 0xffff, true); len = 2;
@@ -1297,15 +1330,20 @@ private:
             }
             int32_t imm;
             uint8_t k = fastKind(insn, true, imm);
-            if (!k) k = jitKind(insn);
+            if (!k) {
+                k = jitKind(insn, pg);
+                if (k == J_AMO && harts.size() > 1) k = K_NONE;  // AMOs break other harts' reservations
+                if (k == J_AMO) imm = (int32_t)((insn >> 27) | ((insn >> 12) & 7) << 8);  // funct5, width
+                else if (k == J_CBOZ) imm = 0;
+            }
             if (!k) { toInterp = true; break; }
-            noteInsn(h, p, len == 4 ? raw : raw & 0xffff, len);
+            noteInsn(h, pg ? (pa0 & ~0xfffull) | (p & 0xfff) : p, len == 4 ? raw : raw & 0xffff, len);
             ops[n++] = Op{p, k, (uint8_t)((insn >> 7) & 31), (uint8_t)((insn >> 15) & 31), (uint8_t)((insn >> 20) & 31),
                           (uint8_t)len, imm};
             p += len;
             if (k >= K_JAL && k <= K_BGEU) { ctl = true; break; }
         }
-        if (!n && p - cb >= region) return nullptr;
+        if (!pg && !n && p - cb >= region) return nullptr;
         if (J.used + 16384 > Jit::BUF) J.flush();
         using R = Jit;
         J.p = J.buf + J.used;
@@ -1319,7 +1357,13 @@ private:
         };
         auto keep = [&] {
             J.used = (size_t)(J.p - J.buf);
-            if (step) J.steps[pc0] = entry; else J.add(pc0, entry);
+            if (pg) {
+                Jit::PgBlock& e = J.pg[pc0];
+                if (e.pa != pa0 || (!e.code && !e.step)) e = {pa0, nullptr, nullptr};
+                (step ? e.step : e.code) = entry;
+                if (!step) J.compiled++;
+            } else if (step) J.steps[pc0] = entry;
+            else J.add(pc0, entry);
             return entry;
         };
         if (!n) {  // the fast loop takes it from here
@@ -1330,13 +1374,17 @@ private:
         auto uses = [](uint8_t k, bool& r1, bool& r2, bool& wd) {
             r1 = k != K_LUI && k != K_AUIPC && k != K_JAL;
             r2 = (k >= K_BEQ && k <= K_BGEU) || (k >= K_SB && k <= K_SD) || (k >= K_ADD && k <= K_MUL) ||
-                 (k >= K_ADDW && k <= K_MULW) || k >= J_MULH;
-            wd = !(k >= K_BEQ && k <= K_BGEU) && !(k >= K_SB && k <= K_SD);
+                 (k >= K_ADDW && k <= K_MULW) || (k >= J_MULH && k <= J_REMUW) || k == J_AMO;
+            wd = !(k >= K_BEQ && k <= K_BGEU) && !(k >= K_SB && k <= K_SD) && k != J_FENCE && k != J_CBOZ;
         };
         // The block's busiest guest registers live in host registers from its
         // start (those it reads before writing are loaded) to each exit
         // (those it wrote are stored back).
-        static const int pool[] = {R::RSI, R::RDI, R::R8, R::R9, R::R10, R::R11, R::RDX};
+        // (with paging, r11 is the page cache entry's address)
+        static const int poolBare[] = {R::RSI, R::RDI, R::R8, R::R9, R::R10, R::R11, R::RDX};
+        static const int poolPg[] = {R::RSI, R::RDI, R::R8, R::R9, R::R10, R::RDX};
+        const int* const pool = pg ? poolPg : poolBare;
+        const unsigned npool = pg ? 6 : 7;
         int hr[33];
         for (int& x : hr) x = -1;
         uint32_t liveIn = 0;
@@ -1352,8 +1400,8 @@ private:
                 if (wd && ops[k].rd) { cnt[ops[k].rd]++; written |= 1u << ops[k].rd; }
             }
             bool rdxUsed = false;  // MULH* and the divisions need rdx
-            for (unsigned k = 0; k < n; k++) rdxUsed |= ops[k].kind >= J_MULH;
-            for (unsigned i = 0; i < sizeof pool / sizeof pool[0] - rdxUsed; i++) {
+            for (unsigned k = 0; k < n; k++) rdxUsed |= ops[k].kind >= J_MULH && ops[k].kind <= J_REMUW;
+            for (unsigned i = 0; i < npool - rdxUsed; i++) {
                 unsigned best = 0;
                 for (unsigned g = 1; g < 32; g++)
                     if (hr[g] < 0 && cnt[g] > cnt[best]) best = g;
@@ -1364,7 +1412,7 @@ private:
         uint32_t dirty = 0;
         struct Bail { uint8_t* rel; unsigned k; uint32_t dirty; };
         struct Link { uint8_t* rel; uint64_t to; };
-        Bail bails[JIT_OPS * 2], stops[JIT_OPS];
+        Bail bails[JIT_OPS * 3], stops[JIT_OPS];
         Link links[2];
         unsigned nb = 0, nl = 0, ns = 0;
         uint8_t* budget = nullptr;
@@ -1401,13 +1449,28 @@ private:
             else J.stg(rd, reg);
         };
         auto chain = [&](uint64_t to) { links[nl++] = Link{J.jmp(), to}; };
+        // Go to the block at rax through the indirect-jump table, or leave
+        // for the run loop to find it.
+        auto jtLook = [&] {
+            J.movRR(R::RCX, R::RAX, false);
+            J.shiftI(5, R::RCX, 1, false);
+            J.aluI(R::A_AND, R::RCX, (int32_t)(Jit::JT - 1), false);
+            J.shiftI(4, R::RCX, 4);
+            J.aluC(R::A_ADD, R::RCX, 80);
+            J.rex(true, R::RAX, R::RCX); J.b(0x3b); J.mem(R::RAX, R::RCX, 0);  // cmp rax, [rcx]
+            uint8_t* miss = J.jcc(R::CC_NE);
+            J.rex(false, 4, R::RCX); J.b(0xff); J.mem(4, R::RCX, 8);           // jmp [rcx + 8]
+            Jit::fix(miss, J.p);
+            J.aluRR(R::A_XOR, R::RDX, R::RDX, false);
+            toEpi();
+        };
         for (unsigned k = 0; k < n; k++) {
             const Op& o = ops[k];
             const int32_t imm = o.imm;
             const uint64_t next = o.pc + o.len;
-            auto addr = [&] {  // rax = rs1 + imm
+            auto addr = [&] {  // rax = rs1 + imm (an AMO's imm is its funct5 and width)
                 ld(R::RAX, o.rs1);
-                if (imm) J.aluI(R::A_ADD, R::RAX, imm);
+                if (imm && o.kind != J_AMO) J.aluI(R::A_ADD, R::RAX, imm);
             };
             auto shift = [&](int ext, bool w) {
                 ld(R::RCX, o.rs2, w);
@@ -1442,7 +1505,44 @@ private:
             };
             auto bail = [&](Jit::Cc c) { bails[nb++] = Bail{J.jcc(c), k, dirty}; };
             // Loads and stores: ad - cb in rax, checked against the span.
-            auto load = [&](std::initializer_list<uint8_t> opc, bool w) {
+            // With paging: the entry for ad's page in the hart's page cache
+            // (r11), checked; rax = where ad is in host memory.
+            auto pageOf = [&](int32_t cache, unsigned nbytes, bool aligned = false) {
+                addr();
+                if (o.kind == J_CBOZ) J.aluI(R::A_AND, R::RAX, -64);
+                if (aligned) {  // else the general path raises the exception
+                    J.rex(false, 0, R::RAX); J.b(0xa9); J.d32(nbytes - 1);  // test eax, n - 1
+                    bail(R::CC_NE);
+                }
+                J.movRR(R::RCX, R::RAX);
+                J.shiftI(5, R::RCX, 12);                                    // vpn
+                J.movRR(R::R11, R::RCX, false);
+                J.aluI(R::A_AND, R::R11, (int32_t)(Hart::DP_SIZE - 1), false);
+                J.rex(true, R::R11, R::R11); J.b(0x6b); J.modrr(R::R11, R::R11); J.b((uint8_t)sizeof(Hart::DataPage));
+                J.aluC(R::A_ADD, R::R11, cache);
+                J.rex(true, R::RCX, R::R11); J.b(0x3b); J.mem(R::RCX, R::R11, 0);  // cmp rcx, [r11].vpn
+                bail(R::CC_NE);
+                J.ldCtx(R::RCX, 104);
+                J.rex(false, R::RCX, R::R11); J.b(0x3b); J.mem(R::RCX, R::R11, (int32_t)offsetof(Hart::DataPage, ctx));
+                bail(R::CC_NE);
+                if (nbytes > 1) {  // within the page
+                    J.movRR(R::RCX, R::RAX, false);
+                    J.aluI(R::A_AND, R::RCX, 0xfff, false);
+                    J.aluI(R::A_CMP, R::RCX, (int32_t)(4096 - nbytes), false);
+                    bail(R::CC_A);
+                }
+                J.aluI(R::A_AND, R::RAX, 0xfff, false);
+                J.rex(true, R::RAX, R::R11); J.b(0x03); J.mem(R::RAX, R::R11, (int32_t)offsetof(Hart::DataPage, host));
+            };
+            auto load = [&](std::initializer_list<uint8_t> opc, bool w, unsigned nbytes) {
+                if (pg) {
+                    pageOf(88, nbytes);
+                    J.rex(w, R::RAX, R::RAX);
+                    for (uint8_t c : opc) J.b(c);
+                    J.mem(R::RAX, R::RAX, 0);
+                    put(o.rd);
+                    return;
+                }
                 addr();
                 J.aluRR(R::A_SUB, R::RAX, R::R14);
                 J.aluRR(R::A_CMP, R::RAX, R::R15);
@@ -1453,6 +1553,15 @@ private:
                 put(o.rd);
             };
             auto store = [&](unsigned nbytes) {
+                if (pg) {
+                    pageOf(96, nbytes);
+                    ld(R::RCX, o.rs2);
+                    if (nbytes == 2) J.b(0x66);
+                    J.rex(nbytes == 8, R::RCX, R::RAX);
+                    J.b(nbytes == 1 ? 0x88 : 0x89);
+                    J.mem(R::RCX, R::RAX, 0);
+                    return;
+                }
                 addr();
                 J.movRR(R::RCX, R::RAX);                  // tohost: ad + n - 1 - th < 7 + n leaves
                 J.aluC(R::A_SUB, R::RCX, 64);
@@ -1483,18 +1592,7 @@ private:
                     J.aluI(R::A_AND, R::RAX, -2);
                     if (o.rd) { J.movI(R::RCX, next); put(o.rd, R::RCX); }
                     writeback(dirty);
-                    // Look the target up: jt[(pc >> 1) & (JT - 1)].
-                    J.movRR(R::RCX, R::RAX, false);
-                    J.shiftI(5, R::RCX, 1, false);
-                    J.aluI(R::A_AND, R::RCX, (int32_t)(Jit::JT - 1), false);
-                    J.shiftI(4, R::RCX, 4);
-                    J.aluC(R::A_ADD, R::RCX, 80);
-                    J.rex(true, R::RAX, R::RCX); J.b(0x3b); J.mem(R::RAX, R::RCX, 0);  // cmp rax, [rcx]
-                    uint8_t* miss = J.jcc(R::CC_NE);
-                    J.rex(false, 4, R::RCX); J.b(0xff); J.mem(4, R::RCX, 8);           // jmp [rcx + 8]
-                    Jit::fix(miss, J.p);
-                    J.aluRR(R::A_XOR, R::RDX, R::RDX, false);
-                    toEpi();
+                    jtLook();
                     break;
                 }
                 case K_BEQ: case K_BNE: case K_BLT: case K_BGE: case K_BLTU: case K_BGEU: {
@@ -1506,13 +1604,13 @@ private:
                     chain(next);
                     break;
                 }
-                case K_LB: load({0x0f, 0xbe}, true); break;
-                case K_LH: load({0x0f, 0xbf}, true); break;
-                case K_LW: load({0x63}, true); break;
-                case K_LD: load({0x8b}, true); break;
-                case K_LBU: load({0x0f, 0xb6}, false); break;
-                case K_LHU: load({0x0f, 0xb7}, false); break;
-                case K_LWU: load({0x8b}, false); break;
+                case K_LB: load({0x0f, 0xbe}, true, 1); break;
+                case K_LH: load({0x0f, 0xbf}, true, 2); break;
+                case K_LW: load({0x63}, true, 4); break;
+                case K_LD: load({0x8b}, true, 8); break;
+                case K_LBU: load({0x0f, 0xb6}, false, 1); break;
+                case K_LHU: load({0x0f, 0xb7}, false, 2); break;
+                case K_LWU: load({0x8b}, false, 4); break;
                 case K_SB: store(1); break;
                 case K_SH: store(2); break;
                 case K_SW: store(4); break;
@@ -1603,6 +1701,38 @@ private:
                     put(o.rd);
                     break;
                 }
+                case J_AMO: {  // rd = old value; memory = op(old, rs2)
+                    const unsigned f5 = (unsigned)imm & 0xff;
+                    const bool w = ((unsigned)imm >> 8) == 3;
+                    pageOf(96, w ? 8 : 4, true);
+                    ld(R::RCX, o.rs2, w);
+                    int res = R::RCX;
+                    if (f5 == 0x01) {        // xchg [rax], rcx
+                        J.rex(w, R::RCX, R::RAX); J.b(0x87); J.mem(R::RCX, R::RAX, 0);
+                    } else if (f5 == 0x00) { // xadd [rax], rcx
+                        J.rex(w, R::RCX, R::RAX); J.b(0x0f); J.b(0xc1); J.mem(R::RCX, R::RAX, 0);
+                    } else {
+                        J.rex(w, R::R11, R::RAX); J.b(0x8b); J.mem(R::R11, R::RAX, 0);  // r11 = old
+                        static const uint8_t cmov[4] = {0x4c, 0x4f, 0x42, 0x47};  // min: l, max: g, minu: b, maxu: a
+                        if (f5 == 0x04) J.aluRR(R::A_XOR, R::RCX, R::R11, w);
+                        else if (f5 == 0x08) J.aluRR(R::A_OR, R::RCX, R::R11, w);
+                        else if (f5 == 0x0c) J.aluRR(R::A_AND, R::RCX, R::R11, w);
+                        else {  // rcx = rs2; if old (cc) rs2, rcx = old
+                            J.aluRR(R::A_CMP, R::R11, R::RCX, w);
+                            J.rex(w, R::RCX, R::R11); J.b(0x0f); J.b(cmov[(f5 - 0x10) >> 2]); J.modrr(R::RCX, R::R11);
+                        }
+                        J.rex(w, R::RCX, R::RAX); J.b(0x89); J.mem(R::RCX, R::RAX, 0);  // store
+                        res = R::R11;
+                    }
+                    if (!w) J.movsxd(res, res);
+                    put(o.rd, res);
+                    break;
+                }
+                case J_CBOZ:  // 64 zero bytes at rs1 & ~63
+                    pageOf(96, 64);
+                    J.aluRR(R::A_XOR, R::RCX, R::RCX, false);
+                    for (int32_t i = 0; i < 64; i += 8) { J.rex(true, R::RCX, R::RAX); J.b(0x89); J.mem(R::RCX, R::RAX, i); }
+                    break;
                 default: break;
             }
             if (step && !term) {
@@ -1634,6 +1764,7 @@ private:
         for (unsigned i = 0; i < nl; i++) {
             Jit::fix(links[i].rel, J.p);
             J.movI(R::RAX, links[i].to);
+            if (pg && (links[i].to ^ pc0) >> 12) { jtLook(); continue; }  // another page: by its translation now
             J.movI(R::RDX, (uint64_t)(uintptr_t)links[i].rel);
             toEpi();
         }
@@ -1712,7 +1843,7 @@ private:
         if (!jp) { jit = false; return; }
         Jit& J = *jp;
         if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; }
-        JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt};
+        JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt, nullptr, nullptr, 0};
         uint8_t* code = J.find(pc);
         if (!code && !(code = jitCompile(J, h, pc))) return;
         for (;;) {
@@ -1732,6 +1863,60 @@ private:
             const uint64_t fl = J.flushes;
             code = J.find(c.pc);
             if (!code && !(code = jitCompile(J, h, c.pc))) break;
+            if (c.link && J.flushes == fl) Jit::patch(c.link, code);
+        }
+        pc = c.pc;
+        left = c.left;
+    }
+    // The same for supervisor or user code with paging on: blocks are found
+    // by virtual pc through the fetch page record (which has the page
+    // translated and allowed), each translated from the physical address
+    // the pc has now; loads and stores go through the data page caches.
+    void jitRunPg(Hart& h, uint64_t* r, uint64_t& pc, uint64_t& left) {
+        Jit* jp = jitFor(h);
+        if (!jp) { jit = false; return; }
+        Jit& J = *jp;
+        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; }
+        if (J.pgFpGen != h.fpGen || J.pgPriv != h.priv) {
+            Jit::clearJt(J.jtPg, J.jtPgUsed);
+            J.pgFpGen = h.fpGen;
+            J.pgPriv = h.priv;
+        }
+        static_assert(sizeof(Hart::DataPage) <= 127 && offsetof(Hart::DataPage, vpn) == 0, "the translator's page cache lookup");
+        JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, J.jtPg, h.dl, h.ds, dataCtx(h)};
+        auto look = [&](uint64_t v, bool stepv) -> uint8_t* {
+            if (!stepv) {
+                const Jit::JtEntry& t = J.jtPg[(v >> 1) & (Jit::JT - 1)];
+                if (t.pc == v) return t.code;
+            }
+            const Hart::FetchPage& e = h.fp[(v >> 12) & (Hart::FP_SIZE - 1)];
+            if (e.vpn != v >> 12 || e.priv != h.priv) return nullptr;
+            const uint64_t pa = e.pa | (v & 0xfff);
+            auto it = J.pg.find(v);
+            uint8_t* code = nullptr;
+            if (it != J.pg.end() && it->second.pa == pa) code = stepv ? it->second.step : it->second.code;
+            if (!code) code = jitCompile(J, h, v, stepv, true, pa);
+            if (code && !stepv) J.setJtPg(v, code);
+            return code;
+        };
+        uint8_t* code = look(pc, false);
+        if (!code) return;
+        for (;;) {
+            c.reason = 0;
+            c.link = 0;
+            J.enter(&c, code);
+            if (c.reason == 2) {  // the block is longer than the budget left
+                if (!c.left) break;
+                uint8_t* sc = look(c.pc, true);
+                if (!sc) break;
+                c.reason = 0;
+                c.link = 0;
+                J.enter(&c, sc);
+            }
+            if (c.reason) break;
+            const uint64_t fl = J.flushes;
+            code = look(c.pc, false);
+            if (!code) break;
             if (c.link && J.flushes == fl) Jit::patch(c.link, code);
         }
         pc = c.pc;
@@ -1853,6 +2038,18 @@ private:
             if (jit) {
                 jitRun(h, r, pc, left, cp, cb, span, sspan, th);
                 if (!left) goto out;
+                d = DCE(pc);
+                DISPATCH;
+            }
+        }
+        if constexpr (RV64 && PG) {
+            if (jit) {
+                jitRunPg(h, r, pc, left);
+                if (!left) goto out;
+                if ((pc ^ fpage) >> 12) {
+                    if (!fetchOk(pc)) goto out;
+                    fpage = pc;
+                }
                 d = DCE(pc);
                 DISPATCH;
             }

@@ -39,6 +39,9 @@ struct JitCtx {
     uint64_t th;       // 64: tohost (stores within 8 bytes of it leave)
     uint64_t reason;   // 72: 0 go on with the next block, 1 run the interpreter, 2 run the counting version
     void* jtab;        // 80: the indirect-jump table
+    void* dl;          // 88: with paging: the hart's load page cache (Hart::dl)
+    void* ds;          // 96: and its store page cache (Hart::ds)
+    uint64_t dctx;     // 104: the key its entries have to carry (Machine::dataCtx)
 };
 
 struct Jit {
@@ -56,13 +59,26 @@ struct Jit {
     bool failed = false;
     uint64_t flushes = 0, compiled = 0;
 
+    // With paging on (supervisor and user code): blocks by virtual pc, each
+    // for the physical address it was translated from; the indirect-jump
+    // table by virtual pc, emptied whenever the hart's fetch page record is
+    // (a TLB flush) or its privilege changes. A block links straight to
+    // another only within its own page.
+    struct PgBlock { uint64_t pa; uint8_t* code; uint8_t* step; };
+    std::unordered_map<uint64_t, PgBlock> pg;
+    JtEntry* jtPg = nullptr;
+    std::vector<uint32_t> jtPgUsed;
+    uint32_t pgFpGen = ~0u;
+    unsigned pgPriv = ~0u;
+
     Jit() {
 #if MVPLAT_JIT
         void* p = mmap(nullptr, BUF, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) { failed = true; return; }
         buf = (uint8_t*)p;
         jt = new JtEntry[JT];
-        for (unsigned i = 0; i < JT; i++) jt[i] = {~0ull, nullptr};
+        jtPg = new JtEntry[JT];
+        for (unsigned i = 0; i < JT; i++) jt[i] = jtPg[i] = {~0ull, nullptr};
         prologue();
         flush();
 #else
@@ -73,20 +89,31 @@ struct Jit {
 #if MVPLAT_JIT
         if (buf) munmap(buf, BUF);
         delete[] jt;
+        delete[] jtPg;
 #endif
     }
     Jit(const Jit&) = delete;
     Jit& operator=(const Jit&) = delete;
 
     std::vector<uint32_t> jtUsed;  // the table entries filled since the last flush
+    static void clearJt(JtEntry* t, std::vector<uint32_t>& u) {
+        if (u.size() > JT / 8) for (unsigned i = 0; i < JT; i++) t[i] = {~0ull, nullptr};
+        else for (uint32_t i : u) t[i] = {~0ull, nullptr};
+        u.clear();
+    }
     void flush() {
         used = codeStart;
         blocks.clear();
         steps.clear();
-        if (jtUsed.size() > JT / 8) for (unsigned i = 0; i < JT; i++) jt[i] = {~0ull, nullptr};
-        else for (uint32_t i : jtUsed) jt[i] = {~0ull, nullptr};
-        jtUsed.clear();
+        pg.clear();
+        clearJt(jt, jtUsed);
+        clearJt(jtPg, jtPgUsed);
         flushes++;
+    }
+    void setJtPg(uint64_t pc, uint8_t* code) {
+        JtEntry& e = jtPg[(pc >> 1) & (JT - 1)];
+        if (e.pc == ~0ull) jtPgUsed.push_back((uint32_t)((pc >> 1) & (JT - 1)));
+        e = {pc, code};
     }
     uint8_t* find(uint64_t pc) {
         JtEntry& e = jt[(pc >> 1) & (JT - 1)];

@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: the translator runs supervisor and user code with paging on
+  (blocks by virtual pc, translated from the physical address, linked
+  within a page; loads, stores, AMOs and CBO.ZERO through the data page
+  caches inline), and translates FENCE. Linux boots to the BusyBox shell in
+  LINUXJIT s (5.1 s with `-nojit`; QEMU 1.5 s). `tests/vplat/jit.c` runs its
+  work again in supervisor mode with Sv39, with accesses across a page
+  boundary and every AMO.
 - mvplat: Linux boots to a BusyBox shell in 5.1 s instead of 7.2 s (one
   hart). The decoded-instruction cache goes by physical address, so
   `SFENCE.VMA` and `satp` writes keep it, and is 8 times larger;
