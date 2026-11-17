@@ -76,6 +76,15 @@ struct Jit {
     // (their links cross pages: a change to one drops everything).
     std::unordered_map<uint64_t, std::vector<uint64_t>> pgByPage;
     std::unordered_set<uint64_t> barePages;
+    // Harts that take turns on one thread (-serial) share one translator for
+    // paged code: `pg`, the blocks and the buffer are here, each hart's
+    // indirect-jump table in its own Jit (a view), emptied with these.
+    std::vector<Jit*> views;
+    uint32_t pgGen = 0;  // a view's: the hart's codeGen the shared one was last synced to
+    void clearPgJt() {
+        clearJt(jtPg, jtPgUsed);
+        for (Jit* v : views) clearJt(v->jtPg, v->jtPgUsed);
+    }
 
     Jit() {
 #if MVPLAT_JIT
@@ -115,7 +124,7 @@ struct Jit {
         pgByPage.clear();
         barePages.clear();
         clearJt(jt, jtUsed);
-        clearJt(jtPg, jtPgUsed);
+        clearPgJt();
         flushes++;
     }
     // Code in these physical pages changed (FENCE.I found it so).
@@ -133,7 +142,7 @@ struct Jit {
             pgByPage.erase(it);
             any = true;
         }
-        if (any) clearJt(jtPg, jtPgUsed);
+        if (any) clearPgJt();
     }
     void setJtPg(uint64_t pc, uint8_t* code) {
         JtEntry& e = jtPg[(pc >> 1) & (JT - 1)];

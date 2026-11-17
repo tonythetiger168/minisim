@@ -140,7 +140,7 @@ after a trap, `vsetvl` corners, the estimates) against scalar models; both
 on RV32 and RV64; together they use 226 distinct vector instruction forms.
 The vector loops run under Linux too, in three processes at once.
 
-**Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000) on
+**Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000, 10000 with `-serial`) on
 its own and then the platform synchronises: devices see time move and
 interrupts are re-evaluated. This is SystemC TLM-2.0's temporal decoupling.
 A quantum ends early at the next timer compare and at the next callback an
@@ -163,10 +163,16 @@ ordered phase. That is another interleaving than the parallel rounds give
 (each hart sees the others' stores of earlier turns at once), still the
 same on every run. Every hart then runs on the fast loop and the
 translator, where a write buffer would hold them to the general path, so
-an SMP operating system runs about as fast as on one hart: Linux on 2 harts
-boots to the BusyBox shell in about 2 s with `-serial` against 20 s in
-rounds. A hart's LR reservation ends with its turn (an SC after the other
-harts ran fails, and the loop around it tries again).
+an SMP operating system runs about as fast as on one hart. The harts also
+share one translation of their paged (supervisor and user) code, each with
+its own table of indirect jumps, so the kernel is translated once rather
+than once per hart, and the quantum is 10000 cycles unless `-quantum` or
+the platform file says otherwise (a turn costs a switch; with no thread
+waiting on another, longer turns are cheaper). Linux on 2 harts boots to
+the BusyBox shell and powers off in about 1.4 s with `-serial`, level with
+QEMU 8.2's virt board, against 20 s in rounds. A hart's LR reservation
+ends with its turn (an SC after the other harts ran fails, and the loop
+around it tries again).
 
 ## The platform file
 
@@ -442,7 +448,7 @@ for it.
 | `-elf FILE` | the program (or give it as the first plain argument) |
 | `-harts N` | override the platform's hart count |
 | `-threads N`, `-j N` | threads for the harts (default: every CPU) |
-| `-quantum N` | cycles between synchronisations (default 1000) |
+| `-quantum N` | cycles between synchronisations (default 1000; 10000 with `-serial`) |
 | `-serial` | harts take turns on one thread, no write buffers (see above) |
 | `-mhz F` | hart clock |
 | `-max-cycles N` | stop after N cycles, exit code 4 |
