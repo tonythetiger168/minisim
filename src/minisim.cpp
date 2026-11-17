@@ -878,12 +878,24 @@ struct Sim {
     // $monitor, coverage, force, VPI or path delay). Otherwise set().
     const bool noFwBit = std::getenv("MSIM_NOFWBIT") != nullptr;
     __attribute__((noinline)) void fwBit(int s, uint64_t n) {
+        if (!bitEdgeOk(s, n)) { fwSlow(s, make(n, 0, 1)); return; }
+        bitEdge(s, n);
+    }
+    // A known one-bit value that changes, and nothing but clocked batches
+    // and comb ranks watches the signal: bitEdge does all set() would.
+    __attribute__((always_inline)) bool bitEdgeOk(int s, uint64_t n) const {
+        const Sig& g = sigs[s];
+        return !(g.fl || g.val.x || g.val.z || g.val.real || g.val.str || !g.val.hi.empty() || g_cov || observed || edgeTrack || tlPart ||
+                 !waiters[s].empty() || !pathIn.empty() || !fmons.empty() || mon.on || (g.val.v & 1) == n || noFwBit);
+    }
+    // A procedural write of a one-bit variable (a testbench clock,
+    // `always #5 clk = ~clk`): the direct edge, or set() for anything else.
+    __attribute__((always_inline)) void setOneBit(int s, const Val& nv) {
+        if (__builtin_expect(!(nv.x | nv.z) && !nv.real && !nv.str && nv.hi.empty() && bitEdgeOk(s, nv.v & 1), 1)) bitEdge(s, nv.v & 1);
+        else set(s, nv);
+    }
+    void bitEdge(int s, uint64_t n) {
         Sig& g = sigs[s];
-        if (g.fl || g.val.x || g.val.z || g.val.real || g.val.str || !g.val.hi.empty() || g_cov || observed || edgeTrack || tlPart ||
-            !waiters[s].empty() || !pathIn.empty() || !fmons.empty() || mon.on || (g.val.v & 1) == n || noFwBit) {
-            fwSlow(s, make(n, 0, 1));
-            return;
-        }
         g.val.v = n;
         g.val.sgn = false;
         const bool pos = n == 1, neg = !pos;
