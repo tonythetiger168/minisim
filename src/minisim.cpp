@@ -513,6 +513,9 @@ struct Sim {
     // pool runs here and is not measured.
     template <class F>
     void parallelTuned(Tuner& t, size_t n, F&& f) {
+        // Most batches are one function (a compiled domain's comb pass): no
+        // tuning, no environment lookup.
+        if (n < kMinParallel || threads <= 1 || tlInPar) { for (size_t i = 0; i < n; i++) f(i); return; }
         static const char* dbgSerial = std::getenv("MSIM_SERIAL");   // debug: c, p, s = comb, partitions, clocked
         const char which = &t == &combTune ? 'c' : &t == &partTune ? 'p' : 's';
         if (threads <= 1 || n < kMinParallel || tlInPar || (dbgSerial && std::strchr(dbgSerial, which))) { for (size_t i = 0; i < n; i++) f(i); return; }
@@ -773,9 +776,14 @@ struct Sim {
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
         // The compiled cycle domain's clock groups (one dseq each) share the
         // NBA slots and their list: those run one after another, here.
-        auto dom = [&](size_t k) { return fastSeqId >= 0 && seqs[seqq[k]].fn == seqs[fastSeqId].fn; };
-        bool anyDom = false;
-        for (size_t k = 0; k < seqq.size() && !anyDom; k++) anyDom = dom(k);
+        // Counted once: with -compile most batches are the domain's, and then
+        // nothing is left for parallelTuned to walk.
+        const auto domFn = fastSeqId >= 0 ? seqs[fastSeqId].fn : nullptr;
+        auto dom = [&](size_t k) { return seqs[seqq[k]].fn == domFn; };
+        size_t nDom = 0;
+        if (domFn)
+            for (size_t k = 0; k < seqq.size(); k++) nDom += dom(k);
+        const bool anyDom = nDom > 0;
         if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
             for (size_t k = 0; k < seqq.size(); k++) {
                 uint64_t t = prof::Profiler::nowNs();
@@ -784,11 +792,12 @@ struct Sim {
                 prof::P().charge(prof::P().seqEnt[seqq[k]], prof::Profiler::nowNs() - t);
             }
         } else {
-            parallelTuned(seqTune, seqq.size(), [&](size_t k) {
-                if (anyDom && dom(k)) return;
-                seqBufs[k].clear();
-                seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
-            });
+            if (nDom < seqq.size())
+                parallelTuned(seqTune, seqq.size(), [&](size_t k) {
+                    if (anyDom && dom(k)) return;
+                    seqBufs[k].clear();
+                    seqs[seqq[k]].fn(seqs[seqq[k]].ctx, seqBufs[k]);
+                });
             if (anyDom)
                 for (size_t k = 0; k < seqq.size(); k++)
                     if (dom(k)) {
