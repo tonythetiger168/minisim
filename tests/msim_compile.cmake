@@ -73,6 +73,8 @@ set(CASES
   "-x-assign 0 -x-initial 0 examples/caseswitch.sv"
   "examples/clkgate.sv"
   "-x-assign 0 -x-initial 0 examples/clkgate.sv"
+  "examples/constsel.sv"
+  "-x-assign 0 -x-initial 0 examples/constsel.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
   "examples/islands.sv"

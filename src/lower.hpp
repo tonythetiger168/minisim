@@ -8742,6 +8742,7 @@ struct Lowerer {
             i.e = node(Op::This);
         }
         const CallExpression::RandomizeCallInfo* info = nullptr;
+        std::vector<std::pair<const Expression*, int>> tmpArgs;   // an argument solved in a temporary
         if (call.isSystemCall())
             info = std::get_if<CallExpression::RandomizeCallInfo>(&std::get<1>(call.subroutine).extraInfo);
         ClassInfo* savedCls = curClass;
@@ -8869,6 +8870,37 @@ struct Lowerer {
             if (!at.isIntegral() && !at.isFloating()) unsupported("randomize() argument of this type");
             E r = expr(a);
             if (at.isFloating() && r->op == Op::AsReal) r = r->kids[0];   // a real (18.4.1): its bits
+            if (r->op != Op::Ref && at.isIntegral() && !isHandleType(at) && a.syntax) {
+                // An element or member with no signal of its own (a[i] with i
+                // known at run time, h.q[2], m[1][0]): solved in a temporary
+                // and written back when randomize() succeeds. In with {...}
+                // the same expression, written alike, names the temporary.
+                int t = fresh(storeW(*a.type));
+                Instr c; c.k = IK::Assign; c.sig = t; c.e = r;
+                prog.emit(c);
+                if (info && info->inlineConstraints) {
+                    auto squeeze = [](std::string x) { std::erase_if(x, [](char ch) { return std::isspace((unsigned char)ch); }); return x; };
+                    struct Same : ASTVisitor<Same, VisitFlags::Expressions> {
+                        std::string want;
+                        std::function<std::string(std::string)> sq;
+                        std::vector<const Expression*> hits;
+                        bool hit(const Expression& x) {
+                            if (!x.syntax || sq(x.syntax->toString()) != want) return false;
+                            hits.push_back(&x);
+                            return true;
+                        }
+                        void handle(const ElementSelectExpression& x) { if (!hit(x)) visitDefault(x); }
+                        void handle(const RangeSelectExpression& x) { if (!hit(x)) visitDefault(x); }
+                        void handle(const MemberAccessExpression& x) { if (!hit(x)) visitDefault(x); }
+                    } sv;
+                    sv.want = squeeze(a.syntax->toString());
+                    sv.sq = squeeze;
+                    info->inlineConstraints->visit(sv);
+                    for (const Expression* x : sv.hits) exprOverride[x] = t;
+                }
+                tmpArgs.push_back({&a, t});
+                r = ref(t, at.isSigned());
+            }
             if (r->op != Op::Ref) unsupported("randomize() argument that is not a variable");
             rc->argReal.resize(rc->args.size());
             rc->argReal.push_back(at.isFloating() ? (at.getBitWidth() == 32 ? 32 : 64) : 0);
@@ -8882,6 +8914,17 @@ struct Lowerer {
         i.sig = fresh(32);
         i.rc = rc;
         prog.emit(i);
+        if (!tmpArgs.empty()) {   // the solved temporaries back into their elements
+            size_t skip = emitJmpIfNot(ref(i.sig, true));
+            for (auto& [a, t] : tmpArgs) {
+                Instr w;
+                w.k = IK::Assign;
+                lhs(*a, w);
+                w.e = ref(t, a->type->isSigned());
+                prog.emit(w);
+            }
+            prog.code[skip].target = prog.here();
+        }
         return ref(i.sig, true);
     }
     // x.rand_mode(v), obj.rand_mode(v), c.constraint_mode(v), and their
