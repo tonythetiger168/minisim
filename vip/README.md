@@ -7,7 +7,7 @@ side is a reactive memory responder on the shared memory model.
 
 | VIP | Directory | Contents |
 |---|---|---|
-| AXI4 | `axi4/` | `axi4_if`, `axi4_pkg` (agent, master driver, memory responder, monitor with several outstanding bursts and W before AW, coverage, random and directed sequences), `axi4_sva` |
+| AXI4 | `axi4/` | `axi4_if` (full AXI4 signal set, widths from `axi4_defines.svh`), `axi4_pkg` (agent, master driver with several outstanding bursts, memory responder with an exclusive monitor and out-of-order / interleaved responses, monitor, coverage, random, exclusive and directed sequences), `axi4_sva` (48 rules of IHI0022H.c, see `spec/README.md`) |
 | AXI4-Lite | `axi4lite/` | `axil_if`, `axil_pkg` (agent, master driver with AW/W order and skew, memory responder, monitor, coverage, scoreboard, sequences), `axil_sva` |
 | APB4 | `apb/` | `apb_if`, `apb_pkg` (requester, completer with wait states and a PSLVERR window, monitor, coverage, sequences), `apb_sva` |
 | Memory | `mem/` | `mem_vip_pkg::mem_model`: sparse byte memory with bus-word access and a backdoor, shared by the responders |

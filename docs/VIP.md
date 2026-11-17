@@ -19,6 +19,10 @@ memory model are checked against each other and against a shadow model:
 
 ```sh
 msim -uvm -f tests/vip/amba/files.f -top vip_tb_top +UVM_TESTNAME=vip_axi4_loopback_test
+msim -uvm -f tests/vip/amba/files.f -top vip_tb_top +UVM_TESTNAME=vip_axi4_outstanding_test
+msim -uvm -f tests/vip/amba/files.f -top vip_tb_top +UVM_TESTNAME=vip_axi4_excl_test
+msim -uvm -f tests/vip/axi4w/files.f -top vip_tb_top +UVM_TESTNAME=vip_axi4_loopback_test
+msim -uvm -f tests/vip/axi4_sva/files.f -top axi4_sva_tb +UVM_TESTNAME=axi4_sva_neg_test
 msim -uvm -f tests/vip/amba/files.f -top vip_tb_top +UVM_TESTNAME=vip_apb_loopback_test
 msim -uvm -f tests/vip/axil/files.f -top axil_tb    +UVM_TESTNAME=axil_loopback_test
 ```
@@ -41,6 +45,45 @@ uvm_config_db#(virtual axil_if)::set(null, "uvm_test_top.*", "vif", bus_if);
 // in a test:
 axil_api::write(env.bus.sqr, 32'h40, 32'h1122_3344, resp);
 ```
+
+### AXI4
+
+`vip/axi4` follows AMBA AXI and ACE Protocol Specification IHI0022H.c for
+the AXI4 interface; `spec/README.md` maps each requirement of the
+specification to the code and the test that covers it.
+
+- **Signals**: the whole AXI4 set, AxQOS, AxREGION and the five xUSER
+  signals included. Widths are fixed per compilation by
+  `vip/axi4/axi4_defines.svh` (`+define+AXI4_DATA_W=128`, `AXI4_ADDR_W`,
+  `AXI4_ID_W`, `AXI4_USER_W`; defaults 32/32/8/8). Code outside the
+  package reads them as `axi4_pkg::AXI4_DATA_WIDTH` and so on.
+- **Master**: `cfg.max_outstanding` bursts in flight (default 1: finish_item
+  returns with the response, as before). Above 1, finish_item returns when
+  the driver has taken the burst and `item.done` marks the response;
+  `axi4_api::run` waits for it. W may lead AW; responses are matched by ID.
+- **Slave** (memory responder): `cfg.reorder` answers different IDs out of
+  order, `cfg.interleave` interleaves read beats of different IDs, an
+  exclusive monitor per ID answers EXOKAY (`cfg.exclusive_support = 0` for
+  a slave without one), BUSER/RUSER echo AxUSER, `err_ranges` give
+  SLVERR/DECERR.
+- **Sequences**: `axi4_random_seq` makes legal bursts with random AxCACHE
+  (Table A4-5 values), AxPROT, QoS, region and user values, `excl_pct`
+  exclusive pairs, and holds back a burst that overlaps one in flight;
+  `axi4_api::excl_read` / `excl_write` run an exclusive pair.
+- **Checker**: `axi4_sva` checks 48 rules (reset, handshakes, X, burst
+  legality, 4 KB, AxCACHE, exclusive restrictions, WSTRB lanes, WLAST/RLAST,
+  B after the write, R after the read, EXOKAY use) and reports each as
+  `[<section> <RULE>]`; `MAX_WAIT` adds warnings for a READY that stays
+  low. `tests/vip/axi4_sva` breaks each of the 48 rules once (and
+  triggers one wait warning) and checks that exactly the expected rules
+  fire.
+
+Benches: `tests/vip/amba` (32-bit; loopback, outstanding with reordering
+and interleaving, directed exclusive cases), `tests/vip/axi4w` (the same
+tests on a 128-bit data, 40-bit address bus), `tests/vip/axi4_sva`.
+
+Not covered: AXI3, AXI5 and ACE signals; the slave is a plain memory
+without the memory-type behaviour of A4.
 
 The AXI4, APB4 and memory VIPs are those of SoC-tb-regress-builder. Two
 names were changed: `axi4_monitor::flush` is `flush_state` and the bench's
