@@ -8,6 +8,18 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mlsp: a language server (LSP 3.17, stdio) for SystemVerilog and Verilog on
+  slang set up as msim: diagnostics as you type from unsaved buffers, go to
+  definition and references (ports, parameters, packages, types, enum
+  values, functions, class members, instances), hover with types, values
+  and hierarchical paths, outline, workspace symbols, completion, mlint
+  findings on save, and `minisim/compileInfo` for editors. It follows the
+  open file's design through the workspace or takes a `-f` list.
+  `mlsp -check` prints the same diagnostics. `docs/LSP.md`.
+- VS Code extension (`editors/vscode/`): starts mlsp, syntax colours, runs
+  msim on the open design as a task with a problem matcher, opens the
+  waveform in mdebug's viewer, shows mcov coverage in VS Code's coverage
+  view, and registers the minisim MCP server (`mmcp`) for agents.
 - msim: VHDL-2019 reflection (IEEE 1076-2019 16.2.2 `'reflect`, 16.12
   std.reflection): subtype and value mirrors of every type class, from
   enumerations and nine-value std_logic to multidimensional arrays, linked
