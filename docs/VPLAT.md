@@ -458,7 +458,8 @@ the next one's, and straight-line code steps to the next cache entry
 without a lookup. It leaves, before the instruction, at anything else: a
 cache miss, a CSR, a device or `tohost` access, the last 7 bytes of a
 memory region, the end of the quantum. A 2.1 G-instruction RV64IMAC
-program (integer loops, a CRC, a sieve) runs at about 400 MIPS this way (136 before). As the ISA allows, a hart sees a store to code only after
+program (integer loops, a CRC, a sieve) runs at about 400 MIPS this way (136 before).
+As the ISA allows, a hart sees a store to code only after
 it executes `FENCE.I`; loading a program, a debugger write and `-restore`
 empty the cache too. With paging on, the page that instructions were last
 fetched from stays translated and PMP-checked until the next `SFENCE.VMA`,
