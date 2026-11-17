@@ -1953,11 +1953,18 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 co_await WaitFork{ctl};
                 TO_REACTIVE;
                 break;
-            case IK::DisableFork:
-                for (auto& k : ctl->kids) procKill(k);
+            case IK::DisableFork: {
+                // every descendant (9.6.3): also those of a child that has
+                // already ended
+                std::function<void(const shared_ptr<ProcCtl>&)> all = [&](const shared_ptr<ProcCtl>& k) {
+                    if (k->ended) { auto ks = k->kids; for (auto& g : ks) all(g); }
+                    else procKill(k);
+                };
+                for (auto& k : ctl->kids) all(k);
                 ctl->kids.clear();
                 pc++;
                 break;
+            }
             case IK::Assert:
                 if (i.join == 4) {   // expect (16.17): wait for the verdict
                     auto w = startExpect(i, ctl);
