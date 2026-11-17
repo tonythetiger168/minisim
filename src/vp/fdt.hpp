@@ -149,11 +149,12 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
         f.propU32("reg", {h});
         f.propStr("status", {"okay"});
         f.propStr("compatible", {"riscv"});
-        f.propStr("riscv,isa", {xl + "imafdcv_zicboz_zicntr_zicond_zicsr_zifencei_zabha_zacas_zalasr_zfh_zfhmin_zba_zbb_zbc_zbkb_zbkx_zbs_zvbb_zvbc_zvfh_zvfhmin_zvkb_zvkg_zvkned_zvknha_zvknhb_zvksed_zvksh_zvkt" +
+        f.propStr("riscv,isa", {xl + "imafdcv_zicboz_zicntr_zicond_zicsr_zifencei_zabha_zacas_zalasr_zfbfmin_zfh_zfhmin_zba_zbb_zbc_zbkb_zbkx_zbs_zvbb_zvbc_zvfbfmin_zvfbfwma_zvfh_zvfhmin_zvkb_zvkg_zvkned_zvknha_zvknhb_zvksed_zvksh_zvkt" +
                                 (rv64 ? "_svnapot_svpbmt" : "")});
         f.propStr("riscv,isa-base", {xl + "i"});
         std::vector<std::string> exts = {"i", "m", "a", "f", "d", "c", "b", "v", "zicboz", "zicntr", "zicond", "zicsr", "zifencei",
-                                         "zabha", "zacas", "zalasr", "zfh", "zfhmin", "zba", "zbb", "zbc", "zbkb", "zbkx", "zbs", "zvbb", "zvbc", "zvfh", "zvfhmin", "zvkb", "zvkg",
+                                         "zabha", "zacas", "zalasr", "zfbfmin", "zfh", "zfhmin", "zba", "zbb", "zbc", "zbkb", "zbkx", "zbs",
+                                         "zvbb", "zvbc", "zvfbfmin", "zvfbfwma", "zvfh", "zvfhmin", "zvkb", "zvkg",
                                          "zvkned", "zvknha", "zvknhb", "zvksed", "zvksh", "zvkt"};
         if (rv64) { exts.push_back("svnapot"); exts.push_back("svpbmt"); }
         f.propStr("riscv,isa-extensions", exts);

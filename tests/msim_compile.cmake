@@ -79,6 +79,8 @@ set(CASES
   "-x-assign 0 -x-initial 0 examples/deadseq.sv"
   "examples/procorder.sv"
   "examples/onebitclk.sv"
+  "examples/twostore.sv"
+  "-x-assign 0 -x-initial 0 examples/twostore.sv"
   "-x-assign 0 -x-initial 0 examples/procorder.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
@@ -152,6 +154,23 @@ foreach(c IN LISTS CASES)
     file(READ ${OUT}/c${n}/design.cpp gen)
     if(NOT gen MATCHES "__builtin_expect\\(S\\.observed, 0\\)")
       message(FATAL_ERROR "${c}: the clocked writes nothing reads still run every cycle")
+    endif()
+  endif()
+  # The 2-state copy of a direct clocked write stores the value word alone
+  # (codegen.hpp pwv2).
+  if(c STREQUAL "examples/twostore.sv")
+    file(GLOB srcs ${OUT}/c${n}/*.cpp)
+    set(gen "")
+    foreach(f ${srcs})
+      file(READ ${f} t)
+      string(APPEND gen "${t}")
+    endforeach()
+    if(NOT gen MATCHES "{ P[0-9]+\\.v = [^;]*; }")
+      message(FATAL_ERROR "${c}: no 2-state clocked write stores the value word alone")
+    endif()
+    # ... and the commit list stores value words alone while pclean holds.
+    if(NOT gen MATCHES "if \\(C0TWO\\)")
+      message(FATAL_ERROR "${c}: the commit list has no value-only path")
     endif()
   endif()
   # A testbench clock toggles through the direct one-bit edge (Sim::setOneBit).

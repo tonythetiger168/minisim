@@ -13,7 +13,7 @@ for p in hello irq smp bench pmp virtio vnet vcon; do
 done
 # The same programs as RV64 (the ELF class makes mvplat's harts 64-bit).
 CC64="${CLANG:-clang} --target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 -mcmodel=medany -O2 -g0 -nostdlib -ffreestanding -fuse-ld=lld -Wl,-T,link.ld -Wl,--build-id=none -static"
-for p in hello irq smp virtio svpbmt; do
+for p in hello irq smp virtio svpbmt jit smc; do
   $CC64 crt0.S $p.c -o "$out/${p}64.elf"
 done
 # The V extension: vkern.c's loops scalar and vectorized by clang (vec),
@@ -34,6 +34,8 @@ for x in 32 64; do
     crt0.S zvbb.c -o "$out/zvbb$x.elf"
   $V -march=rv${x}gcv_zfh_zvfh -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fuse-ld=lld -Wl,-T,link.ld \
     -Wl,--build-id=none -static crt0.S zvfh.c -o "$out/zvfh$x.elf"
+  $V -march=rv${x}gcv -fno-vectorize -fno-slp-vectorize -ffp-contract=off -fuse-ld=lld -Wl,-T,link.ld \
+    -Wl,--build-id=none -static crt0.S bf16.c -o "$out/bf16$x.elf"
   $V -march=rv${x}gcv_zvkned_zvknhb_zvkg_zvbc_zvksed_zvksh -fno-vectorize -fno-slp-vectorize -fuse-ld=lld -Wl,-T,link.ld \
     -Wl,--build-id=none -static crt0.S zvk.c -o "$out/zvk$x.elf"
 done

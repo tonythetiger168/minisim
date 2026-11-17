@@ -206,6 +206,16 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_default_width
            COMMAND msim -sv ${CLI}/adder.sv ${CLI}/adder_tb.sv -top adder_tb)
   set_tests_properties(msim_default_width PROPERTIES PASS_REGULAR_EXPRESSION "W= +4 sum=12\n")
+  # 3.12.1: one compilation unit for the files of a command line (macros and
+  # $unit declarations carry over, into -v library files too); 33.3.1: an
+  # uninstantiated library module is not elaborated. --single-unit=false
+  # gives each file its own unit.
+  add_test(NAME msim_one_unit
+           COMMAND msim ${CLI}/unit_defs.svh ${CLI}/unit_use.sv -v ${CLI}/unit_lib.v)
+  set_tests_properties(msim_one_unit PROPERTIES PASS_REGULAR_EXPRESSION "^w=6 x=63 twice=42\ncell w=6\n$")
+  add_test(NAME msim_separate_units
+           COMMAND msim --single-unit=false ${CLI}/unit_defs.svh ${CLI}/unit_use.sv -v ${CLI}/unit_lib.v)
+  set_tests_properties(msim_separate_units PROPERTIES WILL_FAIL TRUE)
   add_test(NAME msim_init COMMAND msim ${CLI}/init.sv)
   set_tests_properties(msim_init PROPERTIES PASS_REGULAR_EXPRESSION "v= +5\nw= +6\nw= +10\n")
   # +notimingcheck (31): the setup and hold checks report nothing.
@@ -308,6 +318,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_large -DPY=${Python3_EXECUTABLE} -DFST=$<BOOL:${MINISIM_WITH_FST}>
                      -P ${CMAKE_SOURCE_DIR}/tests/mdebug_large.cmake)
+    # bench/gen_manycore.py: tiled many-core with coherent shared memory, self-checking.
+    add_test(NAME msim_manycore
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_manycore -DPY=${Python3_EXECUTABLE}
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_manycore.cmake)
     add_test(NAME msim_fuzz
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}

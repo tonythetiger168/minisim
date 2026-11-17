@@ -91,7 +91,39 @@
 // earlier compilation may share addresses with this one's.
 using ArrMap = std::unordered_map<const slang::ast::Symbol*, std::shared_ptr<ArrShape>>;
 inline ArrMap& arrMap() { static ArrMap m; return m; }
-constexpr int64_t kMaxArrayElems = 1 << 20;
+constexpr int64_t kMaxArrayElems = 1 << 24;
+// True when every invalid node in e is there only because of a reversed
+// constant part select under it (found: there was one).
+inline bool onlyReversedSelects(const slang::ast::Expression& e, bool& found) {
+    using namespace slang::ast;
+    if (e.kind != ExpressionKind::Invalid) return true;   // a valid node has valid operands
+    const Expression* c = e.as<InvalidExpression>().child;
+    if (!c) return false;
+    switch (c->kind) {
+        case ExpressionKind::RangeSelect: {
+            auto& rs = c->as<RangeSelectExpression>();
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple || !rs.value().type->isIntegral()) return false;
+            found = true;
+            return !rs.value().bad();
+        }
+        case ExpressionKind::Assignment: {
+            auto& a = c->as<AssignmentExpression>();
+            return !a.left().bad() && onlyReversedSelects(a.right(), found);
+        }
+        case ExpressionKind::BinaryOp: {
+            auto& b = c->as<BinaryExpression>();
+            return onlyReversedSelects(b.left(), found) && onlyReversedSelects(b.right(), found);
+        }
+        case ExpressionKind::UnaryOp: return onlyReversedSelects(c->as<UnaryExpression>().operand(), found);
+        case ExpressionKind::ConditionalOp: {
+            auto& q = c->as<ConditionalExpression>();
+            if (q.conditions.size() != 1 || q.conditions[0].pattern) return false;
+            return onlyReversedSelects(*q.conditions[0].expr, found) && onlyReversedSelects(q.left(), found) &&
+                   onlyReversedSelects(q.right(), found);
+        }
+        default: return false;
+    }
+}
 // The design's source manager, for file names and line numbers in messages.
 inline const slang::SourceManager*& srcMgr() { static const slang::SourceManager* m = nullptr; return m; }
 // Net types that resolve differently from wire (6.6): signal -> kind.
@@ -1341,7 +1373,16 @@ struct Lowerer {
         if (s < 0) unsupported("reference to a variable with no signal");
         return s;
     }
+    // with {...}: the caller's array and container properties, through a
+    // slot holding their address in the caller's object (18.7)
+    std::unordered_map<const slang::ast::Symbol*, std::pair<int, std::shared_ptr<ArrShape>>> arrOverride;
+    std::unordered_map<const slang::ast::Symbol*, std::pair<int, DynObj>> dynOverride;
     std::shared_ptr<const ArrShape> arrFind(const slang::ast::Symbol* sym) const {
+        if (auto ov = arrOverride.find(sym); ov != arrOverride.end()) {
+            auto a = std::make_shared<ArrShape>(*ov->second.second);
+            a->base = indThrough(ov->second.first);
+            return a;
+        }
         if (auto rf = refFormals().find(sym); rf != refFormals().end()) {
             if (rf->second.kind != 1) return nullptr;
             auto a = std::make_shared<ArrShape>(*rf->second.arr);
@@ -1362,6 +1403,11 @@ struct Lowerer {
         return it == arrMap().end() ? nullptr : it->second;
     }
     int dynFind(const slang::ast::Symbol* sym) const {
+        if (auto ov = dynOverride.find(sym); ov != dynOverride.end()) {
+            int d = indThrough(ov->second.first);
+            indShape[d] = ov->second.second;
+            return d;
+        }
         if (auto rf = refFormals().find(sym); rf != refFormals().end()) {
             if (rf->second.kind != 2) return -1;
             int d = indThrough(refSlot(sym));
@@ -5810,10 +5856,13 @@ struct Lowerer {
                 if (n == s) {
                     if (!call.type->isIntegral()) unsupported("reduction with a non-integral with clause");
                     int ph = fresh(itSym ? std::max(1, storeW(itSym->getType())) : 64);
+                    int phx = o.kind == 2 ? -1 : fresh(32);   // item.index (7.12.4): the element's position
                     if (itSym) symOverride[itSym] = ph;
+                    if (itSym && phx >= 0) iterIndex[itSym] = phx;
                     E body = expr(*withE);
-                    if (itSym) symOverride.erase(itSym);
+                    if (itSym) { symOverride.erase(itSym); iterIndex.erase(itSym); }
                     auto x = node(Op::DynReduce, {resize(body, (int)call.type->getBitWidth(), withE->type->isSigned(), false)});
+                    if (phx >= 0) x->kids.push_back(ref(phx, true));
                     x->sig = d;
                     x->hi = id;
                     x->lo = ph;
@@ -6299,6 +6348,9 @@ struct Lowerer {
                 }
                 if (int ix = iterIndexSig(call); ix >= 0)   // item.index in a with clause (7.12.4)
                     return sized(ref(ix, e.type->isSigned()), storeW(*e.type), e.type->isSigned(), ctx);
+                if (n == "index" && call.arguments().size() == 1 && peel(*call.arguments()[0]).kind == ExpressionKind::NamedValue)
+                    if (auto xb = exprIndexBind.find(&peel(*call.arguments()[0]).as<NamedValueExpression>().symbol); xb != exprIndexBind.end())
+                        return sized(konst(make((uint64_t)xb->second, 0, 32, 0, true)), 32, true, ctx);
                 if ((n == "$rtoi" || n == "$realtobits") && call.arguments().size() == 1) {
                     E r = realOf(*call.arguments()[0]);
                     int w = (int)e.type->getBitWidth();
@@ -6723,6 +6775,54 @@ struct Lowerer {
                     parts = std::move(rep);
                 }
                 return sized(concat(parts), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+            }
+            case ExpressionKind::Invalid: {
+                // An expression slang kept only as invalid because of a
+                // diagnostic msim turns into a warning: a reversed constant
+                // part select (11.5.1 makes it illegal; other simulators read
+                // x, and real designs have it in branches a parameter turns
+                // off). The select reads x; the operators around it work on
+                // that x, so `0 && v[31:34]` is still 0 (11.4.7).
+                const Expression* c = e.as<InvalidExpression>().child;
+                if (!c) unsupported("invalid expression");
+                auto xOf = [&](int w) { return sized(konst(allx(std::max(w, 1))), std::max(w, 1), false, ctx); };
+                if (c->kind == ExpressionKind::RangeSelect) {
+                    auto& rs = c->as<RangeSelectExpression>();
+                    int64_t w = 1;
+                    if (rs.getSelectionKind() == RangeSelectionKind::Simple)
+                        w = std::llabs(constInt(rs.left()) - constInt(rs.right())) + 1;
+                    else
+                        w = constInt(rs.right());
+                    return xOf((int)std::min<int64_t>(w, 1 << 20));
+                }
+                if (c->kind == ExpressionKind::Assignment) return expr(*c);
+                if (!c->type->isError()) {
+                    if (c->kind == ExpressionKind::BinaryOp || c->kind == ExpressionKind::UnaryOp) return expr(*c);
+                }
+                if (c->kind == ExpressionKind::BinaryOp) {
+                    auto& b = c->as<BinaryExpression>();
+                    switch (b.op) {
+                        case BinaryOperator::LogicalAnd: return sized(bin(Op::LogAnd, expr(b.left()), expr(b.right())), 1, false, ctx);
+                        case BinaryOperator::LogicalOr: return sized(bin(Op::LogOr, expr(b.left()), expr(b.right())), 1, false, ctx);
+                        default: break;
+                    }
+                    // Any other operator on an operand that reads x: x (11.4).
+                    // Its width is lost with the error, so 1 bit, which is
+                    // what the comparisons and reductions around a select give.
+                    return xOf(1);
+                }
+                if (c->kind == ExpressionKind::UnaryOp) return xOf(1);
+                if (c->kind == ExpressionKind::ConditionalOp) {
+                    auto& q = c->as<ConditionalExpression>();
+                    if (q.conditions.size() == 1 && !q.conditions[0].pattern) {
+                        E l = expr(q.left()), r = expr(q.right());
+                        int w = 1;   // the width a valid arm has (an invalid one lost it)
+                        for (const Expression* x : {&q.left(), &q.right()})
+                            if (!x->type->isError() && x->type->isIntegral()) w = std::max(w, (int)x->type->getBitWidth());
+                        return sized(node(Op::Mux, {expr(*q.conditions[0].expr), sized(l, w, false, ctx), sized(r, w, false, ctx)}), w, false, ctx);
+                    }
+                }
+                unsupported("invalid expression");
             }
             default:
                 throw std::runtime_error("lower: unsupported expression kind " + std::string(toString(e.kind)));
@@ -7972,7 +8072,29 @@ struct Lowerer {
         if (n == "$shortrealtobits" && args.size() == 1) return sysFnNode(SF_SR2BITS, {realOf(*args[0])});
         if (n == "$clog2" && args.size() == 1) return sysFnNode(SF_CLOG2, {a(0)});
         if (n == "$countones" && args.size() == 1) return sysFnNode(SF_COUNTBITS, {a(0)}, 2);
-        if (n == "$countbits" && args.size() >= 2) return sysFnNode(SF_COUNTBITS, {a(0)}, countCtl(args.subspan(1)));
+        if (n == "$countbits" && args.size() >= 2) {
+            bool allConst = true;
+            for (size_t k = 1; k < args.size(); k++) allConst &= tryConst(peel(*args[k])).isInteger();
+            if (allConst) return sysFnNode(SF_COUNTBITS, {a(0)}, countCtl(args.subspan(1)));
+            // A control bit known only at run time (20.9: its LSB counts):
+            // the count of each value that some control matches, added up.
+            int tmp = -1;
+            E v0 = a(0);
+            if (stmtDepth) { tmp = fresh(std::max(1, (int)args[0]->type->getBitWidth())); Instr t; t.k = IK::Assign; t.sig = tmp; t.e = v0; prog.emit(t); v0 = ref(tmp); }
+            static const Val vals[4] = {make(0, 0, 1), make(1, 0, 1), make(0, 1, 1), make(0, 1, 1, 1)};
+            E sum;
+            for (int b = 0; b < 4; b++) {
+                E any;
+                for (size_t k = 1; k < args.size(); k++) {
+                    E lsb = slice(expr(*args[k]), 0, 0);
+                    E m = bin(Op::CaseEq, lsb, konst(vals[b]));
+                    any = any ? bin(Op::LogOr, any, m) : m;
+                }
+                E cnt = mux(any, sysFnNode(SF_COUNTBITS, {v0}, 1 << b), konst(make(0, 0, 32, 0, true)));
+                sum = sum ? bin(Op::Add, sum, cnt) : cnt;
+            }
+            return sum;
+        }
         if ((n == "$onehot" || n == "$onehot0") && args.size() == 1) {
             E c = sysFnNode(SF_COUNTBITS, {a(0)}, 2);
             return bin(n == "$onehot" ? Op::Eq : Op::Le, c, konst(make(1, 0, 32, 0, true)));
@@ -8504,6 +8626,7 @@ struct Lowerer {
     std::unordered_map<const slang::ast::Expression*, int> exprOverride;
     using BeforeList = std::vector<std::pair<std::vector<E>, std::vector<E>>>;
     std::unordered_map<const slang::ast::Symbol*, E> exprBind;
+    std::unordered_map<const slang::ast::Symbol*, int64_t> exprIndexBind;   // item.index there
     // a.sum(), a.sum() with (expr) ... of a fixed-size array (7.12.3): the
     // elements folded, at the result's width.
     E fixedReduce(const slang::ast::CallExpression& call, std::string_view n) {
@@ -8518,12 +8641,18 @@ struct Lowerer {
         needWidth(w);
         Op op = n == "sum" ? Op::Add : n == "product" ? Op::Mul : n == "and" ? Op::And : n == "or" ? Op::Or : Op::Xor;
         E acc;
-        for (E x : el) {
+        const auto& fr = arr.type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
+        bool oneDim = (int64_t)el.size() == (int64_t)fr.width();
+        for (size_t k = 0; k < el.size(); k++) {
+            E x = el[k];
             E t;
             if (iter) {
                 exprBind[iv] = x;
+                // item.index: the declared index, left to right
+                if (oneDim) exprIndexBind[iv] = fr.left + (fr.left <= fr.right ? (int64_t)k : -(int64_t)k);
                 t = expr(*iter, ExprCtx{w, sg, sg, true});
                 exprBind.erase(iv);
+                exprIndexBind.erase(iv);
             } else t = resize(x, w, et.isSigned(), sg);
             acc = acc ? bin(op, acc, t) : t;
         }
@@ -8896,13 +9025,22 @@ struct Lowerer {
                 }
                 for (const Symbol* sym : v.found) {
                     auto pm = propMap().find(sym);
-                    if (pm == propMap().end() || symOverride.count(sym)) continue;
+                    if (pm == propMap().end() || symOverride.count(sym) || dynOverride.count(sym) || arrOverride.count(sym)) continue;
                     const Scope* sc = sym->getParentScope();
                     bool inObj = false;
                     for (ClassInfo* c = wc; c; c = c->base)
                         if (sc == static_cast<const Scope*>(c->ty)) inObj = true;
                     if (inObj) continue;
-                    if (pm->second.kind != 0) unsupported("an array or container of the caller in with {...}");
+                    if (pm->second.kind != 0) {   // the caller's array or container: through its address
+                        int t = fresh(64);
+                        auto ad = node(Op::Addr, {node(Op::This)});
+                        ad->sig = pm->second.kind == 1 ? pm->second.arr->base : pm->second.off;
+                        Instr a; a.k = IK::Assign; a.sig = t; a.e = ad;
+                        prog.emit(a);
+                        if (pm->second.kind == 1) arrOverride[sym] = {t, pm->second.arr};
+                        else dynOverride[sym] = {t, dynShapeOf(sym->as<ValueSymbol>().getType())};
+                        continue;
+                    }
                     int t = fresh(storeW(sym->as<ValueSymbol>().getType()));
                     Instr a; a.k = IK::Assign; a.sig = t;
                     a.e = ref(thisRel(pm->second.off));
@@ -9015,6 +9153,8 @@ struct Lowerer {
         curClass = savedCls;
         symOverride = std::move(savedOv);
         exprOverride.clear();
+        arrOverride.clear();
+        dynOverride.clear();
         i.sig = fresh(32);
         i.rc = rc;
         prog.emit(i);
@@ -10604,6 +10744,13 @@ struct Lowerer {
     // Assignments, ++/--, and system calls used as statements.
     void exprStmt(const slang::ast::Expression& ex) {
         using namespace slang::ast;
+        // An assignment kept invalid only for a reversed part select on its
+        // right (see onlyReversedSelects): the assignment, the select reading x.
+        if (ex.kind == ExpressionKind::Invalid && ex.as<InvalidExpression>().child &&
+            ex.as<InvalidExpression>().child->kind == ExpressionKind::Assignment) {
+            exprStmt(*ex.as<InvalidExpression>().child);
+            return;
+        }
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
             if (syncDrive(a) || vifSyncDrive(a)) return;   // cb.v <= e, v.cb.v <= e (14.16, 25.9)
@@ -10889,6 +11036,12 @@ struct Lowerer {
                 if (c && c->kind != StatementKind::ExpressionStatement && c->kind != StatementKind::ProceduralAssign &&
                     c->kind != StatementKind::ProceduralDeassign)
                     stmt(*c);
+                // A statement whose only fault is a reversed part select (a
+                // warning in msim, see Invalid in expr) runs, the select reading x.
+                else if (c && c->kind == StatementKind::ExpressionStatement) {
+                    bool found = false;
+                    if (onlyReversedSelects(c->as<ExpressionStatement>().expr, found) && found) stmt(*c);
+                }
                 break;
             }
             case StatementKind::List:
@@ -12238,7 +12391,7 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             shape->dims.push_back({ft.range.left, ft.range.right});
             total *= (int64_t)ft.range.width();
             if (total > kMaxArrayElems)
-                throw std::runtime_error("lower: unsupported array with more than 2^20 elements: " + std::string(s.name));
+                throw std::runtime_error("lower: unsupported array with more than 2^24 elements: " + std::string(s.name));
             t = &ft.elementType.getCanonicalType();
         }
         int w = storeW(*t);
@@ -13240,7 +13393,11 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
 
     void handle(const slang::ast::ContinuousAssignSymbol& ca) {
         using namespace slang::ast;
-        const auto& a = ca.getAssignment().as<AssignmentExpression>();
+        const Expression* ax = &ca.getAssignment();
+        if (bool found = false; ax->kind == ExpressionKind::Invalid && onlyReversedSelects(*ax, found) && found)
+            ax = ax->as<InvalidExpression>().child;   // a reversed part select on the right reads x
+        if (ax->kind != ExpressionKind::Assignment) Lowerer::unsupported("continuous assignment that did not bind");
+        const auto& a = ax->as<AssignmentExpression>();
         Lowerer::covLoc(ca.location);
         Lowerer::lastLoc() = ca.location;
         Lowerer lw(sigmap);
@@ -14802,7 +14959,10 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                 if (const Symbol* sym = x.getSymbolReference(); sym && sym->kind == SymbolKind::Net) n[sym]++;
             }
             void handle(const slang::ast::ContinuousAssignSymbol& a) {
-                const auto& x = a.getAssignment();
+                const slang::ast::Expression* xp = &a.getAssignment();
+                if (xp->kind == slang::ast::ExpressionKind::Invalid && xp->as<slang::ast::InvalidExpression>().child)
+                    xp = xp->as<slang::ast::InvalidExpression>().child;
+                const auto& x = *xp;
                 if (x.kind == slang::ast::ExpressionKind::Assignment) count(&x.as<slang::ast::AssignmentExpression>().left());
             }
             void handle(const slang::ast::NetSymbol& net) {

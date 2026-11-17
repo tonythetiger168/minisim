@@ -76,9 +76,25 @@ for x in 32 64; do
     expect "Zvbb, RV$x, VLEN $v: every instruction at SEW 8 to 64" 0 zvbb${x}_$v.out "checks passed, all"
     "$MVPLAT" "$E/zvfh$x.elf" -vlen $v -q > zvfh${x}_$v.out 2>&1; rc=$?
     expect "Zvfh, RV$x, VLEN $v: half precision against Zfh, five rounding modes" 0 zvfh${x}_$v.out "checks passed, all"
+    "$MVPLAT" "$E/bf16$x.elf" -vlen $v -q > bf16${x}_$v.out 2>&1; rc=$?
+    expect "Zfbfmin/Zvfbfmin/Zvfbfwma, RV$x, VLEN $v: BFloat16 conversions and widening multiply-add" 0 bf16${x}_$v.out "checks passed, all"
     "$MVPLAT" "$E/zvk$x.elf" -vlen $v -q > zvk${x}_$v.out 2>&1; rc=$?
     expect "Zvkned/Zvknhb/Zvkg/Zvbc, RV$x, VLEN $v: AES, SHA-2, GHASH known answers" 0 zvk${x}_$v.out "checks passed, all"
   done
+done
+"$MVPLAT" "$E/jit64.elf" -q > jit.out 2>&1; rc=$?
+expect "translator, RV64: M-extension corner cases, translated" 0 jit.out "checks passed, all"
+"$MVPLAT" "$E/jit64.elf" -q -nojit > jit_nojit.out 2>&1
+"$MVPLAT" "$E/jit64.elf" -q -quantum 7 > jit_q7.out 2>&1
+"$MVPLAT" "$E/jit64.elf" > jit_count.out 2>&1
+"$MVPLAT" "$E/jit64.elf" -nojit > jit_count_nojit.out 2>&1
+cmp -s jit.out jit_nojit.out && cmp -s jit.out jit_q7.out && \
+  [ "$(grep -o '[0-9]* instructions' jit_count.out)" = "$(grep -o '[0-9]* instructions' jit_count_nojit.out)" ] \
+  && ok "translator: the same checksum and instruction count as -nojit, and with a 7-cycle quantum" \
+  || bad "translator: differs from -nojit"
+for o in "" -nojit "-quantum 7" "-harts 2"; do
+  "$MVPLAT" "$E/smc64.elf" -q $o > smc.out 2>&1; rc=$?
+  expect "self-modifying code and FENCE.I, machine and supervisor mode (Sv39, an alias) ${o:-(translated)}" 0 smc.out "checks passed, all"
 done
 "$MVPLAT" "$E/svpbmt64.elf" -q > svpbmt.out 2>&1; rc=$?
 expect "Svpbmt (PBMT, menvcfg.PBMTE) and Zalasr (load-acquire, store-release)" 0 svpbmt.out "checks passed, all"

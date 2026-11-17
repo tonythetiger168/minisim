@@ -46,7 +46,9 @@ and store-release Zalasr (LB..LD.AQ, SB..SD.RL and their .AQRL forms;
 misaligned addresses raise address-misaligned exceptions), compare and
 swap Zacas (AMOCAS.W/D, AMOCAS.Q on RV64 and AMOCAS.D on RV32 with register
 pairs, AMOCAS.B/H), half-precision floating point Zfh (every operation,
-rounding mode and flag, NaN-boxed in the F registers), and the cache-block operations CBO.ZERO, CBO.CLEAN,
+rounding mode and flag, NaN-boxed in the F registers), BFloat16 Zfbfmin
+(FCVT.BF16.S and FCVT.S.BF16, with FLH, FSH, FMV.H.X and FMV.X.H from Zfh),
+and the cache-block operations CBO.ZERO, CBO.CLEAN,
 CBO.FLUSH and CBO.INVAL with 64-byte blocks; there are no caches, so the
 last three only check privilege), in machine,
 supervisor and user mode. The program's ELF class picks the width: a 64-bit
@@ -86,7 +88,14 @@ Zvfhmin) makes SEW 16 half precision for every vector floating-point
 instruction, widening to single and narrowing from it, and the conversions
 to and from 8, 16 and 32-bit integers; `tests/vplat/zvfh.c` checks each one
 against the scalar Zfh instruction in all five rounding modes, flags
-included. Vector cryptography: Zvkned (AES rounds, `vaesz`, the AES-128 and
+included. BFloat16 vectors at SEW 16: Zvfbfmin (`vfncvtbf16.f.f.w`,
+`vfwcvtbf16.f.f.v`) and Zvfbfwma (`vfwmaccbf16.vv/.vf`, BFloat16 sources
+widened exactly and fused into a single-precision accumulator);
+`tests/vplat/bf16.c` checks FCVT.BF16.S against a rounding model written
+from the specification and each vector form against the scalar ones.
+(QEMU 8.2 reads an F register that is not NaN-boxed as half precision's
+canonical NaN, 0x7e00, in FCVT.S.BF16; mvplat uses BFloat16's, 0x7fc0.)
+Vector cryptography: Zvkned (AES rounds, `vaesz`, the AES-128 and
 AES-256 key schedules), Zvknha and Zvknhb (SHA-256 and SHA-512 message
 schedule and rounds), Zvkg (GHASH), Zvksed (SM4 rounds and key
 schedule), Zvksh (SM3 message expansion and compression), Zvbc (`vclmul`,
@@ -452,39 +461,68 @@ Measured on the container this was developed in (4 cores), with
 | 1 hart | 150 to 170 MIPS |
 | 4 harts, 4 threads | 190 to 200 MIPS in all |
 
-Each hart keeps a cache of decoded instructions (32768 entries, by address),
+Each hart keeps a cache of decoded instructions (262144 entries, by
+physical address, so `SFENCE.VMA` and `satp` writes leave it alone),
 so an instruction is fetched, expanded from its compressed form and split
 into fields once. A hart in machine mode with no trace, profile,
 breakpoint, watchpoint, single step, write buffer, PMP lock or MPRV runs a
 fast loop: the common integer, branch, load and store instructions (RV32I,
 RV64I, MUL and MULW) go straight from the cache, each handler jumping to
 the next one's. A run of them up to a jump or branch becomes a basic block
-(2048 per hart, up to 32 instructions each) that runs with no pc or budget
+(16384 per hart, up to 32 instructions each) that runs with no pc or budget
 check inside; it is built from the cache and dropped with it. The same
 loop runs supervisor and user code with paging on: instructions from pages
 the hart has already fetched from at that privilege, loads and stores
 through the data page caches below; a miss leaves for the general path,
-which fills them. Linux boots to a BusyBox shell in about 7 s. It leaves, before the instruction, at anything else: a
+which fills them. Linux boots to a BusyBox shell in about 5 s (QEMU 8.2:
+1.5 s). It leaves, before the instruction, at anything else: a
 cache miss, a CSR, a device or `tohost` access, the last 7 bytes of a
 memory region, the end of the quantum. A 2.1 G-instruction RV64IMAC
 program (integer loops, a CRC, a sieve) runs at about 670 MIPS this way (136 before).
 As the ISA allows, a hart sees a store to code only after
-it executes `FENCE.I`; loading a program, a debugger write and `-restore`
-empty the cache too. With paging on, the page that instructions were last
+it executes `FENCE.I`. The hart keeps a copy of each page it decoded
+instructions from (up to 512 pages), and `FENCE.I` drops only what came
+from pages that differ from their copy, however they were changed (a store
+on any path, DMA, another hart); Linux runs about 4,600 of them while it
+boots, and they drop about 100 pages in all. Loading a program, a debugger
+write and `-restore` empty the cache. With paging on, the page that instructions were last
 fetched from stays translated and PMP-checked until the next `SFENCE.VMA`,
 `satp` or PMP write or change of privilege. Loads and stores with paging on
-keep the same for the last 64 pages of plain memory each read and wrote
+keep the same for the last 256 pages of plain memory each read and wrote
 (a page any part of which is a device, is only partly allowed by PMP, or holds
-`tohost` takes the general path). Linux boots at about 120 MIPS. Loads and
+`tohost` takes the general path). Linux boots at about 180 MIPS. Loads and
 stores to plain memory with nothing to check
 (no PMP in force, no watchpoint, no write buffer) take an inline path. RAM is
 mapped on first touch, so a large memory costs nothing until it is used. A
 co-simulated RTL access costs two socket round trips plus the RTL's own
 simulation time.
 
+On x86-64 hosts (Linux, macOS) an RV64 hart in machine mode under the same
+conditions runs translated code instead (`src/vp/jit.hpp`; `-nojit` turns
+it off). A block of up to 64 instructions (RV64I, M, and the compressed
+forms of both) becomes x86-64 code: up to seven of its busiest registers
+live in host registers, loads and stores go straight to host memory after
+one range check (the general path takes the rest), a jump or branch to a
+known address goes straight to the next block once that exists, and JALR
+looks its target up in a table. The budget is checked once per block; when
+the quantum ends inside a block, a counting copy of that block runs the
+rest exactly, so a run retires the same instructions on the same cycles
+as with `-nojit`. Translations are dropped with the decoded-instruction
+cache (FENCE.I, SFENCE.VMA, a new program). With one hart and no device that
+keeps time of its own, run() lets up to 64 quanta go by at once and cuts
+back to the quantum boundary after the first device access, which is what
+the quanta would have done.
+
+With `bench/mvplat/run.sh` (best of 3, wall clock, QEMU 8.2 with TCG on
+the same host), the translator brings CoreMark (4000 iterations) from 3.6 s
+to 0.40 s (QEMU 0.78 s), Dhrystone from 2.1 s to 0.28 s (QEMU 0.54 s), and
+each of the 17 Embench programs ahead of QEMU (0.04 to 0.19 s against 0.10
+to 0.28 s). Supervisor and user mode (Linux) and floating point still run
+on the fast loop.
+
 ## Limits / Not yet
 
-- No Zvfbfmin/Zvfbfwma (BF16), no Zbkc,
+- No Zbkc,
   no Svadu (hardware A/D update), and every hart of a platform
   has the program's width. F and D
   round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions
