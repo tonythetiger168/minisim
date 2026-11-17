@@ -505,7 +505,7 @@ public:
                     while (a < n.size() && std::isalpha((unsigned char)n[a])) a++;
                     std::string pre = n.substr(0, a);
                     if (a == n.size() || !std::isdigit((unsigned char)n[a])) return std::string();
-                    static const char* ok[] = {"proc", "ds", "dsT", "cyA", "cyB", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
+                    static const char* ok[] = {"proc", "ds", "dsT", "cyA", "cyB", "cyAT", "cyBT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
                     for (const char* k : ok) if (pre == k) return pre + (n.size() > 2 && n.compare(n.size() - 2, 2, "_2") == 0 ? "2" : "");
                     return std::string();
                 };
@@ -2813,6 +2813,26 @@ private:
     static constexpr long long kSlotRef = 1LL << 40, kAIRef = 2LL << 40, kCCRef = 3LL << 40;
     // -1: a signal outside the instance `key` (a top-level clock, say): the
     // same number in every copy. 5: an array shape (refToks makes them negative).
+    // The instance a signal belongs to, for sharing one copy of the code
+    // between instances of a module: the first name component (u3 of
+    // u3.cpu.pc), or, when the scope has generate or instance array indexes
+    // (soc.row[1].col[2].t.pc), the path down to the last of them, so that
+    // the tiles of a mesh are instances of their own. MSIM_SHAREKEY0: always
+    // the first component.
+    static std::string instKey(const std::string& m) {
+        static const bool first = std::getenv("MSIM_SHAREKEY0") != nullptr;
+        const size_t d = m.find('.');
+        if (d == std::string::npos) return "";
+        const size_t last = m.rfind('.');
+        size_t end = std::string::npos;
+        for (size_t at = 0; !first && at < last;) {
+            size_t nx = m.find('.', at);
+            if (nx == std::string::npos || nx > last) nx = last;
+            if (m.find('[', at) < nx) end = nx;
+            at = nx + 1;
+        }
+        return end == std::string::npos ? m.substr(0, d) : m.substr(0, end);
+    }
     int refCls(long long n, const std::string& key) const {
         if (n < 0) return 5;
         if (n >= kCCRef) return 8;
@@ -2950,15 +2970,14 @@ private:
             if (r < 0) refScan(text[j], [&](size_t, size_t, size_t, long long n, int kind) { if (r < 0 && kind <= 1 && good(n)) r = (int)n; });
             return keySig[j] = r;
         };
-        auto key = [&](size_t j) -> std::string {   // the instance: the first name component
+        auto key = [&](size_t j) -> std::string {   // the instance (instKey)
             int sg = ksig(j);
             if (sg < 0) return "";
-            const std::string& n = sigName_[sg];
-            return n.substr(0, n.find('.'));
+            return instKey(sigName_[sg]);
         };
         auto rest = [&](size_t j) {
             const std::string& n = sigName_[ksig(j)];
-            return n.substr(n.find('.') + 1);
+            return n.substr(instKey(n).size() + 1);
         };
         for (size_t a = 0; a < js.size();) {
             size_t b = a;
@@ -3142,7 +3161,7 @@ private:
                 if ((in.k == IK::Nba || in.k == IK::Assign) && in.sig >= 0 && (size_t)in.sig < sigName_.size()) {
                     const std::string& m = sigName_[in.sig];
                     size_t d = m.find('.');
-                    if (d != std::string::npos && m[0] != '_' && m[0] != '$') return m.substr(0, d);
+                    if (d != std::string::npos && m[0] != '_' && m[0] != '$') return instKey(m);
                 }
             return "";
         };
@@ -3423,6 +3442,9 @@ private:
     std::vector<int> coneIns_;   // emitCycle: the outside signals of the clock cone (combCone), sorted
     std::map<int, std::vector<int>> snap_;   // emitCycle: per domain process, the registers it reads from a snapshot (sorted)
     const bool noCySplit_ = std::getenv("MSIM_NOCYSPLIT") != nullptr;   // a merged comb cycle in one function
+    const bool noShareCy_ = std::getenv("MSIM_NOSHARE") != nullptr;   // the members of a merged cycle: one copy per module
+    int cySerial_ = 0;
+    std::map<std::string, std::vector<std::tuple<int, std::string, std::string>>> cyTmpl_;   // shape -> (id, instance, text)
     std::set<int> viaK_;         // domain NBA targets also written at a run-time index: all through DNB (see the domain choice)
     bool dAhead_ = false;        // emitCycle: a direct NBA some comb process reads (DAHEAD, see directNba)
     // Of those, the clocks themselves, and their own smaller cone (combConeK):
@@ -4509,8 +4531,9 @@ private:
             const Prog& cp = *procs[i].prog;
             if (combBranches(cp)) {
                 std::string c4 = "    {\n", c2 = "    {\n";
-                auto L4 = [&](size_t pc) { return "cb" + std::to_string(i) + "_" + std::to_string(pc); };
-                auto L2 = [&](size_t pc) { return "cq" + std::to_string(i) + "_" + std::to_string(pc); };
+                size_t lbase = 0;   // a merged block's member: its labels count from its start
+                auto L4 = [&](size_t pc) { return "cb" + std::to_string(i) + "_" + std::to_string(pc - lbase); };
+                auto L2 = [&](size_t pc) { return "cq" + std::to_string(i) + "_" + std::to_string(pc - lbase); };
                 if (deadProc[i]) {
                     size_t pc = 0;
                     for (; pc < cp.code.size(); pc++) {
@@ -4623,13 +4646,58 @@ private:
                     if (sg < cp.segs.size() && cp.segs[sg].first == pc && cp.segs[sg].second > pc && !noCySplit_) {
                         const size_t e = cp.segs[sg].second;
                         std::string h4, h2;
+                        lbase = pc;
                         for (size_t q = pc; q < e; q++) one(q, h4, h2);
+                        h4 += L4(e) + ": ;\n";
+                        h2 += L2(e) + ": return false;\n";
+                        lbase = 0;
                         for (size_t at; (at = h2.find("@BAIL@")) != std::string::npos;) h2.replace(at, 6, "return true;");
-                        const std::string f = std::to_string(i) + "_" + std::to_string(sg);
-                        o << "static void cyA" << f << "() {\n    const bool obs = S.observed; (void)obs;\n" << h4 << L4(e) << ": ;\n}\n";
-                        o << "static bool cyB" << f << "() {\n    const bool obs = S.observed; (void)obs;\n" << h2 << L2(e) << ": return false;\n}\n";
-                        c4 += L4(pc) + ": cyA" + f + "(); goto " + L4(e) + ";\n";
-                        c2 += L2(pc) + ": if (cyB" + f + "()) { @BAIL@ } goto " + L2(e) + ";\n";
+                        // Members of other instances of one module share one copy
+                        // (the same text but for signal numbers moved by D, as shareChunks).
+                        std::string key;
+                        for (size_t q = pc; q < e && key.empty(); q++) {
+                            const Instr& in = cp.code[q];
+                            if (in.k == IK::Assign && !in.tmp && in.sig >= 0 && (size_t)in.sig < sigName_.size()) {
+                                const std::string& m = sigName_[in.sig];
+                                if (!m.empty() && m[0] != '_' && m[0] != '$') key = instKey(m);
+                            }
+                        }
+                        const std::string both = h4 + "\x01" + h2;
+                        int id = -1;
+                        std::array<long long, kRefCls> D{};
+                        if (!key.empty() && !noShareCy_) {
+                            RefToks rt = refToks(both);
+                            std::string shape;
+                            for (auto& pcs : rt.piece) shape += pcs + "\x02";
+                            auto& lst = cyTmpl_[shape];
+                            for (auto& [tid, tk, tt] : lst) {
+                                std::array<long long, kRefCls> Dx{};
+                                bool set[kRefCls] = {};
+                                if (refMatch(tt, both, tk, key, Dx.data(), set)) { id = tid; D = Dx; break; }
+                            }
+                            if (id < 0) {
+                                id = cySerial_++;
+                                lst.push_back({id, key, both});
+                                o << "static void cyAT" << id << "(" << dParams() << ") {\n    const bool obs = S.observed; (void)obs;" << dUnused() << "\n"
+                                  << refParam(h4, key) << "}\n";
+                                o << "static bool cyBT" << id << "(" << dParams() << ") {\n    const bool obs = S.observed; (void)obs;" << dUnused() << "\n"
+                                  << refParam(h2, key) << "}\n";
+                            } else shareSaved_ += h4.size();
+                        }
+                        std::string f;
+                        if (id >= 0) {
+                            std::string args;
+                            for (int c = 0; c < kRefCls; c++) args += (c ? ", " : "") + std::to_string(D[c]);
+                            c4 += L4(pc) + ": cyAT" + std::to_string(id) + "(" + args + "); goto " + L4(e) + ";\n";
+                            c2 += L2(pc) + ": if (cyBT" + std::to_string(id) + "(" + args + ")) { @BAIL@ } goto " + L2(e) + ";\n";
+                        } else {
+                            f = std::to_string(i) + "_" + std::to_string(sg);
+                            o << "static void cyA" << f << "() {\n    const bool obs = S.observed; (void)obs;\n" << h4 << "}\n";
+                            o << "static bool cyB" << f << "() {\n    const bool obs = S.observed; (void)obs;\n" << h2 << "}\n";
+                            c4 += L4(pc) + ": cyA" + f + "(); goto " + L4(e) + ";\n";
+                            c2 += L2(pc) + ": if (cyB" + f + "()) { @BAIL@ } goto " + L2(e) + ";\n";
+                        }
+                        shareTotal_ += h4.size();
                         pc = e - 1;
                         continue;
                     }
