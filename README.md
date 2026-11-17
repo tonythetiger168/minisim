@@ -764,6 +764,17 @@ here is the reading half: the checks above, on RTL, before any of that.
 every path, and the union-find that makes one clock one domain across module
 boundaries.
 
+### AI agents: `mmcp`
+
+`mmcp` is an MCP server: an AI agent (Claude Code, Cursor, VS Code, or an
+agent on another model) calls msim, mlint, mcov, mdebug, mregress and mplan
+as tools and reads JSON back. See docs/MCP.md.
+
+```sh
+claude mcp add minisim -- mmcp -root .
+mmcp -call msim_run '{"files": ["tb.sv"], "top": "tb"}'
+```
+
 ### Support agents: `msupport`
 
 Each product has an AI support agent that answers users' questions from that
