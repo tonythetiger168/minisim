@@ -121,4 +121,48 @@ cat iv1.bin ct1.bin > data1.bin
 want "tb: y=55"
 grep -qF "no digest_block" log || fail "no warning for a clause 34 data_block without a digest"
 
+# ---- an IEEE 1735-2014 version 2 envelope, as AMD Vivado writes them --------
+# The key_block holds the session key plus 1 (version - 1, 5.3.2); the HMAC
+# in end_toolblock covers the tool block without its markup (7.4.3).
+while :; do
+  "$OPENSSL" rand -out sk2.bin 16
+  last=$(od -An -v -tu1 -j15 -N1 sk2.bin | tr -d ' ')
+  [ "$last" -lt 255 ] && break
+done
+skh=$(hex sk2.bin)
+salth=$(printf '%s%02x' "$(echo "$skh" | cut -c1-30)" $((last + 1)))
+head -c 15 sk2.bin > salt2.bin
+printf "\\$(printf '%03o' $((last + 1)))" >> salt2.bin
+[ "$(hex salt2.bin)" = "$salth" ] || fail "salting the key in the shell"
+"$OPENSSL" pkeyutl -encrypt -pubin -inkey acme_pub.pem -pkeyopt rsa_padding_mode:pkcs1 -in salt2.bin -out kb2.bin
+"$OPENSSL" rand -out iv2.bin 16
+"$OPENSSL" enc -aes-128-cbc -K "$skh" -iv "$(hex iv2.bin)" -in "$T/interop_ip.sv" -out ct2.bin
+cat iv2.bin ct2.bin > data2.bin
+{
+  echo '`pragma protect begin_toolblock'
+  echo '`pragma protect key_keyowner = "Acme", key_keyname = "acme-1", key_method = "rsa", rights_digest_method = "sha256"'
+  printf '`pragma protect encoding = (enctype = "BASE64", line_length = 64, bytes = %s)\n' "$(wc -c < kb2.bin)"
+  echo '`pragma protect key_block'
+  "$OPENSSL" base64 -in kb2.bin
+} > tb2.txt
+sed -e 's/^`pragma protect //' -e '/^begin_toolblock$/d' tb2.txt > rights2.txt
+mac=$("$OPENSSL" dgst -sha256 -mac HMAC -macopt "hexkey:$salth" -binary rights2.txt | "$OPENSSL" base64 -A)
+{
+  echo '`pragma protect begin_protected'
+  echo '`pragma protect version = 2'
+  echo '`pragma protect encrypt_agent = "other_vendor", encrypt_agent_info = "2014"'
+  cat tb2.txt
+  printf '`pragma protect end_toolblock = "%s"\n' "$mac"
+  echo '`pragma protect data_method = "AES128-CBC"'
+  printf '`pragma protect encoding = (enctype = "BASE64", line_length = 64, bytes = %s)\n' "$(wc -c < data2.bin)"
+  echo '`pragma protect data_block'
+  "$OPENSSL" base64 -in data2.bin
+  echo '`pragma protect end_protected'
+} > v2.svp
+"$MSIM" -keyfile Acme:acme-1=acme.pem v2.svp "$T/interop_tb.sv" > log 2>&1 || fail "the version 2 envelope did not run"
+want "tb: y=55"
+sed 's/key_method = "rsa"/key_method = "rsa" /' v2.svp > v2_changed.svp
+"$MSIM" -keyfile Acme:acme-1=acme.pem v2_changed.svp "$T/interop_tb.sv" > log 2>&1 && fail "a changed tool block should fail the digest"
+want "end_toolblock digest does not match"
+
 echo "ok    msim opens IEEE 1735 and clause 34 envelopes it did not make"

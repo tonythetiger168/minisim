@@ -377,6 +377,53 @@ int main() {
             assert(l.size() == 2 && l[0].name == "m.a" && l[1].name == "m.blk.b");
         }
 
+        // IEEE 1735-2014 version 2, the format AMD Vivado reads and writes:
+        // salted session key (5.3.2) and a rights digest per tool block (7.4.3).
+        {
+            assert(v3::saltKey(std::string("\x01\x23\xff", 3), 1) == std::string("\x01\x24\x00", 3));
+            assert(v3::saltKey(std::string("\xff\xff", 2), 1) == std::string("\x00\x00", 2));
+            assert(v3::saltKey(std::string("\x00\x00", 2), -1) == std::string("\xff\xff", 2));
+            // 7.4.3.1: markup, blank lines and the block lines go.
+            assert(v3::rightsText("`pragma protect begin_toolblock\n  `pragma protect key_keyowner=\"a\"  \r\n\n"
+                                  "`protect key_block\nQUJD\n`pragma protect end_toolblock=\"x\"\n") ==
+                   "key_keyowner=\"a\"\nkey_block\nQUJD\n");
+            V3Options v2 = va;
+            v2.version = 2;
+            v2.tools[0].controls.push_back("visibility = \"full\"");
+            std::string e2 = encryptSourceV3(VP, v2, "vp.sv");
+            assert(e2.find("version = 2") != std::string::npos && e2.find("rights_digest_method") != std::string::npos);
+            assert(e2.find("viewport") == std::string::npos && e2.find("hidden2") == std::string::npos);
+            Decrypted d2 = decryptSource(e2, a, "vp.svp");
+            assert(d2.envs[0].version == 2 && d2.envs[0].owner == "Alice Corp");
+            assert(d2.envs[0].right("visibility") == "full");
+            assert(d2.envs[0].viewports.size() == 3 && d2.text.find("viewport") == std::string::npos);
+            assert(d2.text.find("reg [1:0] seen, also;") != std::string::npos);
+            // A changed right fails the digest; a changed data_block fails to decrypt.
+            std::string bad = e2;
+            bad.replace(bad.find("\"full\""), 6, "\"none\"");
+            assert(throws([&] { decryptSource(bad, a, "vp.svp"); }, "end_toolblock digest does not match"));
+            size_t db = e2.find("`pragma protect data_block\n") + 27 + 40;
+            bad = e2;
+            bad[db] = bad[db] == 'A' ? 'B' : 'A';
+            // Version 2 has no digest over the data, so a change there is not
+            // caught; msim says so when it opens one.
+            int w2 = 0;
+            DecryptOptions dw2;
+            dw2.warn = [&](const std::string& m) { w2 += m.find("no digest of the data") != std::string::npos; };
+            assert(decryptSource(bad, a, "vp.svp", dw2).text != d2.text);
+            assert(w2 == 1);
+            // Upper-case names outside the tool blocks, as Vivado writes them
+            // (inside, they are covered by the digest and stay as written).
+            std::string up = e2;
+            size_t dm = up.find("data_method");
+            for (auto [from, to] : {std::pair<std::string, std::string>{"\"aes128-cbc\"", "\"AES128-CBC\""},
+                                    {"\"base64\"", "\"BASE64\""}})
+                for (size_t q = up.find(from, dm); q != std::string::npos; q = up.find(from, q)) up.replace(q, from.size(), to);
+            assert(decryptSource(up, a, "vp.svp").envs[0].version == 2);
+            Keyring none2;
+            assert(throws([&] { decryptSource(e2, none2, "vp.svp"); }, "no key for this protected envelope"));
+        }
+
         // The same viewports in a clause 34 envelope (msimprotect -v1): read
         // and blanked too, so the compiler never sees `pragma protect viewport.
         {
@@ -536,7 +583,8 @@ int main() {
             std::string u = sub("`pragma protect version=3\n", "`pragma protect version=3, author=\"x\"\n");
             assert(throws([&] { decryptSource(u, a, "v.svp"); }, "alone"));
             std::string w = sub("`pragma protect version=3\n", "`pragma protect version=2\n");
-            assert(throws([&] { decryptSource(w, a, "v.svp"); }, "version 2 envelopes are not supported"));
+            // A version 3 envelope relabelled 2 is read as version 2, and fails.
+            assert(throws([&] { decryptSource(w, a, "v.svp"); }, "data_method"));
             std::string nosig = e3.substr(0, ep) + "`pragma protect end_protected\n";
             assert(throws([&] { decryptSource(nosig, a, "v.svp"); }, "no signature"));
         }
