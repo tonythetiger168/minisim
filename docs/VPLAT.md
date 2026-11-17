@@ -496,9 +496,12 @@ As the ISA allows, a hart sees a store to code only after
 it executes `FENCE.I`. The hart keeps a copy of each page it decoded
 instructions from (up to 512 pages), and `FENCE.I` drops only what came
 from pages that differ from their copy, however they were changed (a store
-on any path, DMA, another hart); Linux runs about 4,600 of them while it
-boots, and they drop about 100 pages in all. Loading a program, a debugger
-write and `-restore` empty the cache. With paging on, the page that instructions were last
+on any path, DMA, another hart). Those pages are also read-only on the host
+(Linux and macOS): the first store to one faults and marks it written, so
+`FENCE.I` compares only pages written since it last looked
+(`MVPLAT_NO_WTRACK=1` compares them all). Linux runs about 4,600 `FENCE.I`
+while it boots, and they drop about 100 pages in all. Loading a program, a
+debugger write and `-restore` empty the cache. With paging on, the page that instructions were last
 fetched from stays translated and PMP-checked until the next `SFENCE.VMA`,
 `satp` or PMP write or change of privilege. Loads and stores with paging on
 keep the same for the last 256 pages of plain memory each read and wrote
