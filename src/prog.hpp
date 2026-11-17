@@ -557,6 +557,11 @@ struct Prog {
     // code[0] is its sensitivity list. Processes woken mid-body run first on
     // the event (see Sim::set), as other simulators order them.
     bool alwaysTop = false;
+    // An always_comb (or always @*) whose sensitivity is everything it
+    // reads: the pc of that wait, which goes back to waiting when the values
+    // it watches are those it last ran with (a change and back by another
+    // process, see exec.inc). -1: none.
+    int settleWait = -1;
     std::vector<Instr> code;
     const void* sub = nullptr;    // a task or function body: its slang SubroutineSymbol (VPI frames)
     const void* inst = nullptr;   // msim -cov: the instance it runs in (slang InstanceSymbol), for VPI (40)
