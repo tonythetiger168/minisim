@@ -82,6 +82,16 @@ for x in 32 64; do
     expect "Zvkned/Zvknhb/Zvkg/Zvbc, RV$x, VLEN $v: AES, SHA-2, GHASH known answers" 0 zvk${x}_$v.out "checks passed, all"
   done
 done
+"$MVPLAT" "$E/jit64.elf" -q > jit.out 2>&1; rc=$?
+expect "translator, RV64: M-extension corner cases, translated" 0 jit.out "checks passed, all"
+"$MVPLAT" "$E/jit64.elf" -q -nojit > jit_nojit.out 2>&1
+"$MVPLAT" "$E/jit64.elf" -q -quantum 7 > jit_q7.out 2>&1
+"$MVPLAT" "$E/jit64.elf" > jit_count.out 2>&1
+"$MVPLAT" "$E/jit64.elf" -nojit > jit_count_nojit.out 2>&1
+cmp -s jit.out jit_nojit.out && cmp -s jit.out jit_q7.out && \
+  [ "$(grep -o '[0-9]* instructions' jit_count.out)" = "$(grep -o '[0-9]* instructions' jit_count_nojit.out)" ] \
+  && ok "translator: the same checksum and instruction count as -nojit, and with a 7-cycle quantum" \
+  || bad "translator: differs from -nojit"
 "$MVPLAT" "$E/svpbmt64.elf" -q > svpbmt.out 2>&1; rc=$?
 expect "Svpbmt (PBMT, menvcfg.PBMTE) and Zalasr (load-acquire, store-release)" 0 svpbmt.out "checks passed, all"
 

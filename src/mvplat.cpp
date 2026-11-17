@@ -77,6 +77,7 @@ void usage() {
         "  -max-cycles N      stop after N cycles (exit code 4)\n"
         "  -input TEXT        characters the first UART receives\n"
         "  -trace FILE        commit log, one line per instruction (spike's format)\n"
+        "  -nojit             interpret only (no translation to host code)\n"
         "Booting an operating system (as QEMU's -bios, -kernel, -initrd, -append, -dtb):\n"
         "  -bios FILE         firmware run first, in machine mode (OpenSBI fw_dynamic)\n"
         "  -kernel FILE       kernel (a raw Image or an ELF) the firmware starts in supervisor mode\n"
@@ -118,7 +119,7 @@ struct Options {
     unsigned threads = par::defaultThreads();
     long long quantum = -1, maxCycles = 0;
     double mhz = 0;
-    bool map = false, quiet = false;
+    bool map = false, quiet = false, nojit = false;
     bool haveInput = false;
 };
 
@@ -171,6 +172,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     m.tick_ps = std::max<uint64_t>(1, (uint64_t)(1e12 / mt + 0.5));
     m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : 1000;
     if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
+    if (o.nojit) m.jit = false;
     if (!m.quantum) throw std::runtime_error("the quantum must be at least one cycle");
     uint64_t reset = pl.get("reset") ? pl.get("reset")->u64() : 0x80000000u;
     m.addHarts(nh, reset);
@@ -515,6 +517,7 @@ int main(int argc, char** argv) {
         else if (s == "-vlen") o.vlen = (unsigned)std::stoul(next("128, 256, 512 or 1024"));
         else if (s == "-map") o.map = true;
         else if (s == "-q") o.quiet = true;
+        else if (s == "-nojit") o.nojit = true;
         else if (!s.empty() && s[0] == '-') {
             int used = 0;
             try {
