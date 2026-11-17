@@ -87,6 +87,13 @@ module mc_tile #(parameter int XW = 1, YW = 1, X = 1, Y = 1, CORE = 0, L2_LINES 
     .n2_v(lv[1]), .n2_rdy(lr[1]), .n2_f(lf[1]),
     .n3_v(tv[2]), .n3_rdy(tr[2]), .n3_f(tf[2]));
   assign req_ready = loc_ready | l1_ready;
+`ifdef MC_TRACE
+  // +define+MC_TRACE: one line per completed core access
+  always @(posedge clk)
+    if (req_valid && req_ready)
+      $display("%0t tile %0d %s %h %h", $time, my_id, req_wstrb != 4'd0 ? "W" : "R", req_addr,
+               req_wstrb != 4'd0 ? req_wdata : rdata);
+`endif
   assign rdata = loc_ready ? loc_rdata : l1_rdata;
 
   // ---- L2 slice ----

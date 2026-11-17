@@ -20,8 +20,9 @@ taken from OpenPiton): an X x Y mesh of tiles, each with
 
 * a RISC-V core: `mcrv` (our own RV32I, `bench/manycore/mc_rv.sv`, the
   default, needs no download), `picorv32`, `femtorv32`, or a mix
-  (`--core mix` is a checkerboard of PicoRV32 and FemtoRV32; a comma list
-  such as `--core mcrv,picorv32,femtorv32` repeats over the tiles),
+  `cva6` (OpenHW CVA6 / Ariane, see below), or a mix (`--core mix` is a
+  checkerboard of PicoRV32 and FemtoRV32; a comma list such as
+  `--core cva6,mcrv,picorv32` repeats over the tiles),
 * 4 KB of private RAM with the program,
 * a private L1 data cache (direct-mapped, write-through),
 * one slice of the distributed shared L2 (lines homed by address mod N), with
@@ -62,6 +63,33 @@ Verilator 5.054 `-O3`; seconds; every run printed PASS with the same checksum):
 |---|---|---|---|---|---|
 | 4x4 | 16 | 11,101 | 4.1 | 22.1 | 0.2 |
 | 8x8 | 64 | 13,667 | 28.0 | | |
+
+### CVA6 (Ariane) tiles
+
+```sh
+python3 bench/manycore/fetch_cva6.py cva6dir      # pinned CVA6 + cvfpu + hpdcache, config, file list
+python3 bench/gen_manycore.py --core cva6 --mesh 4x4 > mc.sv
+verilator --binary -Wno-fatal -Wno-lint -Wno-style -Wno-UNOPTFLAT --top-module mc_tb -f cva6dir/cva6.f mc.sv
+```
+
+CVA6 is not copied into minisim; the script clones it (Solderpad 0.51,
+hpdcache Solderpad 2.1, cvfpu's T-Head divider Apache-2.0) and derives a
+config from `cv32a6_imac_sv32`: RV32IMAC with its own I-cache and
+write-through D-cache, where only the private RAM is cacheable (so every
+shared access goes through the tile's coherent L1) and the
+fetch-and-increment alias and MMIO are non-idempotent. `bench/manycore/mc_cva6.sv`
+turns its AXI4 port into the tile port. With CVA6 the program gets FENCEs
+around each barrier (RVWMO), so CVA6 cannot share a mesh with FemtoRV32,
+which does not decode FENCE.
+
+On Verilator 5.054 1x1, 2x2, 4x4 and a 3x3 mix of CVA6, mcrv and PicoRV32
+print PASS. msim does not elaborate it yet:
+`core/cva6_mmu/cva6_mmu.sv:405` selects `[31:34]` in a branch that is dead for
+RV32, which slang reports as an error (Verilator only warns). Turning the MMU
+off avoids that file but is not an option: with `MmuPresent = 0` CVA6 checks
+non-idempotence against the previous access's address, issued the
+fetch-and-increment load speculatively and then replayed it, and the
+barrier hung.
 
 `msim -compile` gives the same result on 4x4 but its build took 9 min 40 s,
 against 4 s for the interpreter: this design is the next compiled-mode case.
