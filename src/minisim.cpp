@@ -57,6 +57,8 @@ using namespace std;
 using Handle = coroutine_handle<>;
 
 #include "prog.hpp"
+#include "dpiconv.hpp"
+#include <dlfcn.h>
 #include "cpu.hpp"
 #include "profile.hpp"
 #include "sva.hpp"
@@ -3480,6 +3482,26 @@ MSIM_KDEF int Sim::sig(const string& n, int w, bool net) {
 // destructor and everything they reach.
 #ifdef MINISIM_EXTERN_S
 extern Sim S;
+
+// msim -compile: the DPI-C libraries simv loads (codegen.hpp
+// compileDpiLibs, pushed by its main) and the C function of an import,
+// looked up once per call site. The interpreter has its own (dpi.inc).
+inline std::vector<std::string>& cdpiLibs() { static std::vector<std::string> v; return v; }
+inline void* cdpiSym(const char* name) {
+    static std::vector<void*> libs = [] {
+        std::vector<void*> h;
+        for (auto& p : cdpiLibs()) {
+            void* l = dlopen(p.c_str(), RTLD_LAZY | RTLD_GLOBAL);
+            if (!l) { std::cerr << "simv: DPI: cannot load " << p << ": " << dlerror() << "\n"; std::exit(1); }
+            h.push_back(l);
+        }
+        return h;
+    }();
+    for (void* l : libs) if (void* f = dlsym(l, name)) return f;
+    if (void* f = dlsym(RTLD_DEFAULT, name)) return f;
+    std::cerr << "simv: DPI: no C function \"" << name << "\"\n";
+    std::exit(1);
+}
 #else
 inline Sim S;
 #endif

@@ -101,7 +101,9 @@ set(CASES
   "examples/cli/init.sv"
   "examples/cli/adder.sv examples/cli/adder_tb.sv -top adder_tb +define+WIDTH=8"
   "examples/cli/spin.sv -maxtime 25"
-  "bench/lanes.sv +define+END_TIME=2000")
+  "bench/lanes.sv +define+END_TIME=2000"
+  "tests/spec/35.5.6-arg-types.sv tests/spec/data/dpi/types.c"
+  "tests/spec/35.5.6-shortreal.sv tests/spec/data/dpi/shortreal.c")
 set(n 0)
 foreach(c IN LISTS CASES)
   math(EXPR mine "${n} % ${SHARDS}")
@@ -113,7 +115,7 @@ foreach(c IN LISTS CASES)
   separate_arguments(args UNIX_COMMAND "${c}")
   set(files "")
   foreach(a IN LISTS args)
-    if(a MATCHES "\\.sv$")
+    if(a MATCHES "\\.(sv|c)$")
       list(APPEND files "${SRC}/${a}")
     else()
       list(APPEND files "${a}")
@@ -173,6 +175,13 @@ foreach(c IN LISTS CASES)
     # ... and the commit list stores value words alone while pclean holds.
     if(NOT gen MATCHES "if \\(C0TWO\\)")
       message(FATAL_ERROR "${c}: the commit list has no value-only path")
+    endif()
+  endif()
+  # DPI-C imports are called from simv itself (codegen.hpp dpiCall).
+  if(c MATCHES "^tests/spec/35")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(NOT gen MATCHES "cdpiSym\\(")
+      message(FATAL_ERROR "${c}: the DPI-C import is not called from compiled code")
     endif()
   endif()
   # A cycle of comb blocks runs as one merged block, a function per member
