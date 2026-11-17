@@ -59,3 +59,17 @@ THE SOFTWARE.
   text and syntax rules (`src/lintsrc.hpp`) check the same things as a
   number of Verible's lint rules and name them in `mlint -explain`. They
   are written for slang's syntax tree; no Verible source is included.
+
+## VS Code language client and its dependencies (editors/vscode)
+
+- Packages (npm, pinned in `editors/vscode/package-lock.json`):
+  vscode-languageclient 9.0.1, vscode-languageserver-protocol 3.17.5,
+  vscode-languageserver-types 3.17.5, vscode-jsonrpc 8.2.0 (MIT,
+  Microsoft, https://github.com/microsoft/vscode-languageserver-node);
+  minimatch 5.1.9 and semver 7.8.6 (ISC); brace-expansion 2.1.8 and
+  balanced-match 1.0.2 (MIT).
+- Used by: the VS Code extension (`editors/vscode/`) to talk to `mlsp`. They
+  are not in the tree; npm installs them and they are packed into the
+  extension's `.vsix` with their own license files.
+- License: MIT and ISC (texts in each package's `LICENSE` file inside the
+  `.vsix`).

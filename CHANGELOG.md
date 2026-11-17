@@ -8,6 +8,25 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mlsp: a language server (LSP 3.17, stdio) for SystemVerilog and Verilog on
+  slang set up as msim: diagnostics as you type from unsaved buffers, go to
+  definition and references (ports, parameters, packages, types, enum
+  values, functions, class members, instances), hover with types, values
+  and hierarchical paths, outline, workspace symbols, completion, mlint
+  findings on save, and `minisim/compileInfo` for editors. It follows the
+  open file's design through the workspace or takes a `-f` list.
+  `mlsp -check` prints the same diagnostics. `docs/LSP.md`.
+- VS Code extension (`editors/vscode/`): starts mlsp, syntax colours, runs
+  msim on the open design as a task with a problem matcher, opens the
+  waveform in mdebug's viewer, shows mcov coverage in VS Code's coverage
+  view, and registers the minisim MCP server (`mmcp`) for agents.
+- mvplat: Linux boots to a BusyBox shell in 5.1 s instead of 7.2 s (one
+  hart). The decoded-instruction cache goes by physical address, so
+  `SFENCE.VMA` and `satp` writes keep it, and is 8 times larger;
+  `FENCE.I` drops only instructions from pages that changed since they
+  were decoded (Linux runs about 4,600 while booting); larger fetch and data
+  page records. `tests/vplat/smc.c` (self-modifying code, machine and
+  supervisor mode, through an alias).
 - mvplat: a dynamic translator to x86-64 for RV64 machine-mode code (RV64I,
   M, C): register allocation per block, direct block linking, an
   indirect-jump table, exact instruction counts (a counting copy of a block
