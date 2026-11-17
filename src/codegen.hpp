@@ -1041,6 +1041,7 @@ private:
                u + ") & " + m + "; q.x = 0; q.z = 0; q.real = false; q.str = false; } else S.fwSlow(" + S_ + ", make((" + u +
                ") & " + m + ", 0, " + std::to_string(sigW_[s]) + ")); }";
     }
+    const bool noSetBit_ = std::getenv("MSIM_NOSETBIT") != nullptr;   // a one-bit write goes through set()
     bool isPriv(int s) const { return s >= 0 && s < (int)priv_.size() && priv_[s]; }
     // Found while emitting: a private signal used where only S.sigs works (an
     // interpreted operator, an assertion). run() ends with CodegenRetry and
@@ -1798,6 +1799,8 @@ private:
         else if (i.hi >= 0)
             o << " S.set(" << i.sig << ", v_insert(S.get(" << i.sig << "), " << val << ", " << i.hi << ", " << i.lo
               << "));\n";
+        else if (sigW_[i.sig] == 1 && !sigNet_[i.sig] && !noSetBit_)
+            o << " S.setOneBit(" << i.sig << ", " << val << ");\n";
         else
             o << " S.set(" << i.sig << ", " << val << ");\n";
         return o.str();
@@ -2740,7 +2743,7 @@ private:
     // calls f(at, len, N) for each.
     template <class F> static void refScan(const std::string& t, F&& f) {
         static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
-                                    "S.get(", "S.set(", "S.poke(", "R(", "int s = "};   // the last: dynTarget
+                                    "S.get(", "S.set(", "S.setOneBit(", "S.poke(", "R(", "int s = "};   // the last: dynTarget
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
         for (size_t i = 0; i < t.size(); i++) {
             char c = t[i];

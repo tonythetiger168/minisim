@@ -78,6 +78,7 @@ set(CASES
   "examples/deadseq.sv"
   "-x-assign 0 -x-initial 0 examples/deadseq.sv"
   "examples/procorder.sv"
+  "examples/onebitclk.sv"
   "-x-assign 0 -x-initial 0 examples/procorder.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
@@ -151,6 +152,18 @@ foreach(c IN LISTS CASES)
     file(READ ${OUT}/c${n}/design.cpp gen)
     if(NOT gen MATCHES "__builtin_expect\\(S\\.observed, 0\\)")
       message(FATAL_ERROR "${c}: the clocked writes nothing reads still run every cycle")
+    endif()
+  endif()
+  # A testbench clock toggles through the direct one-bit edge (Sim::setOneBit).
+  if(c STREQUAL "examples/onebitclk.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    file(GLOB parts ${OUT}/c${n}/part*.cpp)
+    foreach(f ${parts})
+      file(READ ${f} t)
+      string(APPEND gen "${t}")
+    endforeach()
+    if(NOT gen MATCHES "S\\.setOneBit\\(")
+      message(FATAL_ERROR "${c}: the one-bit clock write does not use setOneBit")
     endif()
   endif()
   # Instances of one module share one copy of its code (codegen.hpp
