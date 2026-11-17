@@ -46,7 +46,9 @@ and store-release Zalasr (LB..LD.AQ, SB..SD.RL and their .AQRL forms;
 misaligned addresses raise address-misaligned exceptions), compare and
 swap Zacas (AMOCAS.W/D, AMOCAS.Q on RV64 and AMOCAS.D on RV32 with register
 pairs, AMOCAS.B/H), half-precision floating point Zfh (every operation,
-rounding mode and flag, NaN-boxed in the F registers), and the cache-block operations CBO.ZERO, CBO.CLEAN,
+rounding mode and flag, NaN-boxed in the F registers), BFloat16 Zfbfmin
+(FCVT.BF16.S and FCVT.S.BF16, with FLH, FSH, FMV.H.X and FMV.X.H from Zfh),
+and the cache-block operations CBO.ZERO, CBO.CLEAN,
 CBO.FLUSH and CBO.INVAL with 64-byte blocks; there are no caches, so the
 last three only check privilege), in machine,
 supervisor and user mode. The program's ELF class picks the width: a 64-bit
@@ -86,7 +88,14 @@ Zvfhmin) makes SEW 16 half precision for every vector floating-point
 instruction, widening to single and narrowing from it, and the conversions
 to and from 8, 16 and 32-bit integers; `tests/vplat/zvfh.c` checks each one
 against the scalar Zfh instruction in all five rounding modes, flags
-included. Vector cryptography: Zvkned (AES rounds, `vaesz`, the AES-128 and
+included. BFloat16 vectors at SEW 16: Zvfbfmin (`vfncvtbf16.f.f.w`,
+`vfwcvtbf16.f.f.v`) and Zvfbfwma (`vfwmaccbf16.vv/.vf`, BFloat16 sources
+widened exactly and fused into a single-precision accumulator);
+`tests/vplat/bf16.c` checks FCVT.BF16.S against a rounding model written
+from the specification and each vector form against the scalar ones.
+(QEMU 8.2 reads an F register that is not NaN-boxed as half precision's
+canonical NaN, 0x7e00, in FCVT.S.BF16; mvplat uses BFloat16's, 0x7fc0.)
+Vector cryptography: Zvkned (AES rounds, `vaesz`, the AES-128 and
 AES-256 key schedules), Zvknha and Zvknhb (SHA-256 and SHA-512 message
 schedule and rounds), Zvkg (GHASH), Zvksed (SM4 rounds and key
 schedule), Zvksh (SM3 message expansion and compression), Zvbc (`vclmul`,

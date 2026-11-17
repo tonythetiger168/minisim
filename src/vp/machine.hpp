@@ -2192,8 +2192,13 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                                 if (f3 > 1) ILLEGAL();
                                 FD(fpu::box16(fpu::hminmax(ha, hb, f3, hfl)));
                                 break;
-                            case 0x08:                                 // FCVT.H.S, FCVT.H.D
-                                if (hrm > 4 || rs2 > 1) ILLEGAL();
+                            case 0x08:                                 // FCVT.H.S, FCVT.H.D, FCVT.BF16.S (Zfbfmin)
+                                if (hrm > 4) ILLEGAL();
+                                if (rs2 == 8) {
+                                    FD(fpu::box16(fpu::sToBf(fpu::unbox(h.f[rs1]), hrm, hfl)));
+                                    break;
+                                }
+                                if (rs2 > 1) ILLEGAL();
                                 FD(fpu::box16(fpu::d2h(rs2 ? h.f[rs1] : fpu::sToD(fpu::unbox(h.f[rs1]), hfl), hrm, hfl)));
                                 break;
                             case 0x14:
@@ -2259,8 +2264,12 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                             if (dbl) FD(fpu::minmax<double>(ra, rb, f3, fl));
                             else FD(fpu::box(fpu::minmax<float>((uint32_t)sa, (uint32_t)sb, f3, fl)));
                             break;
-                        case 0x08:                                     // FCVT.S.D, FCVT.D.S, FCVT.S/D.H
+                        case 0x08:                                     // FCVT.S.D, FCVT.D.S, FCVT.S/D.H, FCVT.S.BF16
                             if (rm > 4) ILLEGAL();
+                            if (rs2 == 6 && !dbl) {                    // Zfbfmin: from BFloat16, exact
+                                FD(fpu::box(fpu::bfToS(fpu::unboxBf(ra), fl)));
+                                break;
+                            }
                             if (rs2 == 2) {                            // from half, exact
                                 uint64_t d = fpu::h2d(fpu::unbox16(ra));
                                 if (dbl) {
