@@ -1846,6 +1846,7 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                 // process already queued runs until its next system task;
                 // that task itself runs (Icarus 13).
                 S.finished = true;
+                if (!i.fmt.empty()) { std::cout.flush(); std::cerr << "msim: " << i.fmt << "\n"; }   // $stop
                 if (i.hi > S.exitCode) S.exitCode = i.hi;   // $fatal
                 goto done;
             case IK::Call: {

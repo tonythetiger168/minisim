@@ -2041,14 +2041,18 @@ struct Lowerer {
     // super.f() (8.15) calls the base class's body, never a derived override.
     static bool superCall(const slang::ast::CallExpression& call) {
         if (!call.syntax) return false;
-        // the first token (its leading comments and spaces are trivia, not text)
-        if (call.syntax->getFirstToken().rawText() == "super") return true;
-        // Class::f() (8.23) names one class's body, so it is not dispatched virtually either
         const slang::syntax::SyntaxNode* n = call.syntax;
         if (n->kind == slang::syntax::SyntaxKind::InvocationExpression)
             n = n->as<slang::syntax::InvocationExpressionSyntax>().left.get();
-        return n->kind == slang::syntax::SyntaxKind::ScopedName &&
-               n->as<slang::syntax::ScopedNameSyntax>().separator.kind == slang::parsing::TokenKind::DoubleColon;
+        if (n->kind != slang::syntax::SyntaxKind::ScopedName) return false;
+        const auto& sn = n->as<slang::syntax::ScopedNameSyntax>();
+        // super.f(), but not super.h.f(): that one calls f on the object h
+        // names, virtually as any other (8.15). (The first token's leading
+        // comments and spaces are trivia, not text.)
+        if (sn.separator.kind == slang::parsing::TokenKind::Dot)
+            return sn.left->kind != slang::syntax::SyntaxKind::ScopedName && sn.left->getFirstToken().rawText() == "super";
+        // Class::f() (8.23) names one class's body, so it is not dispatched virtually either
+        return sn.separator.kind == slang::parsing::TokenKind::DoubleColon;
     }
     // Package UPF (IEEE 1801-2024 11.2.4), added by msim -upf: the functions
     // that change or read supplies run in the power-aware runtime
@@ -7944,6 +7948,7 @@ struct Lowerer {
         if (n == "$fgetc" && args.size() == 1) return sysFnNode(SF_FGETC, {a(0)});
         if (n == "$ungetc" && args.size() == 2) return sysFnNode(SF_UNGETC, {a(0), a(1)});
         if (n == "$isunbounded" && args.size() == 1) {   // 20.6.3: is the constant `$`?
+            if (peel(*args[0]).kind == slang::ast::ExpressionKind::UnboundedLiteral) return konst(make(1, 0, 1));   // $isunbounded($)
             slang::ConstantValue cv = tryConst(*args[0]);
             return konst(make(cv.isUnbounded() ? 1 : 0, 0, 1));
         }
@@ -8797,10 +8802,27 @@ struct Lowerer {
                 struct V : ASTVisitor<V, VisitFlags::Expressions> {
                     const std::unordered_set<const Expression*>* skip;
                     std::vector<const Symbol*> found;
-                    void handle(const NamedValueExpression& n) { if (!skip->count(&n)) found.push_back(&n.symbol); }
+                    std::vector<const NamedValueExpression*> locals;   // local::x (18.7.1): the caller's x
+                    void handle(const NamedValueExpression& n) {
+                        if (skip->count(&n)) return;
+                        if (n.syntax && n.syntax->getFirstToken().rawText() == "local") locals.push_back(&n);
+                        else found.push_back(&n.symbol);
+                    }
                 } v;
                 v.skip = &covered;
                 info->inlineConstraints->visit(v);
+                // local::x names the caller's x even when the object being
+                // randomized has an x of its own (both inherit one from a
+                // common base): read it now, into a signal for that use only.
+                for (const NamedValueExpression* n : v.locals) {
+                    auto pm = propMap().find(&n->symbol);
+                    if (pm == propMap().end() || pm->second.kind != 0 || !savedCls) continue;
+                    int t = fresh(storeW(*n->type));
+                    Instr a; a.k = IK::Assign; a.sig = t;
+                    a.e = ref(thisRel(pm->second.off));
+                    prog.emit(a);
+                    exprOverride[n] = t;
+                }
                 for (const Symbol* sym : v.found) {
                     auto pm = propMap().find(sym);
                     if (pm == propMap().end() || symOverride.count(sym)) continue;
@@ -9028,7 +9050,22 @@ struct Lowerer {
             return;
         }
         if (n == "$finish" || n == "$stop") {
-            Instr i; i.k = IK::Finish; prog.emit(i); return;
+            Instr i; i.k = IK::Finish;
+            // $stop (20.2): batch msim has no prompt to stop at, so the run
+            // ends as with $finish, and says so on standard error (unless
+            // its diagnostics level is 0) so a run a test ends this way is
+            // not mistaken for a clean finish.
+            bool quiet = false;
+            if (!call.arguments().empty()) {
+                slang::ConstantValue cv = tryConst(*call.arguments()[0]);
+                quiet = cv.isInteger() && cv.integer().as<int64_t>() == 0;
+            }
+            if (n == "$stop" && !quiet) {
+                std::string w = whereStr();
+                if (w.size() >= 2) w.resize(w.size() - 2);   // "file:line"
+                i.fmt = "$stop" + (w.empty() ? std::string() : " at " + w);
+            }
+            prog.emit(i); return;
         }
         if (n == "$exit") { Instr i; i.k = IK::Exit; prog.emit(i); return; }
         if (n == "$fatal" || n == "$error" || n == "$warning" || n == "$info") { severity(call, n); return; }

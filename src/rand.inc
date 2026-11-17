@@ -1415,6 +1415,12 @@ struct Rewrite {
         return c;
     }
     bool isWide(int addr) const { return wide && wide->count(addr); }
+    // reads a variable (not only constants and loop indexes)
+    static bool readsVar(const E& x) {
+        if (x->op == Op::Ref || x->at) return true;
+        for (auto& k : x->kids) if (readsVar(k)) return true;
+        return false;
+    }
     // A constant select of a wide variable read as the chunks it covers, so
     // the solver sees variables of at most 64 bits: x[127:120] is a slice of
     // the top chunk.
@@ -1572,6 +1578,15 @@ struct Rewrite {
                 if (pass == 1) { dropped = true; return e; }
                 if (e->op == Op::DynGet) {
                     E ix = (*this)(e->kids[0]);
+                    if (ix->op != Op::Const && !c->assoc && c->n > 0 && c->n <= 1024 && readsVar(ix)) {
+                        // q[i] with i not known yet (i itself random, 18.5): the
+                        // element i will pick, as a choice over every element;
+                        // an index outside the queue reads 0.
+                        E acc = konst(make(0, 0, c->w, 0, c->sgn));
+                        for (int64_t k = c->n; k-- > 0;)
+                            acc = node(Op::Mux, {bin(Op::Eq, ix, konst(make((uint64_t)k, 0, 64, 0, true))), elem(*c, k), acc});
+                        return acc;
+                    }
                     Val iv = eval(ix, rd);
                     if (iv.x) return konst(make(0, 0, c->w, 0, c->sgn));
                     if (c->assoc) {   // the element at that key
