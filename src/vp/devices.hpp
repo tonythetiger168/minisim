@@ -213,6 +213,8 @@ public:
     std::vector<uint32_t> msip;
     std::vector<uint64_t> mtimecmp;
     int64_t offset = 0;  // what software wrote into mtime, against the cycle count
+    mutable uint64_t memoCmp_ = UINT64_MAX, memoCycle_ = 0;
+    mutable int64_t memoOff_ = 0;
 
     Clint() { type = "clint"; size = 0x10000; }
     void start() override {
@@ -225,6 +227,12 @@ public:
     // The first cycle at which mtime >= cmp.
     uint64_t cycleOf(uint64_t cmp) const {
         if (cmp == UINT64_MAX) return UINT64_MAX;
+        if (cmp == memoCmp_ && offset == memoOff_) return memoCycle_;  // asked every quantum
+        memoCmp_ = cmp;
+        memoOff_ = offset;
+        return memoCycle_ = cycleOfCalc(cmp);
+    }
+    uint64_t cycleOfCalc(uint64_t cmp) const {
         int64_t ticks = (int64_t)cmp - offset;
         if (ticks <= 0) return 0;
         unsigned __int128 ps = (unsigned __int128)(uint64_t)ticks * p->tickPs();
