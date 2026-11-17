@@ -77,6 +77,8 @@ set(CASES
   "-x-assign 0 -x-initial 0 examples/constsel.sv"
   "examples/deadseq.sv"
   "-x-assign 0 -x-initial 0 examples/deadseq.sv"
+  "examples/procorder.sv"
+  "-x-assign 0 -x-initial 0 examples/procorder.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
   "examples/islands.sv"
