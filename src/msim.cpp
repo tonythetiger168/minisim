@@ -1163,13 +1163,15 @@ static void inlineCombCalls(LowerResult& lowered) {
     // (`def`: written so far; a wait forgets them all). Returns false for a
     // body it cannot follow: its candidates are then all in `bad`.
     std::set<int> cand, bad;
+    bool univ = false;   // every signal is a candidate (othersBad below)
+    auto isCand = [&](int x) { return univ || cand.count(x) > 0; };
     // def: the bits written so far of each signal (all ones: the whole of it).
     using Def = std::map<int, uint64_t>;
     auto full = [&](int x) -> uint64_t { int w = x >= 0 && (size_t)x < S.sigs.size() ? S.sigs[(size_t)x].w : 0; return w > 0 && w < 64 ? (1ULL << w) - 1 : ~0ULL; };
     auto isDef = [&](const Def& d, int x) { auto it = d.find(x); return it != d.end() && (it->second & full(x)) == full(x); };
     auto both = [](const Def& a, const Def& b) { Def r; for (auto& [x, m] : a) { auto it = b.find(x); if (it != b.end() && (m & it->second)) r[x] = m & it->second; } return r; };
     const char* curWhy = "";
-    auto mark = [&](int x, const char* why) { if (bad.insert(x).second && dbg && x >= 0 && (size_t)x < S.sigs.size()) std::cerr << "    shared: " << S.sigs[(size_t)x].name << " (" << why << ", " << curWhy << ")\n"; };
+    auto mark = [&](int x, const char* why) { if (univ) { bad.insert(x); return; } if (bad.insert(x).second && dbg && x >= 0 && (size_t)x < S.sigs.size()) std::cerr << "    shared: " << S.sigs[(size_t)x].name << " (" << why << ", " << curWhy << ")\n"; };
     std::function<void(const Prog&, Def&, int)> flow = [&](const Prog& q, Def& def, int depth) {
         size_t n = q.code.size();
         std::vector<char> has(n + 1, 0), back(n + 1, 0);
@@ -1204,17 +1206,17 @@ static void inlineCombCalls(LowerResult& lowered) {
                 case IK::JmpIfNot: case IK::Display: case IK::Finish: case IK::Assert: case IK::Ret: break;
                 case IK::WaitDelay: break;
                 case IK::WaitEdge:
-                    if (i.events.empty()) { if (cand.count(i.sig)) mark(i.sig, "waited on"); }
-                    for (auto& [sg, ed] : i.events) if (cand.count(sg)) mark(sg, "waited on");
+                    if (i.events.empty()) { if (isCand(i.sig)) mark(i.sig, "waited on"); }
+                    for (auto& [sg, ed] : i.events) if (isCand(sg)) mark(sg, "waited on");
                     break;
                 case IK::Call: break;
                 default: known = false; break;
             }
-            for (int x : rd) if (cand.count(x) && !isDef(d, x)) mark(x, "read before written");
+            for (int x : rd) if (isCand(x) && !isDef(d, x)) mark(x, "read before written");
             if (!known) {   // anything else: whatever it names is out
-                if (i.sig >= 0 && cand.count(i.sig)) mark(i.sig, "other use");
-                for (int x : rd) if (cand.count(x)) mark(x, "other use");
-                for (int x : {i.dsrc, i.dres, i.dkey, i.dyn}) if (cand.count(x)) mark(x, "other use");
+                if (i.sig >= 0 && isCand(i.sig)) mark(i.sig, "other use");
+                for (int x : rd) if (isCand(x)) mark(x, "other use");
+                for (int x : {i.dsrc, i.dres, i.dkey, i.dyn}) if (isCand(x)) mark(x, "other use");
                 for (const Prog* b : i.branches) { Def e; flow(*b, e, depth + 1); }
                 d.clear();
             }
@@ -1229,10 +1231,10 @@ static void inlineCombCalls(LowerResult& lowered) {
                     if (i.callee) {
                         std::vector<int> sg; std::vector<const Prog*> seen;
                         collectProgRefs(*i.callee, sg, seen);
-                        for (int x : sg) if (cand.count(x)) mark(x, "other use");
+                        for (int x : sg) if (isCand(x)) mark(x, "other use");
                         std::unordered_set<int> wr; seen.clear();
                         collectProgWrites(*i.callee, wr, seen);
-                        for (int x : wr) if (cand.count(x)) mark(x, "other use");
+                        for (int x : wr) if (isCand(x)) mark(x, "other use");
                     }
                     d.clear();
                 }
@@ -1245,25 +1247,35 @@ static void inlineCombCalls(LowerResult& lowered) {
         if (has[n]) leave(in[n]);
         def = exits ? out : Def{};
     };
-    // Does a prog (or one it calls or forks) name a candidate at all?
-    auto touches = [&](const Prog& q) {
-        std::vector<const Prog*> seen;
-        std::function<bool(const Prog&)> t = [&](const Prog& r) {
-            if (std::find(seen.begin(), seen.end(), &r) != seen.end()) return false;
-            seen.push_back(&r);
-            for (auto& i : r.code) {
-                std::set<int> rd;
-                instrRefs(i, rd);
-                if (i.k != IK::Assert && i.sig >= 0) rd.insert(i.sig);
-                for (auto& [sg, ed] : i.events) rd.insert(sg);
-                for (int x : {i.dsrc, i.dres, i.dkey, i.dyn}) if (x >= 0) rd.insert(x);
-                for (int x : rd) if (cand.count(x)) return true;
-                if (i.callee && t(*i.callee)) return true;
-                for (const Prog* b : i.branches) if (t(*b)) return true;
-            }
-            return false;
-        };
-        return t(q);
+    // What every other process and final block would mark, computed once:
+    // the signals each one reads before it writes them whole, waits on or
+    // uses some other way (flow with every signal a candidate). A process's
+    // own entry is left out of its count; a block inlined below is
+    // measured again. Checking every process against each calling block in
+    // turn took NVDLA (hundreds of thousands of processes) half an hour.
+    std::vector<std::vector<int>> othBad;
+    std::unordered_map<int, int> othCnt;
+    std::set<int> assertRd;
+    auto badOf = [&](const Prog& q) {
+        univ = true;
+        bad.clear();
+        Def d;
+        flow(q, d, 0);
+        univ = false;
+        std::vector<int> v(bad.begin(), bad.end());
+        bad.clear();
+        return v;
+    };
+    auto prepare = [&] {
+        if (!othBad.empty()) return;
+        othBad.resize(lowered.procs.size() + lowered.finals.size());
+        for (size_t k = 0; k < othBad.size(); k++) {
+            othBad[k] = badOf(k < lowered.procs.size() ? lowered.procs[k].prog : lowered.finals[k - lowered.procs.size()].prog);
+            for (int x : othBad[k]) othCnt[x]++;
+        }
+        for (auto& a : asserts())
+            for (auto* cs : {&a.passCap, &a.failCap, &a.passSlot, &a.failSlot})
+                for (auto& c : *cs) refs(c, assertRd);
     };
     int serial = 0;
     for (size_t pi = 0; pi < lowered.procs.size(); pi++) {
@@ -1281,6 +1293,7 @@ static void inlineCombCalls(LowerResult& lowered) {
             else ok = i.k == IK::Assign;
         }
         if (!calls || !ok) continue;
+        prepare();
         // The signals of the subroutines: everything their bodies name.
         cand.clear(); bad.clear();
         {
@@ -1330,19 +1343,12 @@ static void inlineCombCalls(LowerResult& lowered) {
             Def d;
             flow(q, d, 0);
         }
-        auto other = [&](const Prog& q) {
-            if (!touches(q)) return;
-            curWhy = "another process";
-            Def d;
-            flow(q, d, 0);
-        };
-        for (size_t pj = 0; pj < lowered.procs.size(); pj++) if (pj != pi) other(lowered.procs[pj].prog);
-        for (auto& f : lowered.finals) other(f.prog);
-        for (auto& a : asserts()) {
-            std::set<int> rd;
-            for (auto* cs : {&a.passCap, &a.failCap, &a.passSlot, &a.failSlot})
-                for (auto& c : *cs) refs(c, rd);
-            for (int x : rd) if (cand.count(x)) mark(x, "other use");
+        curWhy = "another process";
+        for (int x : cand) {
+            auto it = othCnt.find(x);
+            const int mine = std::binary_search(othBad[pi].begin(), othBad[pi].end(), x) ? 1 : 0;
+            if (it != othCnt.end() && it->second - mine > 0) mark(x, "read before written");
+            if (assertRd.count(x)) mark(x, "other use");
         }
         std::map<int, int> clone;
         for (int x : cand) {
@@ -1391,6 +1397,11 @@ static void inlineCombCalls(LowerResult& lowered) {
                       << " private of " << cand.size() << (shaped ? "" : " (still not a static block)") << "\n";
         }
         lp.prog.code = std::move(code);
+        if (!othBad.empty()) {   // its new code, for the blocks after it
+            for (int x : othBad[pi]) othCnt[x]--;
+            othBad[pi] = badOf(lp.prog);
+            for (int x : othBad[pi]) othCnt[x]++;
+        }
     }
 }
 
@@ -1997,6 +2008,22 @@ static std::string kernelObject(const std::string& cc, const std::string& cflags
     return obj;
 }
 
+// MSIM_PHASES=1: time and memory after each step of elaboration and
+// -compile, on stderr (for a large design that runs out of time or memory).
+static void phaseMark(const char* what) {
+    static const bool on = std::getenv("MSIM_PHASES") != nullptr;
+    if (!on) return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    long rss = 0, hwm = 0;
+    std::ifstream f("/proc/self/status");
+    for (std::string k; f >> k;) {
+        if (k == "VmRSS:") f >> rss;
+        else if (k == "VmHWM:") f >> hwm;
+    }
+    double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "msim: phase %-22s %8.1f s  rss %6.2f GB  peak %6.2f GB\n", what, t, rss / 1048576.0, hwm / 1048576.0);
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -2092,6 +2119,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
     }
+    phaseMark("codegen");
     std::string inc = kernelIncludeDir();
     if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
     std::string cpp = dir + "/design.cpp", exe = dir + "/simv";
@@ -2258,6 +2286,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                 }
             });
         for (auto& t : pool) t.join();
+        phaseMark("C++ compile");
         if (failed) return 1;
         if (!kernelReady()) return 1;   // a new kernel object relinks (simv.kobj)
         if (!jobs.empty() || !std::filesystem::exists(exe, ec) || slurp(dir + "/simv.kobj") != kobj) {
@@ -2288,6 +2317,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         }
         std::ofstream(dir + "/simv.stamp") << stamp;
     }
+    phaseMark("simv built");
     if (lockFd >= 0) ::flock(lockFd, LOCK_UN);
     std::string run = shq(exe);
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
@@ -3070,7 +3100,10 @@ static void usage() {
 }
 
 static int msimMain(int argc, char** argv);
-int main(int argc, char** argv) { return runres::finish(msimMain(argc, argv)); }
+int main(int argc, char** argv) {
+    phaseMark("start");
+    return runres::finish(msimMain(argc, argv));
+}
 
 static int msimMain(int argc, char** argv) {
     annexStartup(argc, argv);   // $reset / $restart run msim again (Annex D)
@@ -4024,6 +4057,7 @@ static int msimMain(int argc, char** argv) {
                     v[(size_t)i.drv] = lp.scope;
                 }
     }
+    phaseMark("elaborated");
     if (xAssign0) xAssignZero(lowered);
     if (xInitial0) xInitialZero();
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
@@ -4034,13 +4068,17 @@ static int msimMain(int argc, char** argv) {
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL"))
         unrollSeqLoops(lowered, true);
+    phaseMark("inline/unroll");
     if (staticComb && !vpi::st().active && !g_upf && !g_cov) splitCombBlocks(lowered);
+    phaseMark("split comb");
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOSEQTMP")) localizeSeqBlocking(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
     if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCYCMERGE"))
         mergeCombCycles(lowered);
+    phaseMark("seq rewrites/cycles");
     Plan pl = plan(lowered, staticComb, staticSeq);
+    phaseMark("plan");
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
         std::cerr << "msim: -compile: the design has protected code; using the interpreter\n";
@@ -4082,6 +4120,7 @@ static int msimMain(int argc, char** argv) {
         size_t n = constSelects(lowered, pl);
         if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constant selects: %zu writes\n", n);
     }
+    phaseMark("constants/simplify");
     // A testbench's clocked block with $display / $finish: a clocked
     // process of the compiled model too (the interpreter keeps it a coroutine).
     Plan plC = pl;
