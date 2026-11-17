@@ -3613,6 +3613,49 @@ static int msimMain(int argc, char** argv) {
         hideMsgIf() = [&pc](slang::SourceLocation l) { return pc.hidden(l); };
     }
     if (!driver.parseAllSources()) return 1;
+    // Library files (-v, -y; 33.3.1) in one compilation unit with the
+    // sources, as VCS and Xcelium read them: after the sources, so they see
+    // the sources' $unit declarations (a DPI import) as well as their macros,
+    // and only for the modules the design instantiates: a library module
+    // nothing uses is not elaborated or checked. The tops are those of the
+    // sources alone.
+    if (driver.options.singleUnit.value_or(false)) {
+        auto& trees = driver.syntaxTrees;
+        int mainK = -1, nMain = 0;
+        std::vector<size_t> libK;
+        for (size_t k = 0; k < trees.size(); k++) {
+            const auto* lib = trees[k]->getSourceLibrary();
+            if (lib && !lib->isDefault) continue;
+            if (trees[k]->isLibraryUnit) libK.push_back(k);
+            else { mainK = (int)k; nMain++; }
+        }
+        if (!libK.empty() && nMain == 1) {
+            if (driver.options.topModules.empty()) {
+                auto c0 = driver.createCompilation();
+                for (const auto* inst : c0->getRoot().topInstances) driver.options.topModules.push_back(std::string(inst->name));
+            }
+            auto& sm = driver.sourceManager;
+            std::vector<slang::SourceBuffer> bufs;
+            auto add = [&](const std::shared_ptr<slang::syntax::SyntaxTree>& t) {
+                // The ids are in the order the preprocessor took the buffers
+                // up, which is the reverse of the files' order (a stack).
+                auto ids = t->getSourceBufferIds();
+                for (auto it = ids.rbegin(); it != ids.rend(); ++it) {
+                    if (sm.getIncludedFrom(*it).valid() || sm.getFullPath(*it).empty()) continue;   // an `include, a predefine
+                    bufs.push_back(slang::SourceBuffer{sm.getSourceText(*it), trees[(size_t)mainK]->getSourceLibrary(), *it});   // one tree: one library
+                }
+            };
+            add(trees[(size_t)mainK]);
+            for (size_t k : libK) add(trees[k]);
+            auto merged = slang::syntax::SyntaxTree::fromBuffers(bufs, sm, driver.createOptionBag());
+            std::vector<std::shared_ptr<slang::syntax::SyntaxTree>> keep;
+            for (size_t k = 0; k < trees.size(); k++)
+                if ((int)k == mainK) keep.push_back(merged);
+                else if (std::find(libK.begin(), libK.end(), k) == libK.end()) keep.push_back(trees[k]);
+            trees = std::move(keep);
+            driver.options.compilationFlags[slang::ast::CompilationFlags::IgnoreUninstantiatedModules] = true;
+        }
+    }
     if (!vhdlFiles.empty()) {
         vhdl::Translator vtr;
         vtr.nine = !vhdl4;
