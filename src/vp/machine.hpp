@@ -1256,8 +1256,7 @@ private:
         do {                                                             \
             pc = npc;                                                    \
             if (--left == 0) goto out;                                   \
-            d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)];                    \
-            DISPATCH;                                                    \
+            goto blockTry;                                               \
         } while (0)
         // Straight-line: the next instruction's entry follows this one's.
 #define SEQ                                                              \
@@ -1267,8 +1266,51 @@ private:
             d = (const Hart::Decoded*)((const char*)d + d->step);        \
             DISPATCH;                                                    \
         } while (0)
+        // Block mode: no pc or budget check between the ops of a block.
+        // Each handler reads its own operands (A1, B2, IM).
+#define BOP goto *op->h
+#define A1 r[op->rs1]
+#define B2 r[op->rs2]
+#define IM ((int64_t)op->imm)
+#define BNEXT do { op++; BOP; } while (0)
+        // The block's last op went to npc.
+#define BEND do { left -= bk->n; pc = npc; if (!left) goto out; goto blockTry; } while (0)
+#define BPC (ax(bk->pc + 2 * (uint64_t)op->off))
         if (cyc >= end) return;
         uint64_t left = end - cyc;  // instructions to go, this one included
+        static const void* const btbl[] = {nullptr, &&B_LUI, &&B_AUIPC, &&B_JAL, &&B_JALR, &&B_BEQ, &&B_BNE, &&B_BLT, &&B_BGE, &&B_BLTU, &&B_BGEU, &&B_LB, &&B_LH, &&B_LW, &&B_LD, &&B_LBU, &&B_LHU, &&B_LWU, &&B_SB, &&B_SH, &&B_SW, &&B_SD, &&B_ADDI, &&B_SLLI, &&B_SLTI, &&B_SLTIU, &&B_XORI, &&B_SRLI, &&B_SRAI, &&B_ORI, &&B_ANDI, &&B_ADD, &&B_SUB, &&B_SLL, &&B_SLT, &&B_SLTU, &&B_XOR, &&B_SRL, &&B_SRA, &&B_OR, &&B_AND, &&B_MUL, &&B_ADDIW, &&B_SLLIW, &&B_SRLIW, &&B_SRAIW, &&B_ADDW, &&B_SUBW, &&B_SLLW, &&B_SRLW, &&B_SRAW, &&B_MULW};
+        if (!h.blocks) h.blocks.reset(new Hart::Block[Hart::BLOCKS]);
+        Hart::Block* const blocks = h.blocks.get();
+        const uint32_t gen = h.dcGen;
+        Hart::Block* bk;
+        const Hart::BlockOp* op;
+    blockTry:
+        // At a jump target: run a whole block when enough of the budget is
+        // left for its longest, else one instruction at a time.
+        if (left > Hart::BLOCK_OPS) {
+            bk = &blocks[(pc >> 1) & (Hart::BLOCKS - 1)];
+            if (bk->pc != pc || bk->gen != gen) {
+                // Build it from the decoded-instruction cache.
+                unsigned n = 0;
+                uint64_t p = pc;
+                bool ctl = false;
+                while (n < Hart::BLOCK_OPS) {
+                    const Hart::Decoded& e = dc[(p >> 1) & (Hart::DC_SIZE - 1)];
+                    if (e.pc != p || !e.kind || p - pc > 2 * 255) break;
+                    Hart::BlockOp& q = bk->ops[n++];
+                    q.h = btbl[e.kind]; q.rd = e.trd; q.rs1 = e.rs1; q.rs2 = e.rs2;
+                    q.off = (uint8_t)((p - pc) >> 1); q.imm = e.imm;
+                    if (e.kind == K_JAL || (e.kind >= K_BEQ && e.kind <= K_BGEU)) bk->target = ax(p + e.imm);
+                    p = ax(p + e.len);
+                    if (e.kind >= K_JAL && e.kind <= K_BGEU) { ctl = true; break; }
+                }
+                if (!n) { bk->pc = 1; d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)]; DISPATCH; }
+                if (!ctl) bk->ops[n++] = Hart::BlockOp{&&B_END, 32, 0, 0, (uint8_t)((p - pc) >> 1), 0};
+                bk->pc = pc; bk->end = p; bk->n = ctl ? n : n - 1; bk->gen = gen;
+            }
+            op = bk->ops;
+            BOP;
+        }
         d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
         DISPATCH;
     L_LUI: *o = (uint64_t)i; SEQ;
@@ -1341,6 +1383,90 @@ private:
     L_SRLW: *o = w((uint32_t)a >> (b & 31)); SEQ;
     L_SRAW: *o = w((int32_t)a >> (b & 31)); SEQ;
     L_MULW: *o = w(a * b); SEQ;
+    // ---- block-mode handlers
+    B_END: npc = bk->end; BEND;
+    B_LUI: r[op->rd] = (uint64_t)IM; BNEXT;
+    B_AUIPC: r[op->rd] = sx(BPC + (uint64_t)IM); BNEXT;
+    B_JAL: r[op->rd] = sx(bk->end); npc = bk->target; BEND;
+    B_JALR: npc = ax((A1 + IM) & ~1ull); r[op->rd] = sx(bk->end); BEND;
+    B_BEQ: npc = A1 == B2 ? bk->target : bk->end; BEND;
+    B_BNE: npc = A1 != B2 ? bk->target : bk->end; BEND;
+    B_BLT: npc = (int64_t)A1 < (int64_t)B2 ? bk->target : bk->end; BEND;
+    B_BGE: npc = (int64_t)A1 >= (int64_t)B2 ? bk->target : bk->end; BEND;
+    B_BLTU: npc = A1 < B2 ? bk->target : bk->end; BEND;
+    B_BGEU: npc = A1 >= B2 ? bk->target : bk->end; BEND;
+#define BLOAD(L, T, N)                                                   \
+    L: {                                                                 \
+        const uint64_t ad = ax(A1 + IM);                                 \
+        if (!inMem(ad, N)) goto bout;                                    \
+        T v;                                                             \
+        memcpy(&v, cp + (ad - cb), N);                                   \
+        r[op->rd] = sx((uint64_t)v);                                     \
+        BNEXT;                                                           \
+    }
+    BLOAD(B_LB, int8_t, 1)
+    BLOAD(B_LH, int16_t, 2)
+    BLOAD(B_LW, int32_t, 4)
+    BLOAD(B_LD, uint64_t, 8)
+    BLOAD(B_LBU, uint8_t, 1)
+    BLOAD(B_LHU, uint16_t, 2)
+    BLOAD(B_LWU, uint32_t, 4)
+#undef BLOAD
+#define BSTORE(L, T, N)                                                  \
+    L: {                                                                 \
+        const uint64_t ad = ax(A1 + IM);                                 \
+        if (!okStore(ad, N)) goto bout;                                  \
+        const T v = (T)B2;                                               \
+        memcpy(cp + (ad - cb), &v, N);                                   \
+        BNEXT;                                                           \
+    }
+    BSTORE(B_SB, uint8_t, 1)
+    BSTORE(B_SH, uint16_t, 2)
+    BSTORE(B_SW, uint32_t, 4)
+    BSTORE(B_SD, uint64_t, 8)
+#undef BSTORE
+    B_ADDI: r[op->rd] = sx(A1 + IM); BNEXT;
+    B_SLLI: r[op->rd] = sx(A1 << IM); BNEXT;
+    B_SLTI: r[op->rd] = (int64_t)A1 < IM; BNEXT;
+    B_SLTIU: r[op->rd] = A1 < (uint64_t)IM; BNEXT;
+    B_XORI: r[op->rd] = A1 ^ IM; BNEXT;
+    B_SRLI: r[op->rd] = RV64 ? A1 >> IM : sx((uint32_t)A1 >> IM); BNEXT;
+    B_SRAI: r[op->rd] = RV64 ? (uint64_t)((int64_t)A1 >> IM) : sx((uint64_t)((int32_t)A1 >> IM)); BNEXT;
+    B_ORI: r[op->rd] = A1 | IM; BNEXT;
+    B_ANDI: r[op->rd] = A1 & IM; BNEXT;
+    B_ADD: r[op->rd] = sx(A1 + B2); BNEXT;
+    B_SUB: r[op->rd] = sx(A1 - B2); BNEXT;
+    B_SLL: r[op->rd] = sx(A1 << (B2 & SM)); BNEXT;
+    B_SLT: r[op->rd] = (int64_t)A1 < (int64_t)B2; BNEXT;
+    B_SLTU: r[op->rd] = A1 < B2; BNEXT;
+    B_XOR: r[op->rd] = A1 ^ B2; BNEXT;
+    B_SRL: r[op->rd] = RV64 ? A1 >> (B2 & SM) : sx((uint32_t)A1 >> (B2 & SM)); BNEXT;
+    B_SRA: r[op->rd] = RV64 ? (uint64_t)((int64_t)A1 >> (B2 & SM)) : sx((uint64_t)((int32_t)A1 >> (B2 & SM))); BNEXT;
+    B_OR: r[op->rd] = A1 | B2; BNEXT;
+    B_AND: r[op->rd] = A1 & B2; BNEXT;
+    B_MUL: r[op->rd] = sx(A1 * B2); BNEXT;
+    B_ADDIW: r[op->rd] = w(A1 + IM); BNEXT;
+    B_SLLIW: r[op->rd] = w((uint32_t)A1 << IM); BNEXT;
+    B_SRLIW: r[op->rd] = w((uint32_t)A1 >> IM); BNEXT;
+    B_SRAIW: r[op->rd] = w((int32_t)A1 >> IM); BNEXT;
+    B_ADDW: r[op->rd] = w(A1 + B2); BNEXT;
+    B_SUBW: r[op->rd] = w(A1 - B2); BNEXT;
+    B_SLLW: r[op->rd] = w((uint32_t)A1 << (B2 & 31)); BNEXT;
+    B_SRLW: r[op->rd] = w((uint32_t)A1 >> (B2 & 31)); BNEXT;
+    B_SRAW: r[op->rd] = w((int32_t)A1 >> (B2 & 31)); BNEXT;
+    B_MULW: r[op->rd] = w(A1 * B2); BNEXT;
+    bout:
+        // An op the fast loop cannot finish: stop before it.
+        pc = BPC;
+        left -= (uint64_t)(op - bk->ops);
+        goto out;
+#undef BPC
+#undef BEND
+#undef BNEXT
+#undef BOP
+#undef A1
+#undef B2
+#undef IM
 #undef SEQ
 #undef NEXT
 #undef DISPATCH
