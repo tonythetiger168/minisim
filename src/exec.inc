@@ -1794,7 +1794,26 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
                     else co_await Wait{evbuf[0].first, evbuf[0].second};
                 } else {
                     bool late = pc == 0 && p == entry && entry->alwaysTop;
-                    if (i.events.size() > 1) co_await WaitAny{&i.events, late};
+                    if (p == entry && (int)pc == entry->settleWait) {
+                        // always_comb (9.2.2.2): woken by a change that another
+                        // process has already undone (it wrote a default and then
+                        // the old value), the block would compute what it did and
+                        // could wake that process again forever. It runs only when
+                        // what it reads differs from its last run.
+                        std::vector<Val> seen;
+                        if (i.events.size() > 1) for (auto& [s, e] : i.events) seen.push_back(S.sigs[s].val);
+                        else seen.push_back(S.sigs[i.sig].val);
+                        for (;;) {
+                            if (i.events.size() > 1) co_await WaitAny{&i.events, late};
+                            else co_await Wait{i.sig, i.edge, late};
+                            bool same = true;
+                            if (i.events.size() > 1) {
+                                for (size_t k = 0; same && k < i.events.size(); k++) same = S.sigs[i.events[k].first].val == seen[k];
+                            } else same = S.sigs[i.sig].val == seen[0];
+                            if (!same) break;
+                        }
+                    }
+                    else if (i.events.size() > 1) co_await WaitAny{&i.events, late};
                     else co_await Wait{i.sig, i.edge, late};
                 }
                 TO_REACTIVE;
