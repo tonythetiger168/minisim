@@ -2394,7 +2394,7 @@ struct Lowerer {
                 i.k = IK::Assign;
                 i.sig = formal.sig;
                 const Expression& l = a.as<AssignmentExpression>().left();
-                i.e = cloneConts(*l.type, expr(l));
+                i.e = inoutIn(l, sub->sym, n);
                 prog.emit(i);
             } else if (a.kind != ExpressionKind::Assignment &&
                        a.kind != ExpressionKind::EmptyArgument) {
@@ -2744,7 +2744,7 @@ struct Lowerer {
             } else if (formal.dir == ArgumentDirection::InOut) {
                 if (a.kind != ExpressionKind::Assignment) unsupported("inout argument");
                 const Expression& l = a.as<AssignmentExpression>().left();
-                c.init.push_back({formal.sig, cloneConts(*l.type, expr(l))});
+                c.init.push_back({formal.sig, inoutIn(l, sub.sym, n)});
             } else if (a.kind != ExpressionKind::Assignment && a.kind != ExpressionKind::EmptyArgument) {
                 unsupported("output argument");
             }
@@ -3297,6 +3297,19 @@ struct Lowerer {
         return un(Op::IToR, expr(e));
     }
     E fcmp(int kind, E a, E b) { auto n = node(Op::FCmp, {std::move(a), std::move(b)}); n->hi = kind; return n; }
+    // An inout argument's value going in (13.5): the actual converted to
+    // the formal's type, as an assignment would (a real into an integral
+    // formal is rounded, an integral into a real formal becomes a real).
+    E inoutIn(const slang::ast::Expression& l, const slang::ast::SubroutineSymbol* sym, size_t n) {
+        const slang::ast::Type* ft = nullptr;
+        if (sym && n < sym->getArguments().size()) ft = &sym->getArguments()[n]->getType().getCanonicalType();
+        const auto& lt = l.type->getCanonicalType();
+        if (ft && lt.isFloating() && ft->isIntegral() && !isHandleType(*ft))
+            return rtoi(exprReal(l), (int)ft->getBitWidth(), ft->isSigned(), false);
+        if (ft && lt.isIntegral() && !isHandleType(lt) && ft->isFloating() && ft->getBitWidth() == 64)
+            return un(Op::IToR, expr(l));
+        return cloneConts(*l.type, expr(l));
+    }
     E rtoi(E a, int w, bool sgn, bool trunc) {
         auto n = node(Op::RToI, {std::move(a)});
         n->hi = w; n->sgn = sgn; n->lo = trunc ? 1 : 0;
