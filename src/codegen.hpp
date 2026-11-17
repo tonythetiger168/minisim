@@ -114,7 +114,8 @@ public:
         auto chunk = [&](auto&& emit) { std::ostringstream c; emit(c); chunks.push_back(c.str()); };
         std::vector<int> byRank;
         std::vector<int> dom = cycle && !cov ? cycleDomain(procs, sigs) : std::vector<int>{};
-        orderDomain(procs, sigs, dom);
+        run_ = dom;
+        orderDomain(procs, sigs, run_);   // the order they run in; dom keeps the code layout
         {
             // The domain re-evaluates every static combinational statement on
             // each commit (and whenever an input outside the clock cone
@@ -1020,6 +1021,7 @@ private:
     // PA, not S.sigs), so the domain compares them with their values at the
     // start of the wait instead (armChk). Per process: its arm number, or -1.
     std::vector<int> armK_;
+    std::vector<int> run_;   // the domain's processes in the order they run (orderDomain)
     std::vector<std::vector<int>> armIns_;   // per arm: its private inputs
     std::vector<const Instr*> armSet_;       // per arm: the flag's Assign
     static bool armShape(const CodegenProc& p, const std::vector<CodegenSig>& sigs) {
@@ -4051,7 +4053,7 @@ private:
             }
             auto cand = [&](int sg) { return sg >= 0 && (size_t)sg < ns && wproc[sg] >= 0 && !bad[sg]; };
             std::vector<int> domPos(procs.size(), -1);
-            for (size_t j = 0; j < dom.size(); j++) domPos[dom[j]] = (int)j;
+            for (size_t j = 0; j < run_.size(); j++) domPos[run_[j]] = (int)j;
             static const bool noEarly = std::getenv("MSIM_NOORDER") != nullptr;
             std::vector<int> cidx(ns, -1);
             for (size_t p = 0; p < procs.size(); p++) {
@@ -4636,12 +4638,13 @@ private:
              "    if (wait) { wait--; pclean = false; return; }\n    uint64_t x = 0;\n";
         for (int s : privs) if (!scratch(s) && !deadSig[s]) o << "    x |= P" << s << ".x;\n";
         o << "    pclean = x == 0;\n    skip = x ? (skip < " << scanCap_ << " ? skip * 2 + 1 : " << scanCap_ << ") : 0;\n    wait = skip;\n}\n";
+        // In run order (orderDomain): readers of another process's registers first.
         o << "static void (*const DS[])() = {";
-        for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j];
+        for (size_t j = 0; j < run_.size(); j++) o << (j ? ", " : "") << "ds" << run_[j];
         o << "};\n";
         if (two) {
             o << "static void (*const DS2[])() = {";
-            for (size_t j = 0; j < dom.size(); j++) o << (j ? ", " : "") << "ds" << dom[j] << "_2";
+            for (size_t j = 0; j < run_.size(); j++) o << (j ? ", " : "") << "ds" << run_[j] << "_2";
             o << "};\n";
         }
         // Several clock groups: dseq is registered once per group and runs
@@ -4650,7 +4653,7 @@ private:
         if (multi) {
             // The processes of each group: DSO[DOFF[g] .. DOFF[g + 1]), indices into DS.
             std::vector<std::vector<size_t>> byG(domGroups_);
-            for (size_t j = 0; j < dom.size(); j++) byG[domGroup_[dom[j]]].push_back(j);
+            for (size_t j = 0; j < run_.size(); j++) byG[domGroup_[run_[j]]].push_back(j);
             o << "static const uint32_t DSO[] = {";
             size_t c = 0;
             for (auto& v : byG) for (size_t j : v) o << (c++ ? ", " : "") << j;
@@ -4852,7 +4855,7 @@ private:
         auto groupOf = [&](int sig) { return islGroup[islandOf(sig)]; };
         if (par) {
             std::vector<std::vector<int>> gProcs(G);
-            for (int n : dom) if (procSig.count(n)) gProcs[groupOf(procSig[n])].push_back(n);
+            for (int n : run_) if (procSig.count(n)) gProcs[groupOf(procSig[n])].push_back(n);
             for (int g = 0; g < G; g++) {
                 o << "static void dsG" << g << "(bool two) {\n    if (two) {";
                 for (int n : gProcs[g]) o << " ds" << n << "_2();";
