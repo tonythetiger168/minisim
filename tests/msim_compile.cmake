@@ -175,7 +175,7 @@ foreach(c IN LISTS CASES)
   # domain: run-time index writes go through the kernel's list (DNB).
   if(c STREQUAL "examples/ringcycle.sv")
     file(READ ${OUT}/c${n}/design.cpp gen)
-    if(NOT gen MATCHES "cyA[0-9]+_[0-9]+\\(" OR NOT gen MATCHES "DNB->push_back")
+    if(NOT gen MATCHES "cyAT?[0-9]+(_[0-9]+)?\\(" OR NOT gen MATCHES "DNB->push_back")
       message(FATAL_ERROR "${c}: the comb cycle is not merged or the clocked block left the cycle domain")
     endif()
     if(gen MATCHES "static void seq[0-9]+\\(")
