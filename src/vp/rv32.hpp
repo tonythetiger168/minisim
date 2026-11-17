@@ -218,14 +218,19 @@ struct Hart {
     struct Decoded {
         uint64_t pc;
         uint32_t insn, raw;
-        int32_t immI;
         uint8_t len, op, rd, f3, rs1, rs2, f7;
         bool xlat;  // fetched through the MMU (the same pc means another page bare)
+        uint8_t kind;  // the fast loop's class of the instruction (0: the general path)
+        uint8_t trd;   // the fast loop's destination: rd, or 32 (a sink) for x0
+        uint8_t step;  // bytes from this entry to the next instruction's (len / 2 entries)
+        int32_t imm;   // its immediate, decoded (I, U, J, B or S type)
     };
     static constexpr unsigned DC_SIZE = 8192;
-    std::unique_ptr<Decoded[]> dc{new Decoded[DC_SIZE]};
+    // Two entries past the end that never hold a pc: the fast loop steps to
+    // the next entry without wrapping and leaves when it lands there.
+    std::unique_ptr<Decoded[]> dc{new Decoded[DC_SIZE + 2]};
     Hart() { flushDecoded(); }
-    void flushDecoded() { for (unsigned i = 0; i < DC_SIZE; i++) dc[i].pc = 1; }
+    void flushDecoded() { for (unsigned i = 0; i < DC_SIZE + 2; i++) dc[i].pc = 1; }
 
     // The last plain memory device used, for the fast path.
     uint64_t cBase = 1, cEnd = 0;
