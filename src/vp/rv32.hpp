@@ -158,6 +158,7 @@ struct Hart {
     uint64_t stvec = 0, sscratch = 0, sepc = 0, scause = 0, stval = 0, satp = 0;
     uint32_t scounteren = 0;
     uint32_t medeleg = 0, mideleg = 0;
+    bool pbmte = false;  // menvcfg.PBMTE (Svpbmt, RV64)
     uint32_t mipSw = 0;  // SSIP, STIP, SEIP as software wrote them
     // Is paging on (Sv32 on RV32; Sv39, Sv48 or Sv57 on RV64)?
     bool paging() const { return rv64 ? (satp >> 60) != 0 : (satp >> 31) != 0; }

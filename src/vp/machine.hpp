@@ -525,7 +525,7 @@ public:
             case 0x342: v = h.mcause; return true;
             case 0x343: v = h.mtval; return true;
             case 0x344: v = h.mip; return true;
-            case 0x30a: v = 0x80; return true;  // menvcfg: CBZE (CBO.ZERO below M)
+            case 0x30a: v = 0x80 | (h.pbmte ? 1ull << 62 : 0); return true;  // menvcfg: CBZE (CBO.ZERO below M), PBMTE
             case 0x31a: v = 0; return true;  // menvcfgh
             case 0x747: case 0x757: v = 0; return true;  // mseccfg
             // Sdtrig with no triggers: tselect is hard-wired to 0 and tdata1 says
@@ -621,7 +621,10 @@ public:
             case 0x342: h.mcause = v; return true;
             case 0x343: h.mtval = v; return true;
             case 0x344: setMipSw(h, (uint32_t)v & (MIP_SSIP | MIP_STIP | MIP_SEIP)); return true;  // the M bits are read-only
-            case 0x30a: case 0x31a: case 0x747: case 0x757: return true;
+            case 0x30a:
+                if (h.rv64 && h.pbmte != ((v >> 62) & 1)) { h.pbmte = (v >> 62) & 1; h.flushTlb(); }
+                return true;
+            case 0x31a: case 0x747: case 0x757: return true;
             case 0x7a0: case 0x7a1: case 0x7a2: case 0x7a3: case 0x7a5: return true;
             case 0x7a4: return false;
             case 0xb00:
@@ -808,8 +811,15 @@ public:
                     if (!pmpAllows(h, pteA, pteN, PMP_R, 1)) return Acc::Fault;
                     if (physReadPte(h, pteA, pteN, pte) != Acc::Ok) return Acc::Fault;
                     if (!(pte & 1) || ((pte & 6) == 4)) return Acc::PageFault;  // invalid, or W without R
-                    if (w && ((pte >> 54) & 0x1ff)) return Acc::PageFault;      // reserved, PBMT: none here
-                    if (pte & 0xa) break;                                         // R or X: a leaf
+                    if (w && ((pte >> 54) & 0x7f)) return Acc::PageFault;       // reserved
+                    if (pte & 0xa) {                                              // R or X: a leaf
+                        // Svpbmt: PMA, NC or IO with menvcfg.PBMTE (all the
+                        // same here: no caches), 3 reserved.
+                        const unsigned pbmt = w ? (unsigned)(pte >> 61) & 3 : 0;
+                        if (pbmt == 3 || (pbmt && !h.pbmte)) return Acc::PageFault;
+                        break;
+                    }
+                    if (w && ((pte >> 61) & 3)) return Acc::PageFault;           // PBMT on a pointer
                     if (pte & 0xd0) return Acc::PageFault;                        // D, A, U on a pointer
                     if (w && (pte >> 63)) return Acc::PageFault;                  // N on a pointer
                     if (i == 0) return Acc::PageFault;
@@ -2001,6 +2011,30 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
                 break;
             case 0x2f: {                                               // A
                 uint32_t f5 = insn >> 27;
+                if (f5 == 6 || f5 == 7) {                              // Zalasr: LB..LD.AQ, SB..SD.RL
+                    const bool ld = f5 == 6;
+                    if (f3 > 3 || (f3 == 3 && !rv64) || (ld ? !((insn >> 26) & 1) || rs2 : !((insn >> 25) & 1) || rd)) ILLEGAL();
+                    const unsigned n = 1u << f3;
+                    const uint64_t a = h.ax(x[rs1]);
+                    cls = ld ? C_LOAD : C_STORE;
+                    if (h.par) return Stop::Pending;
+                    if (a & (n - 1)) TRAP(ld ? 4 : 6, a);
+                    Acc r;
+                    if (ld) {
+                        uint64_t v = 0;
+                        r = load(h, a, n, v);
+                        if (r != Acc::Ok) MEMFAIL(r, 5, a);
+                        RD(n == 1 ? (uint64_t)(int64_t)(int8_t)v : n == 2 ? (uint64_t)(int64_t)(int16_t)v : n == 4 ? W(v) : v);
+                        memAcc = true; memW = false; memA = a; memN = n;
+                    } else {
+                        const uint64_t v = x[rs2];
+                        r = store(h, a, n, v);
+                        if (r != Acc::Ok) MEMFAIL(r, 7, a);
+                        breakReservations(h, a);
+                        memAcc = true; memW = true; memA = a; memN = n; memV = n == 8 ? v : v & ((1ull << (8 * n)) - 1);
+                    }
+                    break;
+                }
                 // Zabha: byte and halfword AMOs (and AMOCAS.B/H); Zacas:
                 // AMOCAS.W/D/Q, the double-width one on a register pair.
                 const bool cas = f5 == 0x05;

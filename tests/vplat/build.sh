@@ -13,7 +13,7 @@ for p in hello irq smp bench pmp virtio vnet vcon; do
 done
 # The same programs as RV64 (the ELF class makes mvplat's harts 64-bit).
 CC64="${CLANG:-clang} --target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 -mcmodel=medany -O2 -g0 -nostdlib -ffreestanding -fuse-ld=lld -Wl,-T,link.ld -Wl,--build-id=none -static"
-for p in hello irq smp virtio; do
+for p in hello irq smp virtio svpbmt; do
   $CC64 crt0.S $p.c -o "$out/${p}64.elf"
 done
 # The V extension: vkern.c's loops scalar and vectorized by clang (vec),
