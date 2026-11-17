@@ -87,6 +87,7 @@ set(CASES
   "examples/islands.sv"
   "examples/combbranch.sv"
   "examples/combcycle.sv"
+  "examples/ringcycle.sv"
   "examples/combsplit.sv"
   "examples/combbidx.sv"
   "examples/clkcone.sv"
@@ -171,6 +172,18 @@ foreach(c IN LISTS CASES)
     # ... and the commit list stores value words alone while pclean holds.
     if(NOT gen MATCHES "if \\(C0TWO\\)")
       message(FATAL_ERROR "${c}: the commit list has no value-only path")
+    endif()
+  endif()
+  # A cycle of comb blocks runs as one merged block, a function per member
+  # (msim.cpp mergeCombCycles), and the clocked block stays in the cycle
+  # domain: run-time index writes go through the kernel's list (DNB).
+  if(c STREQUAL "examples/ringcycle.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(NOT gen MATCHES "cyA[0-9]+_[0-9]+\\(" OR NOT gen MATCHES "DNB->push_back")
+      message(FATAL_ERROR "${c}: the comb cycle is not merged or the clocked block left the cycle domain")
+    endif()
+    if(gen MATCHES "static void seq[0-9]+\\(")
+      message(FATAL_ERROR "${c}: the clocked block runs as a kernel process")
     endif()
   endif()
   # A testbench clock toggles through the direct one-bit edge (Sim::setOneBit).
