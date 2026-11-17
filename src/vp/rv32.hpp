@@ -173,6 +173,7 @@ struct Hart {
     void flushTlb() {
         for (auto& t : tlb) t.valid = false;
         fpVpn = ~0ull;
+        flushFetchPages();
         flushDataPages();
     }
     // Pages of plain memory that loads (dl) and stores (ds) with paging on
@@ -192,6 +193,12 @@ struct Hart {
     // privilege it was checked at. Emptied with the TLB and by PMP writes.
     uint64_t fpVpn = ~0ull, fpPa = 0;
     unsigned fpPriv = 0;
+    // The fast loop's record of pages instructions were fetched from the same
+    // way (fpVpn and fpPriv as each was set), by virtual page.
+    struct FetchPage { uint64_t vpn = ~0ull; unsigned priv = 0; };
+    static constexpr unsigned FP_SIZE = 16;
+    FetchPage fp[FP_SIZE];
+    void flushFetchPages() { for (auto& e : fp) e.vpn = ~0ull; }
     // The active PMP entries, decoded from the CSRs in priority order
     // (Machine::pmpDecode). pmpLock: some entry binds machine mode too.
     struct PmpRegion { uint64_t lo, hi; uint8_t cfg; };
@@ -216,7 +223,7 @@ struct Hart {
     // stores to code only after FENCE.I, as the ISA allows; loading a
     // program, a debugger write and a restore empty it too.
     struct Decoded {
-        uint64_t pc;
+        uint64_t pc;  // the instruction's address, | 1 when fetched through the MMU (~0: empty)
         uint32_t insn, raw;
         uint8_t len, op, rd, f3, rs1, rs2, f7;
         bool xlat;  // fetched through the MMU (the same pc means another page bare)
@@ -225,13 +232,13 @@ struct Hart {
         uint8_t step;  // bytes from this entry to the next instruction's (len / 2 entries)
         int32_t imm;   // its immediate, decoded (I, U, J, B or S type)
     };
-    static constexpr unsigned DC_SIZE = 8192;
+    static constexpr unsigned DC_SIZE = 32768;
     // Two entries past the end that never hold a pc: the fast loop steps to
     // the next entry without wrapping and leaves when it lands there.
     std::unique_ptr<Decoded[]> dc{new Decoded[DC_SIZE + 2]};
     Hart() { flushDecoded(); }
     void flushDecoded() {
-        for (unsigned i = 0; i < DC_SIZE + 2; i++) dc[i].pc = 1;
+        for (unsigned i = 0; i < DC_SIZE + 2; i++) dc[i].pc = ~0ull;
         dcGen++;
     }
     // The fast loop's basic blocks: runs of decoded instructions ending at a
@@ -245,7 +252,7 @@ struct Hart {
     };
     static constexpr unsigned BLOCK_OPS = 32, BLOCKS = 2048;
     struct Block {
-        uint64_t pc = 1, end = 0, target = 0;  // end: after the last op; target: a branch's or JAL's
+        uint64_t pc = ~0ull, end = 0, target = 0;  // pc: as Decoded::pc; end: after the last op; target: a branch's or JAL's
         uint32_t gen = 0;
         uint32_t n = 0;
         BlockOp ops[BLOCK_OPS + 1];  // the last is the fall-through exit
