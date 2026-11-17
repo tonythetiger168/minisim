@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: Svpbmt on RV64 (`menvcfg.PBMTE`, PBMT PMA/NC/IO on leaf PTEs; 3,
+  PBMT without PBMTE and PBMT on a pointer fault) and Zalasr (LB..LD.AQ,
+  SB..SD.RL, .AQRL); both in the device tree. `tests/vplat/svpbmt.c`.
 - mmcp: the minisim engines as Model Context Protocol tools for AI agents
   (Claude, DeepSeek, local models, any MCP client): `msim_run`, `mlint_check`,
   `mcov_report`, `mdebug_query`, `mregress_run`, `mplan_report`, `read_file`,

@@ -41,7 +41,9 @@ names what is missing. Sections marked *(extension)* describe these parts.
 
 **Harts.** RV32GCBV or RV64GCBV (IMAFDC with Zicsr and Zifencei, the B
 extension's Zba, Zbb and Zbs, Zbc, Zicond, the scalar-crypto bit
-manipulation Zbkb and Zbkx, the byte and halfword atomics Zabha, compare and
+manipulation Zbkb and Zbkx, the byte and halfword atomics Zabha, load-acquire
+and store-release Zalasr (LB..LD.AQ, SB..SD.RL and their .AQRL forms;
+misaligned addresses raise address-misaligned exceptions), compare and
 swap Zacas (AMOCAS.W/D, AMOCAS.Q on RV64 and AMOCAS.D on RV32 with register
 pairs, AMOCAS.B/H), half-precision floating point Zfh (every operation,
 rounding mode and flag, NaN-boxed in the F registers), and the cache-block operations CBO.ZERO, CBO.CLEAN,
@@ -102,7 +104,9 @@ superpages at every level; a virtual address not sign-extended from bit 38,
 47 or 56 faults), with a 256-entry TLB per hart
 and page faults (causes 12, 13 and 15). No ASIDs (`satp.ASID` reads 0). Svnapot
 64 KiB pages on RV64 (`N` on a level-0 leaf whose PPN ends in `1000`);
-no Svpbmt (the PBMT bits fault). `menvcfg.CBZE` and `senvcfg.CBZE` read 1,
+Svpbmt on RV64: with `menvcfg.PBMTE` set a leaf may say PMA, NC or IO
+(the same here, as there are no caches); PBMT 3, any PBMT with PBMTE clear,
+or a PBMT on a pointer PTE faults. `menvcfg.CBZE` and `senvcfg.CBZE` read 1,
 so CBO.ZERO works in every mode; CBCFE and CBIE are 0, so the others are
 machine-mode only. Accessed and dirty bits follow Svade: a page whose A bit is clear,
 or a store to a page whose D bit is clear, faults and the supervisor sets
@@ -481,7 +485,7 @@ simulation time.
 ## Limits / Not yet
 
 - No Zvfbfmin/Zvfbfwma (BF16), no Zbkc,
-  no Svadu (hardware A/D update), no Svpbmt, and every hart of a platform
+  no Svadu (hardware A/D update), and every hart of a platform
   has the program's width. F and D
   round to nearest-ties-to-max-magnitude (RMM) exactly only in conversions
   to integers; other RMM results round as ties-to-even (differs only for a

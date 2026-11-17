@@ -80,6 +80,8 @@ for x in 32 64; do
     expect "Zvkned/Zvknhb/Zvkg/Zvbc, RV$x, VLEN $v: AES, SHA-2, GHASH known answers" 0 zvk${x}_$v.out "checks passed, all"
   done
 done
+"$MVPLAT" "$E/svpbmt64.elf" -q > svpbmt.out 2>&1; rc=$?
+expect "Svpbmt (PBMT, menvcfg.PBMTE) and Zalasr (load-acquire, store-release)" 0 svpbmt.out "checks passed, all"
 
 "$MVPLAT" "$E/irq.elf" -input abc -q -max-cycles 20000 > part1.out 2>&1; rc=$?
 expect "-max-cycles stops with exit code 4" 4 part1.out "stopped at cycle 20000"
