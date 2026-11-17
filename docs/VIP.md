@@ -102,8 +102,9 @@ python3 tools/mvip.py --portfolio open-vip-portfolio UART-VIP SPI-VIP    # some 
 tests and pass rule from the portfolio's own runner
 (`tools/run_uvm_tests.py`); it only replaces the simulator, running
 `msim -uvm --single-unit ...` where that runner builds a Verilator binary.
-`--single-unit` makes the files one compilation unit, as Verilator compiles
-them: the VIPs rely on a macro or `$unit` class of an earlier file.
+`--single-unit` (msim's default) makes the files one compilation unit, as
+Verilator compiles them: the VIPs rely on a macro or `$unit` class of an
+earlier file.
 
 Results per test: `PASS`; `WARN` (no error, but the VIP's own checkers
 warned); `FAIL` (a UVM error, a timeout, or no pass marker); `ERROR` (msim
