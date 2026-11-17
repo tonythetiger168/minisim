@@ -565,6 +565,33 @@ static exprsimp::Stats simplifyExprs(LowerResult& lowered, const Plan& pl) {
     return sp.stats;
 }
 
+// A select written at a run-time index whose index folded to a constant
+// (v[IRQ_EBREAK] = 1 with a parameter): an ordinary constant part select, so
+// the compiled model can keep v in its own storage. Only in range, never
+// for an array element or a descending (-:) select. MSIM_NOCONSTSEL: off.
+static size_t constSelects(LowerResult& lowered, const Plan& pl) {
+    size_t n = 0;
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        if (pl.rank[i] < 0 && !pl.seq[i]) continue;
+        for (auto& in : lowered.procs[i].prog.code) {
+            if ((in.k != IK::Assign && in.k != IK::Nba) || !in.bidx || in.bidx->op != Op::Const || in.arr || !in.aidx.empty() || in.pdown ||
+                in.sig < 0 || (size_t)in.sig >= S.sigs.size())
+                continue;
+            const Val& k = in.bidx->k;
+            if (k.x || k.z || !k.hi.empty() || k.real || k.str) continue;
+            int64_t b = (int64_t)v_to_i64(k) - in.lo;
+            int w = in.pw ? in.pw : 1, W = S.sigs[in.sig].w;
+            if (b < 0 || b + w > W) continue;
+            in.bidx = nullptr;
+            in.lo = (int)b;
+            in.hi = (int)b + w - 1;
+            in.pw = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
 // -x-assign 0 / -x-initial 0 (Verilator's options of the same names): the
 // design runs as a 2-state model would. Every X bit of a literal becomes 0
 // (picorv32 writes 'bx as a don't-care into a dozen registers every cycle,
@@ -3794,6 +3821,10 @@ static int msimMain(int argc, char** argv) {
     if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOSIMP")) {
         exprsimp::Stats st = simplifyExprs(lowered, pl);
         if (std::getenv("MSIM_WHYSIMP")) std::fprintf(stderr, "simplified: %zu rewrites\n", st.rewrites);
+    }
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCONSTSEL")) {
+        size_t n = constSelects(lowered, pl);
+        if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constant selects: %zu writes\n", n);
     }
     // A testbench's clocked block with $display / $finish: a clocked
     // process of the compiled model too (the interpreter keeps it a coroutine).
