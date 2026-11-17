@@ -530,7 +530,9 @@ check. In supervisor and user mode with paging on, a block is found by
 virtual pc through the fetch page record and translated from the physical
 address the pc has then (so another mapping of the same code gets its own
 translation); it links straight only to blocks in its own page, and goes
-to others through the table, which is emptied with the TLB. Loads, stores,
+to others through the table, which is emptied with the TLB (SFENCE.VMA
+with an address empties only what lies in that address's 1 GiB, the
+largest page that can map it with Sv39). Loads, stores,
 the AMOs, LR and SC (one hart, or `-serial`) and CBO.ZERO look their page up in the
 hart's data page caches inline; a miss, a device, an access across a page
 or a misaligned AMO leaves for the general path. CSRRCI on sstatus in

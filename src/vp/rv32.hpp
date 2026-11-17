@@ -179,6 +179,29 @@ struct Hart {
         flushFetchPages();
         flushDataPages();
     }
+    // SFENCE.VMA with an address (RV64): what came from the leaf entry that
+    // maps va, which may be a superpage up to 1 GiB (512 GiB, 256 TiB with
+    // Sv48, Sv57), so everything in va's 1 GiB with Sv39. Translated code
+    // finds the fetch pages dropped here in fpRegions (Machine::jitRunPg).
+    std::vector<uint64_t> fpRegions;  // va >> rsh of each
+    void flushTlbAt(uint64_t va) {
+        const unsigned levels = (unsigned)(satp >> 60) - 5;  // Sv39: 3
+        const unsigned rsh = 12 + 9 * (levels - 1);          // the largest superpage
+        const uint64_t r = va >> rsh, vmask = (1ull << (9 * levels)) - 1;
+        const uint64_t tr = ((va >> 12) & vmask) >> (rsh - 12);
+        for (auto& t : tlb)
+            if (t.valid && (t.vpn >> (rsh - 12)) == tr) t.valid = false;
+        fpVpn = ~0ull;
+        for (auto& e : fp)
+            if (e.vpn != ~0ull && (e.vpn >> (rsh - 12)) == r) e.vpn = ~0ull;
+        const uint64_t tagMask = (1ull << 52) - 1;
+        for (auto& e : dl)
+            if (e.tag != ~0ull && ((e.tag & tagMask) >> (rsh - 12)) == (r & (tagMask >> (rsh - 12)))) e.tag = ~0ull;
+        for (auto& e : ds)
+            if (e.tag != ~0ull && ((e.tag & tagMask) >> (rsh - 12)) == (r & (tagMask >> (rsh - 12)))) e.tag = ~0ull;
+        if (fpRegions.size() < 16) fpRegions.push_back(r);
+        else { fpRegions.clear(); flushFetchPages(); }
+    }
     // Pages of plain memory that loads (dl) and stores (ds) with paging on
     // last went to: va >> 12, where the page is in host memory, and the
     // privilege, SUM and MXR they were checked with. Each one was translated
@@ -208,6 +231,7 @@ struct Hart {
     FetchPage fp[FP_SIZE];
     uint32_t fpGen = 0;  // counts the flushes below
     void flushFetchPages() { for (auto& e : fp) e.vpn = ~0ull; fpGen++; }
+    unsigned fpRegionShift() const { return 12 + 9 * ((unsigned)(satp >> 60) - 6); }
     // The active PMP entries, decoded from the CSRs in priority order
     // (Machine::pmpDecode). pmpLock: some entry binds machine mode too.
     struct PmpRegion { uint64_t lo, hi; uint8_t cfg; };

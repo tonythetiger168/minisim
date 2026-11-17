@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: SFENCE.VMA with an address (RV64) drops only what came from
+  that address's 1 GiB (Sv39; the largest page that can map it) from the
+  TLB, the fetch and data page caches and the translator's jump table,
+  instead of all of them. Linux fences single pages about 16000 times while
+  it boots; exits from translated code fall by about a fifth.
+  `tests/vplat/jit.c` remaps a 4 KiB page of code and a 2 MiB page and
+  checks loads and translated code see the new pages.
 - mvplat: the translator runs Zbb (clz, ctz, cpop and their W forms,
   sext.b, sext.h, zext.h, orc.b, rev8, andn, orn, xnor, min, max, minu,
   maxu, rol, ror, rori and the W rotates), which Linux's string functions
