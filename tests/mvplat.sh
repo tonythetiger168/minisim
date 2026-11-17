@@ -102,10 +102,13 @@ cmp -s jit.out jit_nojit.out && cmp -s jit.out jit_q7.out && \
   [ "$(grep -o '[0-9]* instructions' jit_count.out)" = "$(grep -o '[0-9]* instructions' jit_count_nojit.out)" ] \
   && ok "translator: the same checksum and instruction count as -nojit, and with a 7-cycle quantum" \
   || bad "translator: differs from -nojit"
-for o in "" -nojit "-quantum 7" "-harts 2"; do
+for o in "" -nojit "-quantum 7" "-harts 2" "-harts 2 -serial"; do
   "$MVPLAT" "$E/smc64.elf" -q $o > smc.out 2>&1; rc=$?
   expect "self-modifying code and FENCE.I, machine and supervisor mode (Sv39, an alias) ${o:-(translated)}" 0 smc.out "checks passed, all"
 done
+# the same with code pages compared at every FENCE.I instead of watched
+MVPLAT_NO_WTRACK=1 "$MVPLAT" "$E/smc64.elf" -q > smc.out 2>&1; rc=$?
+expect "self-modifying code, pages not watched" 0 smc.out "checks passed, all"
 "$MVPLAT" "$E/svpbmt64.elf" -q > svpbmt.out 2>&1; rc=$?
 expect "Svpbmt (PBMT, menvcfg.PBMTE) and Zalasr (load-acquire, store-release)" 0 svpbmt.out "checks passed, all"
 

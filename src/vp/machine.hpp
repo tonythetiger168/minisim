@@ -1820,8 +1820,13 @@ private:
             h.codeUntracked = true;
             return;
         }
-        Hart::CodePage cp{d->memory() + ((pg << 12) - d->base), std::unique_ptr<uint8_t[]>(new uint8_t[4096]), false, pieces};
+        Hart::CodePage cp{d->memory() + ((pg << 12) - d->base), std::unique_ptr<uint8_t[]>(new uint8_t[4096]), false, pieces, -1, 0};
         memcpy(cp.snap.get(), cp.host, 4096);
+        if (!d->writable()) cp.wr = -2;
+        else if (int id = watchRegion(d); id >= 0) {
+            const size_t wp = ((pg << 12) - d->base) >> 12;
+            if (WriteWatch::watch(id, wp)) { cp.wr = id; cp.seen = WriteWatch::gen(id, wp); }
+        }
         if (memcmp(cp.snap.get() + (fa & 0xfff), &raw, n)) cp.changed = true;
         h.codePages.emplace(pg, std::move(cp));
     }
@@ -1831,6 +1836,22 @@ private:
             noteCode(h, fa + 2, raw >> 16, 2);
         } else noteCode(h, fa, raw, len);
     }
+    // The device's memory as a WriteWatch region (-1: not watched).
+    int watchRegion(Device* d) {
+        if (d == wrDev_) return wrId_;
+        auto it = wrIds_.find(d);
+        int id = it != wrIds_.end() ? it->second : -1;
+        if (it == wrIds_.end()) {
+            id = (d->base & 4095) || (d->size & 4095) ? -1 : WriteWatch::add(d->memory(), d->size);
+            wrIds_[d] = id;
+        }
+        wrDev_ = d;
+        wrId_ = id;
+        return id;
+    }
+    Device* wrDev_ = nullptr;
+    int wrId_ = -1;
+    std::unordered_map<Device*, int> wrIds_;
     // FENCE.I: forget what was decoded from pages that changed.
     void fenceI(Hart& h) {
         if (h.codeUntracked || (h.par && !h.ov.empty())) {
@@ -1842,13 +1863,27 @@ private:
         bool any = false;
         for (auto it = h.codePages.begin(); it != h.codePages.end();) {
             Hart::CodePage& c = it->second;
+            // not written since it was last compared (or read-only)
+            if (!c.changed && c.wr != -1) {
+                if (c.wr == -2) { ++it; continue; }
+                const size_t wp = (size_t)(c.host - WriteWatch::base(c.wr)) >> 12;
+                if (WriteWatch::readOnly(c.wr, wp) && WriteWatch::gen(c.wr, wp) == c.seen) { ++it; continue; }
+            }
             // only the pieces instructions were decoded from matter
             bool changed = c.changed;
             for (uint64_t m = c.used; m && !changed; m &= m - 1) {
                 const unsigned o = 64 * (unsigned)__builtin_ctzll(m);
                 changed = memcmp(c.snap.get() + o, c.host + o, 64) != 0;
             }
-            if (!changed) { ++it; continue; }
+            if (!changed) {
+                if (c.wr >= 0) {  // watch it again from here
+                    const size_t wp = (size_t)(c.host - WriteWatch::base(c.wr)) >> 12;
+                    c.seen = WriteWatch::gen(c.wr, wp);
+                    if (!WriteWatch::watch(c.wr, wp)) c.wr = -1;
+                }
+                ++it;
+                continue;
+            }
             const uint64_t pg = it->first;
             // its entries, and one at the end of the page before (4 bytes across)
             Hart::Decoded* e = &h.dc[((pg << 12) >> 1) & (Hart::DC_SIZE - 1)];
