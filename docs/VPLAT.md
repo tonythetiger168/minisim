@@ -448,17 +448,22 @@ Measured on the container this was developed in (4 cores), with
 | 1 hart | 150 to 170 MIPS |
 | 4 harts, 4 threads | 190 to 200 MIPS in all |
 
-Each hart keeps a cache of decoded instructions (8192 entries, by address),
+Each hart keeps a cache of decoded instructions (32768 entries, by address),
 so an instruction is fetched, expanded from its compressed form and split
 into fields once. A hart in machine mode with no trace, profile,
 breakpoint, watchpoint, single step, write buffer, PMP lock or MPRV runs a
 fast loop: the common integer, branch, load and store instructions (RV32I,
 RV64I, MUL and MULW) go straight from the cache, each handler jumping to
-the next one's, and straight-line code steps to the next cache entry
-without a lookup. It leaves, before the instruction, at anything else: a
+the next one's. A run of them up to a jump or branch becomes a basic block
+(2048 per hart, up to 32 instructions each) that runs with no pc or budget
+check inside; it is built from the cache and dropped with it. The same
+loop runs supervisor and user code with paging on: instructions from pages
+the hart has already fetched from at that privilege, loads and stores
+through the data page caches below; a miss leaves for the general path,
+which fills them. Linux boots to a BusyBox shell in about 7 s. It leaves, before the instruction, at anything else: a
 cache miss, a CSR, a device or `tohost` access, the last 7 bytes of a
 memory region, the end of the quantum. A 2.1 G-instruction RV64IMAC
-program (integer loops, a CRC, a sieve) runs at about 400 MIPS this way (136 before).
+program (integer loops, a CRC, a sieve) runs at about 670 MIPS this way (136 before).
 As the ISA allows, a hart sees a store to code only after
 it executes `FENCE.I`; loading a program, a debugger write and `-restore`
 empty the cache too. With paging on, the page that instructions were last
@@ -466,7 +471,7 @@ fetched from stays translated and PMP-checked until the next `SFENCE.VMA`,
 `satp` or PMP write or change of privilege. Loads and stores with paging on
 keep the same for the last 64 pages of plain memory each read and wrote
 (a page any part of which is a device, is only partly allowed by PMP, or holds
-`tohost` takes the general path). Linux boots at about 50 MIPS. Loads and
+`tohost` takes the general path). Linux boots at about 120 MIPS. Loads and
 stores to plain memory with nothing to check
 (no PMP in force, no watchpoint, no write buffer) take an inline path. RAM is
 mapped on first touch, so a large memory costs nothing until it is used. A

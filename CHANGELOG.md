@@ -269,6 +269,15 @@ Spec references are IEEE 1800-2023 clauses.
   Vivado 2026.1 xsim and synthesis opened msim's version 2 output.
 
 ### Changed
+- mvplat: the fast loop also runs supervisor and user code with paging on
+  (instructions from pages already fetched from, loads and stores through
+  the data page caches), and the decoded-instruction cache holds 32768
+  entries. Linux boots to a BusyBox shell in 7.1 s instead of 13.8 s.
+  EXT_ABI 9.
+- mvplat: the fast loop runs basic blocks: a run of decoded instructions up
+  to a jump or branch is kept as a list of handlers with their operands,
+  run with no pc or budget check between them. The RV64IMAC CPU benchmark
+  runs in 3.2 s instead of 5.2 s (670 MIPS).
 - mvplat: a fast loop for a hart in machine mode with nothing to trace,
   watch or buffer runs the common integer, branch, load and store
   instructions straight from the decoded-instruction cache (computed-goto

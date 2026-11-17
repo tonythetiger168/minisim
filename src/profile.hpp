@@ -122,9 +122,9 @@ struct Profiler {
     }
 };
 
-inline Profiler& P() {
-    static Profiler p;
-    return p;
-}
+// A namespace-scope object, not a function-local static: the kernel tests
+// P().on several times a clock edge, and a local static pays its init guard each time.
+inline Profiler g_profiler;
+inline Profiler& P() { return g_profiler; }
 
 }   // namespace prof
