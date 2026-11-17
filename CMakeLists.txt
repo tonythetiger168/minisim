@@ -214,6 +214,8 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME msim_maxtime COMMAND msim ${CLI}/spin.sv -maxtime 25)
   set_tests_properties(msim_maxtime PROPERTIES PASS_REGULAR_EXPRESSION
                        "^tick\ntick\ntick\nmsim: stopped by -maxtime at time 25ns with events still pending\n$")
+  add_test(NAME msim_stop COMMAND msim ${CLI}/stop.sv)
+  set_tests_properties(msim_stop PROPERTIES PASS_REGULAR_EXPRESSION "^before\nmsim: \\$stop at [^\n]*stop.sv:6\n$")
   add_test(NAME msim_run_status
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_run_status.cmake)

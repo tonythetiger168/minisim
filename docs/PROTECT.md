@@ -68,8 +68,9 @@ On decryption the tool picks the first tool block whose `key_keyowner` /
 `key_keyname` it has a key for, checks the signature, and only then
 decrypts. A changed envelope (a right, a name, one base64 character) gives
 one error, `signature verification failed`, and nothing else. Envelopes may
-not nest in version 3. Version 1 and 2 envelopes are refused with a message;
-clause 34 envelopes (no `version`) still open.
+not nest in version 3. Version 2 envelopes (IEEE 1735-2014, the format AMD
+Vivado uses) open too, see "IEEE 1735-2014 version 2 envelopes" below; clause
+34 envelopes (no `version`, or `version = 1`) still open.
 
 minisim's decryptor and encryptor were checked against the test vector of
 IEEE 1735-2023 Annex B (its RSA block, key split, AES and HMAC all match).
@@ -408,13 +409,21 @@ A second round of nine hand-built envelopes showed:
   clause 34 digest at all, so this is not a layout we could change.
 - Version 2 needs `rights_digest_method` and a value on `end_toolblock`. The
   value is computed as IEEE 1735-2014 defines it, and Vivado reports the
-  envelope as modified when the value is left empty. minisim does not write
-  version 2.
+  envelope as modified when the value is left empty.
 
-So to encrypt for Vivado, write a clause 34 envelope with no digest and no
-`key_public_key`: `EncryptOptions` with `digestMethod = ""` and
-`publicKey = false`. That envelope carries no integrity check, so msim warns
-when it opens one (see the clause 34 section below).
+On 2026-11-17 version 2 was built to IEEE 1735-2014 (5.3.2, 7.4.3) and
+checked the same way, in two more rounds. Vivado opened six envelopes
+written by minisim's version 2 writer and by a separate script. They had
+`aes128-cbc` or `aes256-cbc`, a `control` right, a common block, and
+`sha256` or `sha512` digests. xsim and synthesis both passed, and xsim's
+output matched the plain run. Vivado refused the same envelopes when the
+key was not salted, or when the digest text lacked its final newline.
+minisim's reader gives the same verdict on all of them.
+
+So to encrypt for Vivado, write version 2 (`V3Options::version = 2`). The
+clause 34 shape also opens: `EncryptOptions` with `digestMethod = ""` and
+`publicKey = false`. Neither format carries a digest of the data, so msim
+warns when it opens one (see below).
 
 The other direction was not checked. The free tier refuses Vivado's
 `encrypt` command ("Your current selected license is BASIC"), so no
@@ -444,6 +453,33 @@ Vivado-made envelope was available.
 | 9.9 | Dynamic objects: the named handle, queue or array variables in the IP are protected; the objects themselves stay usable through them | ✅ `test_protect`; end to end beside `msimprotect` |
 | Annex A | Syntax: what a tool block and a common block may hold, BASE64_TEXT without spaces or inner padding, INTEGER version, STRING; msimprotect output checked against it | ✅ `test_protect`; end to end beside `msimprotect` |
 | Annex B | Test vector | ✅ checked locally (not redistributable) |
+
+## IEEE 1735-2014 version 2 envelopes
+
+`version = 2` envelopes follow IEEE 1735-2014. msim reads them, and
+`encryptSourceV3` writes them when `V3Options::version` is 2.
+
+- A tool block holds `key_keyowner`, `key_keyname`, `key_method="rsa"`
+  (PKCS#1 v1.5), `rights_digest_method` (`sha256` or `sha512`), the
+  `key_block`, and its `control` rights. It ends with
+  `end_toolblock="<HMAC>"`. A tool block without one of these is ignored
+  (7.4.1).
+- The `key_block` holds the session key plus (version - 1), read as a
+  big-endian number (5.3.2). The `data_block` is encrypted with the key
+  itself.
+- The HMAC is keyed with that salted key. It covers the common block and the
+  tool block, after the markup, the trailing and leading white space, the
+  empty lines and the begin / end block lines are removed, and each line
+  ends in a UNIX newline (7.4.3). msim checks it before decrypting. A
+  mismatch is an error, `end_toolblock digest does not match`.
+- `control` rights come from the common block, and then from the tool
+  block. Version 2 license checks (`license_proxyname` and the rest) are
+  not run, so licensed rights take their unlicensed value, with a warning.
+- Version 2 has no digest over the data, so msim warns when it opens one,
+  as it does for a clause 34 envelope without a digest.
+- `tests/protect_interop.sh` builds a version 2 envelope with the `openssl`
+  command line alone, runs it in msim, and checks that a changed tool block
+  fails the digest.
 
 ## IEEE 1800-2023 clause 34 envelopes (`-v1`)
 
