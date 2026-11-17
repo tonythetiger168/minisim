@@ -4,6 +4,96 @@ Designs and scripts for measuring minisim tools; see the bench-speed skill
 (`.claude/skills/bench-speed`) for the method. This page covers the SoC
 generator.
 
+## gen_manycore.py: tiled many-core with shared memory
+
+```sh
+python3 bench/gen_manycore.py --help
+python3 bench/gen_manycore.py --mesh 8x8 > mc.sv && msim mc.sv -top mc_tb
+python3 bench/gen_soc.py --tiles 8x8          # the same, through gen_soc.py
+```
+
+The N-core designs of `gen_soc.py` below are N copies that never talk to
+each other, which makes them an easy case for a simulator: one module
+repeated, and every core busy on every clock. `gen_manycore.py` builds a chip
+the way tiled many-cores such as OpenPiton are built (our own RTL, nothing
+taken from OpenPiton): an X x Y mesh of tiles, each with
+
+* a RISC-V core: `mcrv` (our own RV32I, `bench/manycore/mc_rv.sv`, the
+  default, needs no download), `picorv32`, `femtorv32`, or a mix
+  `cva6` (OpenHW CVA6 / Ariane, see below), or a mix (`--core mix` is a
+  checkerboard of PicoRV32 and FemtoRV32; a comma list such as
+  `--core cva6,mcrv,picorv32` repeats over the tiles),
+* 4 KB of private RAM with the program,
+* a private L1 data cache (direct-mapped, write-through),
+* one slice of the distributed shared L2 (lines homed by address mod N), with
+  a limited-pointer directory (`--dir-ptrs`, default 4) that invalidates the
+  sharers on a write and broadcasts once a line has more sharers than pointers,
+* three routers, one per physical network as in OpenPiton: NoC1 requests,
+  NoC2 data, write acks and invalidations, NoC3 invalidation acks
+  (single-flit packets, XY routing, round-robin arbitration).
+
+The program is the same in every tile. In each of `--rounds` rounds core i
+runs a xorshift loop whose length depends on i (so some cores compute while
+others wait at the barrier spinning in their L1), writes its value to a shared
+array, joins a barrier (fetch-and-increment, then the last arrival releases a
+flag), and mixes in the values of tiles i+1 and i+X. Core 0 then folds every
+core's result into a checksum. The generator computes the same checksum in
+Python, and the testbench prints PASS only when they agree:
+
+```
+mc: tiles=64 mesh=8x8 cores=mcrv done=64/64 cycles=13667 l2_requests=928 checksum=99886ab5 expect=99886ab5 PASS
+```
+
+So a run checks the NoC, the coherence protocol and the cores, not only that
+nothing hangs. `tests/msim_manycore.cmake` runs three small meshes on msim
+with 1 and 4 threads.
+
+| file | contents |
+|---|---|
+| `manycore/mc_router.sv` | 5-port router, 2-deep input FIFOs |
+| `manycore/mc_l1.sv` | L1 data cache, NoC1/NoC3 inject, NoC2 eject |
+| `manycore/mc_l2.sv` | L2 slice, directory, invalidation and ack counting |
+| `manycore/mc_tile.sv` | core port decode, private RAM, MMIO, the three routers |
+| `manycore/mc_rv.sv` | the mcrv core |
+
+Measured (2026-11-17, 4-core VM, `--rounds 2`, mcrv, msim interpreter vs
+Verilator 5.054 `-O3`; seconds; every run printed PASS with the same checksum):
+
+| mesh | tiles | cycles | msim interp | Verilator build | Verilator run |
+|---|---|---|---|---|---|
+| 4x4 | 16 | 11,101 | 4.1 | 22.1 | 0.2 |
+| 8x8 | 64 | 13,667 | 28.0 | | |
+
+### CVA6 (Ariane) tiles
+
+```sh
+python3 bench/manycore/fetch_cva6.py cva6dir      # pinned CVA6 + cvfpu + hpdcache, config, file list
+python3 bench/gen_manycore.py --core cva6 --mesh 4x4 > mc.sv
+verilator --binary -Wno-fatal -Wno-lint -Wno-style -Wno-UNOPTFLAT --top-module mc_tb -f cva6dir/cva6.f mc.sv
+```
+
+CVA6 is not copied into minisim; the script clones it (Solderpad 0.51,
+hpdcache Solderpad 2.1, cvfpu's T-Head divider Apache-2.0) and derives a
+config from `cv32a6_imac_sv32`: RV32IMAC with its own I-cache and
+write-through D-cache, where only the private RAM is cacheable (so every
+shared access goes through the tile's coherent L1) and the
+fetch-and-increment alias and MMIO are non-idempotent. `bench/manycore/mc_cva6.sv`
+turns its AXI4 port into the tile port. With CVA6 the program gets FENCEs
+around each barrier (RVWMO), so CVA6 cannot share a mesh with FemtoRV32,
+which does not decode FENCE.
+
+On Verilator 5.054 1x1, 2x2, 4x4 and a 3x3 mix of CVA6, mcrv and PicoRV32
+print PASS. msim does not elaborate it yet:
+`core/cva6_mmu/cva6_mmu.sv:405` selects `[31:34]` in a branch that is dead for
+RV32, which slang reports as an error (Verilator only warns). Turning the MMU
+off avoids that file but is not an option: with `MmuPresent = 0` CVA6 checks
+non-idempotence against the previous access's address, issued the
+fetch-and-increment load speculatively and then replayed it, and the
+barrier hung.
+
+`msim -compile` gives the same result on 4x4 but its build took 9 min 40 s,
+against 4 s for the interpreter: this design is the next compiled-mode case.
+
 ## gen_soc.py: SoC of N cores
 
 ```sh
