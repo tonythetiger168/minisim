@@ -34,6 +34,24 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <chrono>
+#include <fstream>
+
+// MSIM_PHASES=1: time and memory after each step of elaboration and
+// -compile, on stderr (for a large design that runs out of time or memory).
+inline void phaseMark(const char* what) {
+    static const bool on = std::getenv("MSIM_PHASES") != nullptr;
+    if (!on) return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    long rss = 0, hwm = 0;
+    std::ifstream f("/proc/self/status");
+    for (std::string k; f >> k;) {
+        if (k == "VmRSS:") f >> rss;
+        else if (k == "VmHWM:") f >> hwm;
+    }
+    double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "msim: phase %-22s %8.1f s  rss %6.2f GB  peak %6.2f GB\n", what, t, rss / 1048576.0, hwm / 1048576.0);
+}
 #include <vector>
 
 #include "prog.hpp"
@@ -139,11 +157,15 @@ public:
         }
         if (!dom.empty()) wakeEvents(procs, dom);
         armK_.clear(); armIns_.clear(); armSet_.clear();
+        phaseMark(" cg: domain chosen");
         if (!dom.empty() && privates) privateSigs(sigs, procs, dom);
+        phaseMark(" cg: private signals");
         std::vector<CodegenProc> wideProcs;
         if (!dom.empty() && privates && !std::getenv("MSIM_NOWIDE")) wideProcs = splitWide(procs, dom);
+        std::vector<char> inDomV(procs.size(), 0);
+        for (int i : dom) inDomV[(size_t)i] = 1;
         for (size_t i = 0; i < procs.size(); i++) {
-            bool inDom = std::find(dom.begin(), dom.end(), (int)i) != dom.end();
+            const bool inDom = inDomV[i] != 0;
             if (upf && procs[i].prog->pd >= 0 && (procs[i].combRank >= 0 || procs[i].seq || inDom))
                 throw CodegenUnsupported("a statically scheduled process of a power domain");
             if (procs[i].combRank >= 0) {
@@ -158,7 +180,9 @@ public:
                 chunk([&](std::ostream& c) { emitProc(c, (int)i, *procs[i].prog, procs[i].kind); });
         }
 
+        phaseMark(" cg: processes");
         if (!dom.empty()) { std::ostringstream c; emitCycle(c, wideProcs.empty() ? procs : wideProcs, dom, byRank); cyc = c.str(); }
+        phaseMark(" cg: cycle domain");
         // Several files: the shared variables are inline (one object for
         // all files) and the process functions external.
         // The cycle domain splits too: its functions (ds<n>, combP<n>, ...)
@@ -3380,10 +3404,9 @@ private:
                 range(e->arr.get());
                 for (auto& k : e->kids) ea(k);
             };
-            std::vector<const Prog*> seen;
+            std::unordered_set<const Prog*> seen;
             std::function<void(const Prog*)> walk = [&](const Prog* p) {
-                if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) return;
-                seen.push_back(p);
+                if (!p || !seen.insert(p).second) return;
                 for (auto& in : p->code) {
                     range(in.arr.get());
                     ea(in.e); ea(in.bidx); ea(in.de);
@@ -3670,10 +3693,9 @@ private:
             for (auto& [sg, ed] : in.events) drop(sg);
         };
         // Anything outside the domain that names one keeps it whole.
-        std::vector<const Prog*> seen;
+        std::unordered_set<const Prog*> seen;
         std::function<void(const Prog*)> outside = [&](const Prog* p) {
-            if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) return;
-            seen.push_back(p);
+            if (!p || !seen.insert(p).second) return;
             for (auto& in : p->code) { dropAll(in); outside(in.callee); for (auto* b : in.branches) outside(b); }
         };
         for (size_t i = 0; i < procs.size(); i++) if (!mine[i]) outside(procs[i].prog);
@@ -3870,10 +3892,9 @@ private:
                 if (ok(in.sig)) out[in.sig] = 1;
                 for (auto& [sg, ed] : in.events) if (ok(sg)) out[sg] = 1;
             };
-            std::vector<const Prog*> seen;
+            std::unordered_set<const Prog*> seen;
             std::function<void(const Prog*, bool)> walk = [&](const Prog* p, bool outside) {
-                if (!p || std::find(seen.begin(), seen.end(), p) != seen.end()) return;
-                seen.push_back(p);
+                if (!p || !seen.insert(p).second) return;
                 for (auto& in : p->code) {
                     if ((in.k == IK::Assign || in.k == IK::Nba) && ok(in.sig)) nw[in.sig]++;
                     if (outside) touchAll(in, live);
@@ -3971,10 +3992,9 @@ private:
             };
             bool seqDead = !std::getenv("MSIM_NODEADSEQ");
             {
-                std::vector<const Prog*> seenD;
+                std::unordered_set<const Prog*> seenD;
                 std::function<void(const Prog*)> dumps = [&](const Prog* p) {
-                    if (!p || !seqDead || std::find(seenD.begin(), seenD.end(), p) != seenD.end()) return;
-                    seenD.push_back(p);
+                    if (!p || !seqDead || !seenD.insert(p).second) return;
                     for (auto& in : p->code) {
                         if (in.k == IK::Dump || in.k == IK::Vpi) { seqDead = false; return; }
                         dumps(in.callee);

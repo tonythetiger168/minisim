@@ -635,13 +635,21 @@ inline void collectRefs(const E& e, std::vector<int>& out) {
     std::unordered_set<int> seen(out.begin(), out.end());
     collectRefsInto(e, out, seen);
 }
+// A prog not visited yet (and now marked): a linear scan of a short list,
+// a hash set for a whole design's processes (a list of 100k was quadratic).
+inline bool firstVisit(std::vector<const Prog*>& seen, const Prog* p) {
+    for (const Prog* s : seen)
+        if (s == p) return false;
+    seen.push_back(p);
+    return true;
+}
+inline bool firstVisit(std::unordered_set<const Prog*>& seen, const Prog* p) { return seen.insert(p).second; }
 // Signals read by this prog and by any prog it calls. @* / always_comb must see
 // a function body, or a call would hide the signals that should wake it.
+template <class Seen>
 inline void collectProgRefsInto(const Prog& p, std::vector<int>& sigs, std::unordered_set<int>& have,
-                                std::vector<const Prog*>& seen, size_t from = 0, size_t to = SIZE_MAX) {
-    for (const Prog* s : seen)
-        if (s == &p) return;
-    seen.push_back(&p);
+                                Seen& seen, size_t from = 0, size_t to = SIZE_MAX) {
+    if (!firstVisit(seen, &p)) return;
     for (size_t pc = from; pc < std::min(to, p.code.size()); pc++) {
         auto& i = p.code[pc];
         collectRefsInto(i.e, sigs, have);
@@ -655,7 +663,8 @@ inline void collectProgRefsInto(const Prog& p, std::vector<int>& sigs, std::unor
         for (const Prog* b : i.branches) collectProgRefsInto(*b, sigs, have, seen);
     }
 }
-inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, std::vector<const Prog*>& seen) {
+template <class Seen>
+inline void collectProgRefs(const Prog& p, std::vector<int>& sigs, Seen& seen) {
     std::unordered_set<int> have(sigs.begin(), sigs.end());
     collectProgRefsInto(p, sigs, have, seen);
 }
@@ -682,10 +691,9 @@ inline std::vector<std::pair<int, Edge>> readSet(const Prog& p, size_t from = 0,
 // Signals a process (or a subroutine it calls) writes whole: an assignment
 // without a part select, or any element of an array written at a run-time
 // index. always_comb leaves these out of its sensitivity (9.2.2.2.1 b).
-inline void collectProgWrites(const Prog& p, std::unordered_set<int>& out, std::vector<const Prog*>& seen) {
-    for (const Prog* s : seen)
-        if (s == &p) return;
-    seen.push_back(&p);
+template <class Seen>
+inline void collectProgWrites(const Prog& p, std::unordered_set<int>& out, Seen& seen) {
+    if (!firstVisit(seen, &p)) return;
     for (auto& i : p.code) {
         if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig >= 0 && i.drv < 0 && i.dyn < 0) {
             if (i.arr) for (int k = 0; k < i.arr->count; k++) out.insert(i.arr->base + k);
@@ -727,10 +735,9 @@ inline void collectReadBits(const E& e, std::unordered_map<int, BitSet>& m) {
     collectReadBits(e->at, m);
     for (auto& k : e->kids) collectReadBits(k, m);
 }
-inline void collectProgReadBits(const Prog& p, std::unordered_map<int, BitSet>& m, std::vector<const Prog*>& seen) {
-    for (const Prog* s : seen)
-        if (s == &p) return;
-    seen.push_back(&p);
+template <class Seen>
+inline void collectProgReadBits(const Prog& p, std::unordered_map<int, BitSet>& m, Seen& seen) {
+    if (!firstVisit(seen, &p)) return;
     for (auto& i : p.code) {
         collectReadBits(i.e, m);
         for (auto& a : i.args) collectReadBits(a, m);
@@ -742,10 +749,9 @@ inline void collectProgReadBits(const Prog& p, std::unordered_map<int, BitSet>& 
     }
 }
 // Bits written at a constant part select (v[3] = ..., v[7:4] = ...).
-inline void collectProgPartWrites(const Prog& p, std::unordered_map<int, BitSet>& out, std::vector<const Prog*>& seen) {
-    for (const Prog* s : seen)
-        if (s == &p) return;
-    seen.push_back(&p);
+template <class Seen>
+inline void collectProgPartWrites(const Prog& p, std::unordered_map<int, BitSet>& out, Seen& seen) {
+    if (!firstVisit(seen, &p)) return;
     for (auto& i : p.code) {
         if ((i.k == IK::Assign || i.k == IK::Nba) && i.sig >= 0 && i.drv < 0 && i.dyn < 0 && !i.arr &&
             i.hi >= 0 && !i.bidx)
