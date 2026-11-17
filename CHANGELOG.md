@@ -8,6 +8,15 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: the pages code was decoded from are read-only on the host (Linux,
+  macOS); the first store to one marks it written, so `FENCE.I` compares
+  only pages written since it last looked (`src/vp/wtrack.hpp`;
+  `MVPLAT_NO_WTRACK=1` compares them all).
+- mvplat: `-serial` (or `"serial": true`): several harts take turns on one
+  thread, a quantum each, storing to memory directly, so every hart runs on
+  the fast loop and the translator. Linux on 2 harts boots in about 2 s
+  instead of 20 s; still the same on every run. Tested with the SMP
+  programs (4 harts, atomics and LR/SC) and Linux on 4 harts.
 - mvplat: the translator runs supervisor and user code with paging on
   (blocks by virtual pc, translated from the physical address, linked
   within a page; loads, stores, AMOs and CBO.ZERO through the data page
