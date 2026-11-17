@@ -775,6 +775,10 @@ claude mcp add minisim -- mmcp -root .
 mmcp -call msim_run '{"files": ["tb.sv"], "top": "tb"}'
 ```
 
+`magent` runs agents on top of it whose output the engines judge: failure
+triage, lint fixes kept only when mlint, msim and the regression agree, and
+coverage closure that keeps a test only when it adds coverage (docs/AGENTS.md).
+
 ### Support agents: `msupport`
 
 Each product has an AI support agent that answers users' questions from that

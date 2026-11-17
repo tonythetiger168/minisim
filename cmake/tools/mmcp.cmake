@@ -15,3 +15,15 @@ if(Python3_FOUND)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/mmcp_test.py ${CMAKE_SOURCE_DIR})
   endif()
 endif()
+
+# magent: verification agents judged by the engines (docs/AGENTS.md), on mmcp.
+install(PROGRAMS tools/magent.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME magent)
+if(Python3_FOUND)
+  if(TARGET msim AND TARGET mlint AND TARGET mdebug)
+    add_test(NAME magent
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/magent_test.py ${CMAKE_SOURCE_DIR} $<TARGET_FILE_DIR:msim>)
+  else()
+    add_test(NAME magent
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/magent_test.py ${CMAKE_SOURCE_DIR})
+  endif()
+endif()

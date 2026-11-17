@@ -39,7 +39,7 @@ If the minisim programs are not on `PATH` or next to `mmcp`, add
 | `minisim_info` | | the programs found, the msim version, the tools offered, the root |
 | `msim_run` | `msim` | `status` (`pass`, `compile_error`, `error`, `fatal`, `uvm_error`, `timeout`), the error lines with `file` and `line`, UVM counts (`msim -result`), the log tail, and with `coverage` / `wave` the database and the waveform to pass on |
 | `mlint_check` | `mlint -json` | every finding (`file`, `line`, `rule`, `severity`, `text`, `signal`), counts by rule; `only`, `severity`, `waivers` narrow it |
-| `mcov_report` | `mcov` | line, branch, toggle, condition, FSM, functional and assertion totals, per file and per covergroup; `uncovered` adds the items not hit and the uncovered source lines per file; `min` gates metrics (`{"line": 90}`) |
+| `mcov_report` | `mcov` | line, branch, toggle, condition, FSM, functional and assertion totals, per file and per covergroup; `uncovered` adds the items not hit, the uncovered source lines per file and the decisions with an outcome never taken; `min` gates metrics (`{"line": 90}`) |
 | `mdebug_query` | `mdebug -script -` | one JSON answer per command: `drivers`, `loads`, `value`, `changes`, `active`, `trace`, `fsm`, `assert`, `uncovered`, `power`, `scopes`, `signals`, `end` (docs/DEBUG.md, "Scripts and other programs") |
 | `mregress_run` | `mregress` | pass / fail counts and the failures grouped by first error line, each with its log |
 | `mplan_report` | `mplan` | `report`: each feature's score and the metrics below goal; `check`: the plan's problems; `triage`: failure buckets |
@@ -49,6 +49,9 @@ A typical loop: `msim_run` with `coverage` → `mcov_report` with
 `uncovered` → the agent writes a test or a constraint → `msim_run` again; or
 `mregress_run` → `read_file` on a failing log → `mdebug_query` on its
 waveform → a fix → `mregress_run` with `rerun`.
+
+Agents built on these tools that keep only what the engines accept: `magent`
+(docs/AGENTS.md).
 
 ## Files and safety
 

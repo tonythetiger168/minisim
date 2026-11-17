@@ -363,7 +363,7 @@ def t_mcov(srv, a):
     dbs = [srv.path(p) for p in srv.args_list(a, "dbs")]
     if not dbs:
         raise ToolError("dbs: give at least one coverage database (msim -cov)")
-    db = mc.merge(mc.load_all(dbs)) if len(dbs) > 1 else mc.load(dbs[0])
+    db = mc.load_all(dbs) if len(dbs) > 1 else mc.load(dbs[0])
     rules = []
     for e in srv.args_list(a, "elfile"):
         rules += mc.read_elfile(srv.path(e))
@@ -409,14 +409,21 @@ def t_mcov(srv, a):
         r["uncovered"] = lines[:limit]
         r["uncovered_truncated"] = len(lines) > limit
         # uncovered source lines per file, the first thing a closure agent needs
-        miss = {}
-        for f, (hits, _br) in mc.by_file(db).items():
+        miss, arms = {}, []
+        for f, (hits, br) in mc.by_file(db).items():
             if ex and re.search(ex, f):
                 continue
             m = sorted(int(l) for l, h in hits.items() if h == 0)
             if m:
                 miss[srv.shown(f)] = m[:200]
+            for ln, outcomes in sorted(br.items(), key=lambda kv: int(kv[0])):
+                for n, t, fl in outcomes:
+                    never = [w for w, h in (("true", t), ("false", fl)) if h == 0]
+                    if never:
+                        arms.append({"file": srv.shown(f), "line": int(ln), "decision": n, "never": never})
         r["uncovered_lines"] = miss
+        # decisions (if / case arm / loop test) with an outcome never taken
+        r["uncovered_branches"] = arms[:limit]
     return r
 
 

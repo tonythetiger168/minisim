@@ -217,7 +217,12 @@ class Engines(unittest.TestCase):
         self.assertGreater(cov["totals"]["line"]["pct"], 50)
         self.assertEqual(cov["gate"]["failed"], ["toggle"])
         self.assertIn("uncovered_lines", cov)
+        self.assertTrue(all(b["file"].endswith(".sv") for b in cov["uncovered_branches"]))
         self.assertTrue(any(f["file"].endswith("counter.sv") for f in cov["files"]))
+        r2, _ = self.c.call("msim_run", files=["rtl/counter.sv", "tb.sv"], top="tb", coverage=True)
+        both, err = self.c.call("mcov_report", dbs=[r["coverage_db"], r2["coverage_db"]])
+        self.assertFalse(err, both)                                  # several databases are merged
+        self.assertEqual(both["totals"]["line"]["total"], cov["totals"]["line"]["total"])
 
         d, err = self.c.call("mdebug_query", files=["rtl/counter.sv", "tb.sv"], top="tb", wave=r["wave"],
                              commands=["end", "value tb.u.q 60", "drivers tb.u.q", "value tb.nope"])
