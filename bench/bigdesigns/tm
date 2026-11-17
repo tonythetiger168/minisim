@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+# tm CMD...: run CMD, print wall time and peak RSS of the largest child to stderr
+import sys, subprocess, time, resource
+t=time.time(); r=subprocess.call(sys.argv[1:])
+u=resource.getrusage(resource.RUSAGE_CHILDREN)
+sys.stderr.write("TM wall=%.1fs user=%.1fs maxrss=%.0fMB rc=%d\n"%(time.time()-t,u.ru_utime,u.ru_maxrss/1024,r))
+sys.exit(r)
