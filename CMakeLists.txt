@@ -308,6 +308,11 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mdebug_large -DPY=${Python3_EXECUTABLE} -DFST=$<BOOL:${MINISIM_WITH_FST}>
                      -P ${CMAKE_SOURCE_DIR}/tests/mdebug_large.cmake)
+    # bench/gen_manycore.py: tiled many-core with coherent shared memory, self-checking.
+    add_test(NAME msim_manycore
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_manycore -DPY=${Python3_EXECUTABLE}
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_manycore.cmake)
     add_test(NAME msim_fuzz
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                      -DOUT=${CMAKE_CURRENT_BINARY_DIR} -DPY=${Python3_EXECUTABLE}
