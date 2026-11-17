@@ -255,6 +255,10 @@ Spec references are IEEE 1800-2023 clauses.
   `key_public_key` out of a clause 34 envelope. AMD Vivado 2026.1 xsim and
   synthesis opened minisim envelopes for AMD's public key that had no
   `key_public_key` and no digest. docs/PROTECT.md lists what it refused.
+- protect: IEEE 1735-2014 version 2 envelopes, the format AMD Vivado uses,
+  can now be read and written. Each tool block carries a salted key (5.3.2)
+  and an HMAC rights digest, which is checked before decryption (7.4.3).
+  Vivado 2026.1 xsim and synthesis opened msim's version 2 output.
 
 ### Changed
 - msim: VHDL processes with a sensitivity list run in the static schedule

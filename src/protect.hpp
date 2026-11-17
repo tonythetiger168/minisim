@@ -1364,6 +1364,253 @@ inline std::string envelope(std::string_view text, size_t lineStart, Scanner& sc
     return std::move(*plain);
 }
 
+// ------------------------------------------------------------ version 2 (IEEE 1735-2014)
+// The format AMD Vivado writes and reads. A tool block holds an RSA PKCS#1
+// key_block with the session key salted by (version - 1) (5.3.2), its rights,
+// and end_toolblock="<HMAC>" over the canonical common and tool block text
+// (7.4.3). There is no signature over the data.
+
+// 7.4.3 a): trailing white space, the `pragma protect / `protect markup,
+// leading white space, empty lines and the begin / end block lines go; each
+// remaining line ends with a UNIX newline.
+inline std::string rightsText(std::string_view blocks) {
+    std::string out;
+    size_t i = 0;
+    while (i <= blocks.size()) {
+        size_t j = blocks.find('\n', i);
+        if (j == std::string_view::npos) j = blocks.size();
+        std::string_view l = blocks.substr(i, j - i);
+        i = j + 1;
+        while (!l.empty() && (l.back() == ' ' || l.back() == '\t' || l.back() == '\r')) l.remove_suffix(1);
+        while (!l.empty() && (l.front() == ' ' || l.front() == '\t')) l.remove_prefix(1);
+        for (std::string_view p : {std::string_view("`pragma"), std::string_view("`protect")})
+            if (l.substr(0, p.size()) == p) {
+                l.remove_prefix(p.size());
+                while (!l.empty() && (l.front() == ' ' || l.front() == '\t')) l.remove_prefix(1);
+                if (p == "`pragma" && l.substr(0, 7) == "protect") l.remove_prefix(7);
+                break;
+            }
+        while (!l.empty() && (l.front() == ' ' || l.front() == '\t')) l.remove_prefix(1);
+        if (l.empty() || l == "begin_commonblock" || l == "end_commonblock" || l == "begin_toolblock" ||
+            l.substr(0, 13) == "end_toolblock")
+            continue;
+        out.append(l);
+        out += '\n';
+        if (j == blocks.size()) break;
+    }
+    return out;
+}
+
+// 5.3.2: add (or subtract) n to the key as a big-endian integer, modulo 2^bits.
+inline std::string saltKey(std::string k, int n) {
+    int carry = n;
+    for (size_t i = k.size(); i-- > 0 && carry != 0;) {
+        int v = (unsigned char)k[i] + carry;
+        k[i] = (char)(v & 0xff);
+        carry = v >> 8;   // arithmetic shift: -1 for a borrow
+    }
+    return k;
+}
+
+inline std::string rightsDigest(const std::string& method, const std::string& key, std::string_view text) {
+    const char* n = digestName(method);
+    if (!n || (method != "sha256" && method != "sha512"))
+        throw Error("rights_digest_method \"" + method + "\" is not sha256 or sha512 (IEEE 1735-2014 7.4.3.3)");
+    unsigned char buf[EVP_MAX_MD_SIZE];
+    unsigned len = 0;
+    EVP_MD* md = EVP_MD_fetch(nullptr, n, nullptr);
+    bool ok = md && HMAC(md, key.data(), (int)key.size(), (const unsigned char*)text.data(), text.size(), buf, &len);
+    EVP_MD_free(md);
+    if (!ok) throw Error("HMAC: " + sslError());
+    return std::string((const char*)buf, len);
+}
+
+inline std::string envelopeV2(std::string_view text, size_t lineStart, Scanner& sc, const Keyring& ring,
+                              const DecryptOptions& opt, std::string_view file, int beginLine, int version,
+                              Envelope& info) {
+    (void)lineStart;
+    auto where = [&](int line) { return std::string(file) + ":" + std::to_string(line) + ": "; };
+    struct TB { ToolBlock tb; std::string digestMethod, digest; size_t begin = 0, end = 0; bool closed = false; };
+    std::vector<TB> tbs;
+    TB* cur = nullptr;
+    bool inCommon = false, done = false, sawVersion = false, licensed = false;
+    size_t commonBegin = 0, commonEnd = 0;
+    std::vector<std::string> commonControls;
+    std::string dataMethod;
+    std::optional<std::string> data;
+    State st;   // encoding in effect
+    auto block = [&]() {
+        std::string t = st.kw.count("encoding") ? lowerCase(st.enctype()) : std::string("base64");
+        long n = st.bytes();
+        return decodeBlock(sc.block(t, n), [&] { State s2 = st; if (s2.kw.count("encoding")) {
+                for (auto& e : s2.kw["encoding"].list) if (e.key == "enctype") e.val.s = t; }
+            else { PVal v; v.kind = PVal::List; PExpr e; e.key = "enctype"; e.val.kind = PVal::Str; e.val.s = "base64";
+                v.list.push_back(e); s2.kw["encoding"] = v; } return s2; }());
+    };
+    while (auto d = sc.next()) {
+        if (d->kind != Directive::Protect) continue;
+        for (auto& e : d->exprs) {
+            const std::string& k = e.key;
+            auto str = [&]() -> std::string { return stringValue(e, where(d->line)); };
+            if (!sawVersion) { sawVersion = true; continue; }   // the version line (5.3.2 salts with it)
+            if (k == "end_protected") {
+                if (cur || inCommon) throw Error(where(d->line) + "end_protected inside a tool or common block");
+                done = true;
+                break;
+            }
+            if (k == "begin_commonblock") {
+                if (cur || inCommon || !tbs.empty()) throw Error(where(d->line) + "the common block goes before the tool blocks");
+                inCommon = true;
+                commonBegin = d->start;
+                continue;
+            }
+            if (k == "end_commonblock") {
+                if (!inCommon) throw Error(where(d->line) + "end_commonblock without begin_commonblock");
+                inCommon = false;
+                commonEnd = d->next;
+                continue;
+            }
+            if (k == "begin_toolblock") {
+                if (cur || inCommon) throw Error(where(d->line) + "a tool or common block may not be nested (7.4.4)");
+                if (data) throw Error(where(d->line) + "tool block after the data_block");
+                tbs.emplace_back();
+                cur = &tbs.back();
+                cur->tb.line = d->line;
+                cur->tb.method = "rsa";
+                cur->begin = d->start;
+                continue;
+            }
+            if (k == "end_toolblock") {
+                if (!cur) throw Error(where(d->line) + "end_toolblock without begin_toolblock");
+                cur->digest = e.val.kind == PVal::Str ? e.val.s : std::string();
+                cur->end = d->next;
+                cur->closed = true;
+                cur = nullptr;
+                continue;
+            }
+            if (k == "encoding") { st.kw[k] = e.val; continue; }
+            if (k == "control") {
+                if (cur) cur->tb.controls.emplace_back(d->args);
+                else if (inCommon) commonControls.emplace_back(d->args);
+                else throw Error(where(d->line) + "control outside a common or tool block (7.4.4)");
+                continue;
+            }
+            if (inCommon) {
+                if (k.rfind("license", 0) == 0) {
+                    licensed = true;
+                    if (k == "license_public_key") block();
+                    continue;
+                }
+                throw Error(where(d->line) + "'" + k + "' does not belong in a common block (7.4.4)");
+            }
+            if (cur) {
+                if (k == "key_keyowner") cur->tb.owner = str();
+                else if (k == "key_keyname") cur->tb.name = str();
+                else if (k == "key_method") cur->tb.method = lowerCase(str());
+                else if (k == "rights_digest_method") cur->digestMethod = lowerCase(str());
+                else if (k == "key_block") cur->tb.keyBlock = block();
+                else if (k == "license") licensed = true;
+                else throw Error(where(d->line) + "'" + k + "' does not belong in a tool block (7.4.4)");
+                continue;
+            }
+            if (k == "data_method") { dataMethod = lowerCase(str()); continue; }
+            if (k == "data_block") {
+                if (data) throw Error(where(d->line) + "a second data_block");
+                data = block();
+                continue;
+            }
+            if (k == "author" || k == "author_info" || k == "encrypt_agent" || k == "encrypt_agent_info") continue;
+            throw Error(where(d->line) + "'" + k + "' does not belong in a version 2 envelope (IEEE 1735-2014 7.4.4)");
+        }
+        if (done) break;
+    }
+    if (!done) throw Error(where(beginLine) + "begin_protected without end_protected");
+    if (tbs.empty()) throw Error(where(beginLine) + "version 2 envelope has no tool block");
+    if (!data) throw Error(where(beginLine) + "protected envelope has no data_block");
+    if (dataMethod.empty()) throw Error(where(beginLine) + "protected envelope has no data_method");
+    Cipher c = fetchCipher(dataMethod);
+    size_t keyLen = (size_t)EVP_CIPHER_get_key_length(c.get());
+    std::string common = commonEnd > commonBegin ? std::string(text.substr(commonBegin, commonEnd - commonBegin)) : "";
+
+    // A tool validates its own tool block (7.4.3.2): the first one a held key names.
+    const TB* used = nullptr;
+    std::string sk;
+    std::string tried;
+    bool modified = false, wildMismatch = false;
+    for (auto& t : tbs) {
+        tried += (tried.empty() ? "" : ", ") + std::string("key_keyowner=") + quote(t.tb.owner) + " key_keyname=" + quote(t.tb.name);
+        if (t.tb.owner.empty() || t.tb.name.empty() || t.tb.keyBlock.empty() || t.digestMethod.empty() || !t.closed)
+            continue;   // 7.4.1: such a tool block is invalid and ignored
+        if (t.tb.method != "rsa") continue;
+        for (auto& k : ring.keys) {
+            if (!k.keyname.empty() && (k.keyname != t.tb.name || (!k.owner.empty() && k.owner != t.tb.owner))) continue;
+            auto salted = rsaDecrypt(k.key.get(), t.tb.keyBlock);
+            if (!salted || salted->size() != keyLen) continue;
+            std::string mac = rightsDigest(t.digestMethod, *salted, rightsText(common + std::string(text.substr(t.begin, t.end - t.begin))));
+            std::string want;
+            try { want = base64Decode(t.digest); } catch (const Error&) { want.clear(); }
+            if (want.size() != mac.size() || CRYPTO_memcmp(want.data(), mac.data(), mac.size()) != 0) {
+                OPENSSL_cleanse(salted->data(), salted->size());
+                (k.keyname.empty() ? wildMismatch : modified) = true;
+                continue;
+            }
+            sk = saltKey(*salted, -(version - 1));
+            OPENSSL_cleanse(salted->data(), salted->size());
+            used = &t;
+            break;
+        }
+        if (used) break;
+    }
+    if (!used) {
+        if (modified)
+            throw Error(where(beginLine) + "end_toolblock digest does not match: the envelope was modified (IEEE 1735-2014 7.4.3)");
+        throw Error(where(beginLine) + "no key for this protected envelope (" + tried + "); " +
+                    (wildMismatch ? "no -keyfile key opens it, or it was modified"
+                                  : "pass the private key with -keyfile or -keyring"));
+    }
+    auto plain = cbcDecrypt(dataMethod, sk, *data);
+    OPENSSL_cleanse(sk.data(), sk.size());
+    if (!plain) throw Error(where(beginLine) + "protected envelope does not decrypt: it was modified or damaged");
+    if (opt.warn)
+        opt.warn(where(beginLine) + "a version 2 envelope has no digest of the data, so a change to its data_block "
+                 "cannot be detected (CERT VU#739007); version 3 signs the whole envelope");
+
+    info.version = 2;
+    info.owner = used->tb.owner;
+    info.keyname = used->tb.name;
+    bool warned = false;
+    auto license = [&](const std::string&) -> LicenseValue {
+        if (!warned && opt.warn) {
+            opt.warn(where(beginLine) + "version 2 license checks are not run, so licensed rights take their unlicensed value");
+            warned = true;
+        }
+        return LicenseValue{};
+    };
+    (void)licensed;
+    std::vector<std::string> all = commonControls;
+    all.insert(all.end(), used->tb.controls.begin(), used->tb.controls.end());
+    for (auto& ctl : all) {
+        try {
+            for (auto& [n, v] : ControlParser(ctl).parse(license)) info.rights[n] = v;
+        } catch (const Error& ex) {
+            OPENSSL_cleanse(plain->data(), plain->size());
+            throw Error(where(used->tb.line) + ex.what());
+        }
+    }
+    Scanner ps(*plain);
+    while (auto d = ps.next()) {
+        if (d->kind != Directive::Protect) continue;
+        for (auto& e : d->exprs) {
+            if (e.key == "begin_protected") {
+                OPENSSL_cleanse(plain->data(), plain->size());
+                throw Error(where(beginLine) + "a version 2 envelope may not hold another envelope here");
+            }
+            if (e.key == "viewport" || e.key == "interface_viewport") takeViewport(*plain, *d, e.key, info);
+        }
+    }
+    return std::move(*plain);
+}
+
 // Is the begin_protected directive at sc's position the start of a version 3
 // envelope? (Looks at the next directive without consuming it.)
 inline bool startsV3(const Scanner& sc, int* version) {
@@ -1558,9 +1805,28 @@ inline void decryptInto(std::string_view text, const Keyring& ring, const Decryp
             if (top) out.text += "`line " + std::to_string(sc.lineAt(copied)) + " " + quote(file) + " 0\n";
             continue;
         }
-        if (version > 0 && version != 3)
+        if (version == 2 && bi == 0 && d->exprs.size() == 1) {
+            size_t lineStart = d->start;
+            while (lineStart > 0 && text[lineStart - 1] != '\n') lineStart--;
+            Envelope info;
+            std::string plain = v3::envelopeV2(text, lineStart, sc, ring, opt, file, d->line, version, info);
+            size_t b = out.text.size();
+            out.text += plain;
+            OPENSSL_cleanse(plain.data(), plain.size());
+            if (!out.text.empty() && out.text.back() != '\n') out.text += '\n';
+            out.ranges.push_back({b, out.text.size()});
+            info.begin = b;
+            info.end = out.text.size();
+            for (auto& v : info.viewports) { v.at += b; v.targetBegin += b; v.targetEnd += b; }
+            out.envs.push_back(std::move(info));
+            out.envelopes += 1;
+            copied = sc.pos;
+            if (top) out.text += "`line " + std::to_string(sc.lineAt(copied)) + " " + quote(file) + " 0\n";
+            continue;
+        }
+        if (version > 0 && version != 3 && version != 1)
             throw Error(where(file, d->line) + "IEEE 1735 version " + std::to_string(version) +
-                        " envelopes are not supported (version 3, or IEEE 1800-2023 clause 34 envelopes without a version)");
+                        " envelopes are not supported (versions 2 and 3, or IEEE 1800-2023 clause 34 / 1735 version 1 envelopes)");
         bool digested = false;
         std::string plain = envelope(sc, env, ring, file, d->line, digested);
         if (!digested && opt.warn)
@@ -1947,6 +2213,12 @@ struct V3Options {
     std::string agentInfo = "minisim";
     std::string author, authorInfo;      // defaults for a recipe without them
     std::function<void(const std::string&)> warn;
+    // 2 writes IEEE 1735-2014 version 2 envelopes, the format AMD Vivado
+    // reads: RSA PKCS#1 key blocks with a salted session key, data_method
+    // v2DataMethod, and a rights digest per tool block.
+    int version = 3;
+    std::string v2DataMethod = "aes128-cbc";
+    std::string v2DigestMethod = "sha256";
 };
 
 namespace v3 {
@@ -1988,7 +2260,7 @@ inline std::string makeEnvelope(std::string_view plain, const Recipe& r, const V
         if (!t.pub)
             throw Error(where() + "no public key for key_keyowner=" + quote(t.owner) + " key_keyname=" + quote(t.name) +
                         ": add key_public_key to the tool block or the key to a -keyring file");
-        if (t.method != kKeyMethod)
+        if (o.version != 2 && t.method != kKeyMethod)
             throw Error(where() + "key_method " + quote(t.method) + " is not version 3; use \"" + kKeyMethod + "\"");
         if (t.owner.empty() || t.name.empty())
             throw Error(where() + "every tool block needs a key_keyowner and a key_keyname (6.2.1)");
@@ -2003,6 +2275,54 @@ inline std::string makeEnvelope(std::string_view plain, const Recipe& r, const V
     std::string authorInfo = r.authorInfo.empty() ? o.authorInfo : r.authorInfo;
     for (const std::string* s : std::initializer_list<const std::string*>{&author, &authorInfo, &o.agent, &o.agentInfo})
         if (!validString(*s)) throw Error(where() + "author and agent strings may not hold \" or \\ (5.2.1)");
+
+    if (o.version == 2) {
+        // IEEE 1735-2014: one session key; each tool block holds it salted
+        // by (version - 1) = 1 (5.3.2) and an HMAC over the canonical common
+        // and tool block text keyed with the salted key (7.4.3).
+        Cipher c = fetchCipher(o.v2DataMethod);
+        std::string sk = randomBytes((size_t)EVP_CIPHER_get_key_length(c.get()));
+        std::string salted = saltKey(sk, 1);
+        std::string env = line("begin_protected") + line("version = 2");
+        env += line("encrypt_agent = " + quote(o.agent) + ", encrypt_agent_info = " + quote(o.agentInfo));
+        if (!author.empty()) env += line("author = " + quote(author));
+        if (!authorInfo.empty()) env += line("author_info = " + quote(authorInfo));
+        std::string common;
+        if (!r.common.empty()) {
+            common += line("begin_commonblock");
+            for (auto& cl : r.common) common += cl;
+            common += line("end_commonblock");
+        }
+        env += common;
+        for (auto& t : tools) {
+            std::string kb = rsaEncrypt(t.pub.get(), salted);
+            std::string tb = line("begin_toolblock");
+            tb += line("key_keyowner = " + quote(t.owner) + ", key_keyname = " + quote(t.name) +
+                       ", key_method = \"rsa\", rights_digest_method = " + quote(o.v2DigestMethod));
+            tb += line("encoding = (enctype = \"base64\", line_length = 76, bytes = " + std::to_string(kb.size()) + ")");
+            tb += line("key_block");
+            tb += base64Encode(kb, 76);
+            for (auto& cl : t.controls) {
+                std::string_view a = cl;
+                while (!a.empty() && (a.front() == ' ' || a.front() == '\t')) a.remove_prefix(1);
+                tb += line("control " + std::string(a));
+            }
+            std::string mac = rightsDigest(o.v2DigestMethod, salted, rightsText(common + tb));
+            std::string m64 = base64Encode(mac, 0);
+            m64.pop_back();
+            tb += line("end_toolblock = \"" + m64 + "\"");
+            env += tb;
+        }
+        OPENSSL_cleanse(salted.data(), salted.size());
+        std::string db = cbcEncrypt(o.v2DataMethod, sk, plain);
+        OPENSSL_cleanse(sk.data(), sk.size());
+        env += line("data_method = " + quote(o.v2DataMethod));
+        env += line("encoding = (enctype = \"base64\", line_length = 76, bytes = " + std::to_string(db.size()) + ")");
+        env += line("data_block");
+        env += base64Encode(db, 76);
+        env += line("end_protected");
+        return env;
+    }
 
     // A fresh root key and IV for every envelope (5.4.5).
     std::string root = randomBytes(kRootLen);
