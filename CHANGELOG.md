@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: Svpbmt on RV64 (`menvcfg.PBMTE`, PBMT PMA/NC/IO on leaf PTEs; 3,
+  PBMT without PBMTE and PBMT on a pointer fault) and Zalasr (LB..LD.AQ,
+  SB..SD.RL, .AQRL); both in the device tree. `tests/vplat/svpbmt.c`.
 - msim: VHDL-2019 reflection (IEEE 1076-2019 16.2.2 `'reflect`, 16.12
   std.reflection): subtype and value mirrors of every type class, from
   enumerations and nine-value std_logic to multidimensional arrays, linked
