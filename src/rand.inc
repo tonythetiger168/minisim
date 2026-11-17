@@ -1350,6 +1350,10 @@ struct RCont {
     FrameP elems;             // pass 2: one signal per element
     int depth = 1;            // int m[][]: 2 until its size is fixed and its elements stand in for it
     bool sized = false;       // its size is fixed (an outer level was solved before)
+    // A rand container of class handles (18.4): only its size is solved; it
+    // keeps its first objects, new elements are null, and the elements'
+    // objects are randomized as objects, not as values.
+    bool hnd = false;
 };
 // A rand variable wider than 64 bits is solved as 64-bit chunks, low first
 // (the top one narrower): one signal each.
@@ -1412,7 +1416,10 @@ struct Rewrite {
             for (int k = (v.w + 63) / 64; k-- > 0;) parts.push_back(ref(v.base + k, false));
         auto c = node(Op::Concat, std::move(parts));
         c->sgn = sgn;
-        return c;
+        // A concatenation is unsigned when evaluated: a signed variable is
+        // read through a same-width signed resize, so >>> and signed
+        // compares see its sign (11.4.10).
+        return sgn ? resize(c, v.w, false, true) : c;
     }
     bool isWide(int addr) const { return wide && wide->count(addr); }
     // reads a variable (not only constants and loop indexes)
@@ -1500,9 +1507,13 @@ struct Rewrite {
         Val v = eval(x, rd);
         return (int)v.v - 1;
     }
-    RCont* contOf(int sig) {
+    RCont* anyCont(int sig) {
         auto it = contIdx->find(R(sig));
         return it == contIdx->end() ? nullptr : &(*conts)[(size_t)it->second];
+    }
+    RCont* contOf(int sig) {   // a container whose elements are solved
+        RCont* c = anyCont(sig);
+        return c && !c->hnd ? c : nullptr;
     }
     E elem(RCont& c, int64_t k) {
         if (k < 0 || k >= c.n) return konst(make(0, 0, c.w, 0, c.sgn));
@@ -1564,7 +1575,7 @@ struct Rewrite {
                 return acc ? acc : konst(mk(0, 1));
             }
         if (e->op == Op::DynSize)
-            if (RCont* c = contOf(e->sig)) {
+            if (RCont* c = anyCont(e->sig)) {
                 if (pass == 2 || c->assoc || c->sized) return konst(make((uint64_t)c->n, 0, 32));   // an associative array keeps its keys
                 if (!c->sizeFr) {
                     c->sizeFr = newFrame(scratchLayout(kSizeW, false, 1), nullptr, 0);
@@ -1714,6 +1725,15 @@ static int doRandomize(int obj, const RandCall* rc) {
                     }
                     continue;
                 }
+                if (rv.obj && rv.dyn && rv.depth == 1 && (S.get(o + rv.mode).v & 1))
+                    for (int k0 = 0; k0 < rv.count; k0++) {   // Foo h[]: its size
+                        RCont c;
+                        c.cid = o + rv.off + k0; c.w = 64; c.owner = o; c.hnd = true;
+                        const DynObj& dd = dynStore()[c.cid];
+                        if (dd.kind == 2) continue;
+                        c.n = (int64_t)dd.size();
+                        if (!contIdx.count(c.cid)) { contIdx[c.cid] = (int)conts.size(); conts.push_back(std::move(c)); }
+                    }
                 if (rv.obj || !(S.get(o + rv.mode).v & 1)) continue;
                 if (rv.dyn) for (int k0 = 0; k0 < rv.count; k0++) {   // int q[4][$]: each queue
                     RCont c;
@@ -1801,7 +1821,8 @@ static int doRandomize(int obj, const RandCall* rc) {
         }
         if (pass == 2)
             for (auto& c : conts)
-                for (int64_t k = 0; k < c.n; k++) addVar(c.elems->base + (int)k, c.w, c.sgn, false, c.owner);
+                if (!c.hnd)
+                    for (int64_t k = 0; k < c.n; k++) addVar(c.elems->base + (int)k, c.w, c.sgn, false, c.owner);
         int prio = 0;
         Rewrite rw;
         rw.conts = &conts; rw.contIdx = &contIdx; rw.pass = pass; rw.sizeVars = &sizeVars;
@@ -1820,9 +1841,9 @@ static int doRandomize(int obj, const RandCall* rc) {
                         if (lc < 0) continue;
                     }
                     const DynObj& d = dynStore()[R(lc)];
-                    if (RCont* c = rw.contOf(lc)) {
+                    if (RCont* c = rw.anyCont(lc)) {
                         if (pass == 1) continue;   // its elements are not known yet
-                        n = c->n;
+                        n = c->hnd ? std::min(c->n, (int64_t)d.size()) : c->n;   // (new handles are null)
                     } else n = (int64_t)d.size();
                     // An associative array (7.8): the loop variable is each key, in order.
                     std::vector<Val> keys;
@@ -2157,6 +2178,7 @@ static int doRandomize(int obj, const RandCall* rc) {
             if (ok) {
                 for (int ci : sizeVars) conts[(size_t)ci].n = (int64_t)S.get(conts[(size_t)ci].sizeFr->base).v;
                 for (auto& c : conts) {
+                    if (c.hnd) continue;
                     c.elems = newFrame(scratchLayout(c.w, c.sgn, c.n), nullptr, 0);
                     const DynObj& dd = dynStore()[c.cid];
                     if (c.assoc) {
@@ -2176,6 +2198,10 @@ static int doRandomize(int obj, const RandCall* rc) {
         if (ok)
             for (auto& c : conts) {
                 auto& d = dynStore()[c.cid];
+                if (c.hnd) {   // the first objects stay; any new element is null
+                    if ((int64_t)d.vec.size() != c.n) { d.vec.resize((size_t)c.n, d.dflt); dynBump(c.cid); }
+                    continue;
+                }
                 if (!c.assoc) d.vec.assign((size_t)c.n, d.dflt);
                 for (int64_t k = 0; k < c.n; k++) {
                     Val v = S.get(c.elems->base + (int)k);
