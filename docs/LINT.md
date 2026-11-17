@@ -366,6 +366,14 @@ What makes the answers precise:
   body) drops the conditions that read it, so a stale condition never
   proves anything.
 
+How the search is kept short, with the same answers as enumerating every
+combination: the items of a case are checked together in one pass over the
+selector's values; path conditions that share no signal with the question
+are only checked once for a value that satisfies them, not multiplied in;
+and the item a selector value lands on is remembered for the block. On
+Ibex the checks take 0.07 s. `formal.fast=0` turns the shortcuts off;
+the tests compare the two.
+
 What they leave alone, by design:
 
 - A question that needs more than `formal.max_bits` free bits (default 16)
@@ -597,6 +605,7 @@ Severities: an `error` finding makes mlint exit 1; a `warning` does with
 | `fmt.line_length` | `100` | `FMT001` |
 | `formal.max_bits` | `16` | `FML001`..`FML003`: free bits one question may enumerate |
 | `formal.reg_bits` | `8` | widest register that gets a reachable-value set |
+| `formal.fast` | `1` | `0`: search without the shortcuts (the same findings, slower; for tests) |
 | `tb.modules` | empty | module names (globs) to treat as testbench code |
 
 Patterns are regular expressions (ECMAScript), matched anywhere in the name
