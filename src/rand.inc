@@ -332,6 +332,30 @@ inline AV aeval(const E& e, bool& exact) {
             if (exact) return concrete(e, exact);
             // x ==? c with no x / z bits in c is x == c.
             if (e->op == Op::WildEq && !(eb && isSingle(b))) return boolAV(true, true);
+            // {p, q} == c: each part has to equal its bits of c. The range of
+            // the whole loses a low part's value ({h[3:0], l} with l known
+            // spans 0..255 while h is open), so the parts are checked too.
+            if (e->op == Op::Eq || e->op == Op::CaseEq)
+                for (int side = 0; side < 2; side++) {
+                    const E& ce = e->kids[(size_t)side];
+                    bool ek = side ? ea : eb;
+                    const AV& kv = side ? a : b;
+                    const AV& cv = side ? b : a;
+                    if (ce->op != Op::Concat || !ek || !isSingle(kv) || cv.w > 64) continue;
+                    AV k = conv(kv, cv.w, false);
+                    if (kv.w > cv.w && conv(kv, kv.w, false).lo != k.lo) continue;   // c has bits above the concat
+                    uint64_t c = (uint64_t)k.lo;
+                    int at = cv.w;
+                    for (const E& part : ce->kids) {
+                        bool ep;
+                        AV p = aeval(part, ep);
+                        at -= p.w;
+                        if (at < 0 || p.w > 64) break;
+                        uint64_t want = (c >> at) & mask(p.w);
+                        AV u = conv(p, p.w, false);
+                        if ((i128)want < u.lo || (i128)want > u.hi) return boolAV(true, false);
+                    }
+                }
             int w = std::max(a.w, b.w);
             bool s = a.sgn && b.sgn;
             a = conv(a, w, s); b = conv(b, w, s);
