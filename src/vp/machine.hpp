@@ -81,6 +81,11 @@ public:
     bool profile = false;
     // The dynamic translator (x86-64 hosts): on unless -nojit.
     bool jit = true;
+    // Several harts take turns on one thread, a quantum each, storing to
+    // memory directly (no write buffers, no ordered phase): another
+    // interleaving than the parallel rounds', also the same on every run,
+    // and each hart runs on the fast loop and the translator.
+    bool serial = false;
 
     // Debugger state.
     std::set<uint64_t> breakpoints;
@@ -214,7 +219,7 @@ public:
                 if (d->memory() && ((d->base | d->size) & 4095))
                     throw std::runtime_error("'" + d->name + "': with more than one hart, memory must start and end on a 4 KiB boundary");
         updateIrqs();
-        if (harts.size() > 1 && threads > 1) {
+        if (harts.size() > 1 && threads > 1 && !serial) {
             pool_ = std::make_unique<par::Pool>(std::min<unsigned>(threads, (unsigned)harts.size()));
             pool_->spin(20000);
         }
@@ -253,6 +258,7 @@ public:
                 break;
             }
             if (harts.size() == 1) runOne(*harts[0], end);
+            else if (serial) runSerial(end);
             else runRound(end);
             if (exit_) break;
             if (cut_ < end) end = cut_;
@@ -1332,7 +1338,7 @@ private:
             uint8_t k = fastKind(insn, true, imm);
             if (!k) {
                 k = jitKind(insn, pg);
-                if (k == J_AMO && harts.size() > 1) k = K_NONE;  // AMOs break other harts' reservations
+                if (k == J_AMO && harts.size() > 1 && !serial) k = K_NONE;  // AMOs break other harts' reservations
                 if (k == J_AMO) imm = (int32_t)((insn >> 27) | ((insn >> 12) & 7) << 8);  // funct5, width
                 else if (k == J_CBOZ) imm = 0;
             }
@@ -2375,6 +2381,19 @@ private:
         if (dbg) dbg->stopped(h.id);
         h.stopSig = 0;
         h.watchKind = 0;
+    }
+
+    // Several harts, -serial: each in turn runs to the end of the quantum.
+    // A hart's LR reservation does not outlast its turn (the others' stores
+    // in theirs did not break it), so an SC after another hart ran fails.
+    void runSerial(uint64_t end) {
+        for (auto& hp : harts) {
+            Hart& h = *hp;
+            if (irqDirty_) updateIrqs();
+            runOne(h, end);
+            h.resv = false;
+            if (exit_) break;
+        }
     }
 
     // Several harts: rounds of a parallel phase and an ordered phase.

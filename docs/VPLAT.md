@@ -156,6 +156,18 @@ therefore does not depend on the thread count or on the operating system's
 scheduler: the console, the commit log and the profile are the same, byte
 for byte, on 1 thread and on 64. The test suite checks exactly that.
 
+**`-serial`** (or `"serial": true` in the platform file) runs the harts
+another way: they take turns on one thread, each running to the end of the
+quantum, and store to memory directly, with no write buffers and no
+ordered phase. That is another interleaving than the parallel rounds give
+(each hart sees the others' stores of earlier turns at once), still the
+same on every run. Every hart then runs on the fast loop and the
+translator, where a write buffer would hold them to the general path, so
+an SMP operating system runs about as fast as on one hart: Linux on 2 harts
+boots to the BusyBox shell in about 2 s with `-serial` against 20 s in
+rounds. A hart's LR reservation ends with its turn (an SC after the other
+harts ran fails, and the loop around it tries again).
+
 ## The platform file
 
 JSON, with `//` and `/* */` comments. Numbers may be written as strings, in
@@ -431,6 +443,7 @@ for it.
 | `-harts N` | override the platform's hart count |
 | `-threads N`, `-j N` | threads for the harts (default: every CPU) |
 | `-quantum N` | cycles between synchronisations (default 1000) |
+| `-serial` | harts take turns on one thread, no write buffers (see above) |
 | `-mhz F` | hart clock |
 | `-max-cycles N` | stop after N cycles, exit code 4 |
 | `-input TEXT` | what the first UART receives |
