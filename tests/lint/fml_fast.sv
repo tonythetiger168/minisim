@@ -68,5 +68,13 @@ module fml_fast (
       4'd2: z = (sel < 3'd6) ? mem[sel] : 8'd0;
       default: ;
     endcase
+    // a register's reachable values (0 to 3) and an equality on it
+    case (cnt)
+      3'd2: z = tab[cnt];
+      3'd5: z = 8'd7;
+      default: ;
+    endcase
+    if (cnt == 3'd1 && addr == 12'h305) z = mem[sel];
+    if (k == 3'd6) z = mem[k];
   end
 endmodule

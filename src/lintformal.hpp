@@ -292,12 +292,72 @@ struct Solver {
             std::vector<const Cond*> mineConds;
             for (size_t k = 0; k < conds.size(); k++)
                 if (inPart(part, condLeaves[k])) mineConds.push_back(conds[k]);
+            // A condition that pins a leaf to constants (case (x) with constant
+            // items, x == constant) lets the leaf run over those values only:
+            // a superset of the values where it holds, in the same order.
+            std::vector<std::vector<uint64_t>> only(mine.size());
+            std::vector<char> pinned(mine.size(), 0);
+            if (m.opt.fast)
+                for (const Cond* cd : mineConds) {
+                    const Expression* x = cd->e;
+                    std::vector<const Expression*> vals;
+                    if (cd->kind == Cond::Item) {
+                        if (cd->item >= cd->cs->items.size() || cd->cs->condition != CaseStatementCondition::Normal)
+                            continue;
+                        for (const Expression* v : cd->cs->items[cd->item].expressions) vals.push_back(v);
+                    } else if (cd->want && x->kind == ExpressionKind::BinaryOp &&
+                               x->as<BinaryExpression>().op == BinaryOperator::Equality) {
+                        auto& be = x->as<BinaryExpression>();
+                        x = &be.left();
+                        vals.push_back(&be.right());
+                    } else {
+                        continue;
+                    }
+                    if (x->kind != ExpressionKind::NamedValue) continue;
+                    auto li = leafAt.find(&x->as<NamedValueExpression>().symbol.as<ValueSymbol>());
+                    if (li == leafAt.end()) continue;
+                    size_t j = std::find(mine.begin(), mine.end(), (size_t)li->second) - mine.begin();
+                    if (j == mine.size()) continue;
+                    const Leaf& l = cone.leaves[mine[j]];
+                    std::set<uint64_t> want;
+                    bool ok = true;
+                    for (const Expression* v : vals) {
+                        Support su;
+                        support(*v, su);
+                        ConstantValue cv = su.ok && su.vars.empty() ? v->eval(ctx) : ConstantValue();
+                        if (cv.bad() || !cv.isInteger() || cv.integer().hasUnknown()) { ok = false; break; }
+                        // x matches only if its w bits equal the low w bits of the
+                        // value (a narrower signed value would be sign-extended: left alone)
+                        const SVInt& iv = cv.integer();
+                        if (iv.getBitWidth() < l.w && iv.isSigned()) { ok = false; break; }
+                        SVInt low = iv.getBitWidth() > l.w ? iv.trunc(l.w) : iv;
+                        want.insert(*low.zext(64).as<uint64_t>());
+                    }
+                    if (!ok) continue;
+                    std::vector<uint64_t> list;
+                    if (pinned[j]) {
+                        for (uint64_t v : only[j]) if (want.count(v)) list.push_back(v);
+                    } else if (l.dom) {
+                        for (uint64_t v : *l.dom) if (want.count(v)) list.push_back(v);
+                    } else {
+                        for (uint64_t v : want) if (l.w >= 64 || v < (uint64_t(1) << l.w)) list.push_back(v);
+                    }
+                    only[j] = std::move(list);
+                    pinned[j] = 1;
+                }
+            auto sizeOf = [&](size_t j) { return pinned[j] ? (uint64_t)only[j].size() : cone.leaves[mine[j]].size(); };
+            n = 1;
+            for (size_t j = 0; j < mine.size(); j++) {
+                if (sizeOf(j) == 0) return 0;
+                n *= sizeOf(j);
+            }
             std::vector<uint64_t> idx(mine.size(), 0);
             long long hits = 0;
             for (uint64_t c = 0; c < n; c++) {
                 for (size_t j = 0; j < mine.size(); j++) {
                     auto& l = cone.leaves[mine[j]];
-                    *slot[mine[j]] = SVInt(l.w, l.dom ? (*l.dom)[idx[j]] : idx[j], l.sgn);
+                    uint64_t v = pinned[j] ? only[j][idx[j]] : l.dom ? (*l.dom)[idx[j]] : idx[j];
+                    *slot[mine[j]] = SVInt(l.w, v, l.sgn);
                 }
                 for (size_t i = 0; i < cone.derived.size(); i++) {
                     ConstantValue cv = cone.derived[i].second->eval(ctx);
@@ -319,7 +379,7 @@ struct Solver {
                     if (!hit()) return hits;
                 }
                 for (size_t j = 0; j < idx.size(); j++) {   // next combination
-                    if (++idx[j] < cone.leaves[mine[j]].size()) break;
+                    if (++idx[j] < sizeOf(j)) break;
                     idx[j] = 0;
                 }
             }
