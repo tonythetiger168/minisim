@@ -1138,6 +1138,219 @@ public:
     Stop exec(Hart& h, uint64_t end);
 
 private:
+    // ---- The fast loop: the common integer instructions of a hart in
+    // machine mode with nothing to trace, watch or buffer, straight from the
+    // decoded-instruction cache. It stops before the first instruction it
+    // does not handle (a cache miss, a CSR, a device access, ...), which the
+    // general path then executes.
+    enum : uint8_t {
+        K_NONE, K_LUI, K_AUIPC, K_JAL, K_JALR, K_BEQ, K_BNE, K_BLT, K_BGE, K_BLTU, K_BGEU,
+        K_LB, K_LH, K_LW, K_LD, K_LBU, K_LHU, K_LWU, K_SB, K_SH, K_SW, K_SD,
+        K_ADDI, K_SLLI, K_SLTI, K_SLTIU, K_XORI, K_SRLI, K_SRAI, K_ORI, K_ANDI,
+        K_ADD, K_SUB, K_SLL, K_SLT, K_SLTU, K_XOR, K_SRL, K_SRA, K_OR, K_AND, K_MUL,
+        K_ADDIW, K_SLLIW, K_SRLIW, K_SRAIW, K_ADDW, K_SUBW, K_SLLW, K_SRLW, K_SRAW, K_MULW
+    };
+    // The fast loop's class of an instruction and its decoded immediate (a
+    // shift amount for the immediate shifts); K_NONE for the general path.
+    static uint8_t fastKind(uint32_t insn, bool rv64, int32_t& imm) {
+        const unsigned op = insn & 0x7f, f3 = (insn >> 12) & 7, f7 = insn >> 25;
+        const int32_t immI = (int32_t)insn >> 20;
+        imm = immI;
+        switch (op) {
+            case 0x37: imm = (int32_t)(insn & 0xfffff000u); return K_LUI;
+            case 0x17: imm = (int32_t)(insn & 0xfffff000u); return K_AUIPC;
+            case 0x6f:
+                imm = (int32_t)(((insn >> 31) << 20) | (((insn >> 12) & 0xff) << 12) | (((insn >> 20) & 1) << 11) |
+                                (((insn >> 21) & 0x3ff) << 1)) << 11 >> 11;
+                return K_JAL;
+            case 0x67: return f3 == 0 ? K_JALR : K_NONE;
+            case 0x63: {
+                static const uint8_t k[8] = {K_BEQ, K_BNE, K_NONE, K_NONE, K_BLT, K_BGE, K_BLTU, K_BGEU};
+                imm = (int32_t)(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 0x3f) << 5) |
+                                (((insn >> 8) & 0xf) << 1)) << 19 >> 19;
+                return k[f3];
+            }
+            case 0x03: {
+                static const uint8_t k[8] = {K_LB, K_LH, K_LW, K_LD, K_LBU, K_LHU, K_LWU, K_NONE};
+                return !rv64 && (f3 == 3 || f3 == 6) ? K_NONE : k[f3];
+            }
+            case 0x23: {
+                static const uint8_t k[8] = {K_SB, K_SH, K_SW, K_SD, K_NONE, K_NONE, K_NONE, K_NONE};
+                imm = (int32_t)(((insn >> 25) << 5) | ((insn >> 7) & 31)) << 20 >> 20;
+                return !rv64 && f3 == 3 ? K_NONE : k[f3];
+            }
+            case 0x13: {
+                const unsigned hi = rv64 ? insn >> 26 : f7, sra = rv64 ? 0x10 : 0x20;
+                const int32_t sh = (int32_t)((insn >> 20) & (rv64 ? 63 : 31));
+                switch (f3) {
+                    case 0: return K_ADDI;
+                    case 1: imm = sh; return hi == 0 ? K_SLLI : K_NONE;
+                    case 2: return K_SLTI;
+                    case 3: return K_SLTIU;
+                    case 4: return K_XORI;
+                    case 5: imm = sh; return hi == 0 ? K_SRLI : hi == sra ? K_SRAI : K_NONE;
+                    case 6: return K_ORI;
+                    default: return K_ANDI;
+                }
+            }
+            case 0x33: {
+                static const uint8_t k0[8] = {K_ADD, K_SLL, K_SLT, K_SLTU, K_XOR, K_SRL, K_OR, K_AND};
+                if (f7 == 0) return k0[f3];
+                if (f7 == 0x20) return f3 == 0 ? K_SUB : f3 == 5 ? K_SRA : K_NONE;
+                return f7 == 1 && f3 == 0 ? K_MUL : K_NONE;
+            }
+            case 0x1b:
+                if (!rv64) return K_NONE;
+                imm = f3 == 0 ? immI : (int32_t)((insn >> 20) & 31);
+                if (f3 == 0) return K_ADDIW;
+                if (f3 == 1 && f7 == 0) return K_SLLIW;
+                if (f3 == 5) return f7 == 0 ? K_SRLIW : f7 == 0x20 ? K_SRAIW : K_NONE;
+                return K_NONE;
+            case 0x3b:
+                if (!rv64) return K_NONE;
+                if (f7 == 0) return f3 == 0 ? K_ADDW : f3 == 1 ? K_SLLW : f3 == 5 ? K_SRLW : K_NONE;
+                if (f7 == 0x20) return f3 == 0 ? K_SUBW : f3 == 5 ? K_SRAW : K_NONE;
+                return f7 == 1 && f3 == 0 ? K_MULW : K_NONE;
+        }
+        return K_NONE;
+    }
+    template <bool RV64> void turbo(Hart& h, uint64_t end) {
+        // A copy of the registers with a sink, r[32], that writes to x0 go to.
+        uint64_t r[33];
+        memcpy(r, h.x, sizeof h.x);
+        const Hart::Decoded* const dc = h.dc.get();
+        const uint64_t cb = h.cBase, th = tohost;
+        // An access of up to 8 bytes at ad is in the cached region when
+        // ad - cb < span (one compare; the last 7 bytes take the general
+        // path). Stores also need the region writable and to miss tohost.
+        const uint64_t region = h.cEnd > cb ? h.cEnd - cb : 0;
+        const uint64_t span = region >= 8 ? region - 7 : 0;
+        const uint64_t sspan = h.cRw ? span : 0;
+        uint8_t* const cp = h.cPtr;
+        uint64_t pc = h.pc, cyc = h.cycle;
+        const uint64_t cyc0 = cyc;
+        auto sx = [](uint64_t v) { return RV64 ? v : (uint64_t)(int64_t)(int32_t)v; };
+        auto ax = [](uint64_t v) { return RV64 ? v : (uint64_t)(uint32_t)v; };
+        auto w = [](uint64_t v) { return (uint64_t)(int64_t)(int32_t)(uint32_t)v; };
+        constexpr unsigned SM = RV64 ? 63 : 31;
+        auto inMem = [&](uint64_t ad, unsigned) { return ad - cb < span; };
+        auto okStore = [&](uint64_t ad, unsigned n) {
+            return ad - cb < sspan && !(th && ad - th + n - 1 < 8 + n - 1);
+        };
+        // Each handler fetches the next instruction and jumps to its handler
+        // itself (computed goto).
+        static void* const tbl[] = {&&out, &&L_LUI, &&L_AUIPC, &&L_JAL, &&L_JALR, &&L_BEQ, &&L_BNE, &&L_BLT, &&L_BGE, &&L_BLTU, &&L_BGEU, &&L_LB, &&L_LH, &&L_LW, &&L_LD, &&L_LBU, &&L_LHU, &&L_LWU, &&L_SB, &&L_SH, &&L_SW, &&L_SD, &&L_ADDI, &&L_SLLI, &&L_SLTI, &&L_SLTIU, &&L_XORI, &&L_SRLI, &&L_SRAI, &&L_ORI, &&L_ANDI, &&L_ADD, &&L_SUB, &&L_SLL, &&L_SLT, &&L_SLTU, &&L_XOR, &&L_SRL, &&L_SRA, &&L_OR, &&L_AND, &&L_MUL, &&L_ADDIW, &&L_SLLIW, &&L_SRLIW, &&L_SRAIW, &&L_ADDW, &&L_SUBW, &&L_SLLW, &&L_SRLW, &&L_SRAW, &&L_MULW};
+        const Hart::Decoded* d;
+        uint64_t npc, a, b;
+        int64_t i;
+        uint64_t* o;
+#define DISPATCH                                                         \
+        do {                                                             \
+            if (d->pc != pc) goto out;                                   \
+            npc = ax(pc + d->len);                                       \
+            a = r[d->rs1]; b = r[d->rs2]; i = d->imm; o = &r[d->trd];    \
+            goto *tbl[d->kind];                                          \
+        } while (0)
+        // After a jump or branch: look pc up.
+#define NEXT                                                             \
+        do {                                                             \
+            pc = npc;                                                    \
+            if (--left == 0) goto out;                                   \
+            d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)];                    \
+            DISPATCH;                                                    \
+        } while (0)
+        // Straight-line: the next instruction's entry follows this one's.
+#define SEQ                                                              \
+        do {                                                             \
+            pc = npc;                                                    \
+            if (--left == 0) goto out;                                   \
+            d = (const Hart::Decoded*)((const char*)d + d->step);        \
+            DISPATCH;                                                    \
+        } while (0)
+        if (cyc >= end) return;
+        uint64_t left = end - cyc;  // instructions to go, this one included
+        d = &dc[(pc >> 1) & (Hart::DC_SIZE - 1)];
+        DISPATCH;
+    L_LUI: *o = (uint64_t)i; SEQ;
+    L_AUIPC: *o = sx(pc + (uint64_t)i); SEQ;
+    L_JAL: *o = sx(npc); npc = ax(pc + i); NEXT;
+    L_JALR: *o = sx(npc); npc = ax((a + i) & ~1ull); NEXT;
+    L_BEQ: if (a == b) { npc = ax(pc + i); NEXT; } SEQ;
+    L_BNE: if (a != b) { npc = ax(pc + i); NEXT; } SEQ;
+    L_BLT: if ((int64_t)a < (int64_t)b) { npc = ax(pc + i); NEXT; } SEQ;
+    L_BGE: if ((int64_t)a >= (int64_t)b) { npc = ax(pc + i); NEXT; } SEQ;
+    L_BLTU: if (a < b) { npc = ax(pc + i); NEXT; } SEQ;
+    L_BGEU: if (a >= b) { npc = ax(pc + i); NEXT; } SEQ;
+#define TLOAD(L, T, N)                                                   \
+    L: {                                                                 \
+        const uint64_t ad = ax(a + i);                                   \
+        if (!inMem(ad, N)) goto out;                                     \
+        T v;                                                             \
+        memcpy(&v, cp + (ad - cb), N);                                   \
+        *o = sx((uint64_t)v);                                            \
+        SEQ;                                                             \
+    }
+    TLOAD(L_LB, int8_t, 1)
+    TLOAD(L_LH, int16_t, 2)
+    TLOAD(L_LW, int32_t, 4)
+    TLOAD(L_LD, uint64_t, 8)
+    TLOAD(L_LBU, uint8_t, 1)
+    TLOAD(L_LHU, uint16_t, 2)
+    TLOAD(L_LWU, uint32_t, 4)
+#undef TLOAD
+#define TSTORE(L, T, N)                                                  \
+    L: {                                                                 \
+        const uint64_t ad = ax(a + i);                                   \
+        if (!okStore(ad, N)) goto out;                                   \
+        const T v = (T)b;                                                \
+        memcpy(cp + (ad - cb), &v, N);                                   \
+        SEQ;                                                             \
+    }
+    TSTORE(L_SB, uint8_t, 1)
+    TSTORE(L_SH, uint16_t, 2)
+    TSTORE(L_SW, uint32_t, 4)
+    TSTORE(L_SD, uint64_t, 8)
+#undef TSTORE
+    L_ADDI: *o = sx(a + i); SEQ;
+    L_SLLI: *o = sx(a << i); SEQ;
+    L_SLTI: *o = (int64_t)a < i; SEQ;
+    L_SLTIU: *o = a < (uint64_t)i; SEQ;
+    L_XORI: *o = a ^ i; SEQ;
+    L_SRLI: *o = RV64 ? a >> i : sx((uint32_t)a >> i); SEQ;
+    L_SRAI: *o = RV64 ? (uint64_t)((int64_t)a >> i) : sx((uint64_t)((int32_t)a >> i)); SEQ;
+    L_ORI: *o = a | i; SEQ;
+    L_ANDI: *o = a & i; SEQ;
+    L_ADD: *o = sx(a + b); SEQ;
+    L_SUB: *o = sx(a - b); SEQ;
+    L_SLL: *o = sx(a << (b & SM)); SEQ;
+    L_SLT: *o = (int64_t)a < (int64_t)b; SEQ;
+    L_SLTU: *o = a < b; SEQ;
+    L_XOR: *o = a ^ b; SEQ;
+    L_SRL: *o = RV64 ? a >> (b & SM) : sx((uint32_t)a >> (b & SM)); SEQ;
+    L_SRA: *o = RV64 ? (uint64_t)((int64_t)a >> (b & SM)) : sx((uint64_t)((int32_t)a >> (b & SM))); SEQ;
+    L_OR: *o = a | b; SEQ;
+    L_AND: *o = a & b; SEQ;
+    L_MUL: *o = sx(a * b); SEQ;
+    L_ADDIW: *o = w(a + i); SEQ;
+    L_SLLIW: *o = w((uint32_t)a << i); SEQ;
+    L_SRLIW: *o = w((uint32_t)a >> i); SEQ;
+    L_SRAIW: *o = w((int32_t)a >> i); SEQ;
+    L_ADDW: *o = w(a + b); SEQ;
+    L_SUBW: *o = w(a - b); SEQ;
+    L_SLLW: *o = w((uint32_t)a << (b & 31)); SEQ;
+    L_SRLW: *o = w((uint32_t)a >> (b & 31)); SEQ;
+    L_SRAW: *o = w((int32_t)a >> (b & 31)); SEQ;
+    L_MULW: *o = w(a * b); SEQ;
+#undef SEQ
+#undef NEXT
+#undef DISPATCH
+    out:
+        memcpy(h.x + 1, r + 1, sizeof h.x - sizeof h.x[0]);
+        h.pc = pc;
+        h.cycle = end - left;
+        h.instret += h.cycle - cyc0;
+    }
+
     void finishSlow(Hart& h, uint64_t pc, int cls, int wrd, uint64_t wval, bool memAcc, uint64_t memA,
                     uint64_t memV, bool memW, unsigned memN) {
         if (trace) {
@@ -1287,6 +1500,10 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             interrupt(h);
         }
         if (h.wfi) { h.cycle = end; return Stop::Budget; }
+        if (!slow && !h.par && h.priv == 3 && !h.pmpLock && !(h.mstatus & MSTATUS_MPRV) && !irqDirty_) {
+            if (rv64) turbo<true>(h, end); else turbo<false>(h, end);
+            if (h.cycle >= end) break;
+        }
         uint64_t pc = h.pc;
         if (slow && !breakpoints.empty() && !h.skipBp && breakpoints.count(pc)) return Stop::Break;
         h.skipBp = false;
@@ -1351,7 +1568,9 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
             dce.pc = pc; dce.insn = insn; dce.raw = raw; dce.len = (uint8_t)len; dce.xlat = fx;
             dce.op = insn & 0x7f; dce.rd = (insn >> 7) & 31; dce.f3 = (insn >> 12) & 7;
             dce.rs1 = (insn >> 15) & 31; dce.rs2 = (insn >> 20) & 31; dce.f7 = (uint8_t)(insn >> 25);
-            dce.immI = (int32_t)insn >> 20;
+            dce.kind = fx ? (uint8_t)K_NONE : fastKind(insn, rv64, dce.imm);  // the fast loop runs bare only
+            dce.trd = dce.rd ? dce.rd : 32;
+            dce.step = (uint8_t)(len / 2 * sizeof(Hart::Decoded));
         }
         if (slow && trace) {
             int w = rv64 ? 16 : 8;
@@ -1361,7 +1580,7 @@ inline Stop Machine::exec(Hart& h, uint64_t end) {
 
         uint64_t npc = h.ax(pc + len);
         uint32_t op = dce.op, rd = dce.rd, f3 = dce.f3, rs1 = dce.rs1, rs2 = dce.rs2, f7 = dce.f7;
-        int64_t immI = dce.immI;
+        int64_t immI = (int32_t)insn >> 20;
         int cls = C_ALU;
         int wrd = -1;          // register written, for the trace
         uint64_t wval = 0;
