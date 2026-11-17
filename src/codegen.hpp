@@ -3734,7 +3734,12 @@ private:
             };
             // An @* arming process (armK_) waits on its block's inputs: those
             // are the block's reads, live only if the block is (its unit).
-            for (size_t i = 0; i < procs.size(); i++) walk(procs[i].prog, !mine[i] && !(i < armK_.size() && armK_[i] >= 0 && !std::getenv("MSIM_NODEADSEQ")));
+            // Only when that block's unit reads every one of them (below); one
+            // the kernel runs keeps its inputs through this process (clkgate.sv).
+            std::vector<char> armUnit(procs.size(), 0);
+            if (!std::getenv("MSIM_NODEADSEQ"))
+                for (size_t i = 0; i < procs.size() && i < armK_.size(); i++) armUnit[i] = armK_[i] >= 0;
+            for (size_t i = 0; i < procs.size(); i++) walk(procs[i].prog, !mine[i] && !armUnit[i]);
             // An assertion's process keeps every signal it names as it is.
             for (int i : byRank)
                 if (i >= 0 && combAsserts(*procs[i].prog))
@@ -3777,6 +3782,24 @@ private:
                     exprs(in, [&](Expr& x) { if (ok(x.sig)) u.rd.push_back(x.sig); });
                     if (in.k == IK::Assign && ok(in.sig)) { u.wr.push_back(in.sig); if (!isPriv(in.sig)) u.live = true; }
                     else if (in.k != IK::Assign && in.k != IK::Jmp && in.k != IK::JmpIfNot) u.live = true;
+                }
+            }
+            {
+                for (size_t i = 0; i < procs.size(); i++) {
+                    if (!armUnit[i]) continue;
+                    const auto& code = procs[i].prog->code;
+                    const int flag = code.size() > 1 ? code[1].sig : -1;
+                    bool all = ok(flag);
+                    if (all) {
+                        std::vector<char> rd(ns, 0);
+                        bool found = false;
+                        for (auto& u : us)
+                            if (std::find(u.rd.begin(), u.rd.end(), flag) != u.rd.end()) { found = true; for (int r : u.rd) rd[r] = 1; }
+                        all = found;
+                        for (auto& in : code)
+                            for (auto& [sg, ed] : in.events) all &= !ok(sg) || rd[sg];
+                    }
+                    if (!all) for (auto& in : code) touchAll(in, live);
                 }
             }
             // A clocked process's clock edge is a copy's root (the domain
@@ -3838,6 +3861,8 @@ private:
                 if (u.live) continue;
                 if (u.seq) { deadSeq.insert(u.one); nDeadSeq++; continue; }
                 nDead++;
+                if (const char* wc = std::getenv("MSIM_WHYCYCLE"); wc && *wc == '2')
+                    for (int w : u.wr) std::fprintf(stderr, "dead comb unit (process %d) writes %s\n", u.proc, sigName_[w].c_str());
                 if (u.one) deadIn.insert(u.one); else deadProc[u.proc] = 1;
                 for (int w : u.wr) deadSig[w] = 1;
             }
