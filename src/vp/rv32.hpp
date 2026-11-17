@@ -230,7 +230,28 @@ struct Hart {
     // the next entry without wrapping and leaves when it lands there.
     std::unique_ptr<Decoded[]> dc{new Decoded[DC_SIZE + 2]};
     Hart() { flushDecoded(); }
-    void flushDecoded() { for (unsigned i = 0; i < DC_SIZE + 2; i++) dc[i].pc = 1; }
+    void flushDecoded() {
+        for (unsigned i = 0; i < DC_SIZE + 2; i++) dc[i].pc = 1;
+        dcGen++;
+    }
+    // The fast loop's basic blocks: runs of decoded instructions ending at a
+    // jump or branch, each a list of handlers with their operands. A block
+    // holds for the decoded-cache generation it was built in.
+    struct BlockOp {
+        const void* h;          // the handler
+        uint8_t rd, rs1, rs2;   // rd: 32 for x0
+        uint8_t off;            // halfwords from the block's pc
+        int32_t imm;
+    };
+    static constexpr unsigned BLOCK_OPS = 32, BLOCKS = 2048;
+    struct Block {
+        uint64_t pc = 1, end = 0, target = 0;  // end: after the last op; target: a branch's or JAL's
+        uint32_t gen = 0;
+        uint32_t n = 0;
+        BlockOp ops[BLOCK_OPS + 1];  // the last is the fall-through exit
+    };
+    uint32_t dcGen = 1;
+    std::unique_ptr<Block[]> blocks;  // made on first use
 
     // The last plain memory device used, for the fast path.
     uint64_t cBase = 1, cEnd = 0;
