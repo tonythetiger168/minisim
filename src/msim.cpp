@@ -347,6 +347,7 @@ struct Plan {
     std::vector<char> seq;
     std::vector<std::vector<std::pair<int, Edge>>> ev;
     bool cyclic = false;   // some comb processes feed each other: no single forward sweep
+    std::vector<char> onCycle;   // comb process on a cycle of comb processes
 };
 // A wire or variable whose drivers are all strong continuous assigns to
 // fixed, disjoint bit ranges that cover it (assign w = ..., or assign w[k]
@@ -1819,10 +1820,14 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
         // MSIM_WHYCYCLE=1: the blocks that feed each other (they keep the
         // design out of the partitions and the cycle domain).
         std::vector<int> cyc;
-        if (std::getenv("MSIM_WHYCYCLE")) g_combCycles = &cyc;
+        g_combCycles = &cyc;
         std::vector<size_t> order = combSchedule(shapes, &lv, &p.cyclic);
         g_combCycles = nullptr;
-        for (size_t a = 0; a < cyc.size(); a++) {
+        p.onCycle.assign(n, 0);
+        for (size_t a = 0; a < cyc.size(); a++)
+            if (cyc[a] >= 0) p.onCycle[procOf[a]] = 1;
+        static const bool why = std::getenv("MSIM_WHYCYCLE") != nullptr;
+        for (size_t a = 0; why && a < cyc.size(); a++) {
             if (cyc[a] < 0) continue;
             std::string o, in;
             for (int x : shapes[a].outs) o += S.sigs[x].name + " ";
@@ -4135,6 +4140,7 @@ static int msimMain(int argc, char** argv) {
         if (prof::P().on) prof::P().combEnt.push_back(profEnt(lowered.procs[i]));
         if (pl.body[i] == 1 && pr->code[0].k == IK::Assign) S.addComb(execComb, pr, pl.ins[i], pl.level[i], combValue, combCommit);
         else S.addComb(execComb, pr, pl.ins[i], pl.level[i]);
+        if (!pl.onCycle.empty() && pl.onCycle[(size_t)i]) S.combs.back().onCycle = true;
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
     std::vector<Task> lateConst;
