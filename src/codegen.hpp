@@ -3411,6 +3411,15 @@ private:
         return "{ P" + std::to_string(s) + ".v = (" + u + ") & " + M(sigW_[s]) + "; P" + std::to_string(s) + ".x = 0; P" +
                std::to_string(s) + ".z = 0; }";
     }
+    // The 2-state copy of a write: twoNow ran only with every scanned private
+    // signal known (pclean), and 2-state code writes no unknown bit, so the
+    // x and z words are already 0. Scratch and dead signals are not scanned:
+    // those keep the full write. MSIM_NOPWV2 turns this off.
+    const bool noPwv2_ = std::getenv("MSIM_NOPWV2") != nullptr;
+    std::string pwv2(int s, const std::string& u, bool scanned) const {
+        if (!scanned || noPwv2_) return pwv(s, u);
+        return "{ P" + std::to_string(s) + ".v = (" + u + ") & " + M(sigW_[s]) + "; }";
+    }
     std::string pw(int s, const std::string& val) const {
         return "PW(P" + std::to_string(s) + ", " + std::to_string(sigW_[s]) + ", " + val + ");";
     }
@@ -4201,7 +4210,7 @@ private:
                             if (i.hi < 0 && split(i.e, g, u, sl)) {
                                 g = snapRen(g);
                                 u = snapRen(u);
-                                fns2 << " " << pwv(i.sig, u) << "\n";
+                                fns2 << " " << pwv2(i.sig, u, !scratch(i.sig) && !deadSig[i.sig]) << "\n";
                                 if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
                                 else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(at(sl)) << "\n";
                             } else {
@@ -4300,7 +4309,7 @@ private:
                             } else {
                                 if (g.empty()) fns << " " << pwv(i.sig, u) << "\n";
                                 else fns << " if (__builtin_expect(" << g << ", 1)) " << pwv(i.sig, u) << " else " << cold(pw(i.sig, sl)) << "\n";
-                                fns2 << " " << pwv(i.sig, u) << "\n";
+                                fns2 << " " << pwv2(i.sig, u, !scratch(i.sig) && !deadSig[i.sig]) << "\n";
                             }
                         } else {
                             std::string t = assign(i);
