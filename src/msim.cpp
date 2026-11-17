@@ -2008,22 +2008,6 @@ static std::string kernelObject(const std::string& cc, const std::string& cflags
     return obj;
 }
 
-// MSIM_PHASES=1: time and memory after each step of elaboration and
-// -compile, on stderr (for a large design that runs out of time or memory).
-static void phaseMark(const char* what) {
-    static const bool on = std::getenv("MSIM_PHASES") != nullptr;
-    if (!on) return;
-    static const auto t0 = std::chrono::steady_clock::now();
-    long rss = 0, hwm = 0;
-    std::ifstream f("/proc/self/status");
-    for (std::string k; f >> k;) {
-        if (k == "VmRSS:") f >> rss;
-        else if (k == "VmHWM:") f >> hwm;
-    }
-    double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::fprintf(stderr, "msim: phase %-22s %8.1f s  rss %6.2f GB  peak %6.2f GB\n", what, t, rss / 1048576.0, hwm / 1048576.0);
-}
-
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -2073,7 +2057,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     {
         std::vector<int> refs;
         std::unordered_set<int> have;
-        std::vector<const Prog*> seen;
+        std::unordered_set<const Prog*> seen;
         for (auto& p : lowered.procs) collectProgRefsInto(p.prog, refs, have, seen);
         for (auto& p : lowered.finals) collectProgRefsInto(p.prog, refs, have, seen);
         for (auto& p : lowered.subs) collectProgRefsInto(*p, refs, have, seen);
