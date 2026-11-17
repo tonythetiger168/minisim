@@ -5318,7 +5318,16 @@ struct Lowerer {
             Instr i = dynCmd(t, D_PUSH_BACK); i.e = resize(strOf(x), 64, false, false); prog.emit(i);
             return;
         }
-        Instr i = dynCmd(t, D_PUSH_BACK); i.e = cloneConts(*x.type, expr(x)); prog.emit(i);
+        Instr i = dynCmd(t, D_PUSH_BACK); i.e = cloneConts(*x.type, expr(x));
+        // An element of {a, 300} takes the element type (10.10, assignment-like):
+        // 300 into a byte queue is 44.
+        const Val& ed = dynShape(t).dflt;
+        if (!dynShape(t).elem && !ed.str && x.type->isIntegral() && !x.type->isUnpackedStruct()) {
+            if (ed.real) i.e = un(Op::IToR, i.e);
+            else if (ed.w > 0 && ed.w <= 64 && (int)x.type->getBitWidth() != ed.w)
+                i.e = resize(i.e, ed.w, x.type->isSigned(), ed.sgn);
+        }
+        prog.emit(i);
     }
     // An array argument (7.7): the formal gets a copy of the actual.
     void copyArrayArg(const slang::ast::FormalArgumentSymbol& f, const slang::ast::Expression& a) {
@@ -12551,6 +12560,10 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     }
     // A class's static property (8.9) starts like a module variable.
     void handle(const slang::ast::ClassPropertySymbol& p) {
+        if (p.lifetime == slang::ast::VariableLifetime::Static && p.getType().isEvent()) {   // its counters start at 0, as a module event's
+            handle(static_cast<const slang::ast::VariableSymbol&>(p));
+            return;
+        }
         if (p.lifetime == slang::ast::VariableLifetime::Static) initStatic(p);
     }
     // An event array (15.5): every counter starts at 0 (not triggered).
