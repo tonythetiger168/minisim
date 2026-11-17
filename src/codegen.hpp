@@ -4448,7 +4448,12 @@ private:
              "static __thread C0E* C0L = C0B;\nstatic __thread C1E* C1L = C1B;\n"
              "static __thread uint32_t C0N;\nstatic __thread uint32_t C1N;\nstatic __thread uint32_t C0CAP = C0CAPG;\nstatic __thread bool COVF;\n"
              "#define C0OK (__builtin_expect(C0N < C0CAP, 1))\n"
-             "#define C1OK (__builtin_expect(C1N < C0CAP, 1))\n";
+             "#define C1OK (__builtin_expect(C1N < C0CAP, 1))\n"
+             // pclean: every scanned private signal is known, and the list's
+             // targets (clocked NBA targets, all scanned) with it. pclean only
+             // turns true in scanP, after the pass, so the commit stores the
+             // value word alone. MSIM_NOPWV2 keeps the full commit.
+          << (noPwv2_ ? "#define C0TWO false\n" : "#define C0TWO (pclean.load(std::memory_order_relaxed))\n");
         std::vector<int> privs;
         for (size_t s = 0; s < priv_.size(); s++) if (priv_[s]) privs.push_back((int)s);
         // Only when something watches every change (a VCD opened at run time).
@@ -5361,7 +5366,7 @@ private:
                 if (two) cQ = shareChunks(o, "cgQ" + G_ + "_", gUnits[g], combStmtsQ, unitProc, unitIns, procs, kChunk);
                 int nc = chunks("cmC" + G_ + "_", gCommit[g]), nl = chunks("cmL" + G_ + "_", gListed[g]);
                 o << "static void cmG" << g << "(bool two) {\n"
-                  << "    { const C0E* L = GS[" << g << "].c0.data(); for (uint32_t j = 0, n = GS[" << g << "].c0n; j < n; j++) { PSig& p = *L[j].p; const uint64_t m = L[j].m; p.v = (p.v & ~m) | L[j].v; p.x &= ~m; p.z &= ~m; } GS[" << g << "].c0n = 0; }\n"
+                  << "    { const C0E* L = GS[" << g << "].c0.data(); const uint32_t n = GS[" << g << "].c0n; if (C0TWO) { for (uint32_t j = 0; j < n; j++) { PSig& p = *L[j].p; p.v = (p.v & ~L[j].m) | L[j].v; } } else for (uint32_t j = 0; j < n; j++) { PSig& p = *L[j].p; const uint64_t m = L[j].m; p.v = (p.v & ~m) | L[j].v; p.x &= ~m; p.z &= ~m; } GS[" << g << "].c0n = 0; }\n"
                   << "    if (GS[" << g << "].c1n) { c1Apply(GS[" << g << "].c1.data(), GS[" << g << "].c1n); GS[" << g << "].c1n = 0; }\n"
                   << "    if (GS[" << g << "].ovf) {\n        GS[" << g << "].ovf = false;\n";
                 for (int k = 0; k < nl; k++) o << "        cmL" << g << "_" << k << "();\n";
@@ -5380,7 +5385,7 @@ private:
             o << "static void fcommit() {\n"
                  "    DAHEAD = false;\n"
                  "    const bool t = twoNow();\n"
-                 "    for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; const uint64_t m = C0L[j].m; p.v = (p.v & ~m) | C0L[j].v; p.x &= ~m; p.z &= ~m; }\n    C0N = 0;\n"                 "    { const bool obs = S.observed;" " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
+                 "    if (C0TWO) { for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = (p.v & ~C0L[j].m) | C0L[j].v; } } else for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; const uint64_t m = C0L[j].m; p.v = (p.v & ~m) | C0L[j].v; p.x &= ~m; p.z &= ~m; }\n    C0N = 0;\n"                 "    { const bool obs = S.observed;" " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
              " const uint64_t m = C1L[j].m; Val& q = g.val;"
              " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { q.v = (q.v & ~m) | C1L[j].v; q.x &= ~m; q.z &= ~m; q.real = false; q.str = false; }"
              " else S.fwSlow(s, Val{(q.v & ~m) | C1L[j].v, q.x & ~m, g.w, q.z & ~m}); } C1N = 0;" " }\n"
@@ -5448,7 +5453,7 @@ private:
         o << "static void fcommit() { DAHEAD = false;" << (multi ? " dpend = false;" : "");
         o << " const bool obs = S.observed;"
              // The common slot inline: a private signal given a known value.
-             " for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; const uint64_t m = C0L[j].m; p.v = (p.v & ~m) | C0L[j].v; p.x &= ~m; p.z &= ~m; } C0N = 0;"
+             " if (C0TWO) { for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = (p.v & ~C0L[j].m) | C0L[j].v; } } else for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; const uint64_t m = C0L[j].m; p.v = (p.v & ~m) | C0L[j].v; p.x &= ~m; p.z &= ~m; } C0N = 0;"
              " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
              " const uint64_t m = C1L[j].m; Val& q = g.val;"
              " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { q.v = (q.v & ~m) | C1L[j].v; q.x &= ~m; q.z &= ~m; q.real = false; q.str = false; }"
