@@ -474,8 +474,8 @@ check inside; it is built from the cache and dropped with it. The same
 loop runs supervisor and user code with paging on: instructions from pages
 the hart has already fetched from at that privilege, loads and stores
 through the data page caches below; a miss leaves for the general path,
-which fills them. Linux boots to a BusyBox shell in about 5 s (QEMU 8.2:
-1.5 s). It leaves, before the instruction, at anything else: a
+which fills them. On this loop alone (`-nojit`) Linux boots to a BusyBox
+shell in about 4.5 s. It leaves, before the instruction, at anything else: a
 cache miss, a CSR, a device or `tohost` access, the last 7 bytes of a
 memory region, the end of the quantum. A 2.1 G-instruction RV64IMAC
 program (integer loops, a CRC, a sieve) runs at about 670 MIPS this way (136 before).
@@ -524,8 +524,8 @@ With `bench/mvplat/run.sh` (best of 3, wall clock, QEMU 8.2 with TCG on
 the same host), the translator brings CoreMark (4000 iterations) from 3.6 s
 to 0.40 s (QEMU 0.78 s), Dhrystone from 2.1 s to 0.28 s (QEMU 0.54 s), and
 each of the 17 Embench programs ahead of QEMU (0.04 to 0.19 s against 0.10
-to 0.28 s). Linux (one hart) boots to the BusyBox shell in LINUXJIT s
-(QEMU 1.5 s on the same host; 5.1 s with `-nojit`). Floating point and
+to 0.28 s). Linux (one hart) boots to the BusyBox shell in 1.16 s, best
+of 7 (QEMU 1.29 s, best of 5, on the same host; 4.4 s with `-nojit`). Floating point and
 vector instructions still run on the general path.
 
 ## Limits / Not yet

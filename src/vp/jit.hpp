@@ -42,7 +42,7 @@ struct JitCtx {
     void* jtab;        // 80: the indirect-jump table
     void* dl;          // 88: with paging: the hart's load page cache (Hart::dl)
     void* ds;          // 96: and its store page cache (Hart::ds)
-    uint64_t dctx;     // 104: the key its entries have to carry (Machine::dataCtx)
+    uint64_t dctx;     // 104: the key their tags have to carry (Machine::dataCtx << 52)
 };
 
 struct Jit {

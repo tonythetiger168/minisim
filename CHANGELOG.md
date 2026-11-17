@@ -12,7 +12,7 @@ Spec references are IEEE 1800-2023 clauses.
   (blocks by virtual pc, translated from the physical address, linked
   within a page; loads, stores, AMOs and CBO.ZERO through the data page
   caches inline), and translates FENCE. Linux boots to the BusyBox shell in
-  LINUXJIT s (5.1 s with `-nojit`; QEMU 1.5 s). `tests/vplat/jit.c` runs its
+  1.16 s (4.4 s with `-nojit`; QEMU 8.2 1.29 s on the same host). `tests/vplat/jit.c` runs its
   work again in supervisor mode with Sv39, with accesses across a page
   boundary and every AMO.
 - mvplat: Linux boots to a BusyBox shell in 5.1 s instead of 7.2 s (one

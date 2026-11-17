@@ -1013,7 +1013,8 @@ public:
     bool dataPage(Hart& h, uint64_t a, bool st, uint8_t*& p, Acc& r) {
         uint32_t ctx = dataCtx(h);
         Hart::DataPage& e = (st ? h.ds : h.dl)[(a >> 12) & (Hart::DP_SIZE - 1)];
-        if (e.vpn == (a >> 12) && e.ctx == ctx) { p = e.host + (a & 0xfff); return true; }
+        const uint64_t tag = Hart::dpTag(a, ctx);
+        if (e.tag == tag) { p = e.host + (a & 0xfff); return true; }
         uint64_t pa;
         r = translate(h, a, st ? 1 : 0, dataPriv(h), pa);
         if (r != Acc::Ok) { p = nullptr; return true; }
@@ -1022,8 +1023,7 @@ public:
         if (!d || !d->memory() || pg + 4096 > d->base + d->size || (st && !d->writable()) ||
             (tohost && (tohost >> 12) == (pa >> 12)) || !pmpAllows(h, pg, 4096, st ? PMP_W : PMP_R, dataPriv(h)))
             return false;
-        e.vpn = a >> 12;
-        e.ctx = ctx;
+        e.tag = tag;
         e.host = d->memory() + (pg - d->base);
         p = e.host + (a & 0xfff);
         return true;
@@ -1520,23 +1520,17 @@ private:
                     J.rex(false, 0, R::RAX); J.b(0xa9); J.d32(nbytes - 1);  // test eax, n - 1
                     bail(R::CC_NE);
                 }
-                J.movRR(R::RCX, R::RAX);
-                J.shiftI(5, R::RCX, 12);                                    // vpn
-                J.movRR(R::R11, R::RCX, false);
+                J.movRR(R::RCX, R::RAX);                                    // the last byte's tag
+                if (nbytes > 1) J.aluI(R::A_ADD, R::RCX, (int32_t)nbytes - 1);
+                J.shiftI(5, R::RCX, 12);
+                J.aluC(R::A_OR, R::RCX, 104);
+                J.movRR(R::R11, R::RAX);                                    // the first byte's entry
+                J.shiftI(5, R::R11, 12);
                 J.aluI(R::A_AND, R::R11, (int32_t)(Hart::DP_SIZE - 1), false);
-                J.rex(true, R::R11, R::R11); J.b(0x6b); J.modrr(R::R11, R::R11); J.b((uint8_t)sizeof(Hart::DataPage));
+                J.shiftI(4, R::R11, 4);
                 J.aluC(R::A_ADD, R::R11, cache);
-                J.rex(true, R::RCX, R::R11); J.b(0x3b); J.mem(R::RCX, R::R11, 0);  // cmp rcx, [r11].vpn
+                J.rex(true, R::RCX, R::R11); J.b(0x3b); J.mem(R::RCX, R::R11, 0);  // cmp rcx, [r11].tag
                 bail(R::CC_NE);
-                J.ldCtx(R::RCX, 104);
-                J.rex(false, R::RCX, R::R11); J.b(0x3b); J.mem(R::RCX, R::R11, (int32_t)offsetof(Hart::DataPage, ctx));
-                bail(R::CC_NE);
-                if (nbytes > 1) {  // within the page
-                    J.movRR(R::RCX, R::RAX, false);
-                    J.aluI(R::A_AND, R::RCX, 0xfff, false);
-                    J.aluI(R::A_CMP, R::RCX, (int32_t)(4096 - nbytes), false);
-                    bail(R::CC_A);
-                }
                 J.aluI(R::A_AND, R::RAX, 0xfff, false);
                 J.rex(true, R::RAX, R::R11); J.b(0x03); J.mem(R::RAX, R::R11, (int32_t)offsetof(Hart::DataPage, host));
             };
@@ -1776,6 +1770,18 @@ private:
         }
         return keep();
     }
+    // Without paging, where PMP is in force: may pc..pc+len be fetched? A
+    // page found executable as a whole goes in the fetch page record (as
+    // its own physical page; emptied with it, by PMP writes and satp), so
+    // the next fetches from it need no PMP walk.
+    bool bareExecOk(Hart& h, uint64_t pc, unsigned len) {
+        Hart::FetchPage& e = h.fp[(pc >> 12) & (Hart::FP_SIZE - 1)];
+        if (e.vpn == pc >> 12 && e.priv == h.priv && (pc & 0xfff) + len <= 4096) return true;
+        if (!pmpAllows(h, pc, len, PMP_X, h.priv)) return false;
+        const uint64_t pg = pc & ~0xfffull;
+        if (pmpAllows(h, pg, 4096, PMP_X, h.priv)) e = {pc >> 12, h.priv, pg};
+        return true;
+    }
     // Does the decoded cache hold the instruction at pc for the fast loop?
     // (Else it would leave at once: the general path decodes it first.)
     bool turboReady(const Hart& h) const {
@@ -1795,9 +1801,11 @@ private:
         if (h.codeUntracked) return;
         const uint64_t pg = fa >> 12;
         auto it = h.codePages.find(pg);
+        const uint64_t pieces = (1ull << ((fa & 0xfff) >> 6)) | (1ull << (((fa & 0xfff) + n - 1) >> 6));
         if (it != h.codePages.end()) {
             // decoded from bytes the copy does not hold: it changed already
             if (!it->second.changed && memcmp(it->second.snap.get() + (fa & 0xfff), &raw, n)) it->second.changed = true;
+            it->second.used |= pieces;
             return;
         }
         Device* d = bus.find(pg << 12);
@@ -1806,7 +1814,7 @@ private:
             h.codeUntracked = true;
             return;
         }
-        Hart::CodePage cp{d->memory() + ((pg << 12) - d->base), std::unique_ptr<uint8_t[]>(new uint8_t[4096]), false};
+        Hart::CodePage cp{d->memory() + ((pg << 12) - d->base), std::unique_ptr<uint8_t[]>(new uint8_t[4096]), false, pieces};
         memcpy(cp.snap.get(), cp.host, 4096);
         if (memcmp(cp.snap.get() + (fa & 0xfff), &raw, n)) cp.changed = true;
         h.codePages.emplace(pg, std::move(cp));
@@ -1828,7 +1836,13 @@ private:
         bool any = false;
         for (auto it = h.codePages.begin(); it != h.codePages.end();) {
             Hart::CodePage& c = it->second;
-            if (!c.changed && !memcmp(c.snap.get(), c.host, 4096)) { ++it; continue; }
+            // only the pieces instructions were decoded from matter
+            bool changed = c.changed;
+            for (uint64_t m = c.used; m && !changed; m &= m - 1) {
+                const unsigned o = 64 * (unsigned)__builtin_ctzll(m);
+                changed = memcmp(c.snap.get() + o, c.host + o, 64) != 0;
+            }
+            if (!changed) { ++it; continue; }
             const uint64_t pg = it->first;
             // its entries, and one at the end of the page before (4 bytes across)
             Hart::Decoded* e = &h.dc[((pg << 12) >> 1) & (Hart::DC_SIZE - 1)];
@@ -1892,8 +1906,8 @@ private:
             J.pgFpGen = h.fpGen;
             J.pgPriv = h.priv;
         }
-        static_assert(sizeof(Hart::DataPage) <= 127 && offsetof(Hart::DataPage, vpn) == 0, "the translator's page cache lookup");
-        JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, J.jtPg, h.dl, h.ds, dataCtx(h)};
+        static_assert(sizeof(Hart::DataPage) == 16 && offsetof(Hart::DataPage, tag) == 0, "the translator's page cache lookup");
+        JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, J.jtPg, h.dl, h.ds, (uint64_t)dataCtx(h) << 52};
         auto look = [&](uint64_t v, bool stepv) -> uint8_t* {
             if (!stepv) {
                 const Jit::JtEntry& t = J.jtPg[(v >> 1) & (Jit::JT - 1)];
@@ -1961,7 +1975,7 @@ private:
         auto ldp = [&](uint64_t ad, unsigned n) -> uint8_t* {
             if constexpr (PG) {
                 const Hart::DataPage& e = h.dl[(ad >> 12) & (Hart::DP_SIZE - 1)];
-                return e.vpn == ad >> 12 && e.ctx == ctx && (ad & 0xfff) <= 4096 - n ? e.host + (ad & 0xfff) : nullptr;
+                return e.tag == Hart::dpTag(ad + n - 1, ctx) ? e.host + (ad & 0xfff) : nullptr;
             } else {
                 (void)n;
                 return ad - cb < span ? cp + (ad - cb) : nullptr;
@@ -1970,7 +1984,7 @@ private:
         auto stp = [&](uint64_t ad, unsigned n) -> uint8_t* {
             if constexpr (PG) {
                 const Hart::DataPage& e = h.ds[(ad >> 12) & (Hart::DP_SIZE - 1)];
-                return e.vpn == ad >> 12 && e.ctx == ctx && (ad & 0xfff) <= 4096 - n ? e.host + (ad & 0xfff) : nullptr;
+                return e.tag == Hart::dpTag(ad + n - 1, ctx) ? e.host + (ad & 0xfff) : nullptr;
             } else {
                 return ad - cb < sspan && !(th && ad - th + n - 1 < 8 + n - 1) ? cp + (ad - cb) : nullptr;
             }
@@ -2469,7 +2483,7 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
                 if (!recorded && len == 4 && !pmpAllows(h, fa + 2, 2, PMP_X, h.priv)) {
                     trap(h, 1, h.ax(pc + 2), false); h.cycle++; continue;
                 }
-            } else if ((h.priv != 3 || h.pmpLock) && !pmpAllows(h, pc, len, PMP_X, h.priv)) {
+            } else if ((h.priv != 3 || h.pmpLock) && !bareExecOk(h, pc, len)) {
                 trap(h, 1, pc, false); h.cycle++; continue;
             }
         } else {

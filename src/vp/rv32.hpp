@@ -184,12 +184,17 @@ struct Hart {
     // privilege, SUM and MXR they were checked with. Each one was translated
     // (with A, and D for a store, set) and found allowed by PMP as a whole.
     // Emptied with the TLB and by PMP writes.
-    struct DataPage { uint64_t vpn = ~0ull; uint8_t* host = nullptr; uint32_t ctx = 0; };
+    // tag: va >> 12 | the key << 52 (no virtual page number reaches bit 52;
+    // ~0, empty, is no tag). An access of n bytes at va hits when its last
+    // byte's tag is the entry's at its first byte's index, so one compare
+    // also catches an access across two pages.
+    struct DataPage { uint64_t tag = ~0ull; uint8_t* host = nullptr; };
+    static uint64_t dpTag(uint64_t va, uint32_t ctx) { return va >> 12 | (uint64_t)ctx << 52; }
     static constexpr unsigned DP_SIZE = 256;
     DataPage dl[DP_SIZE], ds[DP_SIZE];
     void flushDataPages() {
-        for (auto& e : dl) e.vpn = ~0ull;
-        for (auto& e : ds) e.vpn = ~0ull;
+        for (auto& e : dl) e.tag = ~0ull;
+        for (auto& e : ds) e.tag = ~0ull;
     }
     // The page instructions were last fetched from, translated and found
     // executable by PMP as a whole: va >> 12, the physical page, and the
@@ -268,7 +273,7 @@ struct Hart {
     // only what came from a page that has changed since (whoever changed
     // it: a store on any path, DMA, another hart's write buffer). A page
     // that cannot be copied, or too many of them, makes it a full flush.
-    struct CodePage { const uint8_t* host; std::unique_ptr<uint8_t[]> snap; bool changed; };
+    struct CodePage { const uint8_t* host; std::unique_ptr<uint8_t[]> snap; bool changed; uint64_t used; };  // used: 64-byte pieces code came from
     static constexpr size_t CODE_PAGES = 512;
     std::unordered_map<uint64_t, CodePage> codePages;
     bool codeUntracked = false;
