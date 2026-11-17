@@ -531,9 +531,11 @@ virtual pc through the fetch page record and translated from the physical
 address the pc has then (so another mapping of the same code gets its own
 translation); it links straight only to blocks in its own page, and goes
 to others through the table, which is emptied with the TLB. Loads, stores,
-the AMOs (one hart; not LR and SC) and CBO.ZERO look their page up in the
+the AMOs, LR and SC (one hart, or `-serial`) and CBO.ZERO look their page up in the
 hart's data page caches inline; a miss, a device, an access across a page
-or a misaligned AMO leaves for the general path. The budget is checked once per block; when
+or a misaligned AMO leaves for the general path. CSRRCI on sstatus in
+supervisor mode (clearing SIE, which lets no interrupt in) is translated;
+other CSR instructions leave. The budget is checked once per block; when
 the quantum ends inside a block, a counting copy of that block runs the
 rest exactly, so a run retires the same instructions on the same cycles
 as with `-nojit`. Translations are dropped when FENCE.I finds a code page

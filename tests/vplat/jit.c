@@ -139,6 +139,23 @@ static uint64_t zbb(uint64_t a, uint64_t b) {
     return h;
 }
 
+// LR/SC: a reservation that holds, one another address breaks, and an SC
+// with none.
+static volatile uint64_t lrCell[4] __attribute__((aligned(64)));
+static uint64_t lrsc(uint64_t a) {
+    uint64_t h = 0, v, f;
+    lrCell[0] = a;
+    __asm__ volatile("lr.d %0, (%2)\n sc.d %1, %3, (%2)" : "=&r"(v), "=&r"(f) : "r"(&lrCell[0]), "r"(a + 1) : "memory");
+    h = mix(h, v); h = mix(h, f); h = mix(h, lrCell[0]);
+    __asm__ volatile("lr.w %0, (%2)\n sc.w %1, %3, (%2)" : "=&r"(v), "=&r"(f) : "r"(&lrCell[1]), "r"(a >> 3) : "memory");
+    h = mix(h, v); h = mix(h, f); h = mix(h, lrCell[1]);
+    __asm__ volatile("lr.d %0, (%2)\n sc.d %1, %3, (%4)" : "=&r"(v), "=&r"(f) : "r"(&lrCell[2]), "r"(a), "r"(&lrCell[3]) : "memory");
+    h = mix(h, v); h = mix(h, f); h = mix(h, lrCell[3]);
+    __asm__ volatile("sc.d %0, %1, (%2)" : "=&r"(f) : "r"(a), "r"(&lrCell[2]) : "memory");  // no reservation now
+    h = mix(h, f); h = mix(h, lrCell[2]);
+    return h;
+}
+
 static uint64_t work(void) {
     // The corner cases, against the ISA (M extension, division by zero and overflow).
     const uint64_t MIN = 0x8000000000000000ull, M32 = 0xffffffff80000000ull;
@@ -208,6 +225,7 @@ static uint64_t work(void) {
         if (i % 1000 == 0) h = mix(h, REG8(UART0 + 5) & 0x60);  // a device load in a hot loop
         if (i % 50 == 0) h = mix(h, straddle(a));
         if (i % 5 == 0) h = mix(h, amos(a, b));
+        if (i % 4 == 1) h = mix(h, lrsc(a));
         if (i % 2 == 0) h = mix(h, zbb(a, i & 4 ? b : a >> (b & 63)));
     }
     return h;
@@ -221,7 +239,22 @@ static uint64_t machineSum;
 static __attribute__((noinline, used)) void supervisor(void) {
     seed = 0x9e3779b97f4a7c15ull;
     for (unsigned i = 0; i < sizeof pages; i++) pages[i] = 0;
+    for (unsigned i = 0; i < 4; i++) lrCell[i] = 0;
     check("supervisor mode, Sv39: the same checksum", work(), machineSum);
+    // CSRRCI on sstatus (translated in supervisor mode): SIE cleared and set
+    // again, the old values in the checksum
+    uint64_t hs = 0;
+    for (int i = 0; i < 3000; i++) {
+        uint64_t o;
+        if (i & 1) __asm__ volatile("csrrci %0, sstatus, 2" : "=r"(o));
+        else __asm__ volatile("csrrci %0, sstatus, 0" : "=r"(o));
+        hs = mix(hs, o);
+        if (i % 3 == 0) __asm__ volatile("csrsi sstatus, 2");
+    }
+    puts_("sstatus checksum ");
+    putx((uint32_t)(hs >> 32));
+    putx((uint32_t)hs);
+    puts_("\n");
     puts_("jit: ");
     putd((uint32_t)(checks - fails));
     puts_(" of ");

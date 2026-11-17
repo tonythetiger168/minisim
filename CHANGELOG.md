@@ -14,7 +14,8 @@ Spec references are IEEE 1800-2023 clauses.
   use; each one used to leave translated code. Linux on 1 hart: about
   1.13 s to 1.0 s; on 2 harts with `-serial` about 1.4 s to 1.3 s.
   `tests/vplat/jit.c` checks each against known answers and the
-  interpreter.
+  interpreter. LR and SC (one hart, or `-serial`) and CSRRCI on sstatus in
+  supervisor mode (how Linux masks interrupts) are translated too.
 - mvplat: with `-serial` the harts share one translation of paged code
   (each keeps its own indirect-jump table), FENCE.I keeps up to 2048 code
   pages per hart and drops translations page by page however many changed,
