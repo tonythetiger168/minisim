@@ -212,7 +212,7 @@ if(MINISIM_WITH_SLANG)
   # gives each file its own unit.
   add_test(NAME msim_one_unit
            COMMAND msim ${CLI}/unit_defs.svh ${CLI}/unit_use.sv -v ${CLI}/unit_lib.v)
-  set_tests_properties(msim_one_unit PROPERTIES PASS_REGULAR_EXPRESSION "^w=6 x=63 twice=42\ncell w=6\n$")
+  set_tests_properties(msim_one_unit PROPERTIES PASS_REGULAR_EXPRESSION "^w=6 x=63 twice=42\ncell w=6 twice=12\n$")
   add_test(NAME msim_separate_units
            COMMAND msim --single-unit=false ${CLI}/unit_defs.svh ${CLI}/unit_use.sv -v ${CLI}/unit_lib.v)
   set_tests_properties(msim_separate_units PROPERTIES WILL_FAIL TRUE)
