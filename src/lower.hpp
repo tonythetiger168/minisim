@@ -2128,12 +2128,27 @@ struct Lowerer {
             if (rw <= 0) unsupported("return type of a function called through a virtual interface");
             res = fresh(rw);
         }
+        // v.sub.f(): f of an interface instance inside the one v names; the
+        // instance names on the way down
+        std::vector<std::string_view> path;
+        for (const Symbol* q = &sym.getParentScope()->asSymbol(); q && q->kind == SymbolKind::InstanceBody;) {
+            const auto& b = q->as<InstanceBodySymbol>();
+            if (&b.getDefinition() == def || !b.parentInstance) break;
+            path.insert(path.begin(), b.parentInstance->name);
+            q = b.parentInstance->getParentScope() ? &b.parentInstance->getParentScope()->asSymbol() : nullptr;
+        }
         std::vector<size_t> ends;
         auto& vi = vifInfo();
         for (size_t k = 1; k < vi.insts.size(); k++) {
             const InstanceSymbol& inst = *vi.insts[k];
             if (&inst.getDefinition() != def) continue;
-            const Symbol* f = inst.body.find(sym.name);
+            const InstanceBodySymbol* body = &inst.body;
+            for (auto nm : path) {
+                const Symbol* s = body ? body->find(nm) : nullptr;
+                body = s && s->kind == SymbolKind::Instance ? &s->as<InstanceSymbol>().body : nullptr;
+            }
+            if (!body) continue;
+            const Symbol* f = body->find(sym.name);
             if (!f || f->kind != SymbolKind::Subroutine) continue;
             size_t no = emitJmpIfNot(bin(Op::Eq, ref(h), konst(make((uint64_t)k, 0, 64))));
             vifTarget = &f->as<SubroutineSymbol>();
@@ -2788,6 +2803,20 @@ struct Lowerer {
                 return ref(sg);
             }
             case ExpressionKind::NewClass: return newObject(e.as<NewClassExpression>());
+            case ExpressionKind::MemberAccess: {   // v.sub: an interface instance inside the one v names (25.9)
+                const auto& m = e.as<MemberAccessExpression>();
+                if (!m.value().type->isVirtualInterface() || m.member.kind != SymbolKind::Instance) break;
+                int h = fresh(64);
+                { Instr i; i.k = IK::Assign; i.sig = h; i.e = exprH(m.value()); prog.emit(i); }
+                E acc = konst(make(0, 0, 64));
+                for (auto& [k, inst] : vifInstances(*m.value().type)) {
+                    const Symbol* sub = inst->body.find(m.member.name);
+                    if (!sub || sub->kind != SymbolKind::Instance) continue;
+                    acc = mux(bin(Op::Eq, ref(h), konst(make((uint64_t)k, 0, 64))),
+                              konst(make((uint64_t)vifInstance(sub->as<InstanceSymbol>()), 0, 64)), acc);
+                }
+                return acc;
+            }
             case ExpressionKind::ArbitrarySymbol: {   // an interface instance as a virtual interface value (25.9)
                 const Symbol* sym = e.as<ArbitrarySymbolExpression>().symbol;
                 if (sym->kind == SymbolKind::InterfacePort) {
@@ -8769,7 +8798,9 @@ struct Lowerer {
             wc = classInfo(*args[0]->type);
             i.e = exprH(*args[0]);
             first = 1;
-        } else if (!isStd && curClass) {
+        } else if (!isStd && curClass && !(call.syntax && call.syntax->getFirstToken().rawText() == "std")) {
+            // randomize(...) in a method is this.randomize(...) (18.11);
+            // std::randomize(...) there randomizes the scope's variables (18.12)
             wc = curClass;
             i.e = node(Op::This);
         }
@@ -15500,11 +15531,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     {
         using namespace slang::ast;
         auto& vi = vifInfo();
-        auto bodyDef = [](const Symbol& m) -> const DefinitionSymbol* {
-            const Scope* sc = m.getParentScope();
-            while (sc && sc->asSymbol().kind != SymbolKind::InstanceBody) sc = sc->asSymbol().getParentScope();
-            return sc ? &sc->asSymbol().as<InstanceBodySymbol>().getDefinition() : nullptr;
-        };
         auto& tab = vifTab();
         tab.assign(vi.insts.size(), {});
         for (size_t k = 1; k < vi.insts.size(); k++) {
@@ -15512,14 +15538,26 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
             tab[k].assign(vi.members.size(), -1);
             for (size_t j = 0; j < vi.members.size(); j++) {
                 const Symbol* m = vi.members[j];
-                if (bodyDef(*m) != &inst.getDefinition()) continue;
                 if (m->kind == SymbolKind::ModportPort)
                     if (const Symbol* in = m->as<ModportPortSymbol>().internalSymbol) m = in;
-                std::vector<std::string_view> path;   // cb.x: [cb, x]
-                for (const Symbol* q = m; q && q->kind != SymbolKind::InstanceBody; q = &q->getParentScope()->asSymbol())
+                // cb.x: [cb, x]; sub.x, a member of an interface instance
+                // inside this one: [sub, x]
+                std::vector<std::string_view> path;
+                bool mine = false;
+                for (const Symbol* q = m; q;) {
+                    if (q->kind == SymbolKind::InstanceBody) {
+                        const auto& b = q->as<InstanceBodySymbol>();
+                        if (&b.getDefinition() == &inst.getDefinition()) { mine = true; break; }
+                        q = b.parentInstance;
+                        continue;
+                    }
                     path.insert(path.begin(), q->name);
+                    q = q->getParentScope() ? &q->getParentScope()->asSymbol() : nullptr;
+                }
+                if (!mine) continue;
                 const Symbol* f = &inst.body;
                 for (auto nm : path) {
+                    if (f && f->kind == SymbolKind::Instance) f = &f->as<InstanceSymbol>().body;
                     if (!f || !f->isScope()) { f = nullptr; break; }
                     f = f->as<Scope>().find(nm);
                 }
