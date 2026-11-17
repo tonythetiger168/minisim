@@ -4,6 +4,68 @@ Designs and scripts for measuring minisim tools; see the bench-speed skill
 (`.claude/skills/bench-speed`) for the method. This page covers the SoC
 generator.
 
+## gen_manycore.py: tiled many-core with shared memory
+
+```sh
+python3 bench/gen_manycore.py --help
+python3 bench/gen_manycore.py --mesh 8x8 > mc.sv && msim mc.sv -top mc_tb
+python3 bench/gen_soc.py --tiles 8x8          # the same, through gen_soc.py
+```
+
+The N-core designs of `gen_soc.py` below are N copies that never talk to
+each other, which makes them an easy case for a simulator: one module
+repeated, and every core busy on every clock. `gen_manycore.py` builds a chip
+the way tiled many-cores such as OpenPiton are built (our own RTL, nothing
+taken from OpenPiton): an X x Y mesh of tiles, each with
+
+* a RISC-V core: `mcrv` (our own RV32I, `bench/manycore/mc_rv.sv`, the
+  default, needs no download), `picorv32`, `femtorv32`, or a mix
+  (`--core mix` is a checkerboard of PicoRV32 and FemtoRV32; a comma list
+  such as `--core mcrv,picorv32,femtorv32` repeats over the tiles),
+* 4 KB of private RAM with the program,
+* a private L1 data cache (direct-mapped, write-through),
+* one slice of the distributed shared L2 (lines homed by address mod N), with
+  a limited-pointer directory (`--dir-ptrs`, default 4) that invalidates the
+  sharers on a write and broadcasts once a line has more sharers than pointers,
+* three routers, one per physical network as in OpenPiton: NoC1 requests,
+  NoC2 data, write acks and invalidations, NoC3 invalidation acks
+  (single-flit packets, XY routing, round-robin arbitration).
+
+The program is the same in every tile. In each of `--rounds` rounds core i
+runs a xorshift loop whose length depends on i (so some cores compute while
+others wait at the barrier spinning in their L1), writes its value to a shared
+array, joins a barrier (fetch-and-increment, then the last arrival releases a
+flag), and mixes in the values of tiles i+1 and i+X. Core 0 then folds every
+core's result into a checksum. The generator computes the same checksum in
+Python, and the testbench prints PASS only when they agree:
+
+```
+mc: tiles=64 mesh=8x8 cores=mcrv done=64/64 cycles=13667 l2_requests=928 checksum=99886ab5 expect=99886ab5 PASS
+```
+
+So a run checks the NoC, the coherence protocol and the cores, not only that
+nothing hangs. `tests/msim_manycore.cmake` runs three small meshes on msim
+with 1 and 4 threads.
+
+| file | contents |
+|---|---|
+| `manycore/mc_router.sv` | 5-port router, 2-deep input FIFOs |
+| `manycore/mc_l1.sv` | L1 data cache, NoC1/NoC3 inject, NoC2 eject |
+| `manycore/mc_l2.sv` | L2 slice, directory, invalidation and ack counting |
+| `manycore/mc_tile.sv` | core port decode, private RAM, MMIO, the three routers |
+| `manycore/mc_rv.sv` | the mcrv core |
+
+Measured (2026-11-17, 4-core VM, `--rounds 2`, mcrv, msim interpreter vs
+Verilator 5.054 `-O3`; seconds; every run printed PASS with the same checksum):
+
+| mesh | tiles | cycles | msim interp | Verilator build | Verilator run |
+|---|---|---|---|---|---|
+| 4x4 | 16 | 11,101 | 4.1 | 22.1 | 0.2 |
+| 8x8 | 64 | 13,667 | 28.0 | | |
+
+`msim -compile` gives the same result on 4x4 but its build took 9 min 40 s,
+against 4 s for the interpreter: this design is the next compiled-mode case.
+
 ## gen_soc.py: SoC of N cores
 
 ```sh
