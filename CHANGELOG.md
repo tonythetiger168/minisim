@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: the translator runs supervisor and user code with paging on
+  (blocks by virtual pc, translated from the physical address, linked
+  within a page; loads, stores, AMOs and CBO.ZERO through the data page
+  caches inline), and translates FENCE. Linux boots to the BusyBox shell in
+  1.16 s (4.4 s with `-nojit`; QEMU 8.2 1.29 s on the same host). `tests/vplat/jit.c` runs its
+  work again in supervisor mode with Sv39, with accesses across a page
+  boundary and every AMO.
 - mlsp: a language server (LSP 3.17, stdio) for SystemVerilog and Verilog on
   slang set up as msim: diagnostics as you type from unsaved buffers, go to
   definition and references (ports, parameters, packages, types, enum
