@@ -1359,11 +1359,17 @@ private:
             J.used = (size_t)(J.p - J.buf);
             if (pg) {
                 Jit::PgBlock& e = J.pg[pc0];
-                if (e.pa != pa0 || (!e.code && !e.step)) e = {pa0, nullptr, nullptr};
+                if (e.pa != pa0 || (!e.code && !e.step)) {
+                    e = {pa0, nullptr, nullptr};
+                    J.pgByPage[pa0 >> 12].push_back(pc0);
+                }
                 (step ? e.step : e.code) = entry;
                 if (!step) J.compiled++;
-            } else if (step) J.steps[pc0] = entry;
-            else J.add(pc0, entry);
+            } else {
+                for (uint64_t a = pc0 >> 12; a <= (p > pc0 ? (p - 1) >> 12 : pc0 >> 12); a++) J.barePages.insert(a);
+                if (step) J.steps[pc0] = entry;
+                else J.add(pc0, entry);
+            }
             return entry;
         };
         if (!n) {  // the fast loop takes it from here
@@ -1831,10 +1837,12 @@ private:
             Hart::Decoded& last = h.dc[(((pg << 12) - 2) >> 1) & (Hart::DC_SIZE - 1)];
             if (((last.pc ^ h.mmuTag) >> 1) == (((pg << 12) - 2) >> 1)) last.pc = ~0ull;
             h.fencePages++;
+            if (h.codeChanged.size() < 64) h.codeChanged.push_back(pg);
+            else h.codeGen++;  // too many: drop every translation
             any = true;
             it = h.codePages.erase(it);
         }
-        if (any) { h.dcGen++; h.codeGen++; }
+        if (any) h.dcGen++;
     }
     // Run translated code from pc until something needs the fast loop.
     void jitRun(Hart& h, uint64_t* r, uint64_t& pc, uint64_t& left, uint8_t* cp, uint64_t cb, uint64_t span,
@@ -1842,7 +1850,8 @@ private:
         Jit* jp = jitFor(h);
         if (!jp) { jit = false; return; }
         Jit& J = *jp;
-        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; }
+        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; h.codeChanged.clear(); }
+        if (!h.codeChanged.empty()) { J.dropPages(h.codeChanged); h.codeChanged.clear(); }
         JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt, nullptr, nullptr, 0};
         uint8_t* code = J.find(pc);
         if (!code && !(code = jitCompile(J, h, pc))) return;
@@ -1876,7 +1885,8 @@ private:
         Jit* jp = jitFor(h);
         if (!jp) { jit = false; return; }
         Jit& J = *jp;
-        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; }
+        if (J.gen != h.codeGen) { J.flush(); J.gen = h.codeGen; h.codeChanged.clear(); }
+        if (!h.codeChanged.empty()) { J.dropPages(h.codeChanged); h.codeChanged.clear(); }
         if (J.pgFpGen != h.fpGen || J.pgPriv != h.priv) {
             Jit::clearJt(J.jtPg, J.jtPgUsed);
             J.pgFpGen = h.fpGen;

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__x86_64__) && (defined(__linux__) || defined(__APPLE__))
@@ -70,6 +71,11 @@ struct Jit {
     std::vector<uint32_t> jtPgUsed;
     uint32_t pgFpGen = ~0u;
     unsigned pgPriv = ~0u;
+    // The physical pages translations came from: those with paging by page
+    // (they link only within it, so they can go alone), the others as a set
+    // (their links cross pages: a change to one drops everything).
+    std::unordered_map<uint64_t, std::vector<uint64_t>> pgByPage;
+    std::unordered_set<uint64_t> barePages;
 
     Jit() {
 #if MVPLAT_JIT
@@ -106,9 +112,28 @@ struct Jit {
         blocks.clear();
         steps.clear();
         pg.clear();
+        pgByPage.clear();
+        barePages.clear();
         clearJt(jt, jtUsed);
         clearJt(jtPg, jtPgUsed);
         flushes++;
+    }
+    // Code in these physical pages changed (FENCE.I found it so).
+    void dropPages(const std::vector<uint64_t>& pages) {
+        for (uint64_t pgn : pages)
+            if (barePages.count(pgn)) { flush(); return; }
+        bool any = false;
+        for (uint64_t pgn : pages) {
+            auto it = pgByPage.find(pgn);
+            if (it == pgByPage.end()) continue;
+            for (uint64_t va : it->second) {
+                auto b = pg.find(va);
+                if (b != pg.end() && (b->second.pa >> 12) == pgn) pg.erase(b);
+            }
+            pgByPage.erase(it);
+            any = true;
+        }
+        if (any) clearJt(jtPg, jtPgUsed);
     }
     void setJtPg(uint64_t pc, uint8_t* code) {
         JtEntry& e = jtPg[(pc >> 1) & (JT - 1)];

@@ -261,6 +261,7 @@ struct Hart {
         mmuTag = (uint64_t)mmuEpoch << 57;
         codePages.clear();
         codeUntracked = false;
+        codeChanged.clear();
     }
     // The physical pages decoded instructions came from since the last
     // flush, each with a copy of its bytes as they were then: FENCE.I drops
@@ -292,7 +293,8 @@ struct Hart {
         BlockOp ops[BLOCK_OPS + 1];  // the last is the fall-through exit
     };
     uint32_t dcGen = 1;    // any flush (the fast loop's blocks)
-    uint32_t codeGen = 1;  // a flush of everything: FENCE.I, a load, a debugger write (translations)
+    uint32_t codeGen = 1;  // a flush of everything: a load, a debugger write (translations)
+    std::vector<uint64_t> codeChanged;  // physical pages FENCE.I found changed, for the translator
     uint32_t mmuEpoch = 1;
     uint64_t mmuTag = 1ull << 57;   // mmuEpoch << 57: the decoded cache's tags carry it
     std::unique_ptr<Block[], Free> blocks;  // made on first use
