@@ -11,6 +11,17 @@ Spec references are IEEE 1800-2023 clauses.
 - mvplat: Svpbmt on RV64 (`menvcfg.PBMTE`, PBMT PMA/NC/IO on leaf PTEs; 3,
   PBMT without PBMTE and PBMT on a pointer fault) and Zalasr (LB..LD.AQ,
   SB..SD.RL, .AQRL); both in the device tree. `tests/vplat/svpbmt.c`.
+- mmcp: the minisim engines as Model Context Protocol tools for AI agents
+  (Claude, DeepSeek, local models, any MCP client): `msim_run`, `mlint_check`,
+  `mcov_report`, `mdebug_query`, `mregress_run`, `mplan_report`, `read_file`,
+  all answering JSON; files confined to a root; add-on tools load as
+  plug-ins from `share/minisim/mcp`. docs/MCP.md, `tests/mmcp_test.py`.
+- magent: three verification agents on mmcp whose results the engines judge:
+  `triage` (failure groups to root cause, scored against known labels),
+  `lintfix` (an edit is kept only if mlint, msim, the regression and mequiv
+  agree) and `covclose` (a new test is kept only if it passes and adds
+  coverage). Claude or any OpenAI-compatible model. docs/AGENTS.md,
+  `tests/magent_test.py`.
 - msim: VHDL-2019 reflection (IEEE 1076-2019 16.2.2 `'reflect`, 16.12
   std.reflection): subtype and value mirrors of every type class, from
   enumerations and nine-value std_logic to multidimensional arrays, linked
