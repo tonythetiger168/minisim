@@ -8183,9 +8183,21 @@ struct Lowerer {
         if (n == "$value$plusargs" && args.size() == 2) {
             // "N=%d": the prefix is the text before the %, the letter says how
             // to read the rest. The variable is written only on a match.
+            // The user string may be any string expression (21.6); one built
+            // as {name, "=%s"} (a prefix known only at run time, the
+            // specifier in its last, literal part) is read the same way.
             const auto& f = peel(*args[0]);
-            if (f.kind != slang::ast::ExpressionKind::StringLiteral) unsupported("$value$plusargs format that is not a literal");
-            std::string fs(f.as<slang::ast::StringLiteral>().getValue());
+            std::vector<E> head;   // the run-time parts before the literal one
+            const slang::ast::Expression* lit = &f;
+            if (f.kind == slang::ast::ExpressionKind::Concatenation) {
+                auto ops = f.as<slang::ast::ConcatenationExpression>().operands();
+                if (!ops.empty()) {
+                    lit = &peel(*ops.back());
+                    for (size_t k = 0; k + 1 < ops.size(); k++) head.push_back(strOf(*ops[k]));
+                }
+            }
+            if (lit->kind != slang::ast::ExpressionKind::StringLiteral) unsupported("$value$plusargs format that is not a literal or ends in one");
+            std::string fs(lit->as<slang::ast::StringLiteral>().getValue());
             size_t pc = fs.find('%');
             if (pc == std::string::npos) unsupported("$value$plusargs format without a specifier");
             size_t q = pc + 1;
@@ -8195,6 +8207,10 @@ struct Lowerer {
             if (std::string_view("dhxobsfeg").find(c) == std::string_view::npos) unsupported("$value$plusargs format letter");
             if (!stmtDepth) unsupported("$value$plusargs outside a procedural statement");
             E pre = konst(mkstr(fs.substr(0, pc)));
+            if (!head.empty()) {
+                head.push_back(pre);
+                pre = node(Op::StrCat, std::move(head));   // read again for the value: the parts have no side effects
+            }
             int found = fresh(32);
             Instr t; t.k = IK::Assign; t.sig = found; t.e = sysFnNode(SF_PLUS_TEST, {pre});
             prog.emit(t);
@@ -15446,7 +15462,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     for (const auto& ex : comp.getDPIExports()) {   // export "DPI-C" (35.5.4)
         using namespace slang::ast;
         auto it = subMap.find(ex.subroutine);
-        if (it == subMap.end()) Lowerer::unsupported("DPI export of this subroutine");
+        if (it == subMap.end()) {
+            // An export in a generate block not taken, or in a module nothing
+            // instantiates, has no instance to call into: it is left out, as
+            // other simulators do (the C side cannot reach it either).
+            const auto* sc = ex.subroutine->getParentScope();
+            if (sc && sc->isUninstantiated()) continue;
+            Lowerer::lastLoc() = ex.subroutine->location;
+            Lowerer::unsupported("DPI export of this subroutine");
+        }
         Subr* sub = it->second;
         if (sub->lay) Lowerer::unsupported("DPI export of an automatic task, or of a function that recurses");
         sub->root = true;
