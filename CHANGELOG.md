@@ -8,6 +8,9 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: BFloat16, Zfbfmin (FCVT.BF16.S, FCVT.S.BF16), Zvfbfmin
+  (`vfncvtbf16.f.f.w`, `vfwcvtbf16.f.f.v`) and Zvfbfwma (`vfwmaccbf16`);
+  all three in the device tree. `tests/vplat/bf16.c`.
 - mvplat: Svpbmt on RV64 (`menvcfg.PBMTE`, PBMT PMA/NC/IO on leaf PTEs; 3,
   PBMT without PBMTE and PBMT on a pointer fault) and Zalasr (LB..LD.AQ,
   SB..SD.RL, .AQRL); both in the device tree. `tests/vplat/svpbmt.c`.

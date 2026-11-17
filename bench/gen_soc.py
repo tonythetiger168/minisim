@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """bench/gen_soc.py [--core synthetic|ibex|picorv32|femtorv32] N [CYCLES] - a SoC-shaped design.
+   bench/gen_soc.py --tiles XxY [gen_manycore options] - a tiled many-core whose cores share memory.
+
+--tiles hands over to bench/gen_manycore.py: an OpenPiton-style mesh of tiles,
+each with a core, an L1, a slice of the shared L2 with a coherence
+directory, and three NoC routers. Its cores talk to each other through the
+mesh, so it is the realistic scale test; the N-core designs below are N
+copies that never interact. See bench/README.md.
 
 --core picks what each of the N cores is (default synthetic). The three real
 RISC-V cores hand over to bench/gen_rv_soc.py, which gives every core 1 KB of
@@ -46,6 +53,11 @@ args = sys.argv[1:]
 if args[:1] in (["-h"], ["--help"]):
     print(__doc__)
     sys.exit(0)
+if args[:1] == ["--tiles"] or (args and args[0].startswith("--tiles=")):
+    mesh = args[0].split("=", 1)[1] if "=" in args[0] else args[1]
+    rest = args[1:] if "=" in args[0] else args[2:]
+    mc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gen_manycore.py")
+    os.execv(sys.executable, [sys.executable, mc, "--mesh", mesh] + rest)
 if len(args) >= 2 and args[0] in ("--core", "--cpu"):
     core, args = args[1], args[2:]
     if core in ("ibex", "picorv32", "femtorv32"):
