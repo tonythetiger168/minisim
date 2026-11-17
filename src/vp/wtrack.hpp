@@ -69,7 +69,8 @@ public:
     static bool watch(int id, size_t pg) {
 #if MVPLAT_WTRACK
         Region& r = state().r[id];
-        if (r.ro[pg].load()) return true;
+        if (r.ro[pg].load(std::memory_order_acquire)) return true;
+        Lock l;  // not between a fault's flag and its mprotect
         if (mprotect(r.base + pg * 4096, 4096, PROT_READ)) return false;
         r.ro[pg].store(1, std::memory_order_release);
         return true;
@@ -90,6 +91,17 @@ public:
     }
 
 private:
+    // A spin lock (it is taken in the signal handler too): watch() and the
+    // handler change a page's protection and its flag together. Neither
+    // stores to guest memory while holding it, so it never faults inside.
+    struct Lock {
+        Lock() { while (flag().test_and_set(std::memory_order_acquire)) {} }
+        ~Lock() { flag().clear(std::memory_order_release); }
+        static std::atomic_flag& flag() {
+            static std::atomic_flag f = ATOMIC_FLAG_INIT;
+            return f;
+        }
+    };
     struct State {
         Region r[MAX] = {};
         int n = 0;
@@ -121,6 +133,7 @@ private:
             if (a >= r.base && a < r.base + r.pages * 4096) {
                 const size_t pg = (size_t)(a - r.base) >> 12;
                 // (another thread may have made it writable meanwhile)
+                Lock l;
                 if (r.ro[pg].exchange(0, std::memory_order_acq_rel)) {
                     r.gen[pg].fetch_add(1, std::memory_order_acq_rel);
                     mprotect(r.base + pg * 4096, 4096, PROT_READ | PROT_WRITE);
