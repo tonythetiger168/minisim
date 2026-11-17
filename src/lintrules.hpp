@@ -89,7 +89,7 @@ struct Params {
         static const std::set<std::string> keys = {
             "name.module", "name.signal", "name.param", "name.clock", "name.reset", "name.active_low",
             "name.instance", "name.port_in", "name.port_out", "name.typedef", "unused.ignore",
-            "name.max_length", "tb.modules", "name.macro", "fmt.line_length", "name.interface", "name.constraint", "name.dff", "formal.max_bits", "formal.reg_bits",
+            "name.max_length", "tb.modules", "name.macro", "fmt.line_length", "name.interface", "name.constraint", "name.dff", "formal.max_bits", "formal.reg_bits", "formal.fast",
             // slang-tidy's settings (linttidy.hpp)
             "tidy.clock", "tidy.reset", "tidy.reset_active_high", "tidy.enum", "tidy.struct", "tidy.union",
             "tidy.covergroup", "tidy.coverpoint", "tidy.cross"};
