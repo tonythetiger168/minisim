@@ -521,7 +521,7 @@ simulation time.
 
 On x86-64 hosts (Linux, macOS) an RV64 hart that would run the fast loop
 runs translated code instead (`src/vp/jit.hpp`; `-nojit` turns it off). A
-block of up to 64 instructions (RV64I, M, the compressed forms of both,
+block of up to 64 instructions (RV64I, M, Zbb, the compressed forms,
 FENCE) becomes x86-64 code: up to seven of its busiest registers live in
 host registers, a jump or branch to a known address goes straight to the
 next block once that exists, and JALR looks its target up in a table. In
@@ -531,9 +531,11 @@ virtual pc through the fetch page record and translated from the physical
 address the pc has then (so another mapping of the same code gets its own
 translation); it links straight only to blocks in its own page, and goes
 to others through the table, which is emptied with the TLB. Loads, stores,
-the AMOs (one hart; not LR and SC) and CBO.ZERO look their page up in the
+the AMOs, LR and SC (one hart, or `-serial`) and CBO.ZERO look their page up in the
 hart's data page caches inline; a miss, a device, an access across a page
-or a misaligned AMO leaves for the general path. The budget is checked once per block; when
+or a misaligned AMO leaves for the general path. CSRRCI on sstatus in
+supervisor mode (clearing SIE, which lets no interrupt in) is translated;
+other CSR instructions leave. The budget is checked once per block; when
 the quantum ends inside a block, a counting copy of that block runs the
 rest exactly, so a run retires the same instructions on the same cycles
 as with `-nojit`. Translations are dropped when FENCE.I finds a code page
@@ -546,8 +548,8 @@ With `bench/mvplat/run.sh` (best of 3, wall clock, QEMU 8.2 with TCG on
 the same host), the translator brings CoreMark (4000 iterations) from 3.6 s
 to 0.40 s (QEMU 0.78 s), Dhrystone from 2.1 s to 0.28 s (QEMU 0.54 s), and
 each of the 17 Embench programs ahead of QEMU (0.04 to 0.19 s against 0.10
-to 0.28 s). Linux (one hart) boots to the BusyBox shell in 1.16 s, best
-of 7 (QEMU 1.29 s, best of 5, on the same host; 4.4 s with `-nojit`). Floating point and
+to 0.28 s). Linux (one hart) boots to the BusyBox shell and powers off in about
+1.0 s, best of 5 (QEMU 1.29 s on the same host; 4.4 s with `-nojit`). Floating point and
 vector instructions still run on the general path.
 
 ## Limits / Not yet
