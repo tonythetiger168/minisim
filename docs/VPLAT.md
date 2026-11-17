@@ -521,7 +521,7 @@ simulation time.
 
 On x86-64 hosts (Linux, macOS) an RV64 hart that would run the fast loop
 runs translated code instead (`src/vp/jit.hpp`; `-nojit` turns it off). A
-block of up to 64 instructions (RV64I, M, the compressed forms of both,
+block of up to 64 instructions (RV64I, M, Zbb, the compressed forms,
 FENCE) becomes x86-64 code: up to seven of its busiest registers live in
 host registers, a jump or branch to a known address goes straight to the
 next block once that exists, and JALR looks its target up in a table. In
@@ -546,8 +546,8 @@ With `bench/mvplat/run.sh` (best of 3, wall clock, QEMU 8.2 with TCG on
 the same host), the translator brings CoreMark (4000 iterations) from 3.6 s
 to 0.40 s (QEMU 0.78 s), Dhrystone from 2.1 s to 0.28 s (QEMU 0.54 s), and
 each of the 17 Embench programs ahead of QEMU (0.04 to 0.19 s against 0.10
-to 0.28 s). Linux (one hart) boots to the BusyBox shell in 1.16 s, best
-of 7 (QEMU 1.29 s, best of 5, on the same host; 4.4 s with `-nojit`). Floating point and
+to 0.28 s). Linux (one hart) boots to the BusyBox shell and powers off in about
+1.0 s, best of 5 (QEMU 1.29 s on the same host; 4.4 s with `-nojit`). Floating point and
 vector instructions still run on the general path.
 
 ## Limits / Not yet

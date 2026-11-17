@@ -119,6 +119,26 @@ static uint64_t amos(uint64_t a, uint64_t b) {
     return h;
 }
 
+// Zbb, by encoding (the programs are built for rv64imac).
+#define ZU(name, op, f3, imm) static uint64_t name(uint64_t a) { uint64_t r; __asm__ volatile(".insn i " #op ", " #f3 ", %0, %1, " #imm : "=r"(r) : "r"(a)); return r; }
+#define ZB(name, op, f3, f7) static uint64_t name(uint64_t a, uint64_t b) { uint64_t r; __asm__ volatile(".insn r " #op ", " #f3 ", " #f7 ", %0, %1, %2" : "=r"(r) : "r"(a), "r"(b)); return r; }
+ZU(clz_, 0x13, 1, 0x600) ZU(ctz_, 0x13, 1, 0x601) ZU(cpop_, 0x13, 1, 0x602) ZU(sextb_, 0x13, 1, 0x604) ZU(sexth_, 0x13, 1, 0x605)
+ZU(orcb_, 0x13, 5, 0x287) ZU(rev8_, 0x13, 5, 0x6b8) ZU(rori13_, 0x13, 5, 0x60d) ZU(rori0_, 0x13, 5, 0x600) ZU(rori63_, 0x13, 5, 0x63f)
+ZU(clzw_, 0x1b, 1, 0x600) ZU(ctzw_, 0x1b, 1, 0x601) ZU(cpopw_, 0x1b, 1, 0x602) ZU(roriw5_, 0x1b, 5, 0x605) ZU(roriw31_, 0x1b, 5, 0x61f)
+ZB(andn_, 0x33, 7, 0x20) ZB(orn_, 0x33, 6, 0x20) ZB(xnor_, 0x33, 4, 0x20) ZB(min_, 0x33, 4, 0x05) ZB(minu_, 0x33, 5, 0x05)
+ZB(max_, 0x33, 6, 0x05) ZB(maxu_, 0x33, 7, 0x05) ZB(rol_, 0x33, 1, 0x30) ZB(ror_, 0x33, 5, 0x30) ZB(rolw_, 0x3b, 1, 0x30)
+ZB(rorw_, 0x3b, 5, 0x30)
+static uint64_t zexth_(uint64_t a) { uint64_t r; __asm__ volatile(".insn r 0x3b, 4, 0x04, %0, %1, x0" : "=r"(r) : "r"(a)); return r; }
+static uint64_t zbb(uint64_t a, uint64_t b) {
+    uint64_t h = 0;
+    uint64_t (*const u[])(uint64_t) = {clz_, ctz_, cpop_, sextb_, sexth_, orcb_, rev8_, rori13_, rori0_, rori63_,
+                                       clzw_, ctzw_, cpopw_, roriw5_, roriw31_, zexth_};
+    uint64_t (*const bi[])(uint64_t, uint64_t) = {andn_, orn_, xnor_, min_, minu_, max_, maxu_, rol_, ror_, rolw_, rorw_};
+    for (unsigned i = 0; i < sizeof u / sizeof u[0]; i++) h = mix(h, u[i](a));
+    for (unsigned i = 0; i < sizeof bi / sizeof bi[0]; i++) h = mix(h, bi[i](a, b));
+    return h;
+}
+
 static uint64_t work(void) {
     // The corner cases, against the ISA (M extension, division by zero and overflow).
     const uint64_t MIN = 0x8000000000000000ull, M32 = 0xffffffff80000000ull;
@@ -149,10 +169,36 @@ static uint64_t work(void) {
         check("mulw", mulw_(0x80000000ull, 2), 0);
         check("sraw by 63 (5 bits)", sraw_(M32, 63), ~0ull);
         check("sll by 65 (6 bits)", sll_(1, 65), 2);
+        check("clz 0", clz_(0), 64);
+        check("clz", clz_(0x0000100000000000ull), 19);
+        check("ctz 0", ctz_(0), 64);
+        check("ctz", ctz_(0x80), 7);
+        check("cpop", cpop_(0xf0f0000000000001ull), 9);
+        check("clzw 0 (the upper half ignored)", clzw_(0xffffffff00000000ull), 32);
+        check("clzw", clzw_(0x10000), 15);
+        check("ctzw 0", ctzw_(0x100000000ull), 32);
+        check("cpopw", cpopw_(0xffffffff000000ffull), 8);
+        check("sext.b", sextb_(0x1280), 0xffffffffffffff80ull);
+        check("sext.h", sexth_(0x18000), 0xffffffffffff8000ull);
+        check("zext.h", zexth_(0xffffffffffff8001ull), 0x8001);
+        check("orc.b", orcb_(0x0100ff0000800002ull), 0xff00ff0000ff00ffull);
+        check("rev8", rev8_(0x0102030405060708ull), 0x0807060504030201ull);
+        check("rori 13", rori13_(1), 1ull << 51);
+        check("roriw 5 (sign-extended)", roriw5_(0x10), 0xffffffff80000000ull);
+        check("rolw", rolw_(0x80000001ull, 1), 3);
+        check("rorw by 33 (5 bits)", rorw_(2, 33), 1);
+        check("rol", rol_(0x8000000000000001ull, 65), 3);
+        check("min", min_(~0ull, 1), ~0ull);
+        check("minu", minu_(~0ull, 1), 1);
+        check("max", max_(~0ull, 1), 1);
+        check("maxu", maxu_(~0ull, 1), ~0ull);
+        check("andn", andn_(0xff, 0x0f), 0xf0);
+        check("orn", orn_(0, ~0xfull), 0xf);
+        check("xnor", xnor_(0xf0, 0xff), ~0x0full);
     }
     uint64_t h = 0;
     for (unsigned i = 0; i < NE; i++)
-        for (unsigned j = 0; j < NE; j++) h = mix(h, ops(edge[i], edge[j]));
+        for (unsigned j = 0; j < NE; j++) h = mix(h, ops(edge[i], edge[j])), h = mix(h, zbb(edge[i], edge[j]));
     for (int i = 0; i < 20000; i++) {
         uint64_t a = rnd(), b = rnd();
         if (i & 1) b >>= (a & 63);
@@ -162,6 +208,7 @@ static uint64_t work(void) {
         if (i % 1000 == 0) h = mix(h, REG8(UART0 + 5) & 0x60);  // a device load in a hot loop
         if (i % 50 == 0) h = mix(h, straddle(a));
         if (i % 5 == 0) h = mix(h, amos(a, b));
+        if (i % 2 == 0) h = mix(h, zbb(a, i & 4 ? b : a >> (b & 63)));
     }
     return h;
 }
