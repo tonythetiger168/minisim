@@ -697,6 +697,9 @@ inline bool vsim(Opts& o, const std::vector<std::string>& args) {
             order.push_back(l.empty() ? workLib : l);
         }
         if (!collect(m, order, o.out, o.name)) return false;
+        // The analysis steps keep their own units (see collect): not msim's
+        // one unit for a whole command line.
+        o.out.push_back("--single-unit=false");
         for (auto& t : tops) {
             std::string l, n;
             splitTop(t, l, n);
