@@ -474,8 +474,8 @@ check inside; it is built from the cache and dropped with it. The same
 loop runs supervisor and user code with paging on: instructions from pages
 the hart has already fetched from at that privilege, loads and stores
 through the data page caches below; a miss leaves for the general path,
-which fills them. Linux boots to a BusyBox shell in about 5 s (QEMU 8.2:
-1.5 s). It leaves, before the instruction, at anything else: a
+which fills them. On this loop alone (`-nojit`) Linux boots to a BusyBox
+shell in about 4.5 s. It leaves, before the instruction, at anything else: a
 cache miss, a CSR, a device or `tohost` access, the last 7 bytes of a
 memory region, the end of the quantum. A 2.1 G-instruction RV64IMAC
 program (integer loops, a CRC, a sieve) runs at about 670 MIPS this way (136 before).
@@ -497,18 +497,25 @@ mapped on first touch, so a large memory costs nothing until it is used. A
 co-simulated RTL access costs two socket round trips plus the RTL's own
 simulation time.
 
-On x86-64 hosts (Linux, macOS) an RV64 hart in machine mode under the same
-conditions runs translated code instead (`src/vp/jit.hpp`; `-nojit` turns
-it off). A block of up to 64 instructions (RV64I, M, and the compressed
-forms of both) becomes x86-64 code: up to seven of its busiest registers
-live in host registers, loads and stores go straight to host memory after
-one range check (the general path takes the rest), a jump or branch to a
-known address goes straight to the next block once that exists, and JALR
-looks its target up in a table. The budget is checked once per block; when
+On x86-64 hosts (Linux, macOS) an RV64 hart that would run the fast loop
+runs translated code instead (`src/vp/jit.hpp`; `-nojit` turns it off). A
+block of up to 64 instructions (RV64I, M, the compressed forms of both,
+FENCE) becomes x86-64 code: up to seven of its busiest registers live in
+host registers, a jump or branch to a known address goes straight to the
+next block once that exists, and JALR looks its target up in a table. In
+machine mode, loads and stores go straight to host memory after one range
+check. In supervisor and user mode with paging on, a block is found by
+virtual pc through the fetch page record and translated from the physical
+address the pc has then (so another mapping of the same code gets its own
+translation); it links straight only to blocks in its own page, and goes
+to others through the table, which is emptied with the TLB. Loads, stores,
+the AMOs (one hart; not LR and SC) and CBO.ZERO look their page up in the
+hart's data page caches inline; a miss, a device, an access across a page
+or a misaligned AMO leaves for the general path. The budget is checked once per block; when
 the quantum ends inside a block, a counting copy of that block runs the
 rest exactly, so a run retires the same instructions on the same cycles
-as with `-nojit`. Translations are dropped with the decoded-instruction
-cache (FENCE.I, SFENCE.VMA, a new program). With one hart and no device that
+as with `-nojit`. Translations are dropped when FENCE.I finds a code page
+changed, and with the decoded-instruction cache (a new program). With one hart and no device that
 keeps time of its own, run() lets up to 64 quanta go by at once and cuts
 back to the quantum boundary after the first device access, which is what
 the quanta would have done.
@@ -517,8 +524,9 @@ With `bench/mvplat/run.sh` (best of 3, wall clock, QEMU 8.2 with TCG on
 the same host), the translator brings CoreMark (4000 iterations) from 3.6 s
 to 0.40 s (QEMU 0.78 s), Dhrystone from 2.1 s to 0.28 s (QEMU 0.54 s), and
 each of the 17 Embench programs ahead of QEMU (0.04 to 0.19 s against 0.10
-to 0.28 s). Supervisor and user mode (Linux) and floating point still run
-on the fast loop.
+to 0.28 s). Linux (one hart) boots to the BusyBox shell in 1.16 s, best
+of 7 (QEMU 1.29 s, best of 5, on the same host; 4.4 s with `-nojit`). Floating point and
+vector instructions still run on the general path.
 
 ## Limits / Not yet
 

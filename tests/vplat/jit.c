@@ -4,7 +4,10 @@
 // loads from a device inside a translated loop (which leave for the
 // interpreter), and blocks longer than the budget left in a quantum. Prints
 // a checksum, which tests/mvplat.sh compares with -nojit's, and checks the
-// division and high-multiply corner cases against the ISA's answers.
+// division and high-multiply corner cases against the ISA's answers. Then
+// all of it again in supervisor mode with Sv39 paging (translated through
+// the data page caches), with loads across a page boundary, AMOs and
+// CBO.ZERO, which has to give the same checksum.
 #include "rt.h"
 
 void exit(int code) { exit_(code); }
@@ -77,8 +80,46 @@ static uint64_t memops(uint64_t a) {
     return h;
 }
 
-int main(int hart) {
-    if (hart) for (;;) {}
+// 8-byte loads and stores at every offset around a page boundary.
+static volatile uint8_t pages[8192] __attribute__((aligned(4096)));
+static uint64_t straddle(uint64_t a) {
+    uint64_t h = 0;
+    for (int o = 4080; o < 4100; o++) {
+        *(volatile uint64_t*)&pages[o] = a + (uint64_t)o;
+        *(volatile uint32_t*)&pages[o + 1] ^= (uint32_t)a;
+        h = mix(h, *(volatile uint64_t*)&pages[o - 3]);
+        h = mix(h, *(volatile uint16_t*)&pages[o]);
+    }
+    return h;
+}
+
+// The AMOs (translated with paging on, one hart) and CBO.ZERO.
+#define AMO(name, insn, T) \
+    static uint64_t name(volatile T* p, uint64_t b) { uint64_t r; __asm__ volatile(insn " %0, %2, (%1)" : "=r"(r) : "r"(p), "r"(b) : "memory"); return r; }
+AMO(amoaddd, "amoadd.d", uint64_t) AMO(amoswapd, "amoswap.d", uint64_t) AMO(amoxord, "amoxor.d", uint64_t)
+AMO(amoord, "amoor.d", uint64_t) AMO(amoandd, "amoand.d", uint64_t) AMO(amomind, "amomin.d", uint64_t)
+AMO(amomaxd, "amomax.d", uint64_t) AMO(amominud, "amominu.d", uint64_t) AMO(amomaxud, "amomaxu.d", uint64_t)
+AMO(amoaddw, "amoadd.w", uint32_t) AMO(amoswapw, "amoswap.w", uint32_t) AMO(amoxorw, "amoxor.w", uint32_t)
+AMO(amoorw, "amoor.w", uint32_t) AMO(amoandw, "amoand.w", uint32_t) AMO(amominw, "amomin.w", uint32_t)
+AMO(amomaxw, "amomax.w", uint32_t) AMO(amominuw, "amominu.w", uint32_t) AMO(amomaxuw, "amomaxu.w", uint32_t)
+static volatile uint64_t amoCell[8] __attribute__((aligned(64)));
+static uint64_t amos(uint64_t a, uint64_t b) {
+    uint64_t h = 0;
+    volatile uint64_t* d = &amoCell[1];
+    volatile uint32_t* w = (volatile uint32_t*)&amoCell[2] + 1;
+    uint64_t (*const fd[])(volatile uint64_t*, uint64_t) = {amoaddd, amoswapd, amoxord, amoord, amoandd, amomind, amomaxd, amominud, amomaxud};
+    uint64_t (*const fw[])(volatile uint32_t*, uint64_t) = {amoaddw, amoswapw, amoxorw, amoorw, amoandw, amominw, amomaxw, amominuw, amomaxuw};
+    for (int i = 0; i < 9; i++) {
+        *d = a; h = mix(h, fd[i](d, b)); h = mix(h, *d);
+        *w = (uint32_t)a; h = mix(h, fw[i](w, b)); h = mix(h, *w); h = mix(h, amoCell[2]);
+    }
+    for (int i = 0; i < 8; i++) amoCell[i] = ~a;
+    __asm__ volatile(".insn i 0x0f, 2, x0, %0, 4" ::"r"((uintptr_t)&amoCell[3] + 5) : "memory");  // cbo.zero
+    for (int i = 0; i < 8; i++) h = mix(h, amoCell[i]);
+    return h;
+}
+
+static uint64_t work(void) {
     // The corner cases, against the ISA (M extension, division by zero and overflow).
     const uint64_t MIN = 0x8000000000000000ull, M32 = 0xffffffff80000000ull;
     for (int rep = 0; rep < 50; rep++) {  // again and again, so the checks run translated
@@ -119,14 +160,45 @@ int main(int hart) {
         h = mix(h, ops(a, b));
         if (i % 3 == 0) h = mix(h, memops(a));
         if (i % 1000 == 0) h = mix(h, REG8(UART0 + 5) & 0x60);  // a device load in a hot loop
+        if (i % 50 == 0) h = mix(h, straddle(a));
+        if (i % 5 == 0) h = mix(h, amos(a, b));
     }
-    puts_("jit checksum ");
-    putx((uint32_t)(h >> 32));
-    putx((uint32_t)h);
-    puts_("\njit: ");
+    return h;
+}
+
+// Sv39: root[0] maps the devices (identity, 1 GiB), root[2] the RAM.
+static uint64_t root[512] __attribute__((aligned(4096)));
+#define PTE(pa) (((uint64_t)(pa) >> 12) << 10 | 0xcf)  // V R W X A D
+static uint64_t machineSum;
+
+static __attribute__((noinline, used)) void supervisor(void) {
+    seed = 0x9e3779b97f4a7c15ull;
+    for (unsigned i = 0; i < sizeof pages; i++) pages[i] = 0;
+    check("supervisor mode, Sv39: the same checksum", work(), machineSum);
+    puts_("jit: ");
     putd((uint32_t)(checks - fails));
     puts_(" of ");
     putd((uint32_t)checks);
     puts_(fails ? " checks passed\n" : " checks passed, all\n");
-    return fails;
+    exit_(fails);
+}
+
+int main(int hart) {
+    if (hart) for (;;) {}
+    const uint64_t h = machineSum = work();
+    puts_("jit checksum ");
+    putx((uint32_t)(h >> 32));
+    putx((uint32_t)h);
+    puts_("\n");
+    csr_write(pmpaddr0, ~0ull >> 10);  // PMP: everything to S and U
+    csr_write(pmpcfg0, 0x1f);
+    root[0] = PTE(0);
+    root[2] = PTE(0x80000000u);
+    csr_write(satp, (8ull << 60) | ((uintptr_t)root >> 12));
+    __asm__ volatile("sfence.vma" ::: "memory");
+    __asm__ volatile("csrc mstatus, %0" ::"r"(3ull << 11));
+    csr_set(mstatus, 1ull << 11);  // MPP = S
+    csr_write(mepc, (uintptr_t)supervisor);
+    __asm__ volatile("mret");
+    return 1;
 }
