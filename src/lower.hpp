@@ -6197,7 +6197,12 @@ struct Lowerer {
         ps.bits = (int)count * ew;
         if (isConst(idx)) { ps.cbit = startPos(constInt(*idx)) * ew; return ps; }
         ps.known = false;
-        E ix = resize(expr(*idx), 64, idx->type->isSigned(), true);
+        // A 32-bit unsigned index into a range with negative indices (v[x-16 +: 4]
+        // of a [15:-16] vector) is read as an integer, as other simulators do:
+        // as unsigned it could never name a bit of such a range.
+        bool asInt = idx->type->isSigned() ||
+                     (std::min(left, right) < 0 && idx->type->isIntegral() && idx->type->getBitWidth() == 32);
+        E ix = resize(expr(*idx), 64, asInt, true);
         auto K = [](int64_t v) { return konst(make((uint64_t)v, 0, 64, 0, true)); };
         E pos;
         switch (kind) {
@@ -11116,6 +11121,29 @@ struct Lowerer {
                 i.e = m;
                 prog.emit(i);
                 return;
+            }
+            if (const Expression& l = peel(a.left()); l.kind == ExpressionKind::RangeSelect &&
+                l.as<RangeSelectExpression>().getSelectionKind() == RangeSelectionKind::Simple &&
+                l.as<RangeSelectExpression>().value().type->getCanonicalType().isQueue() && !a.isNonBlocking() &&
+                !a.timingControl && !a.isCompound()) {
+                // q[i:j] = v (7.10.1, 7.6): elements i..j of q become those of v,
+                // as q = {q[0:i-1], v, q[j+1:$]}
+                const auto& r = l.as<RangeSelectExpression>();
+                if (int q = dynSig(r.value()); q >= 0 && !dynShape(q).elem) {
+                    int lo = fresh(64), hi = fresh(64);
+                    { Instr i; i.k = IK::Assign; i.sig = lo; i.e = dynKey(q, r.left()); prog.emit(i); }
+                    { Instr i; i.k = IK::Assign; i.sig = hi; i.e = dynKey(q, r.right()); prog.emit(i); }
+                    int v = dynTemp(q);
+                    assignContainer(v, a.right());
+                    int t = dynTemp(q);
+                    auto k64 = [](int64_t x) { return konst(make((uint64_t)x, 0, 64, 0, true)); };
+                    prog.emit(dynCmd(t, D_DELETE));   // a static temporary keeps its last contents
+                    { Instr i = dynCmd(t, D_APPEND_SLICE); i.dsrc = q; i.args = {k64(0), bin(Op::Sub, ref(lo, true), k64(1))}; prog.emit(i); }
+                    { Instr i = dynCmd(t, D_APPEND); i.dsrc = v; prog.emit(i); }
+                    { Instr i = dynCmd(t, D_APPEND_SLICE); i.dsrc = q; i.args = {bin(Op::Add, ref(hi, true), k64(1)), k64(INT32_MAX)}; prog.emit(i); }
+                    Instr c = dynCmd(q, D_COPY); c.dsrc = t; prog.emit(c);
+                    return;
+                }
             }
             if (int d = dynSig(a.left()); d >= 0) {   // q = '{1, 2}; d = new[8]; aa = other;
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this container assignment");
