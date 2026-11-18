@@ -14722,30 +14722,6 @@ framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all,
     return out;
 }
 
-inline void rejectRecursive(const std::vector<Subr*>& subs) {
-    enum class Color { White, Gray, Black };
-    std::unordered_map<const Subr*, Color> color;
-    for (Subr* s : subs) color[s] = Color::White;
-    auto dfs = [&](auto& self, Subr* s) -> void {
-        color[s] = Color::Gray;
-        for (Subr* c : s->calls) {
-            if (c->lay) continue;   // an automatic subroutine may recurse (13.4.2)
-            if (color[c] == Color::Gray) Lowerer::unsupported("recursive static subroutine");
-            if (color[c] == Color::White) self(self, c);
-        }
-        color[s] = Color::Black;
-    };
-    // Only cycles that can run matter: a static task that calls itself only
-    // through subroutines nothing calls is never entered. Class methods may be
-    // reached through a virtual method table, so they count as called.
-    auto entered = [](const Subr* s) {
-        if (s->root || s->cls) return true;
-        const auto* sc = s->sym ? s->sym->getParentScope() : nullptr;
-        return !s->sym || (sc && sc->asSymbol().kind == slang::ast::SymbolKind::ClassType);
-    };
-    for (Subr* s : subs)
-        if (color[s] == Color::White && entered(s)) dfs(dfs, s);
-}
 
 // Object shape, constructor and virtual method table of every class,
 // base classes first (8.13). Called after every subroutine has its Subr.
@@ -15885,7 +15861,6 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     pc.finishUserNets();
     pc.placeInit();
     sampledInit(out);
-    rejectRecursive(order);
     // Virtual interfaces (25.9): each referenced instance's signal for each
     // member reached through a virtual interface.
     {
