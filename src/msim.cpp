@@ -4324,7 +4324,7 @@ static int msimMain(int argc, char** argv) {
         if (!pl.onCycle.empty() && pl.onCycle[(size_t)i]) S.combs.back().onCycle = true;
     }
     installCovergroupHooks();   // the init process below may run now, and may create covergroups
-    std::vector<Task> lateConst;
+    std::vector<Task> lateConst, lateComb;
     bool constsOut = false;   // the constant assigns have started
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         // A process run as a function (static comb or clocked) still takes
@@ -4361,6 +4361,10 @@ static int msimMain(int argc, char** argv) {
         // already reads the constant, as in other simulators. Each Task is
         // still made in declaration order, which keeps the random seeds (18.14.2).
         if (lowered.procs[i].kind == "assign" && !lowered.procs[i].loops && !constsOut) { lateConst.push_back(t); continue; }
+        // always_comb and always_latch run once at time zero after every
+        // initial and always procedure has started (9.2.2.2.1), so an
+        // event they trigger then reaches an always @(e) declared later.
+        if (lowered.procs[i].kind == "AlwaysComb" || lowered.procs[i].kind == "AlwaysLatch") { lateComb.push_back(t); continue; }
         if (lowered.procs[i].kind == "Initial" && !constsOut) {
             constsOut = true;
             for (auto& c : lateConst) S.spawn(c);
@@ -4369,6 +4373,7 @@ static int msimMain(int argc, char** argv) {
         S.spawn(t);
     }
     for (auto& t : lateConst) S.spawn(t);
+    for (auto& t : lateComb) S.spawn(t);
     }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.

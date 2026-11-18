@@ -3584,6 +3584,19 @@ struct Lowerer {
             return num((int64_t)dims.size());
         }
         if (n == "$unpacked_dimensions") return num(unpacked);
+        if (dims.empty() && t.isString()) {   // one dimension (20.7), its characters [0 : len-1] as foreach takes them
+            if (args.size() > 1 && !(args[1]->getConstant() && args[1]->getConstant()->isInteger() &&
+                                     !args[1]->getConstant()->integer().hasUnknown() && constInt(*args[1]) == 1))
+                return xv;
+            if (n == "$increment") return num(-1);
+            if (n == "$left" || n == "$low") return num(0);
+            auto len = node(Op::StrMethod, {exprStr(*args[0])});
+            len->hi = S_LEN;
+            E size = resize(len, 32, false, true);
+            if (n == "$size") return size;
+            Val one = make(1, 0, 32); one.sgn = true;
+            return bin(Op::Sub, size, konst(one));
+        }
         if (dims.empty() && t.isIntegral() && t.getBitWidth() == 1) dims.push_back({0, 0, 0});   // a scalar
         int64_t d = 1;
         if (args.size() > 1) {
@@ -13020,6 +13033,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
         i.e = resize(init->expr(*e), storeW(v.getType()), e->type->isSigned(), v.getType().isSigned());
         init->prog.emit(i);
+    }
+    // A function's result variable (13.4.1) is not a member of its scope:
+    // when static, a 2-state one starts at 0 like any static local, so a
+    // call that never assigns it returns 0, not x.
+    void handle(const slang::ast::SubroutineSymbol& sub) {
+        if (const auto* rv = sub.returnValVar; rv && sigmap.count(rv) && !arrMap().count(rv) && !dynMap().count(rv))
+            initStatic(*rv);
+        visitDefault(sub);
     }
     // A class's static property (8.9) starts like a module variable.
     void handle(const slang::ast::ClassPropertySymbol& p) {
