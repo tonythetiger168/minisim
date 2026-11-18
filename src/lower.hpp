@@ -2030,6 +2030,13 @@ struct Lowerer {
         unsupported("non-constant select bound");
     }
 
+    // An index known at elaboration with no x or z bits.
+    static bool knownIndex(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        if (x.kind == ExpressionKind::IntegerLiteral) return !x.as<IntegerLiteral>().getValue().hasUnknown();
+        const auto* cv = x.getConstant();
+        return cv && cv->isInteger() && !cv->integer().hasUnknown();
+    }
     static void needWidth(int w) {
         if (w <= 0) unsupported("non-positive width");
     }
@@ -2987,7 +2994,10 @@ struct Lowerer {
     }
     static bool classMember(const slang::ast::Expression& e) {
         if (e.kind != slang::ast::ExpressionKind::MemberAccess) return false;
-        const auto& t = *e.as<slang::ast::MemberAccessExpression>().value().type;
+        const auto& m = e.as<slang::ast::MemberAccessExpression>();
+        if (m.member.kind == slang::ast::SymbolKind::Parameter || m.member.kind == slang::ast::SymbolKind::EnumValue)
+            return false;   // h.P (8.25): a constant, not a slot behind the handle
+        const auto& t = *m.value().type;
         return isHandleType(t) && !t.isVirtualInterface();
     }
     // The virtual interface v of v.x or v.cb.x (25.9), or null.
@@ -4433,8 +4443,8 @@ struct Lowerer {
         s.idx.assign(idx.rbegin(), idx.rend());
         if (s.idx.size() > s.a->dims.size() || (!partial && s.idx.size() != s.a->dims.size()))
             unsupported("array slice (fewer indices than dimensions)");
-        for (auto* x : s.idx)
-            if (!(x->kind == ExpressionKind::IntegerLiteral || x->getConstant())) s.constant = false;
+        for (auto* x : s.idx)   // a constant index with x or z bits selects nothing (7.4.6): left to the run-time path
+            if (!knownIndex(*x)) s.constant = false;
         return s;
     }
     // m[i] of a multidimensional array (7.4.5): the index lists of the
@@ -6036,7 +6046,7 @@ struct Lowerer {
         int64_t n = (desc ? left - right : right - left) + 1;
         int ew = n > 0 ? (int)(W / n) : 1;
         PSel ps;
-        auto isConst = [](const Expression* x) { return x->kind == ExpressionKind::IntegerLiteral || x->getConstant(); };
+        auto isConst = [](const Expression* x) { return knownIndex(*x); };   // an x index is left to the run-time path (11.5.1)
         // first declared index covered by the select, lowest position first
         auto startPos = [&](int64_t i) -> int64_t {
             switch (kind) {
@@ -14715,15 +14725,23 @@ framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all,
     return out;
 }
 
-inline void rejectRecursive(const std::vector<Subr*>& subs) {
+// A static subroutine on a call cycle (13.4.2) is legal, but every call
+// shares its one copy of the arguments and variables, so a recursive
+// factorial written as a static function gives results that depend on
+// operand evaluation order: warn when it has arguments.
+inline void warnRecursive(const std::vector<Subr*>& subs) {
     enum class Color { White, Gray, Black };
     std::unordered_map<const Subr*, Color> color;
+    std::unordered_set<const Subr*> warned;
     for (Subr* s : subs) color[s] = Color::White;
     auto dfs = [&](auto& self, Subr* s) -> void {
         color[s] = Color::Gray;
         for (Subr* c : s->calls) {
             if (c->lay) continue;   // an automatic subroutine may recurse (13.4.2)
-            if (color[c] == Color::Gray) Lowerer::unsupported("recursive static subroutine");
+            if (color[c] == Color::Gray && c->sym && !c->sym->getArguments().empty() && warned.insert(c).second)
+                std::cerr << "msim: warning: static " << (c->sym->subroutineKind == slang::ast::SubroutineKind::Task ? "task" : "function")
+                          << " '" << c->sym->name << "' is called recursively; every call shares its arguments and variables"
+                             " (declare it automatic for a copy per call, 13.4.2)\n";
             if (color[c] == Color::White) self(self, c);
         }
         color[s] = Color::Black;
@@ -15878,7 +15896,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     pc.finishUserNets();
     pc.placeInit();
     sampledInit(out);
-    rejectRecursive(order);
+    warnRecursive(order);
     // Virtual interfaces (25.9): each referenced instance's signal for each
     // member reached through a virtual interface.
     {
