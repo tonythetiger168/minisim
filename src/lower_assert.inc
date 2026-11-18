@@ -274,10 +274,22 @@ E sampledE(const E& e) {
         if (!sh || sh->count != e->arr->count) {
             auto a = std::make_shared<ArrShape>(*e->arr);
             int first = -1;
-            for (int k = 0; k < a->count; k++) {
+            bool apart = false;
+            for (int k = 0; k < a->count && !apart; k++) {
                 int s = shadowOf(e->arr->base + k);
                 if (first < 0) first = s;
-                else if (s != first + k) unsupported("sampled value of this array");
+                else if (s != first + k) apart = true;
+            }
+            if (apart) {   // some elements were sampled one by one first: a second, contiguous copy
+                first = -1;
+                for (int k = 0; k < a->count; k++) {
+                    int src = e->arr->base + k;
+                    auto [n, w] = sigInfo()[src];
+                    int s = mkSig(n + "$smpa", w, false);
+                    if (first < 0) first = s;
+                    else if (s != first + k) unsupported("sampled value of this array");
+                    shadowPairs().push_back({src, s});
+                }
             }
             a->base = first;
             sh = a;
@@ -397,6 +409,10 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n0) {
     if (n == "$sampled") return sampledE(expr(x));
     std::vector<std::pair<int, Edge>> gev;
     if (gclk) collectEvents(globalClocking()->getEvent(), gev);
+    if (gclk && !past && x.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+        auto [cur, prev, w] = arraySampledPair(x, gev);
+        return sampledCompare(n, cur, prev, w);
+    }
     if (gclk) {
         E cur = sampledE(expr(x));
         E prev = pastOf(x, 1, nullptr, gev);
@@ -411,9 +427,32 @@ E sampledFn(const slang::ast::CallExpression& call, std::string_view n0) {
         if (args.size() > 2 && args[2]->kind != ExpressionKind::EmptyArgument) gate = sampledE(expr(*args[2]));
         return pastOf(x, k, gate, clockArg(call, 3));
     }
+    if (x.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {   // $stable(arr) (16.9.3): all elements
+        auto [cur, prev, w] = arraySampledPair(x, clockArg(call, 1));
+        return sampledCompare(n, cur, prev, w);
+    }
     E cur = sampledE(expr(x));
     E prev = pastOf(x, 1, nullptr, clockArg(call, 1));
     return sampledCompare(n, cur, prev, storeW(*x.type));
+}
+// A fixed-size unpacked array's sampled value and its value one tick of ev
+// before, each as the concatenation of its elements, and their width.
+std::tuple<E, E, int> arraySampledPair(const slang::ast::Expression& x, const std::vector<std::pair<int, Edge>>& ev) {
+    std::vector<E> els;
+    arrayElems(*x.type, x, els);
+    const slang::ast::Type* leaf = &x.type->getCanonicalType();
+    while (leaf->isUnpackedArray()) leaf = &leaf->getArrayElementType()->getCanonicalType();
+    int w = storeW(*leaf);
+    if (w <= 0 || els.empty()) unsupported("sampled value function of an array of this element type");
+    std::vector<E> cur, prev;
+    for (auto& e : els) {
+        cur.push_back(sampledE(e));
+        prev.push_back(pastOfE(e, w, false, 1, nullptr, ev));
+    }
+    int tw = w * (int)els.size();
+    needWidth(tw);
+    auto cat = [](std::vector<E> v) { return v.size() == 1 ? v[0] : node(Op::Concat, std::move(v)); };
+    return {cat(std::move(cur)), cat(std::move(prev)), tw};
 }
 // The global clocking future sampled value functions (16.9.4): the value at
 // the next tick of the global clock. The assertion that uses them is checked
