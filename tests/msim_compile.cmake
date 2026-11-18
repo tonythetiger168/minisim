@@ -201,7 +201,8 @@ foreach(c IN LISTS CASES)
   # A named initial nothing disables, a clocked block with a $display and an
   # automatic task writing bits of its output: all compiled, no mixed mode.
   if(c MATCHES "nomix\\.sv")
-    if(EXISTS ${OUT}/c${n}/design.so OR err MATCHES "interpreted")
+    # (by its messages: a design.so there may be another case's from an earlier run)
+    if(err MATCHES "interpreted|mixed mode")
       message(FATAL_ERROR "${c}: mixed mode\n${err}")
     endif()
   endif()
