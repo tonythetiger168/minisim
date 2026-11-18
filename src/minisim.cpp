@@ -87,6 +87,9 @@ struct Task {
     };
     coroutine_handle<promise_type> h;
 };
+// msim -compile mixed mode (codegen.hpp Codegen::mix): the compiled library's
+// process n that codegen could not compile, started in msim's interpreter.
+inline Task (*g_mixInterp)(int n) = nullptr;
 
 // A small thread pool for Sim::parallelFor. Each batch is split into one
 // contiguous range per thread (thread k takes items [n*k/T, n*(k+1)/T)), so a

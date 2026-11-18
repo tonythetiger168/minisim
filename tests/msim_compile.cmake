@@ -103,7 +103,12 @@ set(CASES
   "examples/cli/spin.sv -maxtime 25"
   "bench/lanes.sv +define+END_TIME=2000"
   "tests/spec/35.5.6-arg-types.sv tests/spec/data/dpi/types.c"
-  "tests/spec/35.5.6-shortreal.sv tests/spec/data/dpi/shortreal.c")
+  "tests/spec/35.5.6-shortreal.sv tests/spec/data/dpi/shortreal.c"
+  "examples/mixed.sv"
+  "-cfiles 3 examples/mixed.sv"
+  "tests/spec/25.9-vif-nba-clocked.sv"
+  "tests/spec/24.3.1-program-reactive.sv"
+  "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c")
 set(n 0)
 foreach(c IN LISTS CASES)
   math(EXPR mine "${n} % ${SHARDS}")
@@ -175,6 +180,16 @@ foreach(c IN LISTS CASES)
     # ... and the commit list stores value words alone while pclean holds.
     if(NOT gen MATCHES "if \\(C0TWO\\)")
       message(FATAL_ERROR "${c}: the commit list has no value-only path")
+    endif()
+  endif()
+  # Mixed mode (codegen.hpp Codegen::mix): the compiled part is a library
+  # msim loads, and what it cannot compile runs in msim's interpreter.
+  if(c MATCHES "mixed\\.sv|^tests/spec/(25\\.9|24\\.3|38\\.10)")
+    if(NOT EXISTS ${OUT}/c${n}/design.so)
+      message(FATAL_ERROR "${c}: no mixed-mode library\n${err}")
+    endif()
+    if(c MATCHES "mixed\\.sv" AND NOT err MATCHES "processes interpreted")
+      message(FATAL_ERROR "${c}: nothing left to the interpreter\n${err}")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).
