@@ -110,6 +110,7 @@ set(CASES
   "-cfiles 3 examples/mixed.sv"
   "examples/nomix.sv"
   "examples/widebits.sv"
+  "examples/wiresub.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -212,6 +213,16 @@ foreach(c IN LISTS CASES)
     file(READ ${OUT}/c${n}/design.cpp gen)
     if(NOT gen MATCHES "bitsV\\(S\\.sigs" OR NOT gen MATCHES "S\\.setBitsV\\(")
       message(FATAL_ERROR "${c}: the wide selects copy the whole vector")
+    endif()
+  endif()
+  # Whole-signal copies are read through their source and dropped
+  # (msim.cpp substituteWires); the forced one, the net with two drivers
+  # and the loop of copies stay.
+  if(c STREQUAL "examples/wiresub.sv")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env MSIM_WHYWIRESUB=1 ${MSIM} -compile -O1 -cc /bin/false -o ${OUT}/c${n}w ${files}
+                    OUTPUT_QUIET ERROR_VARIABLE werr)
+    if(NOT werr MATCHES "wire substitution: 16 of 19 copies")
+      message(FATAL_ERROR "${c}: copies not substituted as expected\n${werr}")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).

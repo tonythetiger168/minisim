@@ -529,6 +529,17 @@ whole on any change (`MSIM_CYCMERGEMAX`). OpenTitan Earl Grey with
 `-noassert` (Verilator's build leaves the assertions out): 60 us of
 simulation from 179 s to 53 s, and its C++ build to 9 minutes.
 
+A continuous assign that copies one whole signal into another (`a = b`:
+port connections, clock and reset buffers, feed-throughs) is dropped under
+`-compile`, and every reader of `a` reads `b`, as Verilator's assignment
+substitution does. A copy stays when its target has another writer or
+driver, is forced, is an array element read by index, or is part of a
+switch; designs with concurrent assertions, clocking blocks, covergroups,
+timing checks, specify paths or a waveform keep all of them
+(`MSIM_NOWIRESUB`, `MSIM_WHYWIRESUB=1` counts them). OpenTitan Earl Grey
+has 211,285 such copies and loses 206,437: 60 us of simulation from 48 s to
+about 25 s.
+
 ### Static combinational schedule
 
 Continuous assigns, gates, and straight-line `always_comb` / `always @*`
