@@ -1978,8 +1978,14 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             case IK::Disable: {   // 9.6.2
                 auto& v = rootProcs()[i.sig];
                 auto list = v;
+                // Everything enabled in the block ends, also processes a
+                // branch forked with join_none and then outlived (9.6.2).
+                std::function<void(const shared_ptr<ProcCtl>&)> all = [&](const shared_ptr<ProcCtl>& k) {
+                    if (k->ended) { auto ks = k->kids; for (auto& g : ks) all(g); }
+                    else procKill(k);
+                };
                 for (auto& w : list)
-                    if (auto c = w.lock()) procKill(c);
+                    if (auto c = w.lock()) all(c);
                 std::erase_if(v, [](auto& w) { auto c = w.lock(); return !c || c->ended; });
                 if (anySpans() && !ctl->killed && disableSpans(i.sig, ctl)) break;   // this process was inside it
                 pc++;
