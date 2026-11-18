@@ -152,7 +152,7 @@ Give the C files on the command line, or a prebuilt library with `-sv_lib`:
 
 C code includes `svdpi.h` (installed in `include/`, and in `include/` of the
 source tree). Import tasks may call exported tasks that wait on simulation
-time. A DPI call runs on the interpreter: `-compile` falls back to it.
+time. With `-compile` an import function is called from the compiled code; anything else of DPI (tasks, exports, context imports) stays in msim beside the compiled design.
 
 ### Regressions: `mregress`
 
@@ -436,8 +436,15 @@ coroutine walks. `msim -compile` translates every process into C++ instead
 (one coroutine per process, `goto` for jumps, inline 4-state operators for
 expressions), compiles it against the same kernel, and runs it. Output is the
 same as the interpreter's (`ctest -R msim_compile` checks this); a design that
-uses something `codegen.hpp` does not translate yet falls back to the
-interpreter with a note on stderr. Times from `bench/run.sh` (lanes with END_TIME=10000000; 4-core cloud
+uses something `codegen.hpp` does not translate yet runs in **mixed mode**:
+the rest of the design is built as a library (`<dir>/design.so`) that msim
+loads, and the processes it could not translate (classes, automatic tasks,
+queues, fork, programs, ...) run in msim's interpreter beside it, as do VPI,
+assertions, covergroups, clocking blocks, SDF and timing checks. stderr says
+how many processes are interpreted (`MSIM_WHYMIX=1` lists them and why;
+`MSIM_NOMIX=1` falls back to the interpreter as before). Mixed mode keeps
+every signal in the kernel and skips the cycle domain, so it is slower than a
+fully compiled design. `-cov` and `-upf` still fall back. Times from `bench/run.sh` (lanes with END_TIME=10000000; 4-core cloud
 VM, g++ 13, seconds of run time, build time not included):
 
 | Design | msim | msim -compile | Verilator 5.020 -O3 | Icarus 13.0 |
