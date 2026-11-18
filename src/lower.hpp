@@ -2030,6 +2030,13 @@ struct Lowerer {
         unsupported("non-constant select bound");
     }
 
+    // An index known at elaboration with no x or z bits.
+    static bool knownIndex(const slang::ast::Expression& x) {
+        using namespace slang::ast;
+        if (x.kind == ExpressionKind::IntegerLiteral) return !x.as<IntegerLiteral>().getValue().hasUnknown();
+        const auto* cv = x.getConstant();
+        return cv && cv->isInteger() && !cv->integer().hasUnknown();
+    }
     static void needWidth(int w) {
         if (w <= 0) unsupported("non-positive width");
     }
@@ -4433,8 +4440,8 @@ struct Lowerer {
         s.idx.assign(idx.rbegin(), idx.rend());
         if (s.idx.size() > s.a->dims.size() || (!partial && s.idx.size() != s.a->dims.size()))
             unsupported("array slice (fewer indices than dimensions)");
-        for (auto* x : s.idx)
-            if (!(x->kind == ExpressionKind::IntegerLiteral || x->getConstant())) s.constant = false;
+        for (auto* x : s.idx)   // a constant index with x or z bits selects nothing (7.4.6): left to the run-time path
+            if (!knownIndex(*x)) s.constant = false;
         return s;
     }
     // m[i] of a multidimensional array (7.4.5): the index lists of the
@@ -6036,7 +6043,7 @@ struct Lowerer {
         int64_t n = (desc ? left - right : right - left) + 1;
         int ew = n > 0 ? (int)(W / n) : 1;
         PSel ps;
-        auto isConst = [](const Expression* x) { return x->kind == ExpressionKind::IntegerLiteral || x->getConstant(); };
+        auto isConst = [](const Expression* x) { return knownIndex(*x); };   // an x index is left to the run-time path (11.5.1)
         // first declared index covered by the select, lowest position first
         auto startPos = [&](int64_t i) -> int64_t {
             switch (kind) {
