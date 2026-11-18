@@ -1959,6 +1959,17 @@ static int g_cfiles = 0;   // -cfiles: 0 = automatic
 // kernel sources; parallel builds wait on its lock. Empty on failure.
 // MSIM_NOKOBJ=1 compiles the kernel into the design as before.
 static bool useKernelObject() { return !std::getenv("MSIM_NOKOBJ"); }
+// msim -compile mixed mode: the loaded library's setup (runCompiled returns -2).
+static int (*g_mixSetup)() = nullptr;
+// A feature only msim's runtime has (VPI, programs, SDF, ...): -compile builds
+// the mixed-mode library, not a simv (runCompiled).
+static const char* g_mixForce = nullptr;
+static bool mixAllowed() { return !g_cov && !g_upf && !std::getenv("MSIM_NOMIX"); }
+static bool needMix(const char* what) {
+    if (!mixAllowed()) return false;
+    if (!g_mixForce) g_mixForce = what;
+    return true;
+}
 static std::string kernelObject(const std::string& cc, const std::string& cflags, const std::string& inc, const std::string& dir) {
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const std::string& t) { for (unsigned char c : t) { h ^= c; h *= 1099511628211ULL; } h ^= 0xff; h *= 1099511628211ULL; };
@@ -2032,12 +2043,18 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         }
     }
     std::vector<CodegenProc> procs;
+    const bool gateDyn = !gateRecs().empty() && (vpi::st().active || !sdfRequests().empty() || sdfAtRunTime());
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         CodegenProc c{&lowered.procs[i].prog, lowered.procs[i].kind, pl.rank[i], pl.ins[i]};
         c.combLevel = pl.level[i];
         c.seq = pl.seq[i];
         c.seqEv = pl.ev[i];
         c.loops = lowered.procs[i].loops;
+        c.interp = lowered.procs[i].program >= 0 || lowered.procs[i].reactive;
+        // A gate's delays that SDF (32.4.1) or vpi_put_delays (38.10) may
+        // change at run time: the interpreter reads them from its record.
+        if (gateDyn)
+            for (auto& in : lowered.procs[i].prog.code) c.interp |= in.gate >= 0 || !in.dly.empty() || !in.dlyE.empty();
         procs.push_back(std::move(c));
     }
     CodegenParts parts;
@@ -2089,6 +2106,19 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
                     : !cgDefs().empty() ? "a covergroup"
                     : annexDUsed() ? "an Annex D system task"
                     : liveShadow ? "a sampled value function" : nullptr;
+    // Mixed mode: what codegen cannot compile of the testbench runs in this
+    // process's interpreter, the rest in a library built from the generated
+    // code (Codegen::mix). A final block is run by msim after the simulation.
+    CodegenMix mix;
+    const bool mixOK = mixAllowed() && !upf;
+    // So is the rest of msim's runtime (assertions, clocking blocks,
+    // covergroups, net kinds, VPI, ...): set up and run by msim around the
+    // library's processes. Not compiled into a simv yet.
+    if ((why || g_mixForce) && mixOK) {
+        mix.domain = !g_mixForce && why && std::string(why) == "a final block";
+        why = nullptr;
+        mix.on = true;   // force: no simv
+    }
     if (why) {
         std::cerr << "msim: -compile: " << why << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -2098,7 +2128,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // A large design is built as several files at once, one per core (16 at most).
         src = codegen(sigs, procs, parts, twoState, cycle, !vcdPath && !upf, g_cov ? &covSlots : nullptr,
                       g_cfiles ? -g_cfiles : std::min(16, maxThreads()), lowered.precExp, lowered.timescale(), upf,
-                      useKernelObject());
+                      useKernelObject(), mixOK ? &mix : nullptr);
     } catch (const CodegenUnsupported& ex) {
         std::cerr << "msim: -compile: " << ex.what() << " is not compiled yet; using the interpreter\n";
         return -1;
@@ -2106,7 +2136,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     phaseMark("codegen");
     std::string inc = kernelIncludeDir();
     if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
-    std::string cpp = dir + "/design.cpp", exe = dir + "/simv";
+    std::string cpp = dir + "/design.cpp", exe = dir + (mix.on ? "/design.so" : "/simv");
     // One build at a time per directory: parallel runs of one test (seeds in
     // mregress) share the build, the first one compiles and the rest reuse it.
     int lockFd = ::open((dir + "/.build.lock").c_str(), O_CREAT | O_RDWR, 0644);
@@ -2114,9 +2144,19 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     struct Unlock { int fd; ~Unlock() { if (fd >= 0) ::close(fd); } } unlock{lockFd};
     std::string build = shq(cc) + " -std=c++20 " + opt + " -I" + shq(inc) + " " + shq(cpp) + " -o " + shq(exe);
     std::string fstC, fstL;   // FST: extra compile and link arguments
+    // Mixed mode: a library with msim's own kernel layout (the macros msim is
+    // built with), its kernel functions and S resolved to msim's (-rdynamic).
+    if (mix.on) {
+        std::string m;
+#ifdef MINISIM_FST
+        m += " -DMINISIM_FST -DMINISIM_FST_PARALLEL -I" + shq(fstSourceDir());
+#endif
+        build += " -fPIC -shared" + m;
+        fstC += m;   // the parts: -fPIC below
+    }
     // An FST waveform: build simv with libfst too. Its C sources are compiled
     // once into <dir>/fst/*.o with $CC (default cc).
-    if (vcdPath && vcdPath->ends_with(".fst")) {
+    if (vcdPath && vcdPath->ends_with(".fst") && !mix.on) {
         std::string fd = fstSourceDir();
         if (fd.empty()) {
             std::cerr << "msim: -compile: no libfst sources for FST output; using the interpreter\n";
@@ -2142,9 +2182,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // functions in simv, exported (-rdynamic) to the user's libraries.
     if (!compileDpiLibs().empty()) {
         std::string d = " -I" + shq(dpiIncludeDir());
-        build += d + " -rdynamic";
+        build += d + (mix.on ? "" : " -rdynamic");
         fstC += d;
-        fstL += " -rdynamic";
+        if (!mix.on) fstL += " -rdynamic";
     }
     // Build cache: the same generated source, compiler command and kernel
     // sources as the simv already in `dir` reuse it. A rebuild of a large
@@ -2156,11 +2196,11 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // The kernel object: built (once, cached) while the design's files compile.
     std::string kobj;
     std::thread kthread;
-    if (useKernelObject())
+    if (useKernelObject() && !mix.on)
         kthread = std::thread([&] { kobj = kernelObject(cc, " -std=c++20 " + opt + " -I" + shq(inc) + fstC, inc, dir); });
     auto kernelReady = [&]() -> bool {
         if (kthread.joinable()) kthread.join();
-        return !useKernelObject() || !kobj.empty();
+        return !useKernelObject() || mix.on || !kobj.empty();
     };
     struct KJoin { std::thread& t; ~KJoin() { if (t.joinable()) t.join(); } } kjoin{kthread};
     std::string stamp = build + "\n";
@@ -2192,6 +2232,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // symbols as displacements and immediates, so no PIE.
         const bool reloc = files[0].second.find("#define MSIM_RELOC 1") != std::string::npos;
         if (reloc) cflags += " -fno-pie";
+        if (mix.on) cflags += " -fPIC";
         stamp = cflags + fstL + "\n" + stamp;
         bool sameFlags = slurp(dir + "/simv.stamp") == stamp;
         bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
@@ -2274,7 +2315,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         if (failed) return 1;
         if (!kernelReady()) return 1;   // a new kernel object relinks (simv.kobj)
         if (!jobs.empty() || !std::filesystem::exists(exe, ec) || slurp(dir + "/simv.kobj") != kobj) {
-            std::string link = shq(cc) + " " + opt + (reloc ? " -no-pie" : "");
+            std::string link = shq(cc) + " " + opt + (reloc ? " -no-pie" : "") + (mix.on ? " -shared" : "");
             for (auto& o : objs) link += " " + shq(o);
             if (!kobj.empty()) link += " " + shq(kobj);
             link += fstL + " -o " + shq(exe);
@@ -2303,6 +2344,18 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     phaseMark("simv built");
     if (lockFd >= 0) ::flock(lockFd, LOCK_UN);
+    if (mix.on) {   // msim runs it: the compiled processes from the library, the rest interpreted
+        void* h = dlopen(exe.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!h) { std::cerr << "msim: -compile: cannot load " << exe << ": " << dlerror() << "\n"; return 1; }
+        g_mixSetup = (int (*)())dlsym(h, "msim_mix_setup");
+        if (!g_mixSetup) { std::cerr << "msim: -compile: " << exe << " has no msim_mix_setup\n"; return 1; }
+        if (std::getenv("MSIM_WHYMIX"))
+            for (auto& [n, r] : mix.procs) std::fprintf(stderr, "msim: -compile: process %d (%s) interpreted: %s\n", n, lowered.procs[n].kind.c_str(), r.c_str());
+        else if (!mix.procs.empty())
+            std::cerr << "msim: -compile: " << mix.procs.size() << " of " << lowered.procs.size()
+                      << " processes interpreted (" << mix.procs[0].second << "; MSIM_WHYMIX=1 lists them)\n";
+        return -2;
+    }
     std::string run = shq(exe);
     if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
     if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
@@ -3984,7 +4037,7 @@ static int msimMain(int argc, char** argv) {
         // -compile: simv calls the import functions itself (codegen.hpp
         // dpiCall) and loads these libraries, so they stay on disk.
         // Exports (C calling SV) are not compiled yet.
-        if (compiled && !dpi::st().exports.empty()) {
+        if (compiled && !dpi::st().exports.empty() && !needMix("DPI-C exports")) {
             std::cerr << "msim: -compile: DPI-C exports are not compiled yet; using the interpreter\n";
             compiled = false;
         }
@@ -3999,7 +4052,7 @@ static int msimMain(int argc, char** argv) {
         std::cerr << "msim: -compile: the interactive mode is not compiled yet; using the interpreter\n";
         compiled = false;
     }
-    if (compiled && (!pathRecs().empty() || !sdfRequests().empty() || sdfAtRunTime())) {
+    if (compiled && (!pathRecs().empty() || !sdfRequests().empty() || sdfAtRunTime()) && !needMix("specify paths, SDF")) {
         std::cerr << "msim: -compile: specify path delays and SDF annotation are not compiled yet; using the interpreter\n";
         compiled = false;
     }
@@ -4013,8 +4066,10 @@ static int msimMain(int argc, char** argv) {
     // so the design runs on one thread in the interpreter, every process
     // scheduled the plain way.
     if (vpi::st().active) {
-        if (compiled) std::cerr << "msim: -compile: VPI is not compiled yet; using the interpreter\n";
-        compiled = false;
+        if (compiled && !needMix("VPI")) {
+            std::cerr << "msim: -compile: VPI is not compiled yet; using the interpreter\n";
+            compiled = false;
+        }
         staticComb = staticSeq = staticPart = false;
         threads = 1;
     }
@@ -4068,7 +4123,7 @@ static int msimMain(int argc, char** argv) {
         std::cerr << "msim: -compile: the design has protected code; using the interpreter\n";
         compiled = false;
     }
-    if (compiled && timingChecksOn() && !timingChecks().empty()) {
+    if (compiled && timingChecksOn() && !timingChecks().empty() && !needMix("timing checks")) {
         std::cerr << "msim: -compile: timing checks are not compiled yet; using the interpreter\n";
         compiled = false;
     }
@@ -4078,7 +4133,7 @@ static int msimMain(int argc, char** argv) {
     }
     bool anyReactive = false;
     for (auto& lp : lowered.procs) anyReactive |= lp.reactive;
-    if (compiled && (lowered.programs || anyReactive)) {
+    if (compiled && (lowered.programs || anyReactive) && !needMix("programs")) {
         std::cerr << "msim: -compile: programs and checkers are not compiled yet; using the interpreter\n";
         compiled = false;
     }
@@ -4126,6 +4181,8 @@ static int msimMain(int argc, char** argv) {
             if (!writeSaif()) return 1;
             return st;
         }
+        runres::R().phase = 0;   // run here: interpreted, or mixed (-2)
+        runres::R().compiledMode = false;
     }
 
     S.vcdPath = vcdPath.value_or("");
@@ -4213,6 +4270,24 @@ static int msimMain(int argc, char** argv) {
     };
     if (prof::P().on) { S.threads = 1; staticPart = false; prof::P().t0 = std::chrono::steady_clock::now(); }
     if (interactiveMode) S.threads = 1;   // a stop at a line pauses inside a process: one thread
+    if (g_mixSetup) {   // msim -compile mixed mode: the library registers every process
+        installCovergroupHooks();
+        // Each process takes its generator seed in start order (18.14.2), as
+        // below, whether compiled or not: an interpreted one draws the same
+        // $urandom values as without -compile.
+        static std::vector<uint64_t> seeds;
+        static const LowerResult* mlw = &lowered;
+        for (size_t i = 0; i < lowered.procs.size(); i++) { ProcCtl c; seedProc(c); seeds.push_back(c.rng); }
+        g_mixInterp = [](int n) {
+            const LoweredProc& lp = mlw->procs[(size_t)n];
+            if (lp.program >= 0 || lp.reactive) return programProc(&lp.prog, lp.program, lp.kind == "Initial", &seeds[(size_t)n]);
+            auto c = std::make_shared<ProcCtl>();
+            c->rng = seeds[(size_t)n];
+            return startProc(&lp.prog, std::move(c), nullptr);
+        };
+        if (g_mixSetup() != 0) return 1;
+        staticPart = false;   // the library built the partitions, if any
+    } else {
     std::vector<int> byRank(lowered.procs.size(), -1);
     for (size_t i = 0; i < pl.rank.size(); i++)
         if (pl.rank[i] >= 0) byRank[pl.rank[i]] = (int)i;
@@ -4272,6 +4347,7 @@ static int msimMain(int argc, char** argv) {
         S.spawn(t);
     }
     for (auto& t : lateConst) S.spawn(t);
+    }
     // Sampled values (16.5.1) and $past clocks. Shadows read every signal at
     // the start of a slot, which the static partitions do not keep current.
     S.freeVars = lowered.freeVars;   // free checker variables start random (17.7.2)

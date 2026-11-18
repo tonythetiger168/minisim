@@ -930,9 +930,10 @@ inline Task process(const Prog* p) {
     return startProc(p, std::move(c), nullptr);
 }
 // A process of a program (24.3): an initial procedure, or a continuous assign.
-inline Task programProc(const Prog* prog, int program, bool initial) {
+inline Task programProc(const Prog* prog, int program, bool initial, const uint64_t* rng = nullptr) {
     auto c = make_shared<ProcCtl>();
-    seedProc(*c);
+    if (rng) c->rng = *rng;   // seeded already, in start order (msim -compile mixed mode)
+    else seedProc(*c);
     c->program = program;
     c->reactive = true;
     if (initial && program >= 0) {
