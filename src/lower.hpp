@@ -3769,6 +3769,7 @@ struct Lowerer {
                 if (!call.isSystemCall()) break;
                 std::string_view n = call.getSubroutineName();
                 if (int ix = iterIndexSig(call); ix >= 0) return un(Op::AsStr, ref(ix));   // item.index of a string key
+                if (n == "$stacktrace") return konst(mkstr("$stacktrace: " + scopeName(call)));   // 20.17.2, as a function
                 if (n == "$sformatf" || n == "$psprintf") {
                     auto args = call.arguments();
                     auto f = node(Op::SFormat);
@@ -4799,6 +4800,10 @@ struct Lowerer {
             }
             case ExpressionKind::NamedValue:
             case ExpressionKind::HierarchicalValue: {
+                if (auto rb = exprRowBind.find(&x.as<ValueExpressionBase>().symbol); rb != exprRowBind.end()) {
+                    for (auto& e : rb->second) out.push_back(e);   // a reduction's item that is a row (7.12.3)
+                    return;
+                }
                 auto a = arrFind(&x.as<ValueExpressionBase>().symbol);
                 if (!a) {   // a parameter array (6.20.1)
                     auto cv = tryConst(x, &x.as<ValueExpressionBase>().symbol);
@@ -9041,6 +9046,7 @@ struct Lowerer {
     using BeforeList = std::vector<std::pair<std::vector<E>, std::vector<E>>>;
     std::unordered_map<const slang::ast::Symbol*, E> exprBind;
     std::unordered_map<const slang::ast::Symbol*, int64_t> exprIndexBind;   // item.index there
+    std::unordered_map<const slang::ast::Symbol*, std::vector<E>> exprRowBind;   // an item that is itself an array: its elements
     // a.sum(), a.sum() with (expr) ... of a fixed-size array (7.12.3): the
     // elements folded, at the result's width.
     E fixedReduce(const slang::ast::CallExpression& call, std::string_view n) {
@@ -9057,6 +9063,19 @@ struct Lowerer {
         E acc;
         const auto& fr = arr.type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
         bool oneDim = (int64_t)el.size() == (int64_t)fr.width();
+        if (iter && !oneDim && et.kind == SymbolKind::FixedSizeUnpackedArrayType &&
+            el.size() % (size_t)fr.width() == 0) {   // m.sum with (item.sum with (item)): each item is a row
+            size_t per = el.size() / (size_t)fr.width();
+            for (int64_t k = 0; k < (int64_t)fr.width(); k++) {
+                exprRowBind[iv] = std::vector<E>(el.begin() + (ptrdiff_t)(k * per), el.begin() + (ptrdiff_t)((k + 1) * per));
+                exprIndexBind[iv] = fr.left + (fr.left <= fr.right ? k : -k);
+                E t = expr(*iter, ExprCtx{w, sg, sg, true});
+                exprRowBind.erase(iv);
+                exprIndexBind.erase(iv);
+                acc = acc ? bin(op, acc, t) : t;
+            }
+            return acc;
+        }
         for (size_t k = 0; k < el.size(); k++) {
             E x = el[k];
             E t;
@@ -9189,8 +9208,10 @@ struct Lowerer {
             case ConstraintKind::SolveBefore: {   // 18.5.9
                 const auto& sb = c.as<SolveBeforeConstraint>();
                 std::vector<E> a, b;
-                for (const Expression* x : sb.solve) randElems(*x, a);
-                for (const Expression* x : sb.after) randElems(*x, b);
+                // A container's elements are only known at solve time: it is left
+                // out of the order (the solution space does not change, 18.5.9).
+                for (const Expression* x : sb.solve) if (!isDynType(*x->type)) randElems(*x, a);
+                for (const Expression* x : sb.after) if (!isDynType(*x->type)) randElems(*x, b);
                 before.push_back({std::move(a), std::move(b)});
                 break;
             }
