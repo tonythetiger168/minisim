@@ -108,6 +108,7 @@ set(CASES
   "tests/spec/35.5.6-shortreal.sv tests/spec/data/dpi/shortreal.c"
   "examples/mixed.sv"
   "-cfiles 3 examples/mixed.sv"
+  "examples/nomix.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -195,6 +196,14 @@ foreach(c IN LISTS CASES)
     endif()
     if(c MATCHES "mixed\\.sv" AND NOT err MATCHES "processes interpreted")
       message(FATAL_ERROR "${c}: nothing left to the interpreter\n${err}")
+    endif()
+  endif()
+  # A named initial nothing disables, a clocked block with a $display and an
+  # automatic task writing bits of its output: all compiled, no mixed mode.
+  if(c MATCHES "nomix\\.sv")
+    # (by its messages: a design.so there may be another case's from an earlier run)
+    if(err MATCHES "interpreted|mixed mode")
+      message(FATAL_ERROR "${c}: mixed mode\n${err}")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).

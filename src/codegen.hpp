@@ -118,6 +118,7 @@ struct CodegenParts {
 struct CodegenMix {
     bool on = false;
     bool domain = false;   // the cycle domain may stay when nothing is interpreted
+    std::vector<const Instr*> ins;   // g_mixIns: the instructions the library runs with msim's code
     std::vector<std::pair<int, std::string>> procs;
 };
 
@@ -167,8 +168,21 @@ public:
             for (auto& p : procs)
                 if (p.combRank >= 0)
                     for (auto& in : p.prog->code) { if (in.k == IK::WaitEdge) break; comb += in.k == IK::Assign; }
-            if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu clocked processes, %zu NBAs, %zu comb statements\n", dom.size(), nba, comb);
+            if (std::getenv("MSIM_WHYCYCLE")) {
+                size_t nseq = 0;
+                for (auto& p : procs) nseq += p.seq && p.combRank < 0;
+                std::fprintf(stderr, "cycle domain: %zu clocked processes, %zu NBAs, %zu comb statements (%zu clocked functions%s)\n", dom.size(), nba, comb, nseq,
+                             cycle ? "" : "; off: a comb cycle, -upf or -no-cycle");
+            }
             if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
+            // Many clock groups (an SoC's gated and divided clocks, ticking at
+            // different times): each group's commit evaluates every comb
+            // statement. OpenTitan Earl Grey, 779 groups, ran 4.6x slower in
+            // the domain than event-driven.
+            if (domGroups_ > 64 && !getenv("MSIM_XCYC")) {
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %d clock groups\n", domGroups_);
+                dom.clear();
+            }
         }
         if (!dom.empty()) wakeEvents(procs, dom);
         armK_.clear(); armIns_.clear(); armSet_.clear();
@@ -206,8 +220,9 @@ public:
                 continue;   // emitCycle
             else if (procs[i].seq && !mix) {
                 std::ostringstream c;
-                emitSeq(c, (int)i, *procs[i].prog, procs[i].kind);
-                if (evShare) evUnits.push_back({(int)i, true, c.str()});
+                const bool fn = seqOrProc(c, procs, i);
+                if (evShare && fn) evUnits.push_back({(int)i, true, c.str()});
+                else if (evShare && !upf && evPlain(c.str(), (int)i)) evUnits.push_back({(int)i, false, plainText(c.str(), (int)i)});
                 else chunks.push_back(c.str());
             }
             else if (!mix) {
@@ -220,9 +235,9 @@ public:
                 std::ostringstream c;
                 try {
                     if (procs[i].interp) throw CodegenUnsupported("a program process, or a gate whose delays change at run time");
-                    if (procs[i].seq) emitSeq(c, (int)i, *procs[i].prog, procs[i].kind);
-                    else emitProc(c, (int)i, *procs[i].prog, procs[i].kind);
-                    if (evShare && procs[i].seq) evUnits.push_back({(int)i, true, c.str()});
+                    const bool fn = procs[i].seq && seqOrProc(c, procs, i);
+                    if (!procs[i].seq) emitProc(c, (int)i, *procs[i].prog, procs[i].kind);
+                    if (evShare && fn) evUnits.push_back({(int)i, true, c.str()});
                     else if (evShare && !upf && procs[i].kind != "init" && evPlain(c.str(), (int)i)) evUnits.push_back({(int)i, false, plainText(c.str(), (int)i)});
                     else chunks.push_back(c.str());
                 } catch (const CodegenUnsupported& ex) {
@@ -289,6 +304,8 @@ public:
              "#include <thread>\n\n"
              "#pragma GCC diagnostic ignored \"-Wunused-label\"\n\n"
              "static inline Val R(int s, bool sg) { Val v = S.get(s); v.sgn = sg; return v; }\n"
+             "#define MSIMI(k) (*static_cast<const Instr*>(g_mixIns[k]))   // mixed mode: msim's instruction k\n"
+             "#define SIGN(n) (n)   // a signal number (shared code moves it: refScan)\n"
              "static inline Val RS(Val v, int w, bool fill, bool sg) {\n"
              "    Val r = v_resize(v, w, fill && w > v.w); r.sgn = sg; return r;\n"
              "}\n"
@@ -473,6 +490,7 @@ public:
         }
         for (size_t i = 0; i < sysArgs_.size(); i++) o << SV << "std::vector<E> A" << i << ";\n";
         for (size_t i = 0; i < evals_.size(); i++) o << SV << "E ET" << i << ";\n";
+        for (size_t i = 0; i < lays_.size(); i++) o << SV << "FrameLayout LAY" << i << ";\n";
         for (size_t i = 0; i < mems_.size(); i++) o << SV << "Instr MI" << i << ";\n";
         // Arrays, like PA: shared comb code reaches them as AIA[k + D7], CCA[n + D8].
         o << SV << "Instr AIA[" << std::max<size_t>(asrts_.size(), 1) << "];\n";
@@ -536,6 +554,13 @@ public:
         std::string initText = privInit_, initCalls;
         for (size_t i = 0; i < sysArgs_.size(); i++) initText += "    A" + std::to_string(i) + " = {" + sysTrees[i] + "};\n";
         for (size_t i = 0; i < evals_.size(); i++) initText += "    ET" + std::to_string(i) + " = " + evTrees[i] + ";\n";
+        for (size_t i = 0; i < lays_.size(); i++) {   // frame layouts (emitProc frames)
+            const FrameLayout& l = *lays_[i];
+            std::string w, v;
+            for (size_t k = 0; k < l.w.size(); k++) { w += (k ? ", " : "") + std::to_string(l.w[k]); v += (k ? ", " : "") + val(l.init[k]); }
+            initText += "    LAY" + std::to_string(i) + ".w = {" + w + "}; LAY" + std::to_string(i) + ".init = {" + v + "}; LAY" +
+                        std::to_string(i) + ".name = " + quote(l.name) + ";\n";
+        }
         for (auto& m : memInit) initText += m;
         initText += asInit;
         if (nf > 1 && !initText.empty()) {
@@ -1112,7 +1137,33 @@ public:
     // output is a library msim loads (msim_mix_setup), not a program.
     bool mix = false;
     std::vector<std::pair<int, std::string>> interp;
-    std::vector<char> mixSeq_;   // a clocked process left to the interpreter
+    std::vector<const FrameLayout*> lays_;   // frame layouts emitProc's calls make (LAY<k>)
+    bool needMsim_ = false;   // generated code needs msim's runtime (classes): mixed mode only
+    std::vector<const Instr*> msimIns_;   // MSIMI(k): msim's instructions the library runs (g_mixIns)
+    std::string msimIns(const Instr& i) {
+        needMsim_ = true;
+        if (!mix) return "MSIMI(0)";   // not built: codegen() goes on to mixed mode
+        msimIns_.push_back(&i);
+        return "MSIMI(" + std::to_string(msimIns_.size() - 1) + ")";
+    }
+    std::vector<char> mixSeq_;   // a clocked process left to the interpreter, or run as a coroutine
+    // A clocked process as a clocked function, or else (a $display in it, say)
+    // as an ordinary coroutine process, as with msim -no-static-seq.
+    // Returns whether it is a clocked function.
+    bool seqOrProc(std::ostream& o, const std::vector<CodegenProc>& procs, size_t i) {
+        std::ostringstream c;
+        try {
+            emitSeq(c, (int)i, *procs[i].prog, procs[i].kind);
+            o << c.str();
+            return true;
+        } catch (const CodegenUnsupported&) {
+            if (std::getenv("MSIM_NOSEQPROC")) throw;
+        }
+        emitProc(o, (int)i, *procs[i].prog, procs[i].kind);
+        mixSeq_.resize(procs.size());
+        mixSeq_[i] = 1;
+        return false;
+    }
     // Event-driven comb and clocked functions shared between instances
     // (shareEv): the template whose function a process calls ("" its own)
     // and where its distances start in the table DT (-1: none).
@@ -1232,7 +1283,9 @@ private:
     std::string dynTarget(const Instr& i, const std::string& val, const std::string& then, bool privOk = false) {
         if (isPriv(i.sig) && !privOk) privHits_.insert(i.sig);
         std::ostringstream o;
-        o << " { Val v = " << val << "; int s = " << i.sig << ", hi = " << i.hi << ", lo = " << i.lo << ";";
+        // A frame slot (emitProc frames): its signal now, from the running frame.
+        const std::string sg = isRel(i.sig) && !i.arr ? "R(" + std::to_string(i.sig) + ")" : std::to_string(i.sig);
+        o << " { Val v = " << val << "; int s = " << sg << ", hi = " << i.hi << ", lo = " << i.lo << ";";
         if (i.arr) {
             o << " s = AOFF(" << arrName(i.arr.get()) << ", {";
             for (size_t k = 0; k < i.aidx.size(); k++) o << (k ? ", " : "") << fast(i.aidx[k]);
@@ -1328,6 +1381,9 @@ private:
         switch (e->op) {
             case Op::Const: return val(e->k);
             case Op::Ref:
+                if (e->at) break;   // h.x: eval()
+                if (isRel(e->sig))   // a frame slot (emitProc frames): resolved now
+                    return "R(R(" + std::to_string(e->sig) + "), " + (e->sgn ? "true" : "false") + ")";
                 if (isPriv(e->sig))
                     return "PR(P" + std::to_string(e->sig) + ", " + std::to_string(sigW_[e->sig]) + ", " + (e->sgn ? "true" : "false") + ")";
                 return "R(" + std::to_string(e->sig) + ", " + (e->sgn ? "true" : "false") + ")";
@@ -1453,7 +1509,7 @@ private:
                 fi = {e->k.w, e->k.sgn};
                 return true;
             case Op::Ref:
-                if (e->sig < 0 || e->sig >= (int)sigW_.size() || sigW_[e->sig] > 64 || sigW_[e->sig] < 1) return false;
+                if (e->at || e->sig < 0 || e->sig >= (int)sigW_.size() || sigW_[e->sig] > 64 || sigW_[e->sig] < 1) return false;
                 refs.push_back(e->sig);
                 out = vRef(e->sig);
                 fi = {sigW_[e->sig], e->sgn};
@@ -1930,6 +1986,13 @@ private:
     std::string assign(const Instr& i, std::string val = "") {
         if (val.empty()) val = fast(i.e);
         std::ostringstream o;
+        if (isRel(i.sig)) {   // a frame slot (emitProc frames, framesOK): resolved now
+            const std::string t = "R(" + std::to_string(i.sig) + ")";
+            if (i.tmp || i.xq) o << " S.poke(" << t << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
+            else if (i.hi >= 0) o << " { int t = " << t << "; S.set(t, v_insert(S.get(t), " << val << ", " << i.hi << ", " << i.lo << ")); }\n";
+            else o << " S.set(" << t << ", " << val << ");\n";
+            return o.str();
+        }
         if ((i.tmp || i.xq) && !isPriv(i.sig)) {   // a temporary of the process, or a quiet -xprop write: no change event
             o << " S.poke(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
             return o.str();
@@ -2680,7 +2743,7 @@ private:
             std::vector<int> writers(sigs.size(), 0);
             for (auto& pr : procs) {
                 std::vector<const Prog*> progs;
-                reach(pr.prog, progs);
+                reachAll(pr.prog, progs);
                 for (const Prog* p : progs)
                     for (auto& in : p->code)
                         if ((in.k == IK::Assign || in.k == IK::Nba || in.k == IK::Force) && in.sig >= 0 && (size_t)in.sig < writers.size())
@@ -2764,6 +2827,9 @@ private:
                     if (clashAt(code[pc].sig, i, via)) { forward = false; why = "vector also written at fixed bits by another process"; whyLine = code[pc].line; }
                 } else if (!tmpw && (code[pc].arr || code[pc].bidx)) { forward = false; why = "run-time index"; whyLine = code[pc].line; }   // no fixed slot: an ordinary clocked function
             }
+            if (forward)   // automatic variables (a frame): an ordinary clocked function or coroutine
+                for (auto& in : code)
+                    try { noFrames(in); } catch (const CodegenUnsupported&) { forward = false; why = "automatic variables"; whyLine = in.line; break; }
             if (forward) viaK_.insert(via.begin(), via.end());
             if (!forward) {
                 if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "not in the domain (%s, line %d): %s line %d\n", why, whyLine, procs[i].kind.c_str(), code.empty() ? 0 : code[0].line);
@@ -2801,10 +2867,14 @@ private:
             for (size_t i = 0; i < procs.size(); i++) {
                 if (mine[i]) continue;
                 std::vector<const Prog*> progs;
-                reach(procs[i].prog, progs);
+                reachAll(procs[i].prog, progs);
                 for (const Prog* p : progs)
                     for (auto& in : p->code)
-                        if (in.k == IK::Nba && std::binary_search(targets.begin(), targets.end(), in.sig)) return true;
+                        if (in.k == IK::Nba && std::binary_search(targets.begin(), targets.end(), in.sig)) {
+                            if (std::getenv("MSIM_WHYCYCLE"))
+                                std::fprintf(stderr, "domain clash: %s (line %d) also writes %s\n", procs[i].kind.c_str(), in.line, sigs[in.sig].name.c_str());
+                            return true;
+                        }
             }
             return false;
         };
@@ -2815,6 +2885,38 @@ private:
         if (groups.size() > 1 && groups.size() <= 1024 && !std::getenv("MSIM_ONEGROUP")) {
             for (auto& g : groups) all.insert(all.end(), g.begin(), g.end());
             std::sort(all.begin(), all.end());
+            if (clash(all) && !std::getenv("MSIM_NOPRUNE")) {
+                // Leave out the processes whose NBA targets another process
+                // outside the domain also writes (each run that way is an
+                // ordinary clocked function), until nothing clashes.
+                std::vector<char> in(procs.size(), 0);
+                for (int i : all) in[i] = 1;
+                std::vector<int> outW(sigs.size(), 0);   // NBA writes from outside the domain
+                auto addOut = [&](size_t i) {
+                    std::vector<const Prog*> progs;
+                    reachAll(procs[i].prog, progs);
+                    for (const Prog* q : progs)
+                        for (auto& x : q->code)
+                            if (x.k == IK::Nba && x.sig >= 0 && (size_t)x.sig < outW.size()) outW[x.sig]++;
+                };
+                for (size_t i = 0; i < procs.size(); i++) if (!in[i]) addOut(i);
+                for (bool more = true; more;) {
+                    more = false;
+                    for (int i : all) {
+                        if (!in[i]) continue;
+                        bool hit = false;
+                        for (auto& x : procs[i].prog->code) hit |= x.k == IK::Nba && x.sig >= 0 && (size_t)x.sig < outW.size() && outW[x.sig] > 0;
+                        if (!hit) continue;
+                        in[i] = 0;
+                        addOut((size_t)i);
+                        more = true;
+                        if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "left out of the domain (a target written outside it): %s line %d\n", procs[i].kind.c_str(), procs[i].prog->code.empty() ? 0 : procs[i].prog->code[0].line);
+                    }
+                }
+                std::erase_if(all, [&](int i) { return !in[i]; });
+                for (auto& g : groups) std::erase_if(g, [&](int i) { return !in[i]; });
+                std::erase_if(groups, [](auto& g) { return g.empty(); });
+            }
             if (clash(all)) all.clear();
         }
         if (!all.empty()) {
@@ -2917,6 +3019,7 @@ private:
     template <class F> static void refScan(const std::string& t, F&& f) {
         static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
                                     "S.get(", "S.set(", "S.setOneBit(", "S.poke(", "R(", "int s = ",   // dynTarget
+                                    "SIGN(",   // a commit list entry's signal (C1E)
                                     "nb.push_back({"};   // an NBA of a clocked function (emitSeq)
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
         for (size_t i = 0; i < t.size(); i++) {
@@ -4445,7 +4548,7 @@ private:
                             fns2 << " if (C0OK) { C0L[C0N].p = &P" << i.sig << "; C0L[C0N].m = " << (i.hi < 0 ? M(sigW_[i.sig]) : c1m) << "; C0L[C0N++].v = " << c1v << " & " << (i.hi < 0 ? M(sigW_[i.sig]) : c1m)
                                  << "; } else { COVF = true; CLP(" << k << ");" << V << " = " << u << ";" << H << " = 1; }\n";
                         else if (c1)
-                            fns2 << " if (C1OK) { C1L[C1N].g = &S.sigs[" << i.sig << "]; C1L[C1N].m = " << c1m << "; C1L[C1N++].v = " << c1v << " & " << c1m
+                            fns2 << " if (C1OK) { C1L[C1N].s = SIGN(" << i.sig << "); C1L[C1N].m = " << c1m << "; C1L[C1N++].v = " << c1v << " & " << c1m
                                  << "; } else { COVF = true; CLP(" << k << ");" << V << " = " << u << ";" << H << " = 1; }\n";
                         else fns2 << " CLP(" << k << ");";
                         if (c0 || c1) {}
@@ -4477,7 +4580,7 @@ private:
                     }
                     case IK::Jmp: fns << " goto " << L(i.target) << ";\n"; fns2 << " goto " << L(i.target) << ";\n"; break;
                     case IK::Assign:
-                        if (!i.tmp) throw CodegenUnsupported("instruction in a clocked process");
+                        if (!i.tmp) throw CodegenUnsupported("blocking assign in a clocked process (line " + std::to_string(i.line) + ")");
                         for (auto& a : i.aidx) noteRefs(a);
                         // The 2-state copy writes the value alone: twoNow checks the
                         // temporaries too (a read before the first write of a pass
@@ -4542,7 +4645,7 @@ private:
                         fns2 << t;
                         break;
                     }
-                    default: throw CodegenUnsupported("instruction in a clocked process");
+                    default: throw CodegenUnsupported("instruction " + std::to_string((int)i.k) + " in a clocked process (line " + std::to_string(i.line) + ")");
                 }
                 std::string t4 = fns.str(), t2 = fns2.str();
                 if (deadSeq.count(&i)) {   // nothing live reads it: only for a waveform or $monitor
@@ -4586,7 +4689,7 @@ private:
         // Off for the parallel path (CLON) and when full: the slot instead.
         // (No sizes in the macros: they go to every part, and a part must not
         // change when a process elsewhere adds slots.)
-        o << "struct C0E { PSig* p; uint64_t v, m; };\nstruct C1E { Sig* g; uint64_t v, m; };\n"
+        o << "struct C0E { PSig* p; uint64_t v, m; };\nstruct C1E { int s; uint64_t v, m; };   // by number: a frame may move S.sigs\n"
              // Thread-local: in the parallel path each group fills its own
              // lists (gBegin), committed by the group's cmG.
              "static C0E C0B[" << std::max<size_t>(2 * slots.size(), 1) << "]; static C1E C1B[" << std::max<size_t>(2 * slots.size(), 1)
@@ -4874,8 +4977,8 @@ private:
         // took the compiler 12 GB and 80 s.
         o << "static bool twoNow() {\n";
         if (two) {
-            // The x words of the narrow signals by address (taken once: S.sigs
-            // does not move after startup), then the wide ones limb by limb:
+            // The x words of the narrow signals by address (taken again whenever S.sigs moves:
+            // a frame makes signals), then the wide ones limb by limb:
             // a loop over Val and its limbs cost about 14 instructions a
             // signal, 30% of Ibex's run time once it was all 2-state.
             o << "    static const int T[] = {-1";
@@ -4884,8 +4987,8 @@ private:
             for (int e : ext) if (!scratch(e) && sigW_[e] > 64) o << ", " << e;
             o << "};\n    constexpr size_t NT = sizeof T / sizeof T[0] - 1;\n"
                  "    static const uint64_t* TX[NT ? NT : 1];\n"
-                 "    static bool init = false;\n"
-                 "    if (!init) { for (size_t k = 0; k < NT; k++) TX[k] = &S.sigs[T[k + 1]].val.x; init = true; }\n"
+                 "    static const Sig* at = nullptr;   // S.sigs moves when a frame makes signals\n"
+                 "    if (at != S.sigs.data()) { for (size_t k = 0; k < NT; k++) TX[k] = &S.sigs[T[k + 1]].val.x; at = S.sigs.data(); }\n"
                  "    if (!pclean) return false;\n    uint64_t x = 0;\n";
             // Up to a few thousand narrow signals: one load each at a constant
             // offset from S.sigs.data(), unrolled (the pointer table took two
@@ -5217,7 +5320,7 @@ private:
                  "static void c1Apply(const C1E* L, uint32_t n) {\n"
                  "    const bool obs = S.observed;\n"
                  "    for (uint32_t j = 0; j < n; j++) {\n"
-                 "        Sig& g = *L[j].g; const int s = (int)(&g - S.sigs.data()); const uint64_t m = L[j].m; Val& q = g.val;\n"
+                 "        const int s = L[j].s; Sig& g = S.sigs[s]; const uint64_t m = L[j].m; Val& q = g.val;\n"
                  "        if (DEF && !locFast(s)) { const int lo = __builtin_ctzll(m), hi = 63 - __builtin_clzll(m); DEF->push_back({s, make(L[j].v >> lo, 0, hi - lo + 1), hi, lo}); continue; }\n"
                  "        if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { q.v = (q.v & ~m) | L[j].v; q.x &= ~m; q.z &= ~m; q.real = false; q.str = false; }\n"
                  "        else S.fwSlow(s, Val{(q.v & ~m) | L[j].v, q.x & ~m, g.w, q.z & ~m});\n"
@@ -5531,7 +5634,7 @@ private:
             o << "static void fcommit() {\n"
                  "    DAHEAD = false;\n"
                  "    const bool t = twoNow();\n"
-                 "    if (C0TWO) { for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = (p.v & ~C0L[j].m) | C0L[j].v; } } else for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; const uint64_t m = C0L[j].m; p.v = (p.v & ~m) | C0L[j].v; p.x &= ~m; p.z &= ~m; }\n    C0N = 0;\n"                 "    { const bool obs = S.observed;" " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
+                 "    if (C0TWO) { for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = (p.v & ~C0L[j].m) | C0L[j].v; } } else for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; const uint64_t m = C0L[j].m; p.v = (p.v & ~m) | C0L[j].v; p.x &= ~m; p.z &= ~m; }\n    C0N = 0;\n"                 "    { const bool obs = S.observed;" " for (uint32_t j = 0; j < C1N; j++) { const int s = C1L[j].s; Sig& g = S.sigs[s];"
              " const uint64_t m = C1L[j].m; Val& q = g.val;"
              " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { q.v = (q.v & ~m) | C1L[j].v; q.x &= ~m; q.z &= ~m; q.real = false; q.str = false; }"
              " else S.fwSlow(s, Val{(q.v & ~m) | C1L[j].v, q.x & ~m, g.w, q.z & ~m}); } C1N = 0;" " }\n"
@@ -5600,7 +5703,7 @@ private:
         o << " const bool obs = S.observed;"
              // The common slot inline: a private signal given a known value.
              " if (C0TWO) { for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; p.v = (p.v & ~C0L[j].m) | C0L[j].v; } } else for (uint32_t j = 0; j < C0N; j++) { PSig& p = *C0L[j].p; const uint64_t m = C0L[j].m; p.v = (p.v & ~m) | C0L[j].v; p.x &= ~m; p.z &= ~m; } C0N = 0;"
-             " for (uint32_t j = 0; j < C1N; j++) { Sig& g = *C1L[j].g; const int s = (int)(&g - S.sigs.data());"
+             " for (uint32_t j = 0; j < C1N; j++) { const int s = C1L[j].s; Sig& g = S.sigs[s];"
              " const uint64_t m = C1L[j].m; Val& q = g.val;"
              " if (__builtin_expect(!obs && S.waiters[s].empty(), 1)) { q.v = (q.v & ~m) | C1L[j].v; q.x &= ~m; q.z &= ~m; q.real = false; q.str = false; }"
              " else S.fwSlow(s, Val{(q.v & ~m) | C1L[j].v, q.x & ~m, g.w, q.z & ~m}); } C1N = 0;"
@@ -5639,7 +5742,7 @@ private:
                 case IK::Assign:   // a temporary of its own (Instr::tmp)
                     o << " S.poke(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
                     break;
-                default: throw CodegenUnsupported("instruction in a clocked process");
+                default: throw CodegenUnsupported("instruction " + std::to_string((int)i.k) + " in a clocked process (line " + std::to_string(i.line) + ")");
             }
         }
         o << L(end) << ": return;\n}\n\n";
@@ -6042,21 +6145,105 @@ private:
         o += " if (S.finished) co_return; }\n";
         return o;
     }
-    static void reach(const Prog* p, std::vector<const Prog*>& out) {
+    // Every subroutine a process may call, with no checks (analysis only).
+    static void reachAll(const Prog* p, std::vector<const Prog*>& out) {
         for (const Prog* q : out)
             if (q == p) return;
         out.push_back(p);
-        for (auto& i : p->code) noFrames(i);
+        for (auto& i : p->code)
+            if (i.k == IK::Call && i.callee) reachAll(i.callee, out);
+    }
+    static void reach(const Prog* p, std::vector<const Prog*>& out, bool frames = false) {
+        for (const Prog* q : out)
+            if (q == p) return;
+        out.push_back(p);
+        for (auto& i : p->code) frames ? framesOK(i) : noFrames(i);
         for (auto& i : p->code)
             if (i.k == IK::Call) {
                 if (!i.callee) throw CodegenUnsupported("call without a callee");
-                reach(i.callee, out);
+                reach(i.callee, out, frames);
             }
+    }
+    // A coroutine process (emitProc) may use frames of its own: an automatic
+    // task or function of a module (a new frame per call, its arguments set
+    // in it), its slots (relative mode 0) and the slots of the frame the
+    // last call returned from (kRelRet). Fork frames, `this`, handles and
+    // containers stay in the interpreter.
+    // Every mode but an enclosing frame (1-7, fork branches) and an
+    // indirect one up the frame chain: R() resolves them from g_fr / g_ret.
+    static bool relOK(int s) {
+        if (!isRel(s)) return true;
+        const int m = relMode(s);
+        // `this` and the indirect modes (objects: randomize, handles) stay in
+        // the interpreter: compiled, the random tests of clause 18 differed.
+        static const bool obj = std::getenv("MSIM_CGOBJFRAMES") != nullptr;
+        if (obj) return m == 0 || m == kRelThis || m == kRelRet || m == kRelIndSig || m == kRelIndFrame;
+        return m == 0 || m == kRelRet;
+    }
+    static bool exprRelOK(const E& e) {
+        if (!e) return true;
+        if ((e->arr && isRel(e->arr->base)) || !relOK(e->sig)) return false;
+        if (e->at && (hasRel(e->at) || !exprRelOK(e->at))) return false;   // h.x through a handle in a frame: the interpreter
+        for (auto& k : e->kids) if (!exprRelOK(k)) return false;
+        return true;
+    }
+    static void framesOK(const Instr& i) {
+        auto no = [](const char* w) { throw CodegenUnsupported(std::string("automatic variables (frames): ") + w); };
+        if (i.dynWait) no("a wait on automatic variables");
+        if (!i.dinit.empty() || (i.lay && !i.lay->dyn.empty())) no("a container in a frame");
+        if (i.lay && i.k != IK::Call) no("a fork block's frame");
+        if (i.lay && i.vslot != -1) no("a virtual method call");
+        if (!exprRelOK(i.self)) no("a method call through a handle or this");
+        if (!i.init.empty() && !i.lay) no("arguments without a frame");
+        for (auto& [off, e] : i.init) if (!exprRelOK(e)) no("an argument through a handle or this");
+        for (auto* b : i.blays) if (b) no("a fork branch's frame");
+        if (isRel(i.sig) && !relOK(i.sig)) no("a write through a handle or this");
+        if (isRel(i.sig) && i.k != IK::New && i.k != IK::Dyn && i.k != IK::Randomize && (i.k != IK::Assign || i.drv >= 0 || i.arr)) throw CodegenUnsupported("automatic variables (frames): a frame slot written by instruction " + std::to_string((int)i.k) +
+                                     (i.arr || i.bidx ? " (an element)" : i.drv >= 0 ? " (a driver)" : "") + ", line " + std::to_string(i.line));
+        if (!exprRelOK(i.e) || !exprRelOK(i.bidx) || !exprRelOK(i.de)) no("a read through a handle or this");
+        for (auto& a : i.args) if (!exprRelOK(a)) no("a read through a handle or this");
+        for (auto& a : i.aidx) if (!exprRelOK(a)) no("an index through a handle or this");
+        for (auto& [s, e] : i.events) if (isRel(s)) no("a wait on automatic variables");
+        if (i.arr && isRel(i.arr->base)) no("an array in a frame");
+    }
+    static bool usesFrames(const Instr& i) {
+        if (i.lay || isRel(i.sig)) return true;
+        if (hasRel(i.e) || hasRel(i.bidx) || hasRel(i.de)) return true;
+        for (auto& a : i.args) if (hasRel(a)) return true;
+        for (auto& a : i.aidx) if (hasRel(a)) return true;
+        return false;
+    }
+    int layIdx(const FrameLayout* l) {
+        for (size_t k = 0; k < lays_.size(); k++) if (lays_[k] == l) return (int)k;
+        lays_.push_back(l);
+        return (int)lays_.size() - 1;
     }
 
     void emitProc(std::ostream& o, int n, const Prog& entry, const std::string& kind) {
         std::vector<const Prog*> progs;
-        reach(&entry, progs);
+        reach(&entry, progs, !std::getenv("MSIM_NOCGFRAMES"));
+        bool frames = false;
+        for (const Prog* q : progs)
+            for (auto& i : q->code) frames |= usesFrames(i);
+        // Frames with objects (new, randomize, rand_mode, a method or member
+        // through a handle) stay in the interpreter: compiled, clauses 7 and
+        // 18 printed other values. MSIM_CGOBJFRAMES=1 compiles them anyway.
+        if (frames && !std::getenv("MSIM_CGOBJFRAMES")) {
+            std::function<bool(const E&)> hasAt = [&](const E& e) {
+                if (!e) return false;
+                if (e->at) return true;
+                for (auto& k : e->kids) if (hasAt(k)) return true;
+                return false;
+            };
+            for (const Prog* q : progs)
+                for (auto& i : q->code) {
+                    bool obj = i.k == IK::New || i.k == IK::Randomize || i.k == IK::RandMode || i.k == IK::Dyn || i.self || i.vslot != -1 ||
+                               hasAt(i.e) || hasAt(i.bidx) || hasAt(i.de);
+                    for (auto& a : i.args) obj |= hasAt(a);
+                    for (auto& [off, e] : i.init) obj |= hasAt(e);
+                    if (obj) throw CodegenUnsupported("automatic variables (frames) with objects");
+                }
+        }
         auto idx = [&](const Prog* p) {
             for (size_t i = 0; i < progs.size(); i++)
                 if (progs[i] == p) return (int)i;
@@ -6069,6 +6256,11 @@ private:
         o << "// process " << n << " (" << kind << ")\n";
         o << "static Task proc" << n << "() {\n";
         if (calls) o << "    std::vector<int> rs;\n";
+        // Frames, as exec.inc: the running one, the one the last call
+        // returned from, and the caller's at each call. g_fr and g_ret are
+        // set at every instruction (another process may have run).
+        if (frames) o << "    FrameP fr, lr;\n    std::vector<FrameP> frs;\n";
+        const std::string FG = frames ? " g_fr = fr.get(); g_ret = lr.get();" : "";
         // msim -upf: a process of a domain that is off sleeps until it powers
         // up, then starts over from its top (exec.inc, 1801 9.5.3).
         const int pd = upf ? entry.pd : -1;
@@ -6095,7 +6287,7 @@ private:
             if (pi) o << "    // subroutine body\n";
             for (size_t pc = 0; pc < p.code.size(); pc++) {
                 const Instr& i = p.code[pc];
-                o << L(P, pc) << ":" << CH(&p, pc);
+                o << L(P, pc) << ":" << CH(&p, pc) << FG;
                 auto tgt = [&](size_t t) { return L(P, t > p.code.size() ? p.code.size() : t); };
                 // A write chosen at run time (a[i] = ..., v[i] = ...): Assign and Nba only.
                 bool dynW = (i.k == IK::Assign || i.k == IK::Nba) && (i.arr || i.bidx);
@@ -6103,8 +6295,8 @@ private:
                     throw CodegenUnsupported(std::string("array or variable-index ") + (i.drv >= 0 ? "continuous assign" : "write (instruction " + std::to_string((int)i.k) + ")"));
                 if (i.nbaLater && i.k != IK::Nba) throw CodegenUnsupported("intra-assignment delay");
                 if (i.de && i.k != IK::Nba && i.k != IK::WaitDelay) throw CodegenUnsupported("delay expression");
-                if (i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) throw CodegenUnsupported("dynamic array");
-                if (!p.roots.empty() || !p.spans.empty()) throw CodegenUnsupported("disable of a named block");
+                if ((i.dyn >= 0 || i.dsrc >= 0 || i.dres >= 0 || i.dkey >= 0) && !(mix && i.k == IK::Dyn)) throw CodegenUnsupported("dynamic array");
+                if (!p.roots.empty() || !p.spans.empty()) throw CodegenUnsupported("disable of a named block (line " + std::to_string(i.line) + ")");
                 if (i.fd) throw CodegenUnsupported("$fstrobe / $fmonitor");
                 if ((!i.dly.empty() || !i.dlyE.empty()) && (i.k != IK::Assign || i.drv < 0 || i.tmp || i.xq || isPriv(i.sig)))   // (SDF timing keeps the interpreter)
                     throw CodegenUnsupported("delayed continuous assignment");
@@ -6243,10 +6435,41 @@ private:
                         break;
                     case IK::Call:
                         retLabels.push_back(L(P, pc + 1));
+                        if (frames) {   // exec.inc IK::Call: the caller's frame kept; an automatic subroutine gets a new one
+                            o << " frs.push_back(fr);";
+                            if (i.lay) {
+                                std::string self = i.noSelf ? "0" : "fr ? fr->self : 0";
+                                if (!i.noSelf && i.self)   // a method: the object the handle names
+                                    self = "[&] { Val h = " + ex(i.self) + "; if (h.x || !h.v) nullAccess(); return (int)h.v; }()";
+                                o << " { FrameP nf = newFrame(&LAY" << layIdx(i.lay) << ", nullptr, " << self << ");";
+                                for (auto& [off, e] : i.init) o << " S.set(nf->base + " << off << ", " << ex(e) << ");";
+                                o << " fr = std::move(nf); }";
+                            }
+                        }
                         o << " rs.push_back(" << retLabels.size() - 1 << "); goto " << L(idx(i.callee), 0) << ";\n";
                         break;
                     case IK::Ret: o << " goto ret;\n"; break;
                     case IK::Dpi: o << dpiCall(i); break;
+                    // Mixed mode: msim's own instruction (MSIMI), run as exec.inc
+                    // runs it; class tables and containers are msim's.
+                    case IK::New:
+                        o << " newObject(" << msimIns(i) << ");\n";
+                        break;
+                    case IK::Dyn:
+                        if (!mix) throw CodegenUnsupported("dynamic array");
+                        o << " dynExec(" << msimIns(i) << ");\n";
+                        break;
+                    case IK::Randomize:   // 18.6, 18.12
+                        o << " { const Instr& i = " << msimIns(i) << "; int obj = 0;"
+                             " if (i.e) { Val h = eval(i.e, rd); if (h.x || !h.v) nullAccess(); obj = (int)h.v;"
+                             " if (i.rc && i.rc->objTmp >= 0) S.set(R(i.rc->objTmp), make((uint64_t)obj, 0, 64)); }"
+                             " int r = doRandomize(obj, i.rc.get());" << FG <<
+                             " if (i.sig >= 0) S.set(R(i.sig), make((uint64_t)r, 0, 32, 0, true)); }\n";
+                        break;
+                    case IK::RandMode:   // 18.8, 18.9
+                        o << " { const Instr& i = " << msimIns(i) << "; Val h = eval(i.e, rd); if (h.x || !h.v) nullAccess();"
+                             " randModeAll((int)h.v, i.hi != 0, truth(eval(i.de, rd)) == 1); }\n";
+                        break;
                     default: throw CodegenUnsupported("instruction " + std::to_string((int)i.k));
                 }
             }
@@ -6255,8 +6478,10 @@ private:
         }
         o << "ret:\n";
         if (calls) {
-            o << "    if (rs.empty()) co_return;\n"
-                 "    { int r = rs.back(); rs.pop_back();\n"
+            o << "    if (rs.empty()) co_return;\n";
+            if (frames)   // exec.inc ret(): back to the caller's frame, the callee's kept for kRelRet
+                o << "    { FrameP f = std::move(frs.back()); frs.pop_back(); if (f != fr) { lr = std::move(fr); fr = std::move(f); } }\n";
+            o << "    { int r = rs.back(); rs.pop_back();\n"
                  "      switch (r) {\n";
             for (size_t r = 0; r < retLabels.size(); r++) o << "        case " << r << ": goto " << retLabels[r] << ";\n";
             o << "      }\n    }\n";
@@ -6280,7 +6505,8 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
             if (!interp->on)   // on already: the library whatever compiles (a final block, say)
                 return codegen(sigs, procs, parts, twoState, cycle, privates, covSlots, split, precExp, timescale, upf, kernelObj);
             throw CodegenUnsupported("mixed mode");
-        } catch (const CodegenUnsupported&) {
+        } catch (const CodegenUnsupported& ex) {
+            if (std::getenv("MSIM_WHYMIX")) std::fprintf(stderr, "msim: -compile: mixed mode: %s\n", ex.what());
             // Interpreted processes make signals at run time (frames,
             // objects: S.sigs grows and moves) and wait on signals no static
             // analysis sees (virtual interfaces): no cycle domain, which
@@ -6298,6 +6524,7 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
                 g.mix = true;
                 std::string src = g.run(sigs, procs, cyc ? parts : CodegenParts{});
                 interp->procs = std::move(g.interp);
+                interp->ins = std::move(g.msimIns_);
                 return src;
             };
             const bool forced = interp->on;
@@ -6306,7 +6533,9 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
                 try {
                     std::string src = pass(true);
                     if (interp->procs.empty()) return src;
-                } catch (const CodegenUnsupported&) {}   // the domain's own limits: without it
+                } catch (const CodegenUnsupported& ex) {   // the domain's own limits: without it
+                    if (std::getenv("MSIM_WHYMIX")) std::fprintf(stderr, "msim: -compile: no cycle domain: %s\n", ex.what());
+                }
             }
             return pass(false);
         }
@@ -6325,6 +6554,7 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
         g.upf = upf;
         g.kernelObj = kernelObj;
         std::string src = g.run(sigs, procs, parts);
+        if (g.needMsim_) throw CodegenUnsupported("classes");   // mixed mode, with msim's class tables
         if (!g.privHits_.empty()) {
             if (!g.privates) throw CodegenUnsupported("a private signal");
             for (int h : g.privHits_) noPriv.insert(g.origOf(h));
