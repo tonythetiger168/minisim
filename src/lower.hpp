@@ -5501,6 +5501,20 @@ struct Lowerer {
     void assignContainer(int dst, const slang::ast::Expression& rhs0) {
         using namespace slang::ast;
         const Expression& rhs = peel(rhs0);
+        if (const Expression* cv = &rhs0; true) {   // q = T'(v), a bit-stream cast (6.24.3): v's bits into elements
+            while (cv->kind == ExpressionKind::Conversion &&
+                   cv->as<ConversionExpression>().conversionKind != ConversionKind::Explicit &&
+                   cv->as<ConversionExpression>().conversionKind != ConversionKind::BitstreamCast)
+                cv = &cv->as<ConversionExpression>().operand();
+            if (cv->kind == ExpressionKind::Conversion && isDynType(*cv->type) &&
+                (rhs.type->isIntegral() || (rhs.type->isUnpackedStruct() && streamStruct(*rhs.type)))) {
+                if (dynShape(dst).kind == 2) unsupported("bit-stream cast into an associative array");
+                Instr i = dynCmd(dst, D_UNPACK);
+                i.e = expr(rhs);
+                prog.emit(i);
+                return;
+            }
+        }
         if (rhs.kind == ExpressionKind::Streaming) {   // q = {>>8{v}} (11.4.14.3): unpack into elements
             const auto& sc = rhs.as<StreamingConcatenationExpression>();
             if (dynShape(dst).kind == 2) unsupported("streaming into an associative array");
@@ -6231,6 +6245,22 @@ struct Lowerer {
                     return sized(streamTo(peel(c.operand()).as<StreamingConcatenationExpression>(), w),
                                  w, c.type->isSigned(), ctx);
                 }
+                if (c.type->isIntegral() && isDynType(*c.operand().type)) {
+                    // T'(container), a bit-stream cast (6.24.3): the elements'
+                    // bits, first element leftmost, as {>>{container}} packs them
+                    int d = dynSig(c.operand());
+                    const Type* et = c.operand().type->getArrayElementType();
+                    if (d < 0 || !et || !et->isIntegral() || dynShape(d).dflt.real || dynShape(d).dflt.str)
+                        unsupported("bit-stream cast of this container");
+                    int w = (int)c.type->getBitWidth();
+                    needWidth(w);
+                    auto b = node(Op::DynBits);
+                    b->sig = d;
+                    auto n = node(Op::StreamPack, {b});
+                    n->hi = w;
+                    n->lo = 0;
+                    return sized(n, w, c.type->isSigned(), ctx);
+                }
                 if (c.operand().type->isString() && c.type->isIntegral()) {   // the text as bytes (6.16)
                     int w = (int)c.type->getBitWidth();
                     needWidth(w);
@@ -6578,6 +6608,13 @@ struct Lowerer {
                         case BinaryOperator::Inequality: out = fcmp(5, realOf(b.left()), realOf(b.right())); break;
                         case BinaryOperator::LogicalAnd: out = bin(Op::LogAnd, truthOf(b.left()), truthOf(b.right())); break;
                         case BinaryOperator::LogicalOr: out = bin(Op::LogOr, truthOf(b.left()), truthOf(b.right())); break;
+                        case BinaryOperator::LogicalImplication:   // 11.4.7: !a || b
+                            out = bin(Op::LogOr, un(Op::LogNot, truthOf(b.left())), truthOf(b.right())); break;
+                        case BinaryOperator::LogicalEquivalence: {   // 11.4.7: (!a || b) && (!b || a)
+                            E l = truthOf(b.left()), r = truthOf(b.right());
+                            out = bin(Op::LogAnd, bin(Op::LogOr, un(Op::LogNot, l), r), bin(Op::LogOr, un(Op::LogNot, r), l));
+                            break;
+                        }
                         default: unsupported("operator on real operands");
                     }
                     return sized(out, 1, false, ctx);
