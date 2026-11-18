@@ -5058,7 +5058,7 @@ struct Lowerer {
                     while (leaf->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType)
                         leaf = &leaf->getCanonicalType().as<FixedSizeUnpackedArrayType>().elementType;
                     int lw = uWidth(*leaf);
-                    if (lw > 0 && (leaf->isIntegral() || leaf->isFloating() || leaf->isString())) {
+                    if (lw > 0 && (leaf->isIntegral() || leaf->isFloating() || leaf->isString() || leaf->isUnpackedStruct())) {
                         E pv = expr(x);
                         for (int top = uWidth(t); top > 0; top -= lw) {
                             auto sl = node(Op::Slice, {pv});
@@ -8943,7 +8943,8 @@ struct Lowerer {
                                 if (et->isFloating()) v = un(Op::AsReal, v);
                                 else if (et->isString()) v = un(Op::AsStr, v);
                             }
-                            pfmtSingular(*et, v, fmt, out);
+                            if (et->isUnpackedStruct() || et->isUnpackedUnion()) pfmtStruct(*et, v, fmt, out);
+                            else pfmtSingular(*et, v, fmt, out);
                         }
                     }
                     fmt += "}";
