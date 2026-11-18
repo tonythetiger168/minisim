@@ -6578,6 +6578,13 @@ struct Lowerer {
                         case BinaryOperator::Inequality: out = fcmp(5, realOf(b.left()), realOf(b.right())); break;
                         case BinaryOperator::LogicalAnd: out = bin(Op::LogAnd, truthOf(b.left()), truthOf(b.right())); break;
                         case BinaryOperator::LogicalOr: out = bin(Op::LogOr, truthOf(b.left()), truthOf(b.right())); break;
+                        case BinaryOperator::LogicalImplication:   // 11.4.7: !a || b
+                            out = bin(Op::LogOr, un(Op::LogNot, truthOf(b.left())), truthOf(b.right())); break;
+                        case BinaryOperator::LogicalEquivalence: {   // 11.4.7: (!a || b) && (!b || a)
+                            E l = truthOf(b.left()), r = truthOf(b.right());
+                            out = bin(Op::LogAnd, bin(Op::LogOr, un(Op::LogNot, l), r), bin(Op::LogOr, un(Op::LogNot, r), l));
+                            break;
+                        }
                         default: unsupported("operator on real operands");
                     }
                     return sized(out, 1, false, ctx);
