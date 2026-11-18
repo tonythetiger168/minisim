@@ -3980,8 +3980,9 @@ struct Lowerer {
         if (e.kind == ExpressionKind::ConditionalOp) {
             const auto& c = e.as<ConditionalExpression>();
             if (!sideEffects(c.left()) && !sideEffects(c.right())) return nullptr;
+            // An unpacked struct or union (from f() ? g() : h()) is held packed, as storeW lays it out.
             int w = isHandleType(*e.type) || e.type->isFloating() || e.type->isString() ? 64
-                  : ctx.live ? ctx.w : (int)e.type->getBitWidth();
+                  : ctx.live ? ctx.w : storeW(*e.type);
             needWidth(w);
             bool sg = ctx.live ? ctx.tag : e.type->isSigned();
             int tmp = fresh(w);
@@ -11903,8 +11904,29 @@ struct Lowerer {
                 if (peel(*tgt).kind == ExpressionKind::Concatenation) concatParts(*tgt, tw - 1, parts);
                 else parts.push_back({tgt, -1, -1});
                 E whole;
+                const Prog* pre = nullptr;
                 if (val) {
+                    // A function call in the expression (force b = f(a)) lowers to
+                    // code, not to an expression: that code becomes a program of
+                    // its own that the hold runs again whenever a value it reads
+                    // changes, leaving the result in a hidden signal.
+                    bool own = frames.empty() && store && mkSig && !consDepth;
+                    Prog saved;
+                    if (own) { saved = std::move(prog); prog = Prog{}; }
                     whole = expr(*val);
+                    if (own) {
+                        if (!prog.code.empty()) {
+                            int w = storeW(*val->type);
+                            needWidth(w);
+                            int t = freshStatic(w);
+                            Instr a; a.k = IK::Assign; a.sig = t; a.e = std::move(whole);
+                            prog.emit(a);
+                            store->push_back(std::make_unique<Prog>(std::move(prog)));
+                            pre = store->back().get();
+                            whole = ref(t, val->type->isSigned());
+                        }
+                        prog = std::move(saved);
+                    }
                     if (parts.size() > 1) {   // evaluated as one value, sliced per part
                         needWidth(tw);
                         whole = resize(whole, tw, false, false);
@@ -11923,6 +11945,7 @@ struct Lowerer {
                     i.hi = force ? 1 : 0;
                     i.lo = 0;
                     if (whole) i.e = phi >= 0 ? slice(whole, phi, plo) : whole;
+                    i.callee = pre;
                     usesForce() = true;
                     prog.emit(i);
                 }

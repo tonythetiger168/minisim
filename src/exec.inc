@@ -1221,6 +1221,22 @@ static void runAtomCall(const Prog* p) {
     g_fr = sf;
     g_ret = sr;
 }
+// force v = f(a) (10.6.2): the call, run to its end each time a value it
+// reads changes, before the forced value is read.
+static void runHoldPre(const Prog* p) {
+    Frame* sf = g_fr;
+    Frame* sr = g_ret;
+    auto ctl = make_shared<ProcCtl>();
+    Task t = exec(p, ctl, newFrame(nullptr, nullptr, 0));
+    t.h.resume();
+    if (!t.h.done()) {
+        cerr << "error: a function called in a force or assign expression waited (time " << S.now << ")\n";
+        exit(1);
+    }
+    t.h.destroy();
+    g_fr = sf;
+    g_ret = sr;
+}
 static void concTick(ConcAssert& c, uint32_t ticked = ~0u) {
     AssertInfo& a = asserts()[c.id];
     if (!a.killAt.empty()) {   // vpi_control(vpiAssertionKill, h, start) (39.5.2): those attempts only
@@ -1663,7 +1679,8 @@ inline Task exec(const Prog* entry, shared_ptr<ProcCtl> ctl, FrameP fr) {
             }
             case IK::Force:
                 S.holdSrc = {i.file, i.line};
-                S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey);
+                if (i.callee && !S.holdPreRun) S.holdPreRun = runHoldPre;
+                S.holdOn(i.sig, i.e, i.hi != 0, i.pw ? i.dkey + i.pw - 1 : -1, i.dkey, i.callee);
                 S.holdSrc = {};
                 pc++;
                 break;
