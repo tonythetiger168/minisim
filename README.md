@@ -521,6 +521,14 @@ waits on a sequence's end point. A design with more than 64 clock groups
 has 779 and ran 4.6x slower in the domain. `MSIM_WHYCYCLE=1` prints the
 domain's choices.
 
+A run-time select of up to 64 bits of a wider vector (`v[i]`, `v[i +: w]`,
+also nested, as SHA-3's lane reshaping in a function does) is read and
+written in place rather than through copies of the whole vector, and a cycle
+of more than 64 comb blocks is no longer merged into one block that re-ran
+whole on any change (`MSIM_CYCMERGEMAX`). OpenTitan Earl Grey with
+`-noassert` (Verilator's build leaves the assertions out): 60 us of
+simulation from 179 s to 53 s, and its C++ build to 9 minutes.
+
 ### Static combinational schedule
 
 Continuous assigns, gates, and straight-line `always_comb` / `always @*`

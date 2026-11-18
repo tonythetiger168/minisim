@@ -109,6 +109,7 @@ set(CASES
   "examples/mixed.sv"
   "-cfiles 3 examples/mixed.sv"
   "examples/nomix.sv"
+  "examples/widebits.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -204,6 +205,13 @@ foreach(c IN LISTS CASES)
     # (by its messages: a design.so there may be another case's from an earlier run)
     if(err MATCHES "interpreted|mixed mode")
       message(FATAL_ERROR "${c}: mixed mode\n${err}")
+    endif()
+  endif()
+  # Run-time bit selects of a wide vector read and write it in place.
+  if(c STREQUAL "examples/widebits.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(NOT gen MATCHES "bitsV\\(S\\.sigs" OR NOT gen MATCHES "S\\.setBitsV\\(")
+      message(FATAL_ERROR "${c}: the wide selects copy the whole vector")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).

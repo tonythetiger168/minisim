@@ -156,6 +156,21 @@ inline uint64_t limbX(const Val& a, int i) {
     if (i <= 0) return a.x;
     return i - 1 < (int)a.hi.size() ? a.hi[i - 1].x : 0;
 }
+// Up to 64 bits of a at bit offset off (off + w within a's width): value
+// bits, and X or Z bits (compiled code's run-time selects of wide vectors).
+inline uint64_t bitsV(const Val& a, uint64_t off, int w) {
+    const int l = (int)(off >> 6), sh = (int)(off & 63);
+    uint64_t r = limbV(a, l) >> sh;
+    if (sh && sh + w > 64) r |= limbV(a, l + 1) << (64 - sh);
+    return w >= 64 ? r : r & ((1ULL << w) - 1);
+}
+inline uint64_t bitsXZ(const Val& a, uint64_t off, int w) {
+    const int l = (int)(off >> 6), sh = (int)(off & 63);
+    auto xz = [&](int i) { return i <= 0 ? (a.x | a.z) : i - 1 < (int)a.hi.size() ? (a.hi[i - 1].x | a.hi[i - 1].z) : 0; };
+    uint64_t r = xz(l) >> sh;
+    if (sh && sh + w > 64) r |= xz(l + 1) << (64 - sh);
+    return w >= 64 ? r : r & ((1ULL << w) - 1);
+}
 inline uint64_t limbZ(const Val& a, int i) {
     if (i <= 0) return a.z;
     return i - 1 < (int)a.hi.size() ? a.hi[i - 1].z : 0;

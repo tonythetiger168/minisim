@@ -1704,6 +1704,37 @@ private:
             }
             case Op::DynSlice: {   // a[i +: w]: X when any of it is outside a
                 if (e->lo || e->kids.size() != 2) return false;
+                {
+                    // Up to 64 bits of a wide signal in S.sigs at a run-time
+                    // offset, through nested up-selects (v[i*320 +: 320][j*64 +: 64][k]):
+                    // read in place, not as copies of the whole vector.
+                    const Expr* c = e.get();
+                    int cw = e->hi;
+                    std::string off = "0";
+                    std::vector<std::string> oor;
+                    bool ok = cw >= 1 && cw <= 64;
+                    while (ok && c->op == Op::DynSlice && !c->lo && c->kids.size() == 2) {
+                        std::string I;
+                        FastInfo fi_{};
+                        if (!fx(c->kids[1], I, fi_, refs)) { ok = false; break; }
+                        const Expr* b = c->kids[0].get();
+                        int bw = b->op == Op::DynSlice && !b->lo ? b->hi
+                               : b->op == Op::Ref && !b->at && b->sig >= 0 && b->sig < (int)sigW_.size() ? sigW_[b->sig] : -1;
+                        if (bw < cw) { ok = false; break; }
+                        oor.push_back("(uint64_t)(" + I + ") > " + std::to_string(bw - cw));
+                        off = "(" + off + " + (uint64_t)(" + I + "))";
+                        cw = bw;
+                        c = b;
+                    }
+                    if (ok && c->op == Op::Ref && !c->at && !isRel(c->sig) && !isPriv(c->sig) && sigW_[c->sig] > 64 && !std::getenv("MSIM_NOWIDEBITS")) {
+                        const std::string val = "S.sigs[" + std::to_string(c->sig) + "].val";
+                        for (auto& q : oor) fxOor_.push_back(q);
+                        fxOor_.push_back("bitsXZ(" + val + ", " + off + ", " + std::to_string(e->hi) + ")");
+                        out = "bitsV(" + val + ", " + off + ", " + std::to_string(e->hi) + ")";
+                        fi = {e->hi, false};
+                        return true;
+                    }
+                }
                 if (!kid(0, A, fa) || !kid(1, B, fb)) return false;
                 int w = e->hi;
                 if (w < 1 || w > fa.w) return false;
@@ -6065,7 +6096,7 @@ private:
             if (i.k != IK::Assign) break;
             if (i.arr) throw CodegenUnsupported("array write in a static combinational process");
             if (i.bidx) {
-                o << L(pc) << ":" << CH(&p, pc) << dynTarget(i, fast(i.e), " S.set(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+                o << L(pc) << ":" << CH(&p, pc) << dynTarget(i, fast(i.e), " S.setBitsV(s, v, hi, lo);");
                 continue;
             }
             o << L(pc) << ":" << CH(&p, pc) << " " << assign(i);
@@ -6337,7 +6368,7 @@ private:
                 }
                 if (dynW) {
                     o << dynTarget(i, W(i, fast(i.e)), i.k == IK::Nba ? " S.nba(s, v, hi, lo);"
-                                                                      : " S.set(s, hi >= 0 ? v_insert(S.get(s), v, hi, lo) : v);");
+                                                                      : " S.setBitsV(s, v, hi, lo);");
                     continue;
                 }
                 switch (i.k) {
