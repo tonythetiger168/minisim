@@ -9139,13 +9139,26 @@ struct Lowerer {
                 const auto& ec = c.as<ExpressionConstraint>();
                 RandItem it;
                 it.soft = ec.isSoft;
-                const Expression& x = ec.expr;
+                const Expression* xp = &ec.expr;
+                E dg = guard;
+                for (;;) {   // g -> (v dist {...}) written as an expression (18.5.6): the dist under a guard
+                    const Expression& y = peel(*xp);
+                    if (y.kind != ExpressionKind::BinaryOp || y.as<BinaryExpression>().op != BinaryOperator::LogicalImplication) break;
+                    const Expression* r = &peel(y.as<BinaryExpression>().right());
+                    while (r->kind == ExpressionKind::BinaryOp && r->as<BinaryExpression>().op == BinaryOperator::LogicalImplication)
+                        r = &peel(r->as<BinaryExpression>().right());
+                    if (r->kind != ExpressionKind::Dist) break;
+                    E p = un(Op::LogNot, un(Op::LogNot, expr(y.as<BinaryExpression>().left())));
+                    dg = dg ? bin(Op::LogAnd, dg, p) : p;
+                    xp = &y.as<BinaryExpression>().right();
+                }
+                const Expression& x = dg != guard ? peel(*xp) : *xp;
                 if (x.kind == ExpressionKind::Dist) {   // 18.5.3
                     const auto& d = x.as<DistExpression>();
                     it.isDist = true;
                     if (auto* dw = d.defaultWeight()) it.distDefault = dw->expr ? expr(*dw->expr) : konst(mk(1, 32));
                     it.e = expr(d.left());
-                    it.guard = guard;
+                    it.guard = dg;
                     for (const auto& di : d.items()) {
                         RandDist rd;
                         if (di.value.kind == ExpressionKind::ValueRange) {
