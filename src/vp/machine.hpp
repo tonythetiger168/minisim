@@ -2130,6 +2130,17 @@ private:
             Jit::clearJt(V.jtPg, V.jtPgUsed);
             V.pgFpGen = h.fpGen;
             V.pgPriv = h.priv;
+            h.fpRegions.clear();
+        }
+        if (!h.fpRegions.empty()) {  // fetch pages dropped by SFENCE.VMA with an address
+            const unsigned sh = h.fpRegionShift();
+            for (uint32_t i : V.jtPgUsed) {
+                Jit::JtEntry& e = V.jtPg[i];
+                if (e.pc == ~0ull) continue;
+                for (uint64_t rg : h.fpRegions)
+                    if ((e.pc >> sh) == rg) { e = {~0ull, nullptr}; break; }
+            }
+            h.fpRegions.clear();
         }
         static_assert(sizeof(Hart::DataPage) == 16 && offsetof(Hart::DataPage, tag) == 0, "the translator's page cache lookup");
         JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, V.jtPg, h.dl, h.ds, (uint64_t)dataCtx(h) << 52,
@@ -3390,7 +3401,8 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
                     }
                     if ((insn & 0xfe007fff) == 0x12000073) {           // SFENCE.VMA
                         if (h.priv == 0 || (h.priv == 1 && (h.mstatus & MSTATUS_TVM))) ILLEGAL();
-                        h.flushTlb();
+                        if (rs1 && h.rv64 && h.paging()) h.flushTlbAt(x[rs1]);
+                        else h.flushTlb();
                         break;
                     }
                     ILLEGAL();

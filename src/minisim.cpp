@@ -2774,13 +2774,25 @@ struct Sim {
     // SF_PATHV: a variable that is a path output with no port connection of
     // its own (an interface terminal, 25.6): its writes arrive after the path delay.
     enum : uint8_t { SF_HELD = 1, SF_LISTEN = 2, SF_PART = 4, SF_VPI = 8, SF_PATHV = 16 };   // SF_VPI: a VPI value-change callback watches it
-    struct PartHold { int hi, lo; E fe, ae; };
-    struct Hold { E fe, ae; vector<PartHold> parts; };
+    // fpre / apre: a program that runs before fe / ae is read, when the
+    // expression calls a function (force b = f(a)): it leaves the result in
+    // the signal the expression reads, and its reads are listened to.
+    struct PartHold { int hi, lo; E fe, ae; const Prog *fpre = nullptr, *apre = nullptr; };
+    struct Hold { E fe, ae; vector<PartHold> parts; const Prog *fpre = nullptr, *apre = nullptr; };
     unordered_map<int, Hold> holds;
     unordered_map<int, vector<int>> holdListeners;   // signal -> held signals whose expression reads it
-    void listenTo(int s, const E& e) {
+    void (*holdPreRun)(const Prog*) = nullptr;   // runs a pre program to its end (exec.inc)
+    void listenTo(int s, const E& e, const Prog* pre = nullptr) {
         vector<int> refs;
         collectRefs(e, refs);
+        if (pre) {   // not what pre writes itself, or it would wake its own hold
+            std::unordered_set<int> wr;
+            std::vector<const Prog*> seen;
+            collectProgWrites(*pre, wr, seen);
+            std::erase_if(refs, [&](int r) { return wr.count(r) > 0; });
+            for (auto& [r, ed] : combReadSet(*pre))
+                if (std::find(refs.begin(), refs.end(), r) == refs.end()) refs.push_back(r);
+        }
         for (int r : refs) {
             auto& v = holdListeners[r];
             if (std::find(v.begin(), v.end(), s) == v.end()) v.push_back(s);
@@ -2802,16 +2814,17 @@ struct Sim {
         if (h.fe || h.ae) { sigs[s].fl |= SF_HELD; return; }
         for (auto& p : h.parts) if (p.fe || p.ae) { sigs[s].fl |= SF_PART; return; }
     }
-    void holdOn(int s, const E& e, bool force, int hi = -1, int lo = 0) {
+    void holdOn(int s, const E& e, bool force, int hi = -1, int lo = 0, const Prog* pre = nullptr) {
         auto& h = holds[s];
-        if (hi < 0) (force ? h.fe : h.ae) = e;
+        if (hi < 0) { (force ? h.fe : h.ae) = e; (force ? h.fpre : h.apre) = pre; }
         else {
             PartHold* ph = nullptr;
             for (auto& p : h.parts) if (p.hi == hi && p.lo == lo) ph = &p;
             if (!ph) { h.parts.push_back({hi, lo, nullptr, nullptr}); ph = &h.parts.back(); }
             (force ? ph->fe : ph->ae) = e;
+            (force ? ph->fpre : ph->apre) = pre;
         }
-        listenTo(s, e);
+        listenTo(s, e, pre);
         holdFlags(s, h);
         applyHold(s);
         if (vpiHoldCb) vpiHoldCb(s, force, true, hi, lo);
@@ -3307,6 +3320,11 @@ MSIM_KDEF void Sim::applyHold(int s) {
     const E& e = it->second.fe ? it->second.fe : it->second.ae;
     uint8_t fl = sigs[s].fl;
     if (e) {
+        if (const Prog* pre = it->second.fe ? it->second.fpre : it->second.apre; pre && holdPreRun) {
+            holdPreRun(pre);
+            it = holds.find(s);   // the program may have touched other holds
+            if (it == holds.end()) return;
+        }
         Val v = eval(e, rd);
         sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);
         set(s, v);
@@ -3316,6 +3334,7 @@ MSIM_KDEF void Sim::applyHold(int s) {
     Val v = sigs[s].val;
     for (auto& p : it->second.parts) {
         const E& pe = p.fe ? p.fe : p.ae;
+        if (const Prog* pre = p.fe ? p.fpre : p.apre; pe && pre && holdPreRun) holdPreRun(pre);
         if (pe) v = v_insert(v, eval(pe, rd), p.hi, p.lo);
     }
     sigs[s].fl &= (uint8_t)~(SF_HELD | SF_PART);

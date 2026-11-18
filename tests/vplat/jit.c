@@ -236,7 +236,51 @@ static uint64_t root[512] __attribute__((aligned(4096)));
 #define PTE(pa) (((uint64_t)(pa) >> 12) << 10 | 0xcf)  // V R W X A D
 static uint64_t machineSum;
 
+// SFENCE.VMA with an address: VA 0xc0000000 (root[3]) goes through l1;
+// l1[0] is a 2 MiB page, l1[1] a table of 4 KiB pages (l0). Remapping one
+// and fencing its address has to show the new page to loads and to code
+// already translated, and for the 2 MiB page to every 4 KiB of it.
+static uint64_t l1[512] __attribute__((aligned(4096)));
+static uint64_t l0[512] __attribute__((aligned(4096)));
+static volatile uint32_t codeA[1024] __attribute__((aligned(4096)));
+static volatile uint32_t codeB[1024] __attribute__((aligned(4096)));
+#define NONLEAF(pa) (((uint64_t)(pa) >> 12) << 10 | 0x01)
+#define MEG1 0x80400000u  // two 2 MiB regions of RAM the program does not use
+#define MEG2 0x80600000u
+#define VA4K 0xc0280000u  // (its fetch page record entry is not one the program's own pages take)
+static void sfenceVa(uintptr_t va) { __asm__ volatile("sfence.vma %0, zero" ::"r"(va) : "memory"); }
+static long callVa(uintptr_t va, int n) {
+    long s = 0;
+    for (int i = 0; i < n; i++) s += ((long (*)(void))va)();
+    return s;
+}
+static void remaps(void) {
+    codeA[0] = 0x00b00513;  // li a0, 11
+    codeA[1] = 0x00008067;  // ret
+    codeB[0] = 0x01600513;  // li a0, 22
+    codeB[1] = 0x00008067;
+    __asm__ volatile("fence.i" ::: "memory");
+    for (int k = 0; k < 40; k++) {
+        const uintptr_t pa = (k & 1) ? (uintptr_t)codeB : (uintptr_t)codeA;
+        l0[0x80] = PTE(pa);
+        sfenceVa(VA4K);
+        check("SFENCE.VMA va: the 4 KiB page's new code runs", (uint64_t)callVa(VA4K, 30), (k & 1) ? 660 : 330);
+        check("SFENCE.VMA va: loads see the new 4 KiB page", *(volatile uint32_t*)(VA4K + 4), 0x00008067);
+        check("SFENCE.VMA va: the new 4 KiB page's word", *(volatile uint32_t*)VA4K, (k & 1) ? 0x01600513u : 0x00b00513u);
+        // the 2 MiB page: fence one address, read another 4 KiB of it
+        l1[0] = PTE((k & 1) ? MEG2 : MEG1) | 0;
+        sfenceVa(0xc0000000u + 0x1000);
+        check("SFENCE.VMA va: the whole 2 MiB page is remapped", *(volatile uint64_t*)(0xc0000000u + 0x123000),
+              (k & 1) ? 0x2222u : 0x1111u);
+        // a load from it again and again (in the page caches) before the next round
+        uint64_t t = 0;
+        for (int i = 0; i < 50; i++) t += *(volatile uint64_t*)(0xc0000000u + 0x123000);
+        check("SFENCE.VMA va: the 2 MiB page, hot", t, 50 * ((k & 1) ? 0x2222u : 0x1111u));
+    }
+}
+
 static __attribute__((noinline, used)) void supervisor(void) {
+    remaps();
     seed = 0x9e3779b97f4a7c15ull;
     for (unsigned i = 0; i < sizeof pages; i++) pages[i] = 0;
     for (unsigned i = 0; i < 4; i++) lrCell[i] = 0;
@@ -274,6 +318,12 @@ int main(int hart) {
     csr_write(pmpcfg0, 0x1f);
     root[0] = PTE(0);
     root[2] = PTE(0x80000000u);
+    root[3] = NONLEAF(l1);
+    l1[0] = PTE(MEG1);
+    l1[1] = NONLEAF(l0);
+    l0[0x80] = PTE(codeA);
+    *(volatile uint64_t*)(MEG1 + 0x123000) = 0x1111;
+    *(volatile uint64_t*)(MEG2 + 0x123000) = 0x2222;
     csr_write(satp, (8ull << 60) | ((uintptr_t)root >> 12));
     __asm__ volatile("sfence.vma" ::: "memory");
     __asm__ volatile("csrc mstatus, %0" ::"r"(3ull << 11));

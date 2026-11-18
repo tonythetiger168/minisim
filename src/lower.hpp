@@ -3980,8 +3980,9 @@ struct Lowerer {
         if (e.kind == ExpressionKind::ConditionalOp) {
             const auto& c = e.as<ConditionalExpression>();
             if (!sideEffects(c.left()) && !sideEffects(c.right())) return nullptr;
+            // An unpacked struct or union (from f() ? g() : h()) is held packed, as storeW lays it out.
             int w = isHandleType(*e.type) || e.type->isFloating() || e.type->isString() ? 64
-                  : ctx.live ? ctx.w : (int)e.type->getBitWidth();
+                  : ctx.live ? ctx.w : storeW(*e.type);
             needWidth(w);
             bool sg = ctx.live ? ctx.tag : e.type->isSigned();
             int tmp = fresh(w);
@@ -4508,6 +4509,9 @@ struct Lowerer {
             }
             return;
         }
+        if (x.kind == ExpressionKind::Call && x.as<CallExpression>().isSystemCall() &&
+            sampledArrayElems(x.as<CallExpression>(), t, out))   // $past(arr) (16.9.3)
+            return;
         switch (x.kind) {
             case ExpressionKind::SimpleAssignmentPattern:
                 for (auto* el : x.as<SimpleAssignmentPatternExpression>().elements()) arrayElems(et, *el, out);
@@ -6319,6 +6323,24 @@ struct Lowerer {
                 if ((n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor") && !call.arguments().empty() &&
                     call.arguments()[0]->type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType)
                     return sized(fixedReduce(call, n), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                // $timeunit / $timeprecision (20.4.1): a power of ten (Table 20-2), of
+                // this scope, of a named instance, of $unit, or with $root the
+                // simulation precision.
+                if (n == "$timeunit" || n == "$timeprecision") {
+                    bool unit = n == "$timeunit";
+                    int u = tsUnit, pr = tsPrec;
+                    if (!call.arguments().empty()) {
+                        const Expression& x = peel(*call.arguments()[0]);
+                        const Symbol* sym = x.kind == ExpressionKind::ArbitrarySymbol ? x.as<ArbitrarySymbolExpression>().symbol.get() : nullptr;
+                        std::optional<slang::TimeScale> ts;
+                        if (sym && sym->kind == SymbolKind::Root) u = pr = simPrecExp();
+                        else if (sym && sym->kind == SymbolKind::Instance) ts = sym->as<InstanceSymbol>().body.getTimeScale();
+                        else if (sym && sym->isScope()) ts = sym->as<Scope>().getTimeScale();
+                        else unsupported("$timeunit / $timeprecision of this argument");
+                        if (ts) { u = tsExp(ts->base); pr = tsExp(ts->precision); }
+                    }
+                    return sized(konst(mk((uint64_t)(int64_t)(unit ? u : pr), 32)), 32, true, ctx);
+                }
                 // $time / $stime / $realtime (20.3.1): the current time. minisim
                 // has one time unit, so $realtime is the same integer.
                 if (n == "$time" || n == "$stime") {
@@ -8183,9 +8205,21 @@ struct Lowerer {
         if (n == "$value$plusargs" && args.size() == 2) {
             // "N=%d": the prefix is the text before the %, the letter says how
             // to read the rest. The variable is written only on a match.
+            // The user string may be any string expression (21.6); one built
+            // as {name, "=%s"} (a prefix known only at run time, the
+            // specifier in its last, literal part) is read the same way.
             const auto& f = peel(*args[0]);
-            if (f.kind != slang::ast::ExpressionKind::StringLiteral) unsupported("$value$plusargs format that is not a literal");
-            std::string fs(f.as<slang::ast::StringLiteral>().getValue());
+            std::vector<E> head;   // the run-time parts before the literal one
+            const slang::ast::Expression* lit = &f;
+            if (f.kind == slang::ast::ExpressionKind::Concatenation) {
+                auto ops = f.as<slang::ast::ConcatenationExpression>().operands();
+                if (!ops.empty()) {
+                    lit = &peel(*ops.back());
+                    for (size_t k = 0; k + 1 < ops.size(); k++) head.push_back(strOf(*ops[k]));
+                }
+            }
+            if (lit->kind != slang::ast::ExpressionKind::StringLiteral) unsupported("$value$plusargs format that is not a literal or ends in one");
+            std::string fs(lit->as<slang::ast::StringLiteral>().getValue());
             size_t pc = fs.find('%');
             if (pc == std::string::npos) unsupported("$value$plusargs format without a specifier");
             size_t q = pc + 1;
@@ -8195,6 +8229,10 @@ struct Lowerer {
             if (std::string_view("dhxobsfeg").find(c) == std::string_view::npos) unsupported("$value$plusargs format letter");
             if (!stmtDepth) unsupported("$value$plusargs outside a procedural statement");
             E pre = konst(mkstr(fs.substr(0, pc)));
+            if (!head.empty()) {
+                head.push_back(pre);
+                pre = node(Op::StrCat, std::move(head));   // read again for the value: the parts have no side effects
+            }
             int found = fresh(32);
             Instr t; t.k = IK::Assign; t.sig = found; t.e = sysFnNode(SF_PLUS_TEST, {pre});
             prog.emit(t);
@@ -11887,8 +11925,29 @@ struct Lowerer {
                 if (peel(*tgt).kind == ExpressionKind::Concatenation) concatParts(*tgt, tw - 1, parts);
                 else parts.push_back({tgt, -1, -1});
                 E whole;
+                const Prog* pre = nullptr;
                 if (val) {
+                    // A function call in the expression (force b = f(a)) lowers to
+                    // code, not to an expression: that code becomes a program of
+                    // its own that the hold runs again whenever a value it reads
+                    // changes, leaving the result in a hidden signal.
+                    bool own = frames.empty() && store && mkSig && !consDepth;
+                    Prog saved;
+                    if (own) { saved = std::move(prog); prog = Prog{}; }
                     whole = expr(*val);
+                    if (own) {
+                        if (!prog.code.empty()) {
+                            int w = storeW(*val->type);
+                            needWidth(w);
+                            int t = freshStatic(w);
+                            Instr a; a.k = IK::Assign; a.sig = t; a.e = std::move(whole);
+                            prog.emit(a);
+                            store->push_back(std::make_unique<Prog>(std::move(prog)));
+                            pre = store->back().get();
+                            whole = ref(t, val->type->isSigned());
+                        }
+                        prog = std::move(saved);
+                    }
                     if (parts.size() > 1) {   // evaluated as one value, sliced per part
                         needWidth(tw);
                         whole = resize(whole, tw, false, false);
@@ -11907,6 +11966,7 @@ struct Lowerer {
                     i.hi = force ? 1 : 0;
                     i.lo = 0;
                     if (whole) i.e = phi >= 0 ? slice(whole, phi, plo) : whole;
+                    i.callee = pre;
                     usesForce() = true;
                     prog.emit(i);
                 }
@@ -12622,7 +12682,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         int sg = mkSig("__event" + std::to_string((*tempSeq)++), w, false);
         // Start equal to the expression, before any procedure waits, so
         // variables that start with a value give no event at time 0.
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         {
             Instr i0; i0.k = IK::Assign; i0.sig = sg;
             i0.e = init->expr(x);
@@ -12816,14 +12876,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     // starts. All of them go into one process that lower() places first, so
     // it is the first thing to run at time 0. Locals of a block, task or
     // function are not module members and are handled by Lowerer.
-    std::unique_ptr<Lowerer> init;
+    std::unique_ptr<Lowerer> init;   // runs as a procedure (stmtDepth 1): an initializer may call $value$plusargs, $sscanf, pop() ...
     std::unique_ptr<Lowerer> init0;   // default values (no initializer): run before every initializer
     void handle(const slang::ast::VariableSymbol& v) {
         const slang::ast::Expression* e = v.getInitializer();
         if (initEventArray(v)) return;
         if (v.getType().isEvent()) {   // both counters start at 0: not triggered
             if (!sigmap.count(&v)) return;   // an automatic one lives in a frame
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
             for (int k = 0; k < 2; k++) {
                 Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v) + k;
                 i.e = konst(mk(0, k ? 64 : 32));
@@ -12867,7 +12927,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!e) return;
         const auto& v = ps.internalSymbol->as<VariableSymbol>();
         if (!sigmap.count(&v) || arrMap().count(&v) || dynMap().count(&v)) Lowerer::unsupported("this output port initializer");
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         init->setScope(ps.getParentScope());
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
         i.e = resize(init->expr(*e), storeW(v.getType()), e->type->isSigned(), v.getType().isSigned());
@@ -12886,7 +12946,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         auto ea = evArrs().find(&v);
         if (ea == evArrs().end()) return false;
         if (ea->second.first) return true;   // an automatic one lives in a frame
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         for (int k = 0; k < 2 * ea->second.second->count; k++) {
             Instr i; i.k = IK::Assign; i.sig = ea->second.second->base + k;
             i.e = konst(mk(0, k & 1 ? 64 : 32));
@@ -12899,12 +12959,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (initEventArray(v)) return;
         if (auto it = dynMap().find(&v); it != dynMap().end()) {   // int q[$] = '{1, 2};
             if (!e) return;
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
             init->assignContainer(it->second, *e);
             return;
         }
         if (e && arrMap().count(&v)) {   // int a[3] = '{1, 2, 3};
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
             init->assignWholeArray(v, v.getType(), *e, false);
             return;
         }
@@ -12962,7 +13022,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             init0->prog.emit(i);
             if (!e) return;
         }
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
         i.e = init->expr(*e);
         init->prog.emit(i);
@@ -14261,7 +14321,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             int fs = sigmap.at(&f);
             int w = storeW(f.getType());
             if (const Expression* ie = c.getOutputInitialExpr()) {   // output int ctr = 0 (17.2)
-                if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+                if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
                 Instr i; i.k = IK::Assign; i.sig = fs;
                 i.e = resize(init->expr(*ie), w, f.getType().isSigned(), ie->type->isSigned());
                 init->prog.emit(i);
@@ -15446,7 +15506,15 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     for (const auto& ex : comp.getDPIExports()) {   // export "DPI-C" (35.5.4)
         using namespace slang::ast;
         auto it = subMap.find(ex.subroutine);
-        if (it == subMap.end()) Lowerer::unsupported("DPI export of this subroutine");
+        if (it == subMap.end()) {
+            // An export in a generate block not taken, or in a module nothing
+            // instantiates, has no instance to call into: it is left out, as
+            // other simulators do (the C side cannot reach it either).
+            const auto* sc = ex.subroutine->getParentScope();
+            if (sc && sc->isUninstantiated()) continue;
+            Lowerer::lastLoc() = ex.subroutine->location;
+            Lowerer::unsupported("DPI export of this subroutine");
+        }
         Subr* sub = it->second;
         if (sub->lay) Lowerer::unsupported("DPI export of an automatic task, or of a function that recurses");
         sub->root = true;
