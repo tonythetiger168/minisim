@@ -3247,8 +3247,13 @@ struct Sim {
         for (int id : seqq) seqPend[id] = 0;
         seqq.clear();
         finished = false;
-        for (auto& t : ts) spawn(t);
-        run(~0ULL, false);
+        // One at a time: $finish in a final procedure ends the simulation
+        // at once, so the final procedures after it do not run (9.2.3).
+        for (auto& t : ts) {
+            if (finished) break;
+            spawn(t);
+            run(~0ULL, false);
+        }
     }
     void run(uint64_t end, bool start = true);   // kernel object (MSIM_KDEF below)
 };
