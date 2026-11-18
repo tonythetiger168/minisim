@@ -14725,6 +14725,38 @@ framedSubroutines(const std::vector<const slang::ast::SubroutineSymbol*>& all,
     return out;
 }
 
+// A static subroutine on a call cycle (13.4.2) is legal, but every call
+// shares its one copy of the arguments and variables, so a recursive
+// factorial written as a static function gives results that depend on
+// operand evaluation order: warn when it has arguments.
+inline void warnRecursive(const std::vector<Subr*>& subs) {
+    enum class Color { White, Gray, Black };
+    std::unordered_map<const Subr*, Color> color;
+    std::unordered_set<const Subr*> warned;
+    for (Subr* s : subs) color[s] = Color::White;
+    auto dfs = [&](auto& self, Subr* s) -> void {
+        color[s] = Color::Gray;
+        for (Subr* c : s->calls) {
+            if (c->lay) continue;   // an automatic subroutine may recurse (13.4.2)
+            if (color[c] == Color::Gray && c->sym && !c->sym->getArguments().empty() && warned.insert(c).second)
+                std::cerr << "msim: warning: static " << (c->sym->subroutineKind == slang::ast::SubroutineKind::Task ? "task" : "function")
+                          << " '" << c->sym->name << "' is called recursively; every call shares its arguments and variables"
+                             " (declare it automatic for a copy per call, 13.4.2)\n";
+            if (color[c] == Color::White) self(self, c);
+        }
+        color[s] = Color::Black;
+    };
+    // Only cycles that can run matter: a static task that calls itself only
+    // through subroutines nothing calls is never entered. Class methods may be
+    // reached through a virtual method table, so they count as called.
+    auto entered = [](const Subr* s) {
+        if (s->root || s->cls) return true;
+        const auto* sc = s->sym ? s->sym->getParentScope() : nullptr;
+        return !s->sym || (sc && sc->asSymbol().kind == slang::ast::SymbolKind::ClassType);
+    };
+    for (Subr* s : subs)
+        if (color[s] == Color::White && entered(s)) dfs(dfs, s);
+}
 
 // Object shape, constructor and virtual method table of every class,
 // base classes first (8.13). Called after every subroutine has its Subr.
@@ -15864,6 +15896,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     pc.finishUserNets();
     pc.placeInit();
     sampledInit(out);
+    warnRecursive(order);
     // Virtual interfaces (25.9): each referenced instance's signal for each
     // member reached through a virtual interface.
     {
