@@ -2019,6 +2019,20 @@ static std::string kernelObject(const std::string& cc, const std::string& cflags
     return obj;
 }
 
+// A one-bit port connection that passes on a weak strength (23.3.3.7):
+// msimMain makes it a switch when its source can be weak. Same test.
+static bool weakPorts(const LowerResult& lowered) {
+    if (lowered.portStr.empty()) return false;
+    std::vector<char> weak(S.sigs.size(), 0);
+    for (auto& [s, k] : lowered.netKinds) if (k != NR_WIRE) weak[(size_t)s] = 1;
+    for (auto& m : lowered.mos) weak[(size_t)m.out] = 1;
+    for (auto& t : lowered.trans) weak[(size_t)t.a] = weak[(size_t)t.b] = 1;
+    for (auto& lp : lowered.procs)
+        for (auto& i : lp.prog.code)
+            if (i.drv >= 0 && i.sig >= 0 && (i.s0 != STR_STRONG || i.s1 != STR_STRONG)) weak[(size_t)i.sig] = 1;
+    for (auto& m : lowered.portStr) if (weak[(size_t)m.src]) return true;
+    return false;
+}
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -2036,6 +2050,9 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             c.v = g.val.v;
             c.x = g.val.x;
             c.z = g.val.z;
+        } else if (!g.net && g.val.str && !g.val.x && !v_str(g.val).empty()) {
+            sigs.back().strInit = true;
+            sigs.back().strText = v_str(g.val);
         } else if (g.w > 64 && !g.net && !g.val.real && !g.val.str && !g.val.v && !g.val.x && !g.val.z) {
             bool z = true;
             for (auto& h : g.val.hi) z &= !h.v && !h.x && !h.z;
@@ -2099,6 +2116,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     const char* why = !lowered.finals.empty() ? "a final block"
                     : !lowered.netDelays.empty() ? "a net delay"
                     : !lowered.netKinds.empty() ? "a wand/wor/tri0/tri1/trireg/supply net"
+                    : weakPorts(lowered) ? "a port that passes on a strength other than strong"
                     : std::any_of(asserts().begin(), asserts().end(), [](const AssertInfo& a) {
                           return a.hidden || (a.type & (AT_CONCURRENT | AT_FINAL | AT_EXPECT));
                       }) ? "a concurrent, final or expect assertion"
@@ -2114,8 +2132,10 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // So is the rest of msim's runtime (assertions, clocking blocks,
     // covergroups, net kinds, VPI, ...): set up and run by msim around the
     // library's processes. Not compiled into a simv yet.
+    std::string mixWhy;
     if ((why || g_mixForce) && mixOK) {
         mix.domain = !g_mixForce && why && std::string(why) == "a final block";
+        mixWhy = g_mixForce ? g_mixForce : why;
         why = nullptr;
         mix.on = true;   // force: no simv
     }
@@ -2354,6 +2374,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         else if (!mix.procs.empty())
             std::cerr << "msim: -compile: " << mix.procs.size() << " of " << lowered.procs.size()
                       << " processes interpreted (" << mix.procs[0].second << "; MSIM_WHYMIX=1 lists them)\n";
+        else if (!mixWhy.empty())
+            std::cerr << "msim: -compile: mixed mode for " << mixWhy << " (msim runs the simulation)\n";
         return -2;
     }
     std::string run = shq(exe);

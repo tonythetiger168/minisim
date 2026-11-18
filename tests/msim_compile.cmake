@@ -108,7 +108,10 @@ set(CASES
   "-cfiles 3 examples/mixed.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
-  "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c")
+  "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
+  "tests/spec/6.20.2-unpacked-struct-parameter.sv"
+  "tests/spec/23.3.3.7-port-passes-strength.sv"
+  "-no-static-comb tests/spec/9.2.2.2-comb-cycle-defaults-event.sv")
 set(n 0)
 foreach(c IN LISTS CASES)
   math(EXPR mine "${n} % ${SHARDS}")
