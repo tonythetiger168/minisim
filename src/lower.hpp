@@ -2470,14 +2470,16 @@ struct Lowerer {
                 copyArrayOut(*formal.arr, as.left(), src);
                 continue;
             }
-            Instr i;
-            i.k = IK::Assign;
-            lhs(as.left(), i);
             OutSlot slot{formal.sig, formal.w, formal.sgn};
             const OutSlot* saved = outSlot;
             outSlot = &slot;
-            i.e = cloneConts(*as.left().type, expr(as.right()));
+            E v = cloneConts(*as.left().type, expr(as.right()));
             outSlot = saved;
+            if (concatTarget(as.left(), v)) continue;   // an output into {a, b} (11.4.12)
+            Instr i;
+            i.k = IK::Assign;
+            lhs(as.left(), i);
+            i.e = std::move(v);
             prog.emit(i);
         }
 
@@ -2593,14 +2595,16 @@ struct Lowerer {
             const Expression& a = *args[n];
             if (a.kind == ExpressionKind::EmptyArgument) continue;
             const auto& as = a.as<AssignmentExpression>();
-            Instr i;
-            i.k = IK::Assign;
-            lhs(as.left(), i);
             OutSlot slot{formal.sig, formal.w, formal.sgn};
             const OutSlot* saved = outSlot;
             outSlot = &slot;
-            i.e = expr(as.right());
+            E v = expr(as.right());
             outSlot = saved;
+            if (concatTarget(as.left(), v)) continue;   // an output into {a, b} (11.4.12)
+            Instr i;
+            i.k = IK::Assign;
+            lhs(as.left(), i);
+            i.e = std::move(v);
             prog.emit(i);
         }
         if (!wantValue) return {};
@@ -4477,6 +4481,12 @@ struct Lowerer {
         const Type& et = ft.elementType;
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
+        if (x.kind == ExpressionKind::ElementSelect || x.kind == ExpressionKind::RangeSelect) {
+            // P[0] of a parameter array, constant indexes: its elements as constants
+            const Symbol* b = selectBase(x);
+            if (b && b->kind == SymbolKind::Parameter)
+                if (auto cv = tryConst(x, b); cv.isUnpacked()) { constElems(t, cv, out); return; }
+        }
         if (auto sa = subArraySel(x)) {   // m[i]: a sub-array of a multidimensional array (7.4.5)
             for (auto& idx : subArrayIdx(*sa)) {
                 auto rd = node(Op::ArrRead, std::move(idx));
@@ -10501,6 +10511,29 @@ struct Lowerer {
         prog.emit(f);
     }
 
+    // An output or inout argument whose actual is a concatenation (13.5,
+    // 35.5.1.2, 11.4.12): v into a temporary, then each part its slice.
+    // False when left is not a concatenation.
+    bool concatTarget(const slang::ast::Expression& left, const E& v) {
+        using namespace slang::ast;
+        const Expression* tgt = &left;
+        if (const Expression* c = modportConn(peel(*tgt))) tgt = c;
+        if (peel(*tgt).kind != ExpressionKind::Concatenation) return false;
+        int w = (int)left.type->getBitWidth();
+        needWidth(w);
+        int tmp = fresh(w);
+        Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = resize(v, w, false, false);
+        prog.emit(hold);
+        std::vector<std::tuple<const Expression*, int, int>> parts;
+        concatParts(*tgt, w - 1, parts);
+        for (auto& [x, hi, lo] : parts) {
+            Instr i; i.k = IK::Assign;
+            lhs(*x, i);
+            i.e = slice(ref(tmp), hi, lo);
+            prog.emit(i);
+        }
+        return true;
+    }
     // {a, b} = v; {a, b} <= v; {a, b} = #d v: v is evaluated once, into a
     // temporary as wide as the target, and each part takes its slice.
     void concatAssign(const slang::ast::AssignmentExpression& a) {
@@ -10760,6 +10793,16 @@ struct Lowerer {
         if (r.kind == ExpressionKind::Streaming && !streamIsDyn(r.as<StreamingConcatenationExpression>())) {
             v = streamBits(r.as<StreamingConcatenationExpression>(), rw);   // {>>{a}} = {<<8{a}}
             if (rw < sw) unsupported("streaming assignment from a narrower stream");
+        } else if (r.type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
+            // {>>{x}} = arr (11.4.14.3): the array's bit stream, its left element first
+            const Type* leaf = &r.type->getCanonicalType();
+            while (leaf->isUnpackedArray()) leaf = &leaf->getArrayElementType()->getCanonicalType();
+            if (!leaf->isIntegral()) unsupported("streaming assignment from an array of this element type");
+            std::vector<E> els;
+            arrayElems(*r.type, r, els);
+            rw = (int)els.size() * (int)leaf->getBitWidth();
+            if (rw < sw) unsupported("streaming assignment from a narrower value");
+            v = els.size() == 1 ? els[0] : node(Op::Concat, std::move(els));
         } else {
             if (!r.type->isIntegral() || rw < sw) unsupported("streaming assignment from a narrower or non-integral value");
             v = expr(r);
