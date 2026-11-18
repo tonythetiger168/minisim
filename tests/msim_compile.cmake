@@ -237,7 +237,8 @@ foreach(c IN LISTS CASES)
     endif()
   endif()
   # ...and outside the cycle domain too: one comb and one clocked function
-  # per module, called with each instance's distances (codegen.hpp shareEv).
+  # per module, called with each instance's distances (codegen.hpp shareEv;
+  # with -cfiles the names carry a hash).
   if(c MATCHES "examples/shareev")
     file(GLOB srcs ${OUT}/c${n}/*.cpp)
     set(gen "")
@@ -245,7 +246,7 @@ foreach(c IN LISTS CASES)
       file(READ ${f} t)
       string(APPEND gen "${t}")
     endforeach()
-    if(NOT gen MATCHES "void combS[0-9]+\\(const void\\* x_" OR NOT gen MATCHES "void seqS[0-9]+\\(const void\\* x_")
+    if(NOT gen MATCHES "void comb[cv]?S[0-9a-f_]+\\(const void\\* x_" OR NOT gen MATCHES "void seqS[0-9a-f_]+\\(const void\\* x_")
       message(FATAL_ERROR "${c}: the instances' comb and clocked functions are not shared")
     endif()
   endif()
