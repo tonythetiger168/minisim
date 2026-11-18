@@ -144,6 +144,13 @@ inline std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*>&
     static std::unordered_map<const slang::ast::Symbol*, const slang::ast::Symbol*> m;
     return m;
 }
+// A ref port connected to an element of a fixed-size array with constant
+// indices (23.3.3): the port variable -> the array and the element's indices.
+// The port is that element's signal.
+inline std::unordered_map<const slang::ast::Symbol*, std::pair<const slang::ast::Symbol*, std::vector<int64_t>>>& elemAliasOf() {
+    static std::unordered_map<const slang::ast::Symbol*, std::pair<const slang::ast::Symbol*, std::vector<int64_t>>> m;
+    return m;
+}
 // Events that an assignment or initializer may make an alias of another
 // (6.17): symbol -> a 64-bit slot holding (signal id + 1) of the event it names now.
 inline std::unordered_map<const slang::ast::Symbol*, int>& eventPtr() {
@@ -12892,8 +12899,10 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
     SigCollector(MkSig f, std::unordered_map<const slang::ast::Symbol*, int>& m)
         : mkSig(std::move(f)), sigmap(m) {}
     std::vector<const slang::ast::Symbol*> aliased;   // nets that share another net's signal
+    std::vector<const slang::ast::Symbol*> elemAliased;   // ref ports that are an array element's signal
     template <typename T> void reg(const T& s, bool net) {
         if (auto a = aliasOf().find(&s); a != aliasOf().end() && a->second != &s) { aliased.push_back(&s); return; }
+        if (elemAliasOf().count(&s)) { elemAliased.push_back(&s); return; }
         if (Lowerer::isDynType(s.getType())) { regDyn(s); return; }
         if (auto sh = eventArrayShape(s.getType())) {   // event e[4] (15.5): two signals per element
             std::string base = prefix + std::string(s.name);
@@ -13099,6 +13108,16 @@ struct SigCollector : slang::ast::ASTVisitor<SigCollector> {
             if (auto it = dynMap().find(root); it != dynMap().end()) { dynMap()[s] = it->second; any = true; }
             if (auto it = dynArrMap().find(root); it != dynArrMap().end()) { dynArrMap()[s] = it->second; any = true; }
             if (!any) Lowerer::unsupported("alias of a net that has no signal");
+        }
+        for (const auto* s : elemAliased) {
+            auto [arr, idx] = elemAliasOf().at(s);
+            if (auto r = aliasOf().find(arr); r != aliasOf().end()) arr = r->second;
+            auto it = arrMap().find(arr);
+            if (it == arrMap().end() || isRel(it->second->base) || it->second->dynElem)
+                Lowerer::unsupported("ref port connected to an element of this array");
+            int64_t off = it->second->offset(idx);
+            if (off < 0) Lowerer::unsupported("ref port connected to an element outside its array");
+            sigmap[s] = it->second->base + (int)off;
         }
         for (auto [s, k] : aliasedKinds)
             if (auto it = sigmap.find(s); it != sigmap.end()) netKinds().push_back({it->second, k});
@@ -14726,7 +14745,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
                 (ps.internalSymbol->kind != SymbolKind::Net || Lowerer::isDynType(ps.getType()) ||
                  ps.internalSymbol->as<NetSymbol>().netType.netKind == NetType::UserDefined))
                 continue;
-            if (ps.direction == ArgumentDirection::Ref) Lowerer::unsupported("ref port connected to anything but a whole variable");
+            if (ps.internalSymbol && elemAliasOf().count(ps.internalSymbol)) continue;   // the element's own signal
+            if (ps.direction == ArgumentDirection::Ref) Lowerer::unsupported("ref port connected to anything but a whole variable or an array element");
             if (ps.internalSymbol && Lowerer::isDynType(ps.getType()))
                 Lowerer::unsupported("container port connected to anything but a whole container variable");
             if (ps.getType().getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType) {
@@ -15550,6 +15570,7 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
     fsmDefs().clear();
     {   // alias statements (10.11), before any signal is made
         aliasOf().clear();
+        elemAliasOf().clear();
         coercedPorts().clear();
         interconnectW().clear();
         // How many things drive each net from where it is declared or
@@ -15652,6 +15673,26 @@ inline LowerResult lower(slang::ast::Compilation& comp, MkSig mkSig,
                     if (!x) continue;
                     const Expression* y = &Lowerer::peel(*x);
                     if (y->kind == ExpressionKind::Assignment) y = &Lowerer::peel(y->as<AssignmentExpression>().left());
+                    if (y->kind == ExpressionKind::ElementSelect) {   // .r(mem[2]) on a ref port: that element (23.3.3)
+                        const auto& ps = c->port.as<PortSymbol>();
+                        const Symbol* in = ps.internalSymbol;
+                        std::vector<int64_t> idx;
+                        const Expression* b = y;
+                        bool ok = ps.direction == ArgumentDirection::Ref && in && in->kind == SymbolKind::Variable &&
+                                  ps.getType().isIntegral();
+                        while (ok && b->kind == ExpressionKind::ElementSelect) {
+                            const auto& es = b->as<ElementSelectExpression>();
+                            if (es.value().type->getCanonicalType().kind != SymbolKind::FixedSizeUnpackedArrayType ||
+                                !Lowerer::knownIndex(es.selector())) { ok = false; break; }
+                            idx.insert(idx.begin(), Lowerer::constInt(es.selector()));
+                            b = &Lowerer::peel(es.value());
+                        }
+                        if (ok && (b->kind == ExpressionKind::NamedValue || b->kind == ExpressionKind::HierarchicalValue) &&
+                            b->as<ValueExpressionBase>().symbol.kind == SymbolKind::Variable &&
+                            ps.getType().isMatching(*y->type))
+                            elemAliasOf()[in] = {&b->as<ValueExpressionBase>().symbol, std::move(idx)};
+                        continue;
+                    }
                     if (y->kind != ExpressionKind::NamedValue && y->kind != ExpressionKind::HierarchicalValue) continue;
                     const Symbol& ns = y->as<ValueExpressionBase>().symbol;
                     // An inout port joined to a whole net is that net (23.3.3.1):
