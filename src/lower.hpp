@@ -5906,7 +5906,9 @@ struct Lowerer {
     // container-valued calls a scratch container holding it; -1 if neither.
     bool isDynCall(const slang::ast::Expression& x) {
         const auto& p = peel(x);
-        return stmtDepth && p.kind == slang::ast::ExpressionKind::Call && isDynType(*p.type);
+        // q[i:j] (7.10.1) as a value (printed with %p, a method called on it) is held the same way
+        return stmtDepth && (p.kind == slang::ast::ExpressionKind::Call || p.kind == slang::ast::ExpressionKind::RangeSelect) &&
+               isDynType(*p.type);
     }
     int dynValue(const slang::ast::Expression& x) {
         int d = dynSig(x);
