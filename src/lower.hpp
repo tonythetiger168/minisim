@@ -7053,6 +7053,25 @@ struct Lowerer {
         }
     }
 
+    // @(h.e) or @(v.x) while the handle h or virtual interface v is still
+    // null (a process that starts before the object is made): wait for the
+    // handle to change until it is set, then wait on what it names. Only a
+    // handle held in a static variable is watched this way.
+    void waitNonNull(const slang::ast::Expression& h0) {
+        using namespace slang::ast;
+        const Expression& h = peel(h0);
+        if (h.kind != ExpressionKind::NamedValue) return;
+        int hs = sigFind(&h.as<NamedValueExpression>().symbol);
+        if (hs < 0 || isRel(hs)) return;
+        size_t top = prog.here();
+        Instr j; j.k = IK::JmpIfNot;
+        j.e = bin(Op::Eq, ref(hs), konst(mk(0, 64)));
+        size_t jf = prog.emit(j);
+        prog.emit(waitInstr({{hs, ANY}}));
+        Instr b; b.k = IK::Jmp; b.target = top;
+        prog.emit(b);
+        prog.code[jf].target = prog.here();
+    }
     // ---------- statements ----------
     // Collect (signal, edge) pairs from a SignalEvent or EventList control.
     // BothEdges is a posedge and a negedge entry. (@* is handled in timing()/finishImplicit().)
@@ -7088,7 +7107,10 @@ struct Lowerer {
                 return;
             }
             int sig;
-            if (classMember(s.expr) || vifAccess(s.expr)) sig = eventSig(s.expr);   // @(h.e), @(h.x), @(v.x)
+            if (classMember(s.expr) || vifAccess(s.expr)) {   // @(h.e), @(h.x), @(v.x)
+                waitNonNull(vifAccess(s.expr) ? *vifBase(s.expr) : s.expr.as<MemberAccessExpression>().value());
+                sig = eventSig(s.expr);
+            }
             else if (s.expr.kind == ExpressionKind::ElementSelect && s.expr.type->isEvent()) sig = eventSig(s.expr);   // @(e[i])
             else if (ValueExpressionBase::isKind(s.expr.kind) && s.expr.type->isEvent())
                 sig = eventSig(s.expr);   // an event that may be an alias (6.17) or an argument
