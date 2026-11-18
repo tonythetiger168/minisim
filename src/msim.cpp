@@ -1690,8 +1690,16 @@ static void mergeCombCycles(LowerResult& lowered) {
     std::vector<char> drop(lowered.procs.size(), 0);
     static int serial = 0;
     size_t nMerged = 0;
+    // A large cycle stays as separate processes: merged, any change re-ran all
+    // of it (OpenTitan's rram_ctrl, 15227 blocks: 44% of the run, 1.8x
+    // slower than event-driven). The design then has no cycle domain.
+    static const size_t maxMerge = [] { const char* e = std::getenv("MSIM_CYCMERGEMAX"); return e ? (size_t)std::atol(e) : (size_t)64; }();
     for (auto& [id, mem] : comps) {
         if (mem.size() < 2) continue;
+        if (mem.size() > maxMerge) {
+            if (dbg) std::cerr << "cycle " << id << ": " << mem.size() << " blocks, not merged (over " << maxMerge << ", MSIM_CYCMERGEMAX)\n";
+            continue;
+        }
         size_t m = mem.size();
         std::vector<std::vector<size_t>> out(m), in(m);
         for (size_t x = 0; x < m; x++)

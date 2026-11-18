@@ -948,6 +948,49 @@ struct Sim {
         if (__builtin_expect(!(nv.x | nv.z) && !nv.real && !nv.str && nv.hi.empty() && bitEdgeOk(s, nv.v & 1), 1)) bitEdge(s, nv.v & 1);
         else set(s, nv);
     }
+    // A write of up to 64 bits of a variable at a run-time position (v[i] = b,
+    // v[i +: w] = ...): in place, without copying a wide value twice, when
+    // nothing but comb processes reads it; else set() as before.
+    void setBitsV(int s, const Val& nv, int hi, int lo) {
+        Sig& g = sigs[s];
+        const int n = hi - lo + 1;
+        if (__builtin_expect(hi >= 0 && lo >= 0 && n >= 1 && n <= 64 && hi < g.w && !(nv.x | nv.z) && !nv.real && !nv.str && nv.hi.empty() &&
+                             !g.fl && !g.val.real && !g.val.str && !g_cov && !observed && !edgeTrack && !tlPart && waiters[s].empty() &&
+                             pathIn.empty() && fmons.empty() && !mon.on && !noFwBit && g.drv.empty() &&
+                             ((size_t)s >= seqOf.size() || seqOf[s].empty()), 1)) {
+            const uint64_t m = n == 64 ? ~0ULL : (1ULL << n) - 1, v = nv.v & m;
+            const int l0 = lo >> 6, sh = lo & 63, l1 = hi >> 6;
+            if ((int)g.val.hi.size() < l1) g.val.hi.resize(l1);
+            // Limb 0 is the v, x, z fields of Val itself, the others in hi.
+            auto get3 = [&](int l, uint64_t& V, uint64_t& X, uint64_t& Z) {
+                if (l == 0) { V = g.val.v; X = g.val.x; Z = g.val.z; } else { const Limb& q = g.val.hi[l - 1]; V = q.v; X = q.x; Z = q.z; }
+            };
+            auto put3 = [&](int l, uint64_t V, uint64_t X, uint64_t Z) {
+                if (l == 0) { g.val.v = V; g.val.x = X; g.val.z = Z; } else g.val.hi[l - 1] = Limb{V, X, Z};
+            };
+            uint64_t V0, X0, Z0, V1 = 0, X1 = 0, Z1 = 0;
+            get3(l0, V0, X0, Z0);
+            const uint64_t m0 = m << sh;
+            uint64_t nV0 = (V0 & ~m0) | (v << sh), nX0 = X0 & ~m0, nZ0 = Z0 & ~m0;
+            bool same = nV0 == V0 && nX0 == X0 && nZ0 == Z0;
+            uint64_t nV1 = 0, nX1 = 0, nZ1 = 0, m1 = 0;
+            if (l1 != l0) {
+                get3(l1, V1, X1, Z1);
+                m1 = m >> (64 - sh);
+                nV1 = (V1 & ~m1) | (v >> (64 - sh)), nX1 = X1 & ~m1, nZ1 = Z1 & ~m1;
+                same = same && nV1 == V1 && nX1 == X1 && nZ1 == Z1;
+            }
+            if (same) return;
+            if (__builtin_expect(combDefer, 0)) deferNote(s);
+            put3(l0, nV0, nX0, nZ0);
+            if (l1 != l0) put3(l1, nV1, nX1, nZ1);
+            g.val.sgn = false;
+            if ((size_t)s < combOf.size() && !combDefer)
+                for (int r : combOf[s]) if (r != curComb) markComb(r);
+            return;
+        }
+        set(s, hi >= 0 ? v_insert(get(s), nv, hi, lo) : nv);
+    }
     void bitEdge(int s, uint64_t n) {
         Sig& g = sigs[s];
         if (__builtin_expect(combDefer, 0)) deferNote(s);
