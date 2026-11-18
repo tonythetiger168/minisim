@@ -339,7 +339,7 @@ struct Sim {
     // a long run). One that waits joins `all`.
     std::unordered_set<void*> oneShot;
     deque<Handle> active, inactive;                  // active / inactive regions
-    struct NbaItem { int s; Val v; int hi, lo; };    // hi < 0: whole signal
+    struct NbaItem { int s; Val v; int hi, lo; bool cb = false; };    // hi < 0: whole signal; cb: a clocking drive (14.16)
     vector<NbaItem> nbaq, nbaRun;                    // NBA region; nbaRun is the batch being applied
     // Postponed region, after NBA and before time advances. `mon` marks the
     // single $monitor slot; anything else is a $strobe, in schedule order.
@@ -3103,6 +3103,20 @@ struct Sim {
                 } else if (!reNbaq.empty()) {              // re-NBA
                     nbaRun.clear();
                     nbaRun.swap(reNbaq);
+                    // Of several clocking drives of the same output maturing here,
+                    // only the last value is driven (14.16.2).
+                    bool anyCb = false;
+                    for (auto& n : nbaRun) anyCb = anyCb || n.cb;
+                    if (anyCb) {
+                        std::set<std::tuple<int, int, int>> later;
+                        vector<NbaItem> keep;
+                        for (size_t k = nbaRun.size(); k-- > 0;) {
+                            auto& n = nbaRun[k];
+                            if (n.cb && !later.insert({n.s, n.hi, n.lo}).second) continue;
+                            keep.push_back(std::move(n));
+                        }
+                        nbaRun.assign(std::make_move_iterator(keep.rbegin()), std::make_move_iterator(keep.rend()));
+                    }
                     timedNba();
                 } else break;
             }
