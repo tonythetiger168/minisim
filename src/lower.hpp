@@ -4495,8 +4495,21 @@ struct Lowerer {
         } else {
             if (cur->kind == ExpressionKind::MemberAccess || cur->kind == ExpressionKind::ElementSelect)
                 return std::nullopt;   // s.arr[i]: an array inside an unpacked struct is bits of it (7.2)
-            if (cur->kind != ExpressionKind::NamedValue && cur->kind != ExpressionKind::HierarchicalValue)
-                unsupported("array select on a non-variable");
+            if (cur->kind != ExpressionKind::NamedValue && cur->kind != ExpressionKind::HierarchicalValue) {
+                // f()[i][j] (7.4.6): the array value in temporaries, one per element, then indexed
+                auto a = fixedShape(*cur->type);
+                if (!a) unsupported("array select on a non-variable");
+                std::vector<E> all;
+                arrayElems(*cur->type, *cur, all);
+                if ((int)all.size() != a->count) unsupported("array select on a non-variable");
+                for (int k = 0; k < a->count; k++) {
+                    int t = fresh(a->elemW);
+                    if (!k) a->base = t;
+                    else if (t != a->base + k) unsupported("array temporaries that are not consecutive");
+                    Instr h; h.k = IK::Assign; h.sig = t; h.e = all[(size_t)k]; prog.emit(h);
+                }
+                shape = a;
+            } else
             shape = arrFind(&cur->as<ValueExpressionBase>().symbol);   // m[i] or top.u.m[i] (23.6)
         }
         if (!shape && ValueExpressionBase::isKind(cur->kind) && sigFind(&cur->as<ValueExpressionBase>().symbol) >= 0)
@@ -4642,6 +4655,16 @@ struct Lowerer {
                 auto rd = node(Op::ArrRead, std::move(idx));
                 rd->arr = sa->a;
                 out.push_back(rd);
+            }
+            return;
+        }
+        if (x.kind == ExpressionKind::Call && x.as<CallExpression>().isSystemCall() &&
+            x.as<CallExpression>().getSubroutineName() == "map" && !isDynType(*x.type)) {   // fa.map() with (...) (7.12.5)
+            int d = mapCall(x.as<CallExpression>());
+            for (int64_t k = 0; k < n; k++) {
+                auto g = node(Op::DynGet, {konst(make((uint64_t)k, 0, 32, 0, true))});
+                g->sig = d;
+                out.push_back(g);
             }
             return;
         }
@@ -4826,8 +4849,31 @@ struct Lowerer {
                         return;
                     }
                 }
-                if (base.kind != ExpressionKind::NamedValue && base.kind != ExpressionKind::HierarchicalValue)
-                    unsupported("slice of an array expression");
+                if (base.kind != ExpressionKind::NamedValue && base.kind != ExpressionKind::HierarchicalValue) {
+                    // s.arr[3:1], f()[2:1] (7.4.6): the whole array's elements, then the slice's
+                    const Type& bt = base.type->getCanonicalType();
+                    if (bt.kind != SymbolKind::FixedSizeUnpackedArrayType || !knownIndex(rs.left()) || !knownIndex(rs.right()))
+                        unsupported("slice of an array expression");
+                    auto rg = bt.as<FixedSizeUnpackedArrayType>().range;
+                    int64_t l = constInt(rs.left()), r = constInt(rs.right());
+                    if (rs.getSelectionKind() != RangeSelectionKind::Simple) {   // a[i +: w], a[i -: w]: in the declared direction
+                        int64_t lo = rs.getSelectionKind() == RangeSelectionKind::IndexedUp ? l : l - r + 1;
+                        int64_t hi = lo + r - 1;
+                        l = rg.left >= rg.right ? hi : lo;
+                        r = rg.left >= rg.right ? lo : hi;
+                    }
+                    std::vector<E> all;
+                    arrayElems(*base.type, base, all);
+                    if ((int64_t)all.size() != (int64_t)rg.width()) unsupported("slice of an array expression");
+                    int64_t step = l <= r ? 1 : -1;
+                    for (int64_t ix = l;; ix += step) {
+                        int64_t pos = rg.left >= rg.right ? rg.left - ix : ix - rg.left;
+                        if (pos < 0 || pos >= (int64_t)all.size()) unsupported("slice outside its array");
+                        out.push_back(all[(size_t)pos]);
+                        if (ix == r) break;
+                    }
+                    return;
+                }
                 auto it = arrMap().find(&base.as<ValueExpressionBase>().symbol);
                 if (it != arrMap().end() && it->second->dims.size() > 1 && rs.getSelectionKind() == RangeSelectionKind::Simple) {
                     // m[1:0] of a multidimensional array (7.4.5): the sub-arrays, each in a row
@@ -5556,6 +5602,11 @@ struct Lowerer {
                 Instr i = dynCmd(t, D_APPEND); i.dsrc = locatorCall(c); prog.emit(i);
                 return;
             }
+            if (c.isSystemCall() && c.getSubroutineName() == "map") {   // r = q.map() with (...) (7.12.5)
+                int r = mapCall(c);
+                Instr i = dynCmd(t, dynShape(t).kind == 2 ? D_COPY : D_APPEND); i.dsrc = r; prog.emit(i);
+                return;
+            }
         }
         if (x.kind == ExpressionKind::ConditionalOp && isDynType(*x.type)) {   // c ? q1 : q2 (11.4.11)
             const auto& c = x.as<ConditionalExpression>();
@@ -6011,6 +6062,64 @@ struct Lowerer {
             return res;
         }
         unsupported("locator method");
+    }
+
+    // q.map(x) with (...) (7.12.5): a scratch container with the source's
+    // indices (or keys), each element the with expression's value.
+    int mapCall(const slang::ast::CallExpression& call) {
+        using namespace slang::ast;
+        auto args = call.arguments();
+        if (!stmtDepth) unsupported("map() outside a procedural statement");
+        const Expression* withE = nullptr;
+        const ValueSymbol* itSym = nullptr;
+        if (auto* sci = std::get_if<CallExpression::SystemCallInfo>(&call.subroutine))
+            std::tie(withE, itSym) = sci->getIteratorInfo();
+        if (!withE) unsupported("map() without a with clause");
+        int d = dynValue(*args[0]);
+        int keys = -1, ixw = 32;
+        if (d < 0) {
+            d = fixedAsQueue(*args[0], true);
+            auto rg = args[0]->type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
+            if (rg.left != 0 || rg.right < 0) {   // a[1:3], a[3:0]: item.index runs over the declared range
+                keys = fresh(64);
+                DynObj o; o.kind = 1; o.dflt = make(0, 0, 32, 0, true);
+                if (isRel(keys)) frames.back()->dyn.push_back({relOff(keys), o});
+                else dynStore()[keys] = o;
+                prog.emit(dynCmd(keys, D_DELETE));
+                for (int64_t k = 0; k < (int64_t)rg.width(); k++) {
+                    Instr p = dynCmd(keys, D_PUSH_BACK);
+                    p.e = konst(make((uint64_t)(rg.left + (rg.left <= rg.right ? k : -k)), 0, 32, 0, true));
+                    prog.emit(p);
+                }
+            }
+        }
+        bool assoc = dynShape(d).kind == 2;
+        if (assoc) {
+            ixw = dynShape(d).strKey ? 64 : dynShape(d).keyW;
+            std::tie(d, keys) = assocAsQueues(d, *args[0]->type);
+        }
+        ElemKey ek{d, withE, itSym, -1};
+        ek.keys = keys;
+        bindIterator(ek, ixw);
+        const Type& rt = *call.type;
+        const Type& et = rt.getCanonicalType().getArrayElementType()->getCanonicalType();
+        int res;
+        if (assoc) {
+            res = dynTemp(dynShapeOf(rt));
+            prog.emit(dynCmd(res, D_DELETE));
+        } else res = keyQueue(et);
+        dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+            E v = elemKey(ek, ix);   // sets the iterator (and its index)
+            if (et.isString()) v = strOf(*withE);
+            else if (et.isFloating()) v = realOf(*withE);
+            else if (!et.isIntegral()) unsupported("map() to elements of this type");
+            if (assoc) {
+                Instr w; w.k = IK::Assign; w.sig = res; w.dyn = res; w.args = {elemAt(keys, ix)}; w.e = v; prog.emit(w);
+            } else {
+                Instr p = dynCmd(res, D_PUSH_BACK); p.e = v; prog.emit(p);
+            }
+        });
+        return res;
     }
 
     // Built-in methods of a container (7.5.2, 7.8, 7.9, 7.10.2, 7.12): as a
@@ -11167,8 +11276,16 @@ struct Lowerer {
             std::vector<const Expression*> pins;
             if (a.isCompound()) pins = pinSelectors(a.left());
             lhs(a.left(), i);
-            if (i.dyn >= 0 && (a.isNonBlocking() || a.timingControl))
+            if (i.dyn >= 0 && a.isNonBlocking())
                 unsupported("nonblocking or delayed write to a container element");
+            if (i.dyn >= 0 && a.timingControl) {   // aa[k] = #d v (9.4.5): the element is chosen now
+                if (peel(a.left()).kind != ExpressionKind::ElementSelect || i.args.size() != 1)
+                    unsupported("delayed write to a part of a container element");
+                const Type& kt = *peel(a.left()).as<ElementSelectExpression>().selector().type;
+                int ks = fresh(storeW(kt));
+                Instr h; h.k = IK::Assign; h.sig = ks; h.e = i.args[0]; prog.emit(h);
+                i.args[0] = asType(kt, ks, kt.isSigned());
+            }
             const Expression* saved = lvalue;
             if (a.isCompound()) lvalue = &a.left();
             i.e = expr(a.right());
@@ -11179,7 +11296,7 @@ struct Lowerer {
                 // a = @(e) b; a = repeat (n) @(e) b (9.4.5): b is taken now and
                 // written after the event (n events for repeat).
                 if (a.isNonBlocking()) { nbaEvent(a, *tc, i.e); return; }   // a <= @(e) b
-                int w = (int)a.left().type->getBitWidth();
+                int w = storeW(*a.left().type);
                 needWidth(w);
                 int tmp = fresh(w);
                 Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = i.e;
@@ -11200,7 +11317,7 @@ struct Lowerer {
                 } else {
                     timing(*tc);
                 }
-                i.e = ref(tmp, a.left().type->isSigned());
+                i.e = asType(*a.left().type, tmp, a.left().type->isSigned());
                 prog.emit(i);
                 return;
             }
@@ -11215,14 +11332,14 @@ struct Lowerer {
                     return;
                 }
                 // Blocking: the value is taken now, written after the wait.
-                int w = (int)a.left().type->getBitWidth();
+                int w = storeW(*a.left().type);
                 needWidth(w);
                 int tmp = fresh(w);
                 Instr hold; hold.k = IK::Assign; hold.sig = tmp; hold.e = i.e;
                 prog.emit(hold);
                 d.k = IK::WaitDelay;
                 prog.emit(d);
-                i.e = ref(tmp);
+                i.e = asType(*a.left().type, tmp, false);
                 prog.emit(i);
                 return;
             }
