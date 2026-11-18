@@ -4483,6 +4483,68 @@ struct Lowerer {
     // The element values of an unpacked-array value of type t, flattened in
     // row-major order (7.4, 10.9.1): an assignment pattern ('{a, b},
     // '{n{a}}, '{0: a, default: b}), or another fixed-size array.
+    // An array of interface instances (a, a[1:2], a[1] of a 2-D one, h.sub.a)
+    // as the value of a virtual interface array (25.9): each instance's
+    // number, left element first. False if x is not one.
+    bool vifArrayElems(const slang::ast::Expression& x, std::vector<E>& out) {
+        using namespace slang::ast;
+        auto arrOf = [&](auto& self, const Expression& e) -> const Symbol* {
+            const Expression& p = peel(e);
+            if (p.kind == ExpressionKind::ArbitrarySymbol) {
+                const Symbol* sym = p.as<ArbitrarySymbolExpression>().symbol;
+                if (sym && sym->kind == SymbolKind::InterfacePort) sym = sym->as<InterfacePortSymbol>().getConnection().first;
+                return sym && sym->kind == SymbolKind::InstanceArray ? sym : nullptr;
+            }
+            if (p.kind == ExpressionKind::ElementSelect) {   // a[1] of a 2-D array: a row
+                const Symbol* b = self(self, p.as<ElementSelectExpression>().value());
+                if (!b || !knownIndex(p.as<ElementSelectExpression>().selector())) return nullptr;
+                const auto& ia = b->as<InstanceArraySymbol>();
+                int64_t k = constInt(p.as<ElementSelectExpression>().selector()) - ia.range.lower();
+                if (k < 0 || k >= (int64_t)ia.elements.size()) return nullptr;
+                const Symbol* c = ia.elements[(size_t)k];
+                return c->kind == SymbolKind::InstanceArray ? c : nullptr;
+            }
+            return nullptr;
+        };
+        const Expression& p = peel(x);
+        const Symbol* arr = nullptr;
+        int64_t l = 0, r = 0;
+        if (p.kind == ExpressionKind::RangeSelect) {
+            const auto& rs = p.as<RangeSelectExpression>();
+            arr = arrOf(arrOf, rs.value());
+            if (!arr) return false;
+            if (rs.getSelectionKind() != RangeSelectionKind::Simple) {
+                int64_t b = constInt(rs.left()), w = constInt(rs.right());
+                bool up = rs.getSelectionKind() == RangeSelectionKind::IndexedUp;
+                const auto& rg = arr->as<InstanceArraySymbol>().range;
+                bool desc = rg.left >= rg.right;
+                int64_t lo = up ? b : b - w + 1, hi = up ? b + w - 1 : b;
+                l = desc ? hi : lo; r = desc ? lo : hi;
+            } else { l = constInt(rs.left()); r = constInt(rs.right()); }
+        } else {
+            arr = arrOf(arrOf, p);
+            if (!arr) return false;
+            l = arr->as<InstanceArraySymbol>().range.left;
+            r = arr->as<InstanceArraySymbol>().range.right;
+        }
+        auto emit = [&](auto& self, const InstanceArraySymbol& ia, int64_t from, int64_t to) -> void {
+            int64_t step = from <= to ? 1 : -1;
+            for (int64_t v = from;; v += step) {
+                int64_t k = v - ia.range.lower();
+                if (k < 0 || k >= (int64_t)ia.elements.size()) unsupported("interface array index out of range");
+                const Symbol* c = ia.elements[(size_t)k];
+                if (c->kind == SymbolKind::InstanceArray) {
+                    const auto& sub = c->as<InstanceArraySymbol>();
+                    self(self, sub, sub.range.left, sub.range.right);
+                } else if (c->kind == SymbolKind::Instance) {
+                    out.push_back(konst(make((uint64_t)vifInstance(c->as<InstanceSymbol>()), 0, 64)));
+                } else unsupported("interface array element of this kind");
+                if (v == to) break;
+            }
+        };
+        emit(emit, arr->as<InstanceArraySymbol>(), l, r);
+        return true;
+    }
     void arrayElems(const slang::ast::Type& t0, const slang::ast::Expression& x0, std::vector<E>& out) {
         using namespace slang::ast;
         const Type& t = t0.getCanonicalType();
@@ -4504,6 +4566,7 @@ struct Lowerer {
         const Type& et = ft.elementType;
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
+        if (vifArrayElems(x, out)) return;   // an array of interface instances into virtual interfaces (25.9)
         if (x.kind == ExpressionKind::ElementSelect || x.kind == ExpressionKind::RangeSelect) {
             // P[0] of a parameter array, constant indexes: its elements as constants
             const Symbol* b = selectBase(x);
