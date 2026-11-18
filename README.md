@@ -509,6 +509,18 @@ files -> 141 MB in 37 files (80% of the process code shared), and the C++
 build from about 4 to 5 hours (10 of 69 files done after 50 minutes) to
 27 minutes; Verilator 5.054 takes about 3 minutes for its 211 MB.
 
+What -compile leaves to msim's interpreter (mixed mode) is listed by
+`MSIM_WHYMIX=1`. A named `initial` block that no `disable` names, a clocked
+block with a `$display` (run as an ordinary process), and an automatic task
+or function of a module (its frame, also bits of its arguments chosen at run
+time) are compiled; frames with objects (`new`, `randomize`, a handle's
+members) stay interpreted. The cycle domain stays with concurrent assertions
+and DPI-C exports, which msim runs around the compiled code, unless a process
+waits on a sequence's end point. A design with more than 64 clock groups
+(an SoC's gated and divided clocks) stays event-driven: OpenTitan Earl Grey
+has 779 and ran 4.6x slower in the domain. `MSIM_WHYCYCLE=1` prints the
+domain's choices.
+
 ### Static combinational schedule
 
 Continuous assigns, gates, and straight-line `always_comb` / `always @*`

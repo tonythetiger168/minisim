@@ -14953,7 +14953,8 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         // (temporaries) are read as they are.
         if (below >= 0) lw.sampleProg(below);
         if (p.procedureKind == ProceduralBlockKind::Initial)
-            if (const auto* nb = Lowerer::namedSeq(p.getBody())) lw.prog.roots.push_back(Lowerer::rootId(nb));
+            if (const auto* nb = Lowerer::namedSeq(p.getBody()); nb && blockIds().targets.count(nb))   // some disable names it (9.6.2)
+                lw.prog.roots.push_back(Lowerer::rootId(nb));
         // A final block (9.2.3) runs once, after the last time slot. slang
         // already rejects delays and event waits in it.
         if (p.procedureKind == ProceduralBlockKind::Final) {
