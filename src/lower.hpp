@@ -1009,6 +1009,70 @@ struct Lowerer {
     // outside the array names a spare event that nothing else triggers.
     int eventElemSig(const slang::ast::Expression& x) {
         using namespace slang::ast;
+        // e[k] of a container of events (7.8, 15.5), or e[k][j] when the
+        // elements are fixed-size arrays of events (constant j): an element
+        // holds (id + 1) of each event's signals, 0 until first used.
+        std::vector<const Expression*> fidx;   // fixed-array indices below the container element, outermost last
+        const Expression* ce = &x;
+        while (ce->kind == ExpressionKind::ElementSelect &&
+               ce->as<ElementSelectExpression>().value().type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType &&
+               ce->as<ElementSelectExpression>().value().kind == ExpressionKind::ElementSelect) {
+            fidx.push_back(&ce->as<ElementSelectExpression>().selector());
+            ce = &ce->as<ElementSelectExpression>().value();
+        }
+        if (ce->kind == ExpressionKind::ElementSelect) {
+            const auto& sel = ce->as<ElementSelectExpression>();
+            if (int d = dynSig(sel.value()); d >= 0) {
+                int64_t off = 0;
+                int ew = 64;
+                if (!fidx.empty()) {
+                    auto sh = eventArrayShape(*ce->type);
+                    if (!sh || sh->dims.size() != fidx.size()) unsupported("a slice of an event array as an event");
+                    std::vector<int64_t> v;
+                    for (size_t k = fidx.size(); k-- > 0;) {
+                        if (!knownIndex(*fidx[k])) unsupported("a run-time index into an event array in a container");
+                        v.push_back(constInt(*fidx[k]));
+                    }
+                    off = sh->offset(v);
+                    if (off < 0) {   // outside the array: a spare event nothing triggers
+                        int c = fresh(32);
+                        if (fresh(64) != c + 1) unsupported("event signals that are not consecutive");
+                        return c;
+                    }
+                    ew = 64 * sh->count;
+                }
+                E key = dynKey(d, sel.selector());
+                int whole = fresh(ew), slot = fresh(64);
+                auto get = node(Op::DynGet, {key});   // a missing element reads as 0: no event yet
+                get->sig = d;
+                { Instr i; i.k = IK::Assign; i.sig = whole; i.e = E(get); prog.emit(i); }
+                E sh64 = konst(mk((uint64_t)(64 * off), 32));
+                { Instr i; i.k = IK::Assign; i.sig = slot; i.e = resize(bin(Op::Shr, ref(whole), sh64), 64, false, false); prog.emit(i); }
+                Instr j; j.k = IK::JmpIfNot; j.e = bin(Op::Eq, ref(slot), konst(mk(0, 64)));
+                size_t jf = prog.emit(j);
+                { Instr i; i.k = IK::Assign; i.sig = slot; i.e = sysFnNode(SF_EVENT_NEW, {}); prog.emit(i); }
+                {
+                    E nv = ref(slot);
+                    if (ew > 64) {   // the element with this event's word replaced
+                        E mask = bin(Op::Shl, resize(konst(mk(~0ull, 64)), ew, false, false), sh64);
+                        nv = bin(Op::Or, bin(Op::And, ref(whole), node(Op::Not, {mask})),
+                                 bin(Op::Shl, resize(ref(slot), ew, false, false), sh64));
+                    }
+                    Instr i; i.k = IK::Assign; i.sig = d; i.dyn = d; i.args = {key}; i.e = nv; prog.emit(i);
+                }
+                prog.code[jf].target = prog.here();
+                int first = -1;   // the count and the trigger time, through consecutive slots (as for an alias)
+                for (int k = 0; k < 2; k++) {
+                    int tmp = fresh(64);
+                    Instr i; i.k = IK::Assign; i.sig = tmp;
+                    i.e = k ? bin(Op::Add, ref(slot), konst(mk(1, 64))) : ref(slot);
+                    prog.emit(i);
+                    int id = indThrough(tmp);
+                    if (!k) first = id;
+                }
+                return first;
+            }
+        }
         std::vector<const Expression*> idx;
         const Expression* cur = &x;
         while (cur->kind == ExpressionKind::ElementSelect &&
@@ -6087,8 +6151,11 @@ struct Lowerer {
             pushContainer(d, i.dcmd, i.dcmd == D_INSERT ? *args[2] : *args[1], i.dcmd == D_INSERT ? args[1] : nullptr);
             return nullptr;
         }
-        if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = cloneConts(*args[1]->type, expr(*args[1]));
-        if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = cloneConts(*args[2]->type, expr(*args[2])); }
+        auto elemVal = [&](const slang::ast::Expression& v) {   // an event names its event (6.17)
+            return v.type->isEvent() ? eventAddr(v) : cloneConts(*v.type, expr(v));
+        };
+        if (i.dcmd == D_PUSH_BACK || i.dcmd == D_PUSH_FRONT) i.e = elemVal(*args[1]);
+        if (i.dcmd == D_INSERT) { i.args = {dynKey(d, *args[1])}; i.e = elemVal(*args[2]); }
         prog.emit(i);
         return nullptr;
     }
@@ -11028,8 +11095,16 @@ struct Lowerer {
                 prog.emit(i);
                 return;
             }
-            if (a.left().type->isEvent() && peel(a.left()).kind == ExpressionKind::ElementSelect)
-                unsupported("assignment to an element of an event array");
+            if (a.left().type->isEvent() && peel(a.left()).kind == ExpressionKind::ElementSelect) {
+                const auto& sel = peel(a.left()).as<ElementSelectExpression>();
+                int d = dynSig(sel.value());
+                if (d < 0 || a.isNonBlocking() || a.timingControl) unsupported("assignment to an element of an event array");
+                Instr i; i.k = IK::Assign; i.sig = d; i.dyn = d;   // q[k] = e (7.8, 6.17): the element names e's event
+                i.args = {dynKey(d, sel.selector())};
+                i.e = eventAddr(a.right());
+                prog.emit(i);
+                return;
+            }
             if (const Expression& l = peel(a.left()); l.kind == ExpressionKind::ElementSelect &&
                 l.as<ElementSelectExpression>().value().type->isString()) {   // s[i] = c (6.16): s.putc(i, c)
                 if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this write to a string character");
@@ -12441,6 +12516,8 @@ inline void Lowerer::elemInto(DynObj& o, const slang::ast::Type& et) {
     if (e.isFloating()) o.dflt = mkreal(0);
     else if (e.isString()) o.dflt = mkstr("");
     else if (isHandleType(e)) o.dflt = make(0, 0, 64);   // a class handle starts null
+    else if (e.isEvent()) o.dflt = make(0, 0, 64);   // an event element: its signals' id + 1, made on first use (0 = none yet)
+    else if (auto sh = eventArrayShape(e)) o.dflt = make(0, 0, 64 * sh->count);   // event a[2] elements: one such word each
     else if (e.isIntegral()) {
         int w = (int)e.getBitWidth();
         o.dflt = e.isFourState() ? allx(w) : make(0, 0, w);

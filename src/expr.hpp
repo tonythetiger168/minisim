@@ -1470,6 +1470,7 @@ enum SysFnId : int {
     SF_PLUS_TEST,    // $test$plusargs(prefix) (21.6); also "is there a match" for $value$plusargs
     SF_PLUS_VALUE,   // the text after prefix kid0, read with format letter lo
     SF_PLUS_FMT,     // a $value$plusargs format known at run time: its prefix (lo 0) or its letter (lo 1)
+    SF_EVENT_NEW,    // a new event (its two signals, not triggered) for a container element: its id + 1
     SF_TIMEFORMAT,   // $timeformat(units, precision, suffix, width) (20.4.3); returns 0
     // File I/O (21.3). A descriptor with bit 31 set is a file (0x80000000-2 are
     // stdin, stdout, stderr); otherwise each set bit is a channel (bit 0 stdout).
@@ -2233,6 +2234,7 @@ inline int scanFormat(const std::string& fmt, Next next, Back back) {
     }
     return (n == 0 && eof) ? -1 : n;
 }
+inline int eventNew();   // below FrameLayout
 inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
     auto u64 = [](const Val& v) { return v.v & ~v.x & mask(std::min(64, v.w)); };
     auto i32 = [&](const Val& v) { return (int32_t)(uint32_t)u64(v); };
@@ -2553,6 +2555,7 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             if (a.size() > 3) t.width = (int)i64(a[3]);
             return make(0, 0, 1, 0);
         }
+        case SF_EVENT_NEW: return make((uint64_t)eventNew() + 1, 0, 64);   // an event element of a container, made on first use
         case SF_PLUS_FMT: {   // "name=%5h": the text before %, or the letter (lowercase, x as h; 0 if none)
             Val p = a[0]; p.str = true;
             std::string f = v_str(p);
@@ -2625,6 +2628,13 @@ struct FrameLayout {
 inline int (*g_allocSigs)(const FrameLayout&) = nullptr;
 inline void (*g_initSigs)(const FrameLayout&, int base) = nullptr;
 inline void (*g_nullAccess)() = nullptr;
+// A new event's two signals (count, trigger time), not triggered: the first one's id.
+inline int eventNew() {
+    static FrameLayout lay = [] { FrameLayout x; x.add(32, make(0, 0, 32)); x.add(64, make(0, 0, 64)); x.name = "event"; return x; }();
+    int id = g_allocSigs(lay);
+    if (g_initSigs) g_initSigs(lay, id);
+    return id;
+}
 inline Val (*g_getSig)(int) = nullptr;
 
 // Containers of containers (7.5, 7.10): an element holds the id of a
