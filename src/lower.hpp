@@ -7362,7 +7362,7 @@ struct Lowerer {
         if (t.kind == TimingControlKind::SignalEvent) {
             const auto& s = t.as<SignalEventControl>();
             if (isGlobalClock(s.expr)) {   // @($global_clock): the global clocking's event (14.14)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $global_clock");
+                if (s.edge != EdgeKind::None) unsupported("an edge on $global_clock");   // iff: checked by the caller (9.4.2.3)
                 collectEvents(globalClocking()->getEvent(), ev);
                 return;
             }
@@ -7374,17 +7374,17 @@ struct Lowerer {
                 return;
             }
             if (const auto* cb = inferredClock(s.expr)) {   // @($inferred_clock) (16.14.7)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $inferred_clock");
+                if (s.edge != EdgeKind::None) unsupported("an edge on $inferred_clock");   // iff: checked by the caller (9.4.2.3)
                 collectEvents(cb->getEvent(), ev);
                 return;
             }
             if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a clocking block event");
+                if (s.edge != EdgeKind::None) unsupported("an edge on a clocking block event");   // iff: checked by the caller (9.4.2.3)
                 ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
                 return;
             }
             if (peel(s.expr).kind == ExpressionKind::AssertionInstance) {   // @(seq): its end point (9.4.2.4)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a sequence event");
+                if (s.edge != EdgeKind::None) unsupported("an edge on a sequence event");   // iff: checked by the caller (9.4.2.3)
                 ev.push_back({seqEventSig(s.expr), ANY});
                 return;
             }
