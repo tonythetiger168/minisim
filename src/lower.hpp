@@ -5924,6 +5924,14 @@ struct Lowerer {
                 prog.emit(i);
                 return nullptr;
             }
+            if (isLocator(n) && !wantValue && withE) {   // q.find(x) with (...); as a statement: the with clause runs, the result is dropped
+                int w = std::max(1, storeW(*withE->type));
+                int t = fresh(w);
+                dynLoop(d, false, [&](int ix, std::vector<size_t>&) {
+                    Instr a; a.k = IK::Assign; a.sig = t; a.e = elemKey(ek, ix); prog.emit(a);
+                });
+                return nullptr;
+            }
             if (isLocator(n)) unsupported("locator method here (assign its result to a queue)");
             unsupported("array method with a `with` clause");
         }
