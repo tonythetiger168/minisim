@@ -4167,9 +4167,12 @@ static int msimMain(int argc, char** argv) {
     if (staticComb && !vpi::st().active && !g_upf && pathRecs().empty() && sdfRequests().empty() && !sdfAtRunTime() &&
         gateRecs().empty() && !dumpPorts && !annexDUsed())   // $countdrivers counts the drivers themselves (D.2)
         mergePartialDrivers(lowered);
+    phaseMark(" partial drivers merged");
     if (!vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOEMPTYCALL")) dropEmptyCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
+    phaseMark(" empty calls, @*");
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
+    phaseMark(" comb calls inlined");
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL"))
         unrollSeqLoops(lowered, true);
     phaseMark("inline/unroll");

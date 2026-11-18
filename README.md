@@ -490,6 +490,25 @@ PicoRV32 cores 2.95G -> 2.65G instructions). `MSIM_WHYPARTS=1` prints each
 file's share, `MSIM_NORELOC=1` goes back to numbers, `MSIM_FULLHDR=1` keeps
 everything in the header.
 
+A large design outside the cycle domain (nearly all comb logic, such as
+OpenTitan Earl Grey: 467,000 processes) builds its comb and clocked
+processes as functions of their own. Each module's function is emitted
+once: an instance whose code is another's with its signal numbers moved
+calls that copy with its own distances (a row of the table `DT`; one
+distance per signal, merged where they move together, so ports bound to
+the parent's nets share too). A process that never waits (a constant
+continuous assign, an initial block without delays) is a plain function
+rather than a coroutine, a function of more than 256 KB has its straight
+runs of writes split into helper functions spread over the files, and the
+parts are at most 2 MB. When the C++ is over 48 MB it builds at `-O1`
+unless `-O<n>` is given, the parts without C++ exceptions, and with gcc
+the parts read `design.hpp` precompiled (`design.hpp.gch`).
+`MSIM_WHYSHARE=1` prints how much is shared, `MSIM_NOSHARE=1` turns it off.
+OpenTitan Earl Grey (`chip_sim_tb`, 4 cores, 16 GB): 395 MB of C++ in 69
+files -> 141 MB in 37 files (80% of the process code shared), and the C++
+build from about 4 to 5 hours (10 of 69 files done after 50 minutes) to
+27 minutes; Verilator 5.054 takes about 3 minutes for its 211 MB.
+
 ### Static combinational schedule
 
 Continuous assigns, gates, and straight-line `always_comb` / `always @*`

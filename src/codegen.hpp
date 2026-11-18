@@ -604,7 +604,7 @@ public:
                     while (a < n.size() && std::isalpha((unsigned char)n[a])) a++;
                     std::string pre = n.substr(0, a);
                     if (a == n.size() || !std::isdigit((unsigned char)n[a])) return std::string();
-                    static const char* ok[] = {"proc", "comb", "seq", "procS", "combS", "seqS", "ds", "dsT", "cyA", "cyB", "cyAT", "cyBT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
+                    static const char* ok[] = {"proc", "comb", "combv", "combc", "seq", "procS", "combS", "combvS", "combcS", "seqS", "ds", "dsT", "cyA", "cyB", "cyAT", "cyBT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
                     for (const char* k : ok) if (pre == k) return pre + (n.size() > 2 && n.compare(n.size() - 2, 2, "_2") == 0 ? "2" : "");
                     return std::string();
                 };
@@ -5937,6 +5937,15 @@ private:
     void emitComb(std::ostream& o, int n, const Prog& p, const std::string& kind) {
         o << "// process " << n << " (" << kind << ", combinational)\n";
         const bool as = combAsserts(p);
+        // One assign: the value and the write (the kernel's batches call
+        // them apart), and the process itself as the two (once, not three
+        // copies of the expression for the C++ compiler).
+        if (oneAssign(p) && !as && !p.code[0].bidx && !p.code[0].arr) {
+            o << "static Val combv" << n << "(const void*) {" << CH(&p, 0) << " return " << fast(p.code[0].e) << "; }\n";
+            o << "static void combc" << n << "(const void*, Val v) {" << assign(p.code[0], "v") << "}\n";
+            o << "static void comb" << n << "(const void* x) { combc" << n << "(x, combv" << n << "(x)); }\n\n";
+            return;
+        }
         if (as) o << combCtlDecl(n);
         o << "static void comb" << n << "(const void*) {\n";
         if (as) o << "    CC" << n << "->epoch++;\n";
