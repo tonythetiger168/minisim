@@ -2474,6 +2474,7 @@ struct Lowerer {
         // f(1, g(2)) where g calls f: the call in a later argument would
         // overwrite the formals set before it, so then every value goes
         // through a temporary first and the formals are set after.
+        size_t rb0 = refBacks.size();
         bool staged = false;
         for (size_t n = 1; n < args.size() && !staged; n++) staged = hasUserCall(*args[n]);
         std::vector<std::pair<int, int>> stagedSet;   // (formal, temporary)
@@ -2524,6 +2525,7 @@ struct Lowerer {
         c.k = IK::Call;
         c.callee = sub->prog;
         prog.emit(c);
+        flushRefBacks(rb0);
 
         for (size_t n = 0; n < args.size(); n++) {
             const auto& formal = sub->args[n];
@@ -2815,6 +2817,7 @@ struct Lowerer {
     E emitAutoCall(const Subr& sub, std::span<const slang::ast::Expression* const> args, bool wantValue,
                    E self = nullptr, bool noSelf = false, int vslot = -1) {
         using namespace slang::ast;
+        size_t rb0 = refBacks.size();
         Instr c;
         c.k = IK::Call;
         c.callee = sub.prog;
@@ -2871,6 +2874,7 @@ struct Lowerer {
             }
         }
         prog.emit(c);
+        flushRefBacks(rb0);
         for (size_t n = 0; n < args.size(); n++) {
             const auto& formal = sub.args[n];
             if (formal.dir != ArgumentDirection::Out && formal.dir != ArgumentDirection::InOut) continue;
@@ -3027,7 +3031,50 @@ struct Lowerer {
                 return mux(ok, addr, at(freshStatic(A.elemW)));
             }
         }
+        if (a.kind == ExpressionKind::ElementSelect) {
+            // q[i], d[i], aa[k] (13.5.2): the element is copied into a
+            // temporary at the call, the callee refers to that, and it is
+            // written back to the element (the key taken at the call) when
+            // the call returns
+            const auto& sel = a.as<ElementSelectExpression>();
+            if (int d = dynSig(sel.value()); d >= 0 && !dynShape(d).elem && !a.type->isUnpackedArray()) {
+                const Type& kt = *sel.selector().type;
+                int ks = fresh(storeW(kt));
+                { Instr i; i.k = IK::Assign; i.sig = ks; i.e = dynKey(d, sel.selector()); prog.emit(i); }
+                int w = storeW(*a.type);
+                needWidth(w);
+                int tmp = fresh(w);
+                auto g = node(Op::DynGet, {asType(kt, ks, kt.isSigned())});
+                g->sig = d;
+                { Instr i; i.k = IK::Assign; i.sig = tmp; i.e = E(g); prog.emit(i); }
+                refBacks.push_back({d, ks, tmp, a.type, &kt});
+                return at(tmp);
+            }
+        }
         unsupported("ref argument that is not a whole variable or property");
+    }
+    // ref actuals that are container elements, written back after the call
+    struct RefBack { int d, keySig, tmp; const slang::ast::Type* t; const slang::ast::Type* kt; };
+    std::vector<RefBack> refBacks;
+    void flushRefBacks(size_t from) {
+        for (size_t n = from; n < refBacks.size(); n++) {
+            const RefBack& b = refBacks[n];
+            E key = asType(*b.kt, b.keySig, b.kt->isSigned());
+            // an element no longer there (deleted, or the array resized) is an
+            // outdated reference: the write is dropped (13.5.2)
+            E have;
+            if (dynShape(b.d).kind == 2) { auto x = node(Op::DynExists, {key}); x->sig = b.d; have = x; }
+            else have = bin(Op::LogAnd, bin(Op::Ge, resize(key, 64, true, true), konst(make(0, 0, 64, 0, true))),
+                            bin(Op::Lt, resize(key, 64, true, true), resize(dynSize(b.d), 64, false, true)));
+            Instr j; j.k = IK::JmpIfNot; j.e = have;
+            size_t jf = prog.emit(j);
+            Instr i; i.k = IK::Assign; i.sig = b.d; i.dyn = b.d;
+            i.args = {key};
+            i.e = asType(*b.t, b.tmp, b.t->isSigned());
+            prog.emit(i);
+            prog.code[jf].target = prog.here();
+        }
+        refBacks.resize(from);
     }
     // A ref formal's kind and shape, from its type.
     static RefFormal refFormalOf(const slang::ast::Type& t0) {
