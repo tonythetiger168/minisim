@@ -650,17 +650,13 @@ static int testStrengths() {
 }
 
 static int testRecur() {
-    bool threw = false;
-    std::string msg;
+    // A static function may recurse (13.4.2): every call shares its
+    // argument, so it compiles (with a warning) instead of being rejected.
     try {
         compileSv(srcPath("examples/recur.sv"), false);
     } catch (const std::exception& ex) {
-        threw = true;
-        msg = ex.what();
+        return fail(std::string("recur.sv threw: ") + ex.what());
     }
-    if (!threw) return fail("recur.sv did not throw");
-    if (msg.find("recursive") == std::string::npos)
-        return fail("recur.sv threw an unexpected error: " + msg);
     return 0;
 }
 
