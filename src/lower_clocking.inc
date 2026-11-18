@@ -181,7 +181,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
             bool net = ts->kind == SymbolKind::Net;
             auto [ik, it] = cv->inputSkew.hasValue() ? skewOf(cv->inputSkew, 0) : std::pair{dinK, dinT};
             auto [ok, ot] = cv->outputSkew.hasValue() ? skewOf(cv->outputSkew, 1) : std::pair{doutK, doutT};
-            if (out && ok == 0) unsupported("#1step as an output skew (14.4)");
+            if (out && ok == 0) { ok = 2; ot = 1; }   // an output skew of #1step: one global time step after the edge (3.14.3)
             int iEdge = skewEdge(cv->inputSkew.hasValue() ? cv->inputSkew : cb.getDefaultInputSkew());
             int oEdge = skewEdge(cv->outputSkew.hasValue() ? cv->outputSkew : cb.getDefaultOutputSkew());
             for (int n = 0; n < A.count; n++) {
@@ -232,7 +232,7 @@ int clockingIdx(const slang::ast::ClockingBlockSymbol& cb) {
             o.cv = sig;
             o.w = (int)init->type->getBitWidth();
             auto [k, t] = cv->outputSkew.hasValue() ? skewOf(cv->outputSkew, 1) : std::pair{doutK, doutT};
-            if (k == 0) unsupported("#1step as an output skew (14.4)");
+            if (k == 0) { k = 2; t = 1; }   // an output skew of #1step: one global time step after the edge (3.14.3)
             o.skew = t;
             if (k == 3) edgeOut(r, o, skewEdge(cv->outputSkew.hasValue() ? cv->outputSkew : cb.getDefaultOutputSkew()));
             outPieces(*init, o.pieces);
