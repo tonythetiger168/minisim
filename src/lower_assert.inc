@@ -325,6 +325,10 @@ std::vector<std::pair<int, Edge>> clockArg(const slang::ast::CallExpression& cal
 E pastOf(const slang::ast::Expression& x, int n, E gate, const std::vector<std::pair<int, Edge>>& ev) {
     int w = storeW(*x.type);
     if (w <= 0) unsupported("$past of this type");
+    return pastOfE(expr(x), w, x.type->isSigned(), n, std::move(gate), ev);
+}
+// The same for a value already lowered (one element of an unpacked array).
+E pastOfE(E src, int w, bool sgn, int n, E gate, const std::vector<std::pair<int, Edge>>& ev) {
     auto& clocks = sampleClocks();
     SampleClock* k = nullptr;
     if (!gate)
@@ -335,12 +339,41 @@ E pastOf(const slang::ast::Expression& x, int n, E gate, const std::vector<std::
         k = &clocks.back();
     }
     SampleClock::Line ln;
-    ln.src = sampledE(expr(x));
+    ln.src = sampledE(std::move(src));
     for (int j = 0; j < n; j++) ln.stages.push_back(mkSig("$past" + std::to_string(*tempSeq) + "_" + std::to_string(j), w, false));
     (*tempSeq)++;
     int last = ln.stages.back();
     k->lines.push_back(std::move(ln));
-    return ref(last, x.type->isSigned());
+    return ref(last, sgn);
+}
+// $past(a) / $sampled(a) of a fixed-size unpacked array (16.9.3): the
+// sampled value is the array's, so each element gets its own line of past
+// values, in arrayElems order. False if call is neither.
+bool sampledArrayElems(const slang::ast::CallExpression& call, const slang::ast::Type& t, std::vector<E>& out) {
+    using namespace slang::ast;
+    std::string_view n = call.getSubroutineName();
+    if (n != "$past" && n != "$sampled") return false;
+    auto args = call.arguments();
+    if (args.empty()) return false;
+    if (!mkSig || !tempSeq) unsupported("sampled value function here");
+    std::vector<E> els;
+    arrayElems(t, *args[0], els);
+    if (n == "$sampled") {
+        for (auto& e : els) out.push_back(sampledE(std::move(e)));
+        return true;
+    }
+    const Type* leaf = &t.getCanonicalType();
+    while (leaf->isUnpackedArray()) leaf = &leaf->getArrayElementType()->getCanonicalType();
+    int w = storeW(*leaf);
+    if (w <= 0) unsupported("$past of an array of this element type");
+    int k = 1;
+    if (args.size() > 1 && args[1]->kind != ExpressionKind::EmptyArgument) k = (int)constInt(*args[1]);
+    if (k < 1) unsupported("$past with fewer than 1 tick");
+    E gate;
+    if (args.size() > 2 && args[2]->kind != ExpressionKind::EmptyArgument) gate = sampledE(expr(*args[2]));
+    auto ev = clockArg(call, 3);
+    for (auto& e : els) out.push_back(pastOfE(std::move(e), w, leaf->isSigned(), k, gate, ev));
+    return true;
 }
 // $sampled, $rose, $fell, $stable, $changed, $past (16.9.3). Null if n is
 // none of them.

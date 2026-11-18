@@ -4509,6 +4509,9 @@ struct Lowerer {
             }
             return;
         }
+        if (x.kind == ExpressionKind::Call && x.as<CallExpression>().isSystemCall() &&
+            sampledArrayElems(x.as<CallExpression>(), t, out))   // $past(arr) (16.9.3)
+            return;
         switch (x.kind) {
             case ExpressionKind::SimpleAssignmentPattern:
                 for (auto* el : x.as<SimpleAssignmentPatternExpression>().elements()) arrayElems(et, *el, out);
@@ -6320,6 +6323,24 @@ struct Lowerer {
                 if ((n == "sum" || n == "product" || n == "and" || n == "or" || n == "xor") && !call.arguments().empty() &&
                     call.arguments()[0]->type->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType)
                     return sized(fixedReduce(call, n), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+                // $timeunit / $timeprecision (20.4.1): a power of ten (Table 20-2), of
+                // this scope, of a named instance, of $unit, or with $root the
+                // simulation precision.
+                if (n == "$timeunit" || n == "$timeprecision") {
+                    bool unit = n == "$timeunit";
+                    int u = tsUnit, pr = tsPrec;
+                    if (!call.arguments().empty()) {
+                        const Expression& x = peel(*call.arguments()[0]);
+                        const Symbol* sym = x.kind == ExpressionKind::ArbitrarySymbol ? x.as<ArbitrarySymbolExpression>().symbol.get() : nullptr;
+                        std::optional<slang::TimeScale> ts;
+                        if (sym && sym->kind == SymbolKind::Root) u = pr = simPrecExp();
+                        else if (sym && sym->kind == SymbolKind::Instance) ts = sym->as<InstanceSymbol>().body.getTimeScale();
+                        else if (sym && sym->isScope()) ts = sym->as<Scope>().getTimeScale();
+                        else unsupported("$timeunit / $timeprecision of this argument");
+                        if (ts) { u = tsExp(ts->base); pr = tsExp(ts->precision); }
+                    }
+                    return sized(konst(mk((uint64_t)(int64_t)(unit ? u : pr), 32)), 32, true, ctx);
+                }
                 // $time / $stime / $realtime (20.3.1): the current time. minisim
                 // has one time unit, so $realtime is the same integer.
                 if (n == "$time" || n == "$stime") {
@@ -12661,7 +12682,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         int sg = mkSig("__event" + std::to_string((*tempSeq)++), w, false);
         // Start equal to the expression, before any procedure waits, so
         // variables that start with a value give no event at time 0.
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         {
             Instr i0; i0.k = IK::Assign; i0.sig = sg;
             i0.e = init->expr(x);
@@ -12855,14 +12876,14 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
     // starts. All of them go into one process that lower() places first, so
     // it is the first thing to run at time 0. Locals of a block, task or
     // function are not module members and are handled by Lowerer.
-    std::unique_ptr<Lowerer> init;
+    std::unique_ptr<Lowerer> init;   // runs as a procedure (stmtDepth 1): an initializer may call $value$plusargs, $sscanf, pop() ...
     std::unique_ptr<Lowerer> init0;   // default values (no initializer): run before every initializer
     void handle(const slang::ast::VariableSymbol& v) {
         const slang::ast::Expression* e = v.getInitializer();
         if (initEventArray(v)) return;
         if (v.getType().isEvent()) {   // both counters start at 0: not triggered
             if (!sigmap.count(&v)) return;   // an automatic one lives in a frame
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
             for (int k = 0; k < 2; k++) {
                 Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v) + k;
                 i.e = konst(mk(0, k ? 64 : 32));
@@ -12906,7 +12927,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (!e) return;
         const auto& v = ps.internalSymbol->as<VariableSymbol>();
         if (!sigmap.count(&v) || arrMap().count(&v) || dynMap().count(&v)) Lowerer::unsupported("this output port initializer");
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         init->setScope(ps.getParentScope());
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
         i.e = resize(init->expr(*e), storeW(v.getType()), e->type->isSigned(), v.getType().isSigned());
@@ -12925,7 +12946,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         auto ea = evArrs().find(&v);
         if (ea == evArrs().end()) return false;
         if (ea->second.first) return true;   // an automatic one lives in a frame
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         for (int k = 0; k < 2 * ea->second.second->count; k++) {
             Instr i; i.k = IK::Assign; i.sig = ea->second.second->base + k;
             i.e = konst(mk(0, k & 1 ? 64 : 32));
@@ -12938,12 +12959,12 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
         if (initEventArray(v)) return;
         if (auto it = dynMap().find(&v); it != dynMap().end()) {   // int q[$] = '{1, 2};
             if (!e) return;
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
             init->assignContainer(it->second, *e);
             return;
         }
         if (e && arrMap().count(&v)) {   // int a[3] = '{1, 2, 3};
-            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+            if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
             init->assignWholeArray(v, v.getType(), *e, false);
             return;
         }
@@ -13001,7 +13022,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             init0->prog.emit(i);
             if (!e) return;
         }
-        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+        if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
         Instr i; i.k = IK::Assign; i.sig = sigmap.at(&v);
         i.e = init->expr(*e);
         init->prog.emit(i);
@@ -14300,7 +14321,7 @@ struct ProcCollector : slang::ast::ASTVisitor<ProcCollector> {
             int fs = sigmap.at(&f);
             int w = storeW(f.getType());
             if (const Expression* ie = c.getOutputInitialExpr()) {   // output int ctr = 0 (17.2)
-                if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); }
+                if (!init) { init = std::make_unique<Lowerer>(sigmap); prep(*init); init->stmtDepth = 1; }
                 Instr i; i.k = IK::Assign; i.sig = fs;
                 i.e = resize(init->expr(*ie), w, f.getType().isSigned(), ie->type->isSigned());
                 init->prog.emit(i);
