@@ -179,6 +179,14 @@ public:
         if (!dom.empty() && privates && !std::getenv("MSIM_NOWIDE")) wideProcs = splitWide(procs, dom);
         std::vector<char> inDomV(procs.size(), 0);
         for (int i : dom) inDomV[(size_t)i] = 1;
+        // Without the cycle domain each comb and clocked process is a function
+        // of its own: one copy per module instead (shareEv). MSIM_NOSHARE=1: off.
+        const bool evShare = dom.empty() && !cov && !std::getenv("MSIM_NOSHARE");
+        std::vector<EvUnit> evUnits;
+        evName_.assign(procs.size(), "");
+        evPlain_.assign(procs.size(), 0);
+        evAt_.assign(procs.size(), -1);
+        evDT_.clear();
         for (size_t i = 0; i < procs.size(); i++) {
             const bool inDom = inDomV[i] != 0;
             if (upf && procs[i].prog->pd >= 0 && (procs[i].combRank >= 0 || procs[i].seq || inDom))
@@ -186,22 +194,37 @@ public:
             if (procs[i].combRank >= 0 || inDom)
                 for (auto& in : procs[i].prog->code) noFrames(in);
             if (procs[i].combRank >= 0) {
-                if (dom.empty()) chunk([&](std::ostream& c) { emitComb(c, (int)i, *procs[i].prog, procs[i].kind); });   // else: inlined in combAll
+                if (dom.empty()) {   // else: inlined in combAll
+                    std::ostringstream c;
+                    emitComb(c, (int)i, *procs[i].prog, procs[i].kind);
+                    if (evShare && !combAsserts(*procs[i].prog)) evUnits.push_back({(int)i, false, c.str()});
+                    else chunks.push_back(c.str());
+                }
                 if ((size_t)procs[i].combRank >= byRank.size()) byRank.resize(procs[i].combRank + 1, -1);
                 byRank[procs[i].combRank] = (int)i;
             } else if (inDom)
                 continue;   // emitCycle
-            else if (procs[i].seq && !mix)
-                chunk([&](std::ostream& c) { emitSeq(c, (int)i, *procs[i].prog, procs[i].kind); });
-            else if (!mix)
-                chunk([&](std::ostream& c) { emitProc(c, (int)i, *procs[i].prog, procs[i].kind); });
+            else if (procs[i].seq && !mix) {
+                std::ostringstream c;
+                emitSeq(c, (int)i, *procs[i].prog, procs[i].kind);
+                if (evShare) evUnits.push_back({(int)i, true, c.str()});
+                else chunks.push_back(c.str());
+            }
+            else if (!mix) {
+                std::ostringstream c;
+                emitProc(c, (int)i, *procs[i].prog, procs[i].kind);
+                if (evShare && !upf && procs[i].kind != "init" && evPlain(c.str(), (int)i)) evUnits.push_back({(int)i, false, plainText(c.str(), (int)i)});
+                else chunks.push_back(c.str());
+            }
             else {   // mixed mode: a process codegen cannot compile runs in msim's interpreter
                 std::ostringstream c;
                 try {
                     if (procs[i].interp) throw CodegenUnsupported("a program process, or a gate whose delays change at run time");
                     if (procs[i].seq) emitSeq(c, (int)i, *procs[i].prog, procs[i].kind);
                     else emitProc(c, (int)i, *procs[i].prog, procs[i].kind);
-                    chunks.push_back(c.str());
+                    if (evShare && procs[i].seq) evUnits.push_back({(int)i, true, c.str()});
+                    else if (evShare && !upf && procs[i].kind != "init" && evPlain(c.str(), (int)i)) evUnits.push_back({(int)i, false, plainText(c.str(), (int)i)});
+                    else chunks.push_back(c.str());
                 } catch (const CodegenUnsupported& ex) {
                     // A clocked one runs as an ordinary process there, as
                     // with msim -no-static-seq.
@@ -213,6 +236,16 @@ public:
             }
         }
 
+        if (!evUnits.empty()) shareEv(evUnits, chunks);
+        {   // the helpers are chunks of their own: they spread over the files
+            std::vector<std::string> out;
+            out.reserve(chunks.size());
+            for (auto& c : chunks) {
+                if (c.size() > kOutlineMin) for (auto& h : outlineRuns(c)) out.push_back(std::move(h));
+                if (!c.empty()) out.push_back(std::move(c));
+            }
+            chunks = std::move(out);
+        }
         phaseMark(" cg: processes");
         if (!dom.empty()) { std::ostringstream c; emitCycle(c, wideProcs.empty() ? procs : wideProcs, dom, byRank); cyc = c.str(); }
         phaseMark(" cg: cycle domain");
@@ -231,8 +264,10 @@ public:
         // files < 0: exactly that many (msim -cfiles), else only for a large design.
         // A large design gets more files than cores: the compiler takes about
         // 0.25 GB per MB of generated code, so 1024 PicoRV32 cores in four
-        // 35 MB files ran a 16 GB machine out of memory. At most 4 MB a file.
-        size_t want = std::max<size_t>(files, (chunkBytes + (4u << 20) - 1) / (4u << 20));
+        // 35 MB files ran a 16 GB machine out of memory. At most 2 MB a file:
+        // OpenTitan's 4 MB parts took 2.6 GB each at -O2, two at a time on
+        // 16 GB beside msim; the header comes precompiled (design.hpp.gch).
+        size_t want = std::max<size_t>(files, (chunkBytes + (2u << 20) - 1) / (2u << 20));
         int nf = files < 0 ? (int)std::min<size_t>(-files, nChunks)
                : files > 1 ? (int)std::min({want, chunkBytes / 65536, nChunks}) : 1;
         nf = std::max(nf, 1);
@@ -316,6 +351,8 @@ public:
              "    return e;\n"
              "}\n"
              "static E XT(const char* p) { return XP(p); }\n"
+             "// A process that never waits, as a plain function (Codegen::evPlain).\n"
+             "[[maybe_unused]] static Task evOnce(void (*f)(const void*), const void* x) { f(x); co_return; }\n"
              "static E XA(E e, const ArrShape& a) { e->arr = std::shared_ptr<const ArrShape>(std::shared_ptr<void>{}, &a); return e; }\n"
              "// Unpacked arrays (eval() Op::ArrRead, target() in exec.inc): the element signal, or -1.\n"
              "static inline int AOFF(const ArrShape& a, std::initializer_list<Val> ix) {\n"
@@ -567,7 +604,7 @@ public:
                     while (a < n.size() && std::isalpha((unsigned char)n[a])) a++;
                     std::string pre = n.substr(0, a);
                     if (a == n.size() || !std::isdigit((unsigned char)n[a])) return std::string();
-                    static const char* ok[] = {"proc", "ds", "dsT", "cyA", "cyB", "cyAT", "cyBT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
+                    static const char* ok[] = {"proc", "comb", "combv", "combc", "seq", "procS", "combS", "combvS", "combcS", "seqS", "ds", "dsT", "cyA", "cyB", "cyAT", "cyBT", "combP", "combQ", "combC", "combK", "combD", "combPT", "combQT", "combCT", "commitS", "cgP", "cgQ", "cmC", "cmL"};
                     for (const char* k : ok) if (pre == k) return pre + (n.size() > 2 && n.compare(n.size() - 2, 2, "_2") == 0 ? "2" : "");
                     return std::string();
                 };
@@ -909,21 +946,27 @@ public:
             for (size_t j = 0; j < ins.size(); j++) o << (j ? ", " : "") << ins[j];
             o << "});\n";
         }
+        if (!evDT_.empty()) {   // shareEv: each process's distances
+            o << "    static const int DT[] = {";
+            for (size_t k = 0; k < evDT_.size(); k++) o << (k ? "," : "") << evDT_[k];
+            o << "};\n";
+        }
         if (dom.empty() && !byRank.empty()) {   // the ranks: functions, wait lists in CINS
             std::string ins, tab;
             size_t off = 0;
             for (int i : byRank) {
                 for (int x : procs[i].combIns) ins += std::to_string(x) + ",";
                 bool one = oneAssign(*procs[i].prog);
-                tab += "        {comb" + std::to_string(i) + ", " + (one ? "combv" + std::to_string(i) : "nullptr") + ", " +
-                       (one ? "combc" + std::to_string(i) : "nullptr") + ", " + std::to_string(procs[i].combLevel) + ", " +
-                       std::to_string(off) + ", " + std::to_string(procs[i].combIns.size()) + "},\n";
+                const std::string nm = evName_.size() > (size_t)i && !evName_[i].empty() ? evName_[i] : std::to_string(i);
+                tab += "        {comb" + nm + ", " + (one ? "combv" + nm : "nullptr") + ", " +
+                       (one ? "combc" + nm : "nullptr") + ", " + std::to_string(procs[i].combLevel) + ", " +
+                       std::to_string(off) + ", " + std::to_string(procs[i].combIns.size()) + ", " + evCtx(i) + "},\n";
                 off += procs[i].combIns.size();
             }
             o << "    static const int CINS[] = {" << ins << "0};\n"
-                 "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); int lv, at, n; } COMBS[] = {\n"
+                 "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); int lv, at, n; const void* x; } COMBS[] = {\n"
               << tab << "    };\n"
-                 "    for (auto& c : COMBS) S.addComb(c.f, nullptr, std::vector<int>(CINS + c.at, CINS + c.at + c.n), c.lv, c.v, c.c);\n";
+                 "    for (auto& c : COMBS) S.addComb(c.f, c.x, std::vector<int>(CINS + c.at, CINS + c.at + c.n), c.lv, c.v, c.c);\n";
         }
         // Declaration initializers take effect before anything waits (6.8):
         // logic clk = 0 is no negedge for a clocked process registered below.
@@ -954,8 +997,9 @@ public:
                 n++;
                 if (procs[i].seq && !(i < mixSeq_.size() && mixSeq_[i])) {
                     for (auto& [sg, ed] : procs[i].seqEv) evs += "{" + std::to_string(sg) + ", " + edge(ed) + "},";
-                    tab += "        {seq" + std::to_string(i) + ", nullptr, " + std::to_string(off) + ", " +
-                           std::to_string(procs[i].seqEv.size()) + ", 0},\n";
+                    const std::string nm = evName_.size() > i && !evName_[i].empty() ? evName_[i] : std::to_string(i);
+                    tab += "        {seq" + nm + ", nullptr, " + std::to_string(off) + ", " +
+                           std::to_string(procs[i].seqEv.size()) + ", 0, " + evCtx((int)i) + ", nullptr},\n";
                     off += procs[i].seqEv.size();
                 } else {
                     // Time 0 order as the interpreter's (msim.cpp): declaration
@@ -963,21 +1007,26 @@ public:
                     // first initial block start just before it (or last if there
                     // is none); each Task is still made in declaration order.
                     const int late = procs[i].kind == "assign" && !procs[i].loops ? 1 : procs[i].kind == "Initial" ? 2 : 0;
-                    tab += "        {nullptr, proc" + std::to_string(i) + ", 0, 0, " + std::to_string(late) + "},\n";
+                    if (i < evPlain_.size() && evPlain_[i]) {
+                        const std::string nm = !evName_[i].empty() ? evName_[i] : std::to_string(i);
+                        tab += "        {nullptr, nullptr, 0, 0, " + std::to_string(late) + ", " + evCtx((int)i) + ", proc" + nm + "},\n";
+                    } else
+                        tab += "        {nullptr, proc" + std::to_string(i) + ", 0, 0, " + std::to_string(late) + ", nullptr, nullptr},\n";
                 }
             }
             if (n) {
                 o << "    static const std::pair<int, Edge> SEV[] = {" << evs << "{0, ANY}};\n"
-                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; } PROCS[] = {\n"
+                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; const void* x; void (*f)(const void*); } PROCS[] = {\n"
                   << tab << "    };\n"
                      "    std::vector<Task> held;\n    bool init1 = false;\n"
+                     "    auto mk = [](const auto& p) { return p.p ? p.p() : evOnce(p.f, p.x); };\n"
                      "    for (auto& p : PROCS)\n"
-                     "        if (p.s) S.addSeq(p.s, nullptr, std::vector<std::pair<int, Edge>>(SEV + p.at, SEV + p.at + p.n));\n"
-                     "        else if (p.late == 1 && !init1) held.push_back(p.p());\n"
+                     "        if (p.s) S.addSeq(p.s, p.x, std::vector<std::pair<int, Edge>>(SEV + p.at, SEV + p.at + p.n));\n"
+                     "        else if (p.late == 1 && !init1) held.push_back(mk(p));\n"
                      "        else if (p.late == 2 && !init1) {\n"
-                     "            init1 = true;\n            Task t = p.p();\n"
+                     "            init1 = true;\n            Task t = mk(p);\n"
                      "            for (auto& h : held) S.spawn(h);\n            held.clear();\n            S.spawn(t);\n"
-                     "        } else S.spawn(p.p());\n"
+                     "        } else S.spawn(mk(p));\n"
                      "    for (auto& h : held) S.spawn(h);\n";
             }
         }
@@ -1064,6 +1113,14 @@ public:
     bool mix = false;
     std::vector<std::pair<int, std::string>> interp;
     std::vector<char> mixSeq_;   // a clocked process left to the interpreter
+    // Event-driven comb and clocked functions shared between instances
+    // (shareEv): the template whose function a process calls ("" its own)
+    // and where its distances start in the table DT (-1: none).
+    std::vector<std::string> evName_;
+    std::vector<char> evPlain_;   // a process that never waits: a plain function, run by evOnce
+    std::vector<int> evAt_;
+    std::vector<int> evDT_;
+    size_t evSaved_ = 0, evTotal_ = 0;
     // Build in up to this many C++ files (in parallel): a large design as one
     // file took minutes. Small designs stay one file. Negative: -files files
     // whatever the size (msim -cfiles).
@@ -2859,11 +2916,12 @@ private:
     // calls f(at, len, N) for each.
     template <class F> static void refScan(const std::string& t, F&& f) {
         static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
-                                    "S.get(", "S.set(", "S.setOneBit(", "S.poke(", "R(", "int s = "};   // the last: dynTarget
+                                    "S.get(", "S.set(", "S.setOneBit(", "S.poke(", "R(", "int s = ",   // dynTarget
+                                    "nb.push_back({"};   // an NBA of a clocked function (emitSeq)
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
         for (size_t i = 0; i < t.size(); i++) {
             char c = t[i];
-            if (c != 'S' && c != 'R' && c != 'P' && c != 'A' && c != 'V' && c != 'H' && c != 'F' && c != 'C' && c != 'i') continue;
+            if (c != 'S' && c != 'R' && c != 'P' && c != 'A' && c != 'V' && c != 'H' && c != 'F' && c != 'C' && c != 'i' && c != 'n') continue;
             if (i > 0 && (idc(t[i - 1]) || t[i - 1] == '.')) continue;
             size_t at = std::string::npos;
             int kind = 0;   // 0 a signal number, 1 a private signal P<N>, 2 an array shape AS<N>, 3 an NBA slot
@@ -5587,10 +5645,307 @@ private:
         o << L(end) << ": return;\n}\n\n";
     }
 
+    // ---- shared event-driven functions (no cycle domain) ----
+    // Each comb and clocked process outside the cycle domain is a function of
+    // its own, with its signal numbers in the text: OpenTitan has 400,000 of
+    // them, 300 MB of C++, mostly the same few thousand functions once per
+    // instance. A process whose text is another's with the numbers of each
+    // scope (instance) moved by one distance calls that one's function with
+    // its distances (ctx: a row of the table DT). The text decides: anything
+    // but a signal number that differs (a constant, a width, a string) keeps
+    // the process's own copy.
+    struct EvUnit { int i; bool seq; std::string text; };
+    // A function of megabytes (OpenTitan's sampled-value process: 46,000
+    // statements; a comb process of 30,000) took the C++ compiler longer
+    // than the rest of its file and held the build up: its straight runs of
+    // signal writes go to helper functions of kOutlineRun statements each.
+    // A label something jumps to starts a new run (the call keeps it).
+    static constexpr size_t kOutlineMin = 256u << 10, kOutlineRun = 1000;
+    // Returns the helpers, one per element, and leaves t calling them.
+    static std::vector<std::string> outlineRuns(std::string& t) {
+        std::vector<std::string> helpers;
+        if (t.find(" D_ = ") != std::string::npos) return helpers;   // shareEv's templates: the distances are locals
+        auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+        std::unordered_set<std::string> tgt;
+        for (size_t a = t.find("goto "); a != std::string::npos; a = t.find("goto ", a + 5)) {
+            size_t e = a + 5;
+            while (e < t.size() && idc(t[e])) e++;
+            tgt.insert(t.substr(a + 5, e - a - 5));
+        }
+        // The function: its signature is the first line that starts with
+        // "static " or "Task " and ends with "{".
+        size_t sigAt = std::string::npos;
+        std::string name;
+        for (size_t at = 0; at < t.size();) {
+            size_t nl = t.find('\n', at);
+            if (nl == std::string::npos) break;
+            if ((t.compare(at, 7, "static ") == 0 || t.compare(at, 5, "Task ") == 0) && nl > at && t[nl - 1] == '{') {
+                size_t par = t.find('(', at);
+                if (par == std::string::npos || par > nl) break;
+                size_t b = par;
+                while (b > at && idc(t[b - 1])) b--;
+                name = t.substr(b, par - b);
+                sigAt = at;
+                break;
+            }
+            at = nl + 1;
+        }
+        if (sigAt == std::string::npos || name.empty()) return helpers;
+        // A line that may move: "<label>: S.set(...);" and friends, naming
+        // nothing local to the function.
+        auto movable = [&](size_t a, size_t nl, size_t& stmt) {
+            size_t c = a;
+            while (c < nl && idc(t[c])) c++;
+            if (c == a || c >= nl || t[c] != ':') return false;
+            stmt = c + 1;
+            size_t b = stmt;
+            while (b < nl && t[b] == ' ') b++;
+            bool ok = false;
+            for (const char* p : {"S.set(", "S.setOneBit(", "S.poke(", "S.drive("})
+                if (t.compare(b, std::strlen(p), p) == 0) { ok = true; break; }
+            if (!ok || t[nl - 1] != ';') return false;
+            std::string_view ln(t.data() + stmt, nl - stmt);
+            for (const char* bad : {"goto", "co_", "rs.", "ctl", "nb.", "return", "x_", "frs", "fr->", "lr"})
+                if (ln.find(bad) != std::string_view::npos) return false;
+            return true;
+        };
+        std::string body;
+        int nh = 0;
+        std::vector<std::pair<std::string, std::string>> run;   // label, statement
+        auto flush = [&] {
+            if (run.size() < 64) {
+                for (auto& [l, st] : run) body += l + ":" + st + "\n";
+            } else
+                for (size_t k = 0; k < run.size(); k += kOutlineRun) {
+                    std::string h = name + "_o" + std::to_string(nh++);
+                    std::string f = "static void " + h + "() {\n";
+                    for (size_t j = k; j < std::min(run.size(), k + kOutlineRun); j++) f += run[j].second + "\n";
+                    f += "}\n\n";
+                    helpers.push_back(std::move(f));
+                    body += run[k].first + ": " + h + "();\n";
+                }
+            run.clear();
+        };
+        for (size_t at = sigAt; at < t.size();) {
+            size_t nl = t.find('\n', at);
+            if (nl == std::string::npos) nl = t.size();
+            size_t stmt = 0;
+            if (movable(at, nl, stmt)) {
+                std::string lab = t.substr(at, stmt - 1 - at);
+                if (tgt.count(lab)) flush();
+                run.push_back({lab, t.substr(stmt, nl - stmt)});
+            } else {
+                flush();
+                body.append(t, at, nl - at);
+                if (nl < t.size()) body += '\n';
+            }
+            at = nl + 1;
+        }
+        flush();
+        if (nh) t = t.substr(0, sigAt) + body;
+        return helpers;
+    }
+    // A process that never waits (a constant continuous assign, an initial
+    // block without delays: OpenTitan has 46,000): a plain function that a
+    // coroutine of the header (evOnce) calls when the process starts, not a
+    // coroutine of its own, which costs the C++ compiler far more.
+    bool evPlain(const std::string& t, int n) {
+        const std::string sig = "static Task proc" + std::to_string(n) + "() {\n";
+        size_t a = t.find(sig);
+        if (a == std::string::npos || t.find("Task", a + sig.size()) != std::string::npos || t.find("co_await") != std::string::npos ||
+            t.find("co_yield") != std::string::npos)
+            return false;
+        size_t r = t.find("co_return;");
+        if (r == std::string::npos || t.find("co_return", r + 1) != std::string::npos) return false;
+        evPlain_[(size_t)n] = 1;
+        return true;
+    }
+    static std::string plainText(const std::string& t, int n) {
+        const std::string sig = "static Task proc" + std::to_string(n) + "() {\n";
+        std::string r = t;
+        size_t a = r.find(sig);
+        r.replace(a, sig.size(), "static void proc" + std::to_string(n) + "(const void*) {\n");
+        size_t c = r.find("co_return;");
+        r.replace(c, 10, "return;");
+        return r;
+    }
+    std::string evCtx(int i) const {
+        if (i < 0 || (size_t)i >= evAt_.size() || evAt_[(size_t)i] < 0) return "nullptr";
+        return "DT + " + std::to_string(evAt_[(size_t)i]);
+    }
+    // The text with the process number in its names and labels as @@.
+    static std::string evNorm(const std::string& t, int n) {
+        const std::string id = std::to_string(n);
+        auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+        std::string r;
+        r.reserve(t.size());
+        for (size_t i = 0; i < t.size();) {
+            bool hit = false;
+            if (i == 0 || !idc(t[i - 1]))
+                for (const char* pre : {"combv", "combc", "comb", "seq", "proc", "c"}) {
+                    size_t n0 = std::strlen(pre);
+                    if (t.compare(i, n0, pre) != 0 || t.compare(i + n0, id.size(), id) != 0) continue;
+                    size_t e = i + n0 + id.size();
+                    char nx = e < t.size() ? t[e] : 0;
+                    if (pre[1] == 0 ? nx != '_' : nx != '(') continue;
+                    r += pre;
+                    r += "@@";
+                    i = e;
+                    hit = true;
+                    break;
+                }
+            if (!hit && t.compare(i, 11, "// process ") == 0 && t.compare(i + 11, id.size(), id) == 0 && i + 11 + id.size() < t.size() &&
+                t[i + 11 + id.size()] == ' ') {
+                r += "// process @@";
+                i += 11 + id.size();
+                hit = true;
+            }
+            if (!hit) r += t[i++];
+        }
+        return r;
+    }
+    void shareEv(std::vector<EvUnit>& us, std::vector<std::string>& chunks) {
+        // Each distinct signal of a template is a slot a member moves by its
+        // own distance (the same signal twice: the same distance). Slots
+        // that move together in every member then share one distance, and a
+        // slot no member moves is left as it is.
+        struct Tpl { size_t u; std::vector<long long> num; std::vector<int> slot; int nslot = 0; std::vector<std::pair<size_t, std::vector<long long>>> mem; };
+        std::vector<Tpl> tpls;
+        std::unordered_map<std::string, std::vector<size_t>> byShape;
+        std::vector<std::string> norm(us.size());
+        constexpr int kTries = 16;
+        for (size_t u = 0; u < us.size(); u++) {
+            norm[u] = evNorm(us[u].text, us[u].i);
+            std::string shape;
+            std::vector<long long> num;
+            bool ok = true;
+            size_t last = 0;
+            refScan(norm[u], [&](size_t, size_t at, size_t e, long long n, int kind) {
+                if (kind != 0) ok = false;
+                shape += refPiece(norm[u].substr(last, at - last));
+                shape += '\x01';
+                num.push_back(n);
+                last = e;
+            });
+            shape += refPiece(norm[u].substr(last));
+            evTotal_ += us[u].text.size();
+            if (!ok || num.empty()) { chunks.push_back(std::move(us[u].text)); norm[u].clear(); continue; }
+            auto& cand = byShape[shape];
+            bool placed = false;
+            std::vector<long long> D;
+            std::vector<char> set;
+            for (size_t c = 0; c < cand.size() && c < (size_t)kTries && !placed; c++) {
+                Tpl& t = tpls[cand[c]];
+                D.assign((size_t)t.nslot, 0);
+                set.assign((size_t)t.nslot, 0);
+                bool good = true;
+                for (size_t k = 0; k < num.size() && good; k++) {
+                    int sl = t.slot[k];
+                    long long d = num[k] - t.num[k];
+                    if (!set[(size_t)sl]) { set[(size_t)sl] = 1; D[(size_t)sl] = d; }
+                    else good = D[(size_t)sl] == d;
+                }
+                if (!good) continue;
+                t.mem.push_back({u, D});
+                evSaved_ += us[u].text.size();
+                std::string().swap(us[u].text);
+                std::string().swap(norm[u]);
+                placed = true;
+            }
+            if (placed) continue;
+            if (cand.size() >= (size_t)kTries) { chunks.push_back(std::move(us[u].text)); norm[u].clear(); continue; }
+            Tpl t;
+            t.u = u;
+            t.num = num;
+            std::unordered_map<long long, int> slotOf;
+            for (long long n : num) {
+                auto [it, fresh] = slotOf.try_emplace(n, (int)slotOf.size());
+                t.slot.push_back(it->second);
+            }
+            t.nslot = (int)slotOf.size();
+            cand.push_back(tpls.size());
+            tpls.push_back(std::move(t));
+        }
+        for (auto& t : tpls) {
+            EvUnit& tu = us[t.u];
+            if (t.mem.empty()) { chunks.push_back(std::move(tu.text)); continue; }
+            // Slots whose distances are the same in every member share one;
+            // all zero: none.
+            std::vector<int> merged((size_t)t.nslot, -1);
+            std::vector<int> rep;   // merged slot -> a slot of it
+            {
+                std::map<std::vector<long long>, int> cols;
+                for (int sl = 0; sl < t.nslot; sl++) {
+                    std::vector<long long> col;
+                    bool zero = true;
+                    for (auto& [u, d] : t.mem) { col.push_back(d[(size_t)sl]); zero &= d[(size_t)sl] == 0; }
+                    if (zero) continue;
+                    auto [it, fresh] = cols.try_emplace(col, (int)rep.size());
+                    if (fresh) rep.push_back(sl);
+                    merged[(size_t)sl] = it->second;
+                }
+            }
+            const int nd = (int)rep.size();
+            // The template: its numbers as N + D<slot>, its distances from ctx.
+            const std::string nm = "S" + std::to_string(tu.i);
+            std::string decl = " const int* D_ = (const int*)x_; (void)D_;";
+            for (int k = 0; k < nd; k++) decl += (k ? ", D" : " const int D") + std::to_string(k) + " = D_[" + std::to_string(k) + "]";
+            if (nd) decl += ";";
+            const std::string& nt = norm[t.u];
+            std::string r;
+            r.reserve(nt.size() + nt.size() / 4);
+            size_t last = 0, k = 0;
+            refScan(nt, [&](size_t, size_t, size_t e, long long, int) {
+                r.append(nt, last, e - last);
+                if (int m = merged[(size_t)t.slot[k]]; m >= 0) r += " + D" + std::to_string(m);
+                k++;
+                last = e;
+            });
+            r.append(nt, last, std::string::npos);
+            std::string out;
+            out.reserve(r.size() + 4096);
+            for (size_t i = 0; i < r.size();) {
+                if (r.compare(i, 2, "@@") == 0) { out += nm; i += 2; continue; }
+                bool hit = false;
+                for (const char* sg : {"(const void*) {", "(const void*, Val v) {", "(const void*, std::vector<Sim::NbaItem>& nb) {"}) {
+                    size_t n0 = std::strlen(sg);
+                    if (r.compare(i, n0, sg) != 0) continue;
+                    out += "(const void* x_";
+                    out.append(sg + 12, n0 - 12);
+                    out += decl;
+                    i += n0;
+                    hit = true;
+                    break;
+                }
+                if (!hit) out += r[i++];
+            }
+            chunks.push_back(std::move(out));
+            auto add = [&](size_t u, const std::vector<long long>* d) {
+                evName_[(size_t)us[u].i] = nm;
+                if (!nd) return;   // the same signals in every copy
+                evAt_[(size_t)us[u].i] = (int)evDT_.size();
+                for (int m = 0; m < nd; m++) evDT_.push_back(d ? (int)(*d)[(size_t)rep[(size_t)m]] : 0);
+            };
+            add(t.u, nullptr);
+            for (auto& [u, d] : t.mem) add(u, &d);
+        }
+        if (std::getenv("MSIM_WHYSHARE"))
+            std::fprintf(stderr, "shared event code: %zu of %zu bytes are calls to another instance's copy\n", evSaved_, evTotal_);
+    }
+
     // A combinational process: its leading Assign instructions as a function.
     void emitComb(std::ostream& o, int n, const Prog& p, const std::string& kind) {
         o << "// process " << n << " (" << kind << ", combinational)\n";
         const bool as = combAsserts(p);
+        // One assign: the value and the write (the kernel's batches call
+        // them apart), and the process itself as the two (once, not three
+        // copies of the expression for the C++ compiler).
+        if (oneAssign(p) && !as && !p.code[0].bidx && !p.code[0].arr) {
+            o << "static Val combv" << n << "(const void*) {" << CH(&p, 0) << " return " << fast(p.code[0].e) << "; }\n";
+            o << "static void combc" << n << "(const void*, Val v) {" << assign(p.code[0], "v") << "}\n";
+            o << "static void comb" << n << "(const void* x) { combc" << n << "(x, combv" << n << "(x)); }\n\n";
+            return;
+        }
         if (as) o << combCtlDecl(n);
         o << "static void comb" << n << "(const void*) {\n";
         if (as) o << "    CC" << n << "->epoch++;\n";
