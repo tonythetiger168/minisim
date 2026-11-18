@@ -2994,7 +2994,10 @@ struct Lowerer {
     }
     static bool classMember(const slang::ast::Expression& e) {
         if (e.kind != slang::ast::ExpressionKind::MemberAccess) return false;
-        const auto& t = *e.as<slang::ast::MemberAccessExpression>().value().type;
+        const auto& m = e.as<slang::ast::MemberAccessExpression>();
+        if (m.member.kind == slang::ast::SymbolKind::Parameter || m.member.kind == slang::ast::SymbolKind::EnumValue)
+            return false;   // h.P (8.25): a constant, not a slot behind the handle
+        const auto& t = *m.value().type;
         return isHandleType(t) && !t.isVirtualInterface();
     }
     // The virtual interface v of v.x or v.cb.x (25.9), or null.
