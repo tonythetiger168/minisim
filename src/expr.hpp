@@ -1469,6 +1469,7 @@ enum SysFnId : int {
     SF_URANDOM_RANGE, // $urandom_range(max, min) (18.13.2)
     SF_PLUS_TEST,    // $test$plusargs(prefix) (21.6); also "is there a match" for $value$plusargs
     SF_PLUS_VALUE,   // the text after prefix kid0, read with format letter lo
+    SF_PLUS_FMT,     // a $value$plusargs format known at run time: its prefix (lo 0) or its letter (lo 1)
     SF_TIMEFORMAT,   // $timeformat(units, precision, suffix, width) (20.4.3); returns 0
     // File I/O (21.3). A descriptor with bit 31 set is a file (0x80000000-2 are
     // stdin, stdout, stderr); otherwise each set bit is a channel (bit 0 stdout).
@@ -2551,6 +2552,18 @@ inline Val v_sysfn(int id, int ctl, const std::vector<Val>& a) {
             if (a.size() > 2) { Val s = a[2]; s.str = true; t.suffix = v_str(s); }
             if (a.size() > 3) t.width = (int)i64(a[3]);
             return make(0, 0, 1, 0);
+        }
+        case SF_PLUS_FMT: {   // "name=%5h": the text before %, or the letter (lowercase, x as h; 0 if none)
+            Val p = a[0]; p.str = true;
+            std::string f = v_str(p);
+            size_t pc = f.find('%');
+            if (ctl == 0) return mkstr(pc == std::string::npos ? f : f.substr(0, pc));
+            if (pc == std::string::npos) return make(0, 0, 32, 0, true);
+            size_t q = pc + 1;
+            while (q < f.size() && isdigit((unsigned char)f[q])) q++;
+            int c = q < f.size() ? tolower((unsigned char)f[q]) : 0;
+            if (c == 'x') c = 'h';
+            return make((uint64_t)c, 0, 32, 0, true);
         }
         case SF_PLUS_VALUE: {   // the caller has checked that a match exists
             Val p = a[0]; p.str = true;

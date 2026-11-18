@@ -8296,7 +8296,39 @@ struct Lowerer {
                     for (size_t k = 0; k + 1 < ops.size(); k++) head.push_back(strOf(*ops[k]));
                 }
             }
-            if (lit->kind != slang::ast::ExpressionKind::StringLiteral) unsupported("$value$plusargs format that is not a literal or ends in one");
+            if (lit->kind != slang::ast::ExpressionKind::StringLiteral) {
+                // A format known only at run time (21.6): split it then, and
+                // read the value as each letter would, keeping the matching one.
+                if (!stmtDepth) unsupported("$value$plusargs outside a procedural statement");
+                E fmtS = strOf(f);   // read more than once: a string expression has no side effects here
+                E pre = sysFnNode(SF_PLUS_FMT, {fmtS}, 0);
+                int letter = fresh(32);
+                { Instr i; i.k = IK::Assign; i.sig = letter; i.e = sysFnNode(SF_PLUS_FMT, {fmtS}, 1); prog.emit(i); }
+                int found = fresh(32);
+                Instr t; t.k = IK::Assign; t.sig = found;
+                t.e = bin(Op::LogAnd, bin(Op::Ne, ref(letter, true), konst(make(0, 0, 32, 0, true))),
+                          sysFnNode(SF_PLUS_TEST, {pre}));
+                prog.emit(t);
+                Instr j; j.k = IK::JmpIfNot; j.e = ref(found);
+                size_t jf = prog.emit(j);
+                const slang::ast::Expression& dst = outArg(*args[1]);
+                std::vector<size_t> ends;
+                for (char c : std::string("dhobsfeg")) {
+                    Instr k; k.k = IK::JmpIfNot;
+                    k.e = bin(Op::Eq, ref(letter, true), konst(make((uint64_t)c, 0, 32, 0, true)));
+                    size_t kf = prog.emit(k);
+                    Instr w; w.k = IK::Assign;
+                    lhs(dst, w);
+                    w.e = readAs(sysFnNode(SF_PLUS_VALUE, {pre}, c), c, *dst.type, "$value$plusargs");
+                    prog.emit(w);
+                    Instr e; e.k = IK::Jmp;
+                    ends.push_back(prog.emit(e));
+                    prog.code[kf].target = prog.here();
+                }
+                for (size_t e : ends) prog.code[e].target = prog.here();
+                prog.code[jf].target = prog.here();
+                return ref(found, true);
+            }
             std::string fs(lit->as<slang::ast::StringLiteral>().getValue());
             size_t pc = fs.find('%');
             if (pc == std::string::npos) unsupported("$value$plusargs format without a specifier");
