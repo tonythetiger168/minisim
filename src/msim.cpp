@@ -2097,6 +2097,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     parts.on = staticPart && !combAssert && !pl.cyclic;
     // The domain evaluates every comb statement once, in rank order. Not with
     // -upf: every write goes through Sim::set, which keeps the UPF holds.
+    if (std::getenv("MSIM_WHYCYCLE") && cycle && (pl.cyclic || upf))
+        std::fprintf(stderr, "cycle domain off: %s\n", upf ? "-upf" : "combinational blocks feed each other (MSIM_WHYCYCMERGE=1)");
     cycle = cycle && !pl.cyclic && !upf;
     if (staticPart) partitionInputs(lowered, pl, parts.outs, parts.ins, parts.targets);
     std::string src;
@@ -2149,8 +2151,21 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // library's processes. Not compiled into a simv yet.
     std::string mixWhy;
     if ((why || g_mixForce) && mixOK) {
-        mix.domain = !g_mixForce && why && std::string(why) == "a final block";
+        // The cycle domain stays when nothing is interpreted and msim's runtime
+        // only looks on: a final block, or the concurrent assertions it
+        // samples at their clocks (OpenTitan's), unless a process waits on a
+        // sequence's end point (@(s), s.triggered: 9.4.2.4, the order of the
+        // processes that wake then differed). MSIM_NOMIXDOM=1: not for assertions.
+        bool seqEnds = false;
+        for (auto& c : concAsserts()) seqEnds |= c.endSig >= 0;
+        const std::string w = why ? why : "";
+        // DPI-C exports (a C model calls back into the design, OpenTitan's
+        // memory loaders): msim runs them as subroutines, so the domain stays too.
+        const bool forceOk = !g_mixForce || (std::string(g_mixForce) == "DPI-C exports" && !std::getenv("MSIM_NOMIXDOM"));
+        mix.domain = forceOk && (w.empty() || w == "a final block" ||
+                                     (w == "a concurrent, final or expect assertion" && !seqEnds && !std::getenv("MSIM_NOMIXDOM")));
         mixWhy = g_mixForce ? g_mixForce : why;
+        if (std::getenv("MSIM_WHYMIX")) std::fprintf(stderr, "msim: -compile: mixed mode for %s%s\n", mixWhy.c_str(), mix.domain ? " (the cycle domain may stay)" : "");
         why = nullptr;
         mix.on = true;   // force: no simv
     }
@@ -2169,6 +2184,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         return -1;
     }
     phaseMark("codegen");
+    if (std::getenv("MSIM_WHYMIX"))
+        for (auto& [n, r] : mix.procs) std::fprintf(stderr, "msim: -compile: process %d (%s in %s) interpreted: %s\n", n, lowered.procs[n].kind.c_str(), lowered.procs[n].scope.c_str(), r.c_str());
     std::string inc = kernelIncludeDir();
     if (std::system(("mkdir -p " + shq(dir)).c_str()) != 0) { std::cerr << "msim: cannot create " << dir << "\n"; return 1; }
     std::string cpp = dir + "/design.cpp", exe = dir + (mix.on ? "/design.so" : "/simv");
@@ -2411,9 +2428,11 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         void* h = dlopen(exe.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (!h) { std::cerr << "msim: -compile: cannot load " << exe << ": " << dlerror() << "\n"; return 1; }
         g_mixSetup = (int (*)())dlsym(h, "msim_mix_setup");
+        static std::vector<const void*> ins;
+        ins.assign(mix.ins.begin(), mix.ins.end());
+        g_mixIns = ins.data();
         if (!g_mixSetup) { std::cerr << "msim: -compile: " << exe << " has no msim_mix_setup\n"; return 1; }
-        if (std::getenv("MSIM_WHYMIX"))
-            for (auto& [n, r] : mix.procs) std::fprintf(stderr, "msim: -compile: process %d (%s) interpreted: %s\n", n, lowered.procs[n].kind.c_str(), r.c_str());
+        if (std::getenv("MSIM_WHYMIX")) {}   // listed after codegen
         else if (!mix.procs.empty())
             std::cerr << "msim: -compile: " << mix.procs.size() << " of " << lowered.procs.size()
                       << " processes interpreted (" << mix.procs[0].second << "; MSIM_WHYMIX=1 lists them)\n";
