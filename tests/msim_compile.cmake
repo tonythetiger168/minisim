@@ -58,6 +58,8 @@ set(CASES
   "-cfiles 3 examples/atstarpriv.sv"
   "-cfiles 3 examples/seqtemp.sv"
   "examples/shareinst.sv"
+  "-no-cycle examples/shareev.sv"
+  "-no-cycle -cfiles 3 examples/shareev.sv"
   "examples/shareport.sv"
   "examples/privpart.sv"
   "-x-assign 0 -x-initial 0 examples/privpart.sv"
@@ -232,6 +234,19 @@ foreach(c IN LISTS CASES)
     file(READ ${OUT}/c${n}/design.cpp gen)
     if(NOT gen MATCHES "dsT[0-9]+\\(" OR NOT gen MATCHES "combPT[0-9]+_0\\(")
       message(FATAL_ERROR "${c}: the instances do not share their code")
+    endif()
+  endif()
+  # ...and outside the cycle domain too: one comb and one clocked function
+  # per module, called with each instance's distances (codegen.hpp shareEv).
+  if(c MATCHES "examples/shareev")
+    file(GLOB srcs ${OUT}/c${n}/*.cpp)
+    set(gen "")
+    foreach(f ${srcs})
+      file(READ ${f} t)
+      string(APPEND gen "${t}")
+    endforeach()
+    if(NOT gen MATCHES "void combS[0-9]+\\(const void\\* x_" OR NOT gen MATCHES "void seqS[0-9]+\\(const void\\* x_")
+      message(FATAL_ERROR "${c}: the instances' comb and clocked functions are not shared")
     endif()
   endif()
   # The tiles of a generate mesh (soc.row[r].col[c].t) share one copy of
