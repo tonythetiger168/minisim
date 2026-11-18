@@ -4699,6 +4699,19 @@ struct Lowerer {
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
         if (vifArrayElems(x, out)) return;   // an array of interface instances into virtual interfaces (25.9)
+        if (x.kind == ExpressionKind::Streaming && !streamIsDyn(x.as<StreamingConcatenationExpression>())) {
+            // a[2][2] = {>>{v}} (11.4.14): the stream's bits, the left element first
+            const Type* leaf = &t;
+            while (leaf->kind == SymbolKind::FixedSizeUnpackedArrayType)
+                leaf = &leaf->as<FixedSizeUnpackedArrayType>().elementType.getCanonicalType();
+            int sw = 0;
+            E v = streamBits(x.as<StreamingConcatenationExpression>(), sw);
+            int W = (int)t.getBitstreamWidth(), ew = (int)leaf->getBitWidth();
+            if (!leaf->isIntegral() || sw < W) unsupported("this stream into an unpacked array");
+            for (int hi = sw - 1; hi > sw - 1 - W; hi -= ew)
+                out.push_back(resize(slice(v, hi, hi - ew + 1), ew, false, leaf->isSigned()));
+            return;
+        }
         if (x.kind == ExpressionKind::ElementSelect || x.kind == ExpressionKind::RangeSelect) {
             // P[0] of a parameter array, constant indexes: its elements as constants
             const Symbol* b = selectBase(x);
@@ -10451,14 +10464,13 @@ struct Lowerer {
                 parts.push_back(expr(op));
             } else if (isFixedArr(op) && op.kind == ExpressionKind::NamedValue) {
                 auto it = arrMap().find(&op.as<NamedValueExpression>().symbol);
-                if (it == arrMap().end() || it->second->dims.size() != 1 ||
-                    !op.type->getArrayElementType()->isIntegral())
+                // integral elements, or (11.4.14.1) unpacked structs and arrays of them, held one signal per element
+                if (it == arrMap().end() || !streamStruct(*op.type) ||
+                    (int64_t)it->second->elemW * it->second->count != (int64_t)op.type->getBitstreamWidth())
                     unsupported("this array in a streaming concatenation");
-                int ew = (int)op.type->getArrayElementType()->getBitWidth();
-                auto r = op.type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
-                (void)r;
+                int ew = it->second->elemW;
                 for (int k = 0; k < it->second->count; k++) {   // foreach order: left index first
-                    parts.push_back(ref(it->second->base + k));
+                    parts.push_back(resize(ref(it->second->base + k), ew, false, false));
                     pw += ew;
                 }
             } else if (op.type->isUnpackedStruct() && streamStruct(*op.type)) {
@@ -11198,6 +11210,18 @@ struct Lowerer {
                 } else loop(lo, hi, down, body);
                 continue;
             }
+            if (isFixedArr(op) && !st.withExpr && ValueExpressionBase::isKind(op.kind) && streamStruct(*op.type)) {
+                // s_t a[2][3]: each element in turn, left index first (11.4.14.3)
+                auto A = arrFind(&op.as<ValueExpressionBase>().symbol);
+                if (!A || (int64_t)A->elemW * A->count != (int64_t)op.type->getBitstreamWidth())
+                    unsupported("this array in a streaming assignment");
+                for (int k = 0; k < A->count; k++) {
+                    Instr i; i.k = IK::Assign; i.sig = A->base + k; i.e = take(A->elemW);
+                    xpDirect(i);
+                    advance(A->elemW);
+                }
+                continue;
+            }
             unsupported("this target of a streaming assignment");
         }
         size_t done = emitJmp();
@@ -11222,6 +11246,11 @@ struct Lowerer {
                 prog.emit(i);
                 return;
             }
+        }
+        if (const Expression& r = peel(a.right()); dynSig(r) >= 0 ||
+            (r.kind == ExpressionKind::Streaming && streamIsDyn(r.as<StreamingConcatenationExpression>()))) {
+            streamAssignDyn(a, sc);   // {<<8{a, b}} = q: a stream whose length is known only at run time
+            return;
         }
         for (auto& st : sc.streams()) {   // a container or a with [...] target: the stream is cut at run time
             const Expression& op = peel(*st.operand);
