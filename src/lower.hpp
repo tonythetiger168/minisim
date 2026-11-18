@@ -2821,6 +2821,7 @@ struct Lowerer {
     // A call of an automatic subroutine (13.3.2): its arguments go straight
     // into the new frame; outputs and the result are copied out of the frame
     // it returned from (relative mode kRelRet) right after the call.
+    std::unordered_map<const slang::ast::Symbol*, E> argSubst;   // formal -> value passed, while lowering a default argument
     E emitAutoCall(const Subr& sub, std::span<const slang::ast::Expression* const> args, bool wantValue,
                    E self = nullptr, bool noSelf = false, int vslot = -1) {
         using namespace slang::ast;
@@ -2858,11 +2859,24 @@ struct Lowerer {
                 // A default argument (13.5.3) is evaluated for the callee: a
                 // method it calls without an object runs on the callee's object.
                 const auto* fs = sub.sym && n < sub.sym->getArguments().size() ? sub.sym->getArguments()[n] : nullptr;
+                // A default that names an earlier argument (f(int a, int b = a ? 1 : 2)) reads the value passed for it.
+                auto saveSubst = argSubst;
+                if (fs && fs->getDefaultValue() == &a)
+                    for (size_t k = 0; k < n; k++)
+                        if (sub.args[k].dir == ArgumentDirection::In && !sub.args[k].arr)
+                            for (auto& [sg, v] : c.init)
+                                if (sg == sub.args[k].sig) argSubst[sub.sym->getArguments()[k]] = v;
                 if (fs && fs->getDefaultValue() == &a && isClassMethod(*sub.sym) && !noSelf) {
                     E saved = defaultSelf;
                     defaultSelf = c.self ? c.self : node(Op::This);
                     c.init.push_back({formal.sig, expr(a)});
                     defaultSelf = saved;
+                    argSubst = std::move(saveSubst);
+                    continue;
+                }
+                if (fs && fs->getDefaultValue() == &a) {
+                    c.init.push_back({formal.sig, cloneConts(*a.type, expr(a))});
+                    argSubst = std::move(saveSubst);
                     continue;
                 }
                 // A string literal put into a typeless mailbox (15.4.9) goes
@@ -4144,17 +4158,20 @@ struct Lowerer {
         if (e.kind == ExpressionKind::BinaryOp) {
             const auto& b = e.as<BinaryExpression>();
             bool andOp = b.op == BinaryOperator::LogicalAnd, orOp = b.op == BinaryOperator::LogicalOr;
+            // a -> b (11.4.7) is !a || b, and b is skipped when a is false (11.3.5)
+            bool implOp = b.op == BinaryOperator::LogicalImplication;
+            if (implOp) orOp = true;
             if ((!andOp && !orOp) || !sideEffects(b.right())) return nullptr;
             auto truthE = [&](const Expression& x) {
                 E v = isHandleType(*x.type) ? exprH(x) : x.type->isFloating() ? realOf(x) : expr(x);
                 return un(Op::LogNot, un(Op::LogNot, v));
             };
             int tmp = fresh(1);
-            Instr l; l.k = IK::Assign; l.sig = tmp; l.e = truthE(b.left()); prog.emit(l);
+            Instr l; l.k = IK::Assign; l.sig = tmp; l.e = implOp ? un(Op::LogNot, truthE(b.left())) : truthE(b.left()); prog.emit(l);
             // Condition coverage: the left term is kept, and after the right
             // one ran (or was skipped) the pair is counted as a lazy
             // condition of (left, result), which has the same vectors.
-            bool cover = g_cov && condCov && condCovOff == 0 && covSM() && b.left().type->isIntegral() &&
+            bool cover = !implOp && g_cov && condCov && condCovOff == 0 && covSM() && b.left().type->isIntegral() &&
                          b.right().type->isIntegral() && !isHandleType(*b.left().type) && !isHandleType(*b.right().type);
             int left = -1;
             if (cover) {
@@ -4193,6 +4210,16 @@ struct Lowerer {
         if (!exprOverride.empty())
             if (auto ov = exprOverride.find(&e); ov != exprOverride.end())
                 return sized(ref(ov->second, e.type->isSigned()), (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+        if (e.kind == ExpressionKind::NamedValue && !argSubst.empty())   // an earlier argument, in a default (13.5.3)
+            if (auto as = argSubst.find(&e.as<NamedValueExpression>().symbol); as != argSubst.end())
+                return sized(as->second, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+        if (e.kind == ExpressionKind::NamedValue && defaultSelf)   // a property, in a method's default argument: the callee's object's
+            if (auto pp = propMap().find(&e.as<NamedValueExpression>().symbol); pp != propMap().end() && pp->second.kind == 0 &&
+                !e.type->isFloating() && !e.type->isString() && e.type->isIntegral()) {
+                E r = ref(pp->second.off, e.type->isSigned());
+                r->at = defaultSelf;
+                return sized(r, (int)e.type->getBitWidth(), e.type->isSigned(), ctx);
+            }
         if (e.kind == ExpressionKind::NamedValue && !labelled().empty())   // a LABEL'd specparam (32.4.3)
             if (auto lv = labelled().find(&e.as<NamedValueExpression>().symbol); lv != labelled().end()) {
                 if (e.type->isFloating()) return konst(mkreal(lv->second));
@@ -4699,6 +4726,19 @@ struct Lowerer {
         int64_t n = (int64_t)ft.range.width();
         const Expression& x = peel(x0);
         if (vifArrayElems(x, out)) return;   // an array of interface instances into virtual interfaces (25.9)
+        if (x.kind == ExpressionKind::Streaming && !streamIsDyn(x.as<StreamingConcatenationExpression>())) {
+            // a[2][2] = {>>{v}} (11.4.14): the stream's bits, the left element first
+            const Type* leaf = &t;
+            while (leaf->kind == SymbolKind::FixedSizeUnpackedArrayType)
+                leaf = &leaf->as<FixedSizeUnpackedArrayType>().elementType.getCanonicalType();
+            int sw = 0;
+            E v = streamBits(x.as<StreamingConcatenationExpression>(), sw);
+            int W = (int)t.getBitstreamWidth(), ew = (int)leaf->getBitWidth();
+            if (!leaf->isIntegral() || sw < W) unsupported("this stream into an unpacked array");
+            for (int hi = sw - 1; hi > sw - 1 - W; hi -= ew)
+                out.push_back(resize(slice(v, hi, hi - ew + 1), ew, false, leaf->isSigned()));
+            return;
+        }
         if (x.kind == ExpressionKind::ElementSelect || x.kind == ExpressionKind::RangeSelect) {
             // P[0] of a parameter array, constant indexes: its elements as constants
             const Symbol* b = selectBase(x);
@@ -10451,14 +10491,13 @@ struct Lowerer {
                 parts.push_back(expr(op));
             } else if (isFixedArr(op) && op.kind == ExpressionKind::NamedValue) {
                 auto it = arrMap().find(&op.as<NamedValueExpression>().symbol);
-                if (it == arrMap().end() || it->second->dims.size() != 1 ||
-                    !op.type->getArrayElementType()->isIntegral())
+                // integral elements, or (11.4.14.1) unpacked structs and arrays of them, held one signal per element
+                if (it == arrMap().end() || !streamStruct(*op.type) ||
+                    (int64_t)it->second->elemW * it->second->count != (int64_t)op.type->getBitstreamWidth())
                     unsupported("this array in a streaming concatenation");
-                int ew = (int)op.type->getArrayElementType()->getBitWidth();
-                auto r = op.type->getCanonicalType().as<FixedSizeUnpackedArrayType>().range;
-                (void)r;
+                int ew = it->second->elemW;
                 for (int k = 0; k < it->second->count; k++) {   // foreach order: left index first
-                    parts.push_back(ref(it->second->base + k));
+                    parts.push_back(resize(ref(it->second->base + k), ew, false, false));
                     pw += ew;
                 }
             } else if (op.type->isUnpackedStruct() && streamStruct(*op.type)) {
@@ -11198,6 +11237,18 @@ struct Lowerer {
                 } else loop(lo, hi, down, body);
                 continue;
             }
+            if (isFixedArr(op) && !st.withExpr && ValueExpressionBase::isKind(op.kind) && streamStruct(*op.type)) {
+                // s_t a[2][3]: each element in turn, left index first (11.4.14.3)
+                auto A = arrFind(&op.as<ValueExpressionBase>().symbol);
+                if (!A || (int64_t)A->elemW * A->count != (int64_t)op.type->getBitstreamWidth())
+                    unsupported("this array in a streaming assignment");
+                for (int k = 0; k < A->count; k++) {
+                    Instr i; i.k = IK::Assign; i.sig = A->base + k; i.e = take(A->elemW);
+                    xpDirect(i);
+                    advance(A->elemW);
+                }
+                continue;
+            }
             unsupported("this target of a streaming assignment");
         }
         size_t done = emitJmp();
@@ -11222,6 +11273,11 @@ struct Lowerer {
                 prog.emit(i);
                 return;
             }
+        }
+        if (const Expression& r = peel(a.right()); dynSig(r) >= 0 ||
+            (r.kind == ExpressionKind::Streaming && streamIsDyn(r.as<StreamingConcatenationExpression>()))) {
+            streamAssignDyn(a, sc);   // {<<8{a, b}} = q: a stream whose length is known only at run time
+            return;
         }
         for (auto& st : sc.streams()) {   // a container or a with [...] target: the stream is cut at run time
             const Expression& op = peel(*st.operand);
