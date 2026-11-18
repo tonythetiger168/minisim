@@ -77,6 +77,10 @@ struct CodegenSig {
     bool init = false;
     uint64_t v = 0, x = 0, z = 0;
     bool zeroWide = false;   // a wider one that is all 0 (-x-initial 0)
+    // A string variable with a value before time 0 (a localparam struct's
+    // string member, 6.20.2): its text, set right after S.sig.
+    bool strInit = false;
+    std::string strText;
 };
 
 // msim -compile: the DPI-C libraries simv loads (the user's C files built
@@ -763,6 +767,15 @@ public:
              "    S.threads = std::min(S.threads, maxThreads());\n";
         // Startup is data plus loops, not one statement per item: a main() of
         // tens of thousands of statements took the C++ compiler minutes.
+        // msim's strings in the same order: a string id inside a constant (a
+        // struct parameter's string member, 6.20.2) names the same text.
+        if (!mix && strPool().text.size() > 1) {
+            o << "    static const char* const STRS[] = {";
+            for (size_t k = 1; k < strPool().text.size(); k++) o << (k > 1 ? ", " : "") << quote(strPool().text[k]);
+            o << "};\n    static const size_t STRN[] = {";
+            for (size_t k = 1; k < strPool().text.size(); k++) o << (k > 1 ? ", " : "") << strPool().text[k].size();
+            o << "};\n    for (size_t k = 0; k < sizeof STRN / sizeof STRN[0]; k++) strPool().of(std::string(STRS[k], STRN[k]));\n";
+        }
         if (nSlots) o << "    XSL = SLT;\n";
         if (!arrs_.empty()) o << "    XAS = AST;\n";
         if (!sigs.empty() && !mix) {
@@ -834,6 +847,8 @@ public:
             if (!iv.empty())
                 o << "    static const struct { int s; uint64_t v, x, z; } SIV[] = {\n" << iv << "    };\n"
                      "    for (auto& e : SIV) { Val& g = S.sigs[e.s].val; g.v = e.v; g.x = e.x; g.z = e.z; }\n";
+            for (size_t s = 0; s < sigs.size(); s++)
+                if (sigs[s].strInit) o << "    S.sigs[" << s << "].val = mkstr(" << quote(sigs[s].strText) << ");\n";
             // A delayed driver is x until its first update arrives (10.3.3,
             // 28.16), with its own strengths, as msim sets it up.
             std::set<int> dlyNets;
@@ -5796,11 +5811,25 @@ private:
                         if (ak >= 0)
                             o << " for (uint32_t j = ARMOFF[" << ak << "]; j < ARMOFF[" << ak + 1 << "]; j++) ARMSNAP[j] = PA[ARMIN[j]]; ARMST[" << ak
                               << "] = 1;\n";
+                        std::string wait;
                         if (i.events.size() > 1) {
                             events_.push_back(i.events);
-                            o << " co_await WaitAny{&EV" << events_.size() - 1 << "};";
+                            wait = " co_await WaitAny{&EV" + std::to_string(events_.size() - 1) + "};";
                         } else
-                            o << " co_await Wait{" << i.sig << ", " << edge(i.edge) << "};";
+                            wait = " co_await Wait{" + std::to_string(i.sig) + ", " + edge(i.edge) + "};";
+                        if (pi == 0 && (int)pc == entry.settleWait && ak < 0) {
+                            // always_comb (9.2.2.2), as exec.inc: a change another
+                            // process has already undone does not run it again.
+                            std::vector<int> ws;
+                            if (i.events.size() > 1) for (auto& [sg, ed] : i.events) ws.push_back(sg);
+                            else ws.push_back(i.sig);
+                            o << " { Val sv[" << ws.size() << "] = {";
+                            for (size_t k = 0; k < ws.size(); k++) o << (k ? ", " : "") << "S.sigs[" << ws[k] << "].val";
+                            o << "}; for (;;) {" << wait << " if (!(";
+                            for (size_t k = 0; k < ws.size(); k++) o << (k ? " && " : "") << "S.sigs[" << ws[k] << "].val == sv[" << k << "]";
+                            o << ")) break; } }";
+                        } else
+                            o << wait;
                         if (ak >= 0) o << " if (ARMST[" << ak << "] == 2) co_return; ARMST[" << ak << "] = 2; ARMLEFT--;";
                         o << (asserting ? " ctl->epoch++;\n" : "\n");   // a deferred assertion flush point (16.4.2)
                         o << gate;
