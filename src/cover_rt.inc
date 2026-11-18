@@ -1369,7 +1369,12 @@ inline double typeCoverage(const CgDef& d, int item, double* covered = nullptr, 
 inline CgInst& instOf(const Val& h) {
     if (h.x || h.v == 0 || h.v > cgInsts().size()) {
         std::cout << "Error: null covergroup handle at time " << S.now << "\n";
+#if __cpp_exceptions
         throw std::runtime_error("msim: covergroup method on a null handle");
+#else
+        std::fprintf(stderr, "msim: covergroup method on a null handle\n");
+        std::exit(1);
+#endif
     }
     return cgInsts()[h.v - 1];
 }
