@@ -260,7 +260,14 @@ inline void setArgs(const CgInst& in) {
         S.set(d.argSigs[k], d.argRef[k] ? S.get(in.refSigs[k]) : in.args[k]);
 }
 constexpr size_t kMaxBins = 1u << 20;
-[[noreturn]] inline void fail(const std::string& m) { throw std::runtime_error("msim: covergroup: " + m); }
+// A covergroup that cannot be built (19.5: a bin count that is not a
+// positive integer, too many bins) is a run-time error of the design, not
+// an internal one: report it and end the run.
+[[noreturn]] inline void fail(const std::string& m) {
+    std::fflush(stdout);
+    std::cerr << "error: covergroup: " << m << "\n";
+    std::exit(1);
+}
 
 // The values of a bin, one by one, for a cross with filter (19.6.1.2): its
 // keys in order; for a coverpoint wider than 64 bits each key is a bound
