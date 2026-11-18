@@ -237,7 +237,15 @@ public:
         }
 
         if (!evUnits.empty()) shareEv(evUnits, chunks);
-        for (auto& c : chunks) if (c.size() > kOutlineMin) c = outlineRuns(c);
+        {   // the helpers are chunks of their own: they spread over the files
+            std::vector<std::string> out;
+            out.reserve(chunks.size());
+            for (auto& c : chunks) {
+                if (c.size() > kOutlineMin) for (auto& h : outlineRuns(c)) out.push_back(std::move(h));
+                if (!c.empty()) out.push_back(std::move(c));
+            }
+            chunks = std::move(out);
+        }
         phaseMark(" cg: processes");
         if (!dom.empty()) { std::ostringstream c; emitCycle(c, wideProcs.empty() ? procs : wideProcs, dom, byRank); cyc = c.str(); }
         phaseMark(" cg: cycle domain");
@@ -256,8 +264,10 @@ public:
         // files < 0: exactly that many (msim -cfiles), else only for a large design.
         // A large design gets more files than cores: the compiler takes about
         // 0.25 GB per MB of generated code, so 1024 PicoRV32 cores in four
-        // 35 MB files ran a 16 GB machine out of memory. At most 4 MB a file.
-        size_t want = std::max<size_t>(files, (chunkBytes + (4u << 20) - 1) / (4u << 20));
+        // 35 MB files ran a 16 GB machine out of memory. At most 2 MB a file:
+        // OpenTitan's 4 MB parts took 2.6 GB each at -O2, two at a time on
+        // 16 GB beside msim; the header comes precompiled (design.hpp.gch).
+        size_t want = std::max<size_t>(files, (chunkBytes + (2u << 20) - 1) / (2u << 20));
         int nf = files < 0 ? (int)std::min<size_t>(-files, nChunks)
                : files > 1 ? (int)std::min({want, chunkBytes / 65536, nChunks}) : 1;
         nf = std::max(nf, 1);
@@ -5651,8 +5661,10 @@ private:
     // signal writes go to helper functions of kOutlineRun statements each.
     // A label something jumps to starts a new run (the call keeps it).
     static constexpr size_t kOutlineMin = 256u << 10, kOutlineRun = 1000;
-    static std::string outlineRuns(const std::string& t) {
-        if (t.find(" D_ = ") != std::string::npos) return t;   // shareEv's templates: the distances are locals
+    // Returns the helpers, one per element, and leaves t calling them.
+    static std::vector<std::string> outlineRuns(std::string& t) {
+        std::vector<std::string> helpers;
+        if (t.find(" D_ = ") != std::string::npos) return helpers;   // shareEv's templates: the distances are locals
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
         std::unordered_set<std::string> tgt;
         for (size_t a = t.find("goto "); a != std::string::npos; a = t.find("goto ", a + 5)) {
@@ -5678,7 +5690,7 @@ private:
             }
             at = nl + 1;
         }
-        if (sigAt == std::string::npos || name.empty()) return t;
+        if (sigAt == std::string::npos || name.empty()) return helpers;
         // A line that may move: "<label>: S.set(...);" and friends, naming
         // nothing local to the function.
         auto movable = [&](size_t a, size_t nl, size_t& stmt) {
@@ -5697,7 +5709,7 @@ private:
                 if (ln.find(bad) != std::string_view::npos) return false;
             return true;
         };
-        std::string helpers, body;
+        std::string body;
         int nh = 0;
         std::vector<std::pair<std::string, std::string>> run;   // label, statement
         auto flush = [&] {
@@ -5706,9 +5718,10 @@ private:
             } else
                 for (size_t k = 0; k < run.size(); k += kOutlineRun) {
                     std::string h = name + "_o" + std::to_string(nh++);
-                    helpers += "static void " + h + "() {\n";
-                    for (size_t j = k; j < std::min(run.size(), k + kOutlineRun); j++) helpers += run[j].second + "\n";
-                    helpers += "}\n";
+                    std::string f = "static void " + h + "() {\n";
+                    for (size_t j = k; j < std::min(run.size(), k + kOutlineRun); j++) f += run[j].second + "\n";
+                    f += "}\n\n";
+                    helpers.push_back(std::move(f));
                     body += run[k].first + ": " + h + "();\n";
                 }
             run.clear();
@@ -5729,8 +5742,8 @@ private:
             at = nl + 1;
         }
         flush();
-        if (!nh) return t;
-        return t.substr(0, sigAt) + helpers + body;
+        if (nh) t = t.substr(0, sigAt) + body;
+        return helpers;
     }
     // A process that never waits (a constant continuous assign, an initial
     // block without delays: OpenTitan has 46,000): a plain function that a
@@ -5792,21 +5805,15 @@ private:
         return r;
     }
     void shareEv(std::vector<EvUnit>& us, std::vector<std::string>& chunks) {
-        // A signal's scope: its name without the last component; the
-        // numbers of one scope move together. Others (no name, scratch,
-        // wide pieces) are the same in every copy.
-        auto scope = [&](long long n) -> std::string {
-            if (n < 0 || (size_t)n >= sigName_.size()) return std::string();
-            const std::string& m = sigName_[(size_t)n];
-            if (m.empty() || m[0] == '_' || m[0] == '$') return std::string();
-            size_t d = m.rfind('.');
-            return d == std::string::npos ? std::string() : m.substr(0, d);
-        };
+        // Each distinct signal of a template is a slot a member moves by its
+        // own distance (the same signal twice: the same distance). Slots
+        // that move together in every member then share one distance, and a
+        // slot no member moves is left as it is.
         struct Tpl { size_t u; std::vector<long long> num; std::vector<int> slot; int nslot = 0; std::vector<std::pair<size_t, std::vector<long long>>> mem; };
         std::vector<Tpl> tpls;
         std::unordered_map<std::string, std::vector<size_t>> byShape;
         std::vector<std::string> norm(us.size());
-        constexpr int kSlots = 8, kTries = 16;
+        constexpr int kTries = 16;
         for (size_t u = 0; u < us.size(); u++) {
             norm[u] = evNorm(us[u].text, us[u].i);
             std::string shape;
@@ -5825,20 +5832,21 @@ private:
             if (!ok || num.empty()) { chunks.push_back(std::move(us[u].text)); norm[u].clear(); continue; }
             auto& cand = byShape[shape];
             bool placed = false;
-            long long D[kSlots];
+            std::vector<long long> D;
+            std::vector<char> set;
             for (size_t c = 0; c < cand.size() && c < (size_t)kTries && !placed; c++) {
                 Tpl& t = tpls[cand[c]];
-                bool set[kSlots] = {};
+                D.assign((size_t)t.nslot, 0);
+                set.assign((size_t)t.nslot, 0);
                 bool good = true;
                 for (size_t k = 0; k < num.size() && good; k++) {
                     int sl = t.slot[k];
                     long long d = num[k] - t.num[k];
-                    if (sl < 0) { good = d == 0; continue; }
-                    if (!set[sl]) { set[sl] = true; D[sl] = d; }
-                    else good = D[sl] == d;
+                    if (!set[(size_t)sl]) { set[(size_t)sl] = 1; D[(size_t)sl] = d; }
+                    else good = D[(size_t)sl] == d;
                 }
                 if (!good) continue;
-                t.mem.push_back({u, std::vector<long long>(D, D + t.nslot)});
+                t.mem.push_back({u, D});
                 evSaved_ += us[u].text.size();
                 std::string().swap(us[u].text);
                 std::string().swap(norm[u]);
@@ -5849,35 +5857,47 @@ private:
             Tpl t;
             t.u = u;
             t.num = num;
-            std::vector<std::string> scopes;
+            std::unordered_map<long long, int> slotOf;
             for (long long n : num) {
-                std::string sc = scope(n);
-                if (sc.empty()) { t.slot.push_back(-1); continue; }
-                auto it = std::find(scopes.begin(), scopes.end(), sc);
-                if (it == scopes.end()) { scopes.push_back(sc); it = scopes.end() - 1; }
-                t.slot.push_back((int)(it - scopes.begin()));
+                auto [it, fresh] = slotOf.try_emplace(n, (int)slotOf.size());
+                t.slot.push_back(it->second);
             }
-            if (scopes.size() > (size_t)kSlots) { chunks.push_back(std::move(us[u].text)); norm[u].clear(); continue; }
-            t.nslot = (int)scopes.size();
+            t.nslot = (int)slotOf.size();
             cand.push_back(tpls.size());
             tpls.push_back(std::move(t));
         }
         for (auto& t : tpls) {
             EvUnit& tu = us[t.u];
             if (t.mem.empty()) { chunks.push_back(std::move(tu.text)); continue; }
+            // Slots whose distances are the same in every member share one;
+            // all zero: none.
+            std::vector<int> merged((size_t)t.nslot, -1);
+            std::vector<int> rep;   // merged slot -> a slot of it
+            {
+                std::map<std::vector<long long>, int> cols;
+                for (int sl = 0; sl < t.nslot; sl++) {
+                    std::vector<long long> col;
+                    bool zero = true;
+                    for (auto& [u, d] : t.mem) { col.push_back(d[(size_t)sl]); zero &= d[(size_t)sl] == 0; }
+                    if (zero) continue;
+                    auto [it, fresh] = cols.try_emplace(col, (int)rep.size());
+                    if (fresh) rep.push_back(sl);
+                    merged[(size_t)sl] = it->second;
+                }
+            }
+            const int nd = (int)rep.size();
             // The template: its numbers as N + D<slot>, its distances from ctx.
             const std::string nm = "S" + std::to_string(tu.i);
-            std::string decl = " const int* D_ = (const int*)x_;";
-            for (int k = 0; k < t.nslot; k++) decl += (k ? ", D" : " [[maybe_unused]] const int D") + std::to_string(k) + " = D_[" + std::to_string(k) + "]";
-            decl += ";";
+            std::string decl = " const int* D_ = (const int*)x_; (void)D_;";
+            for (int k = 0; k < nd; k++) decl += (k ? ", D" : " const int D") + std::to_string(k) + " = D_[" + std::to_string(k) + "]";
+            if (nd) decl += ";";
             const std::string& nt = norm[t.u];
             std::string r;
             r.reserve(nt.size() + nt.size() / 4);
             size_t last = 0, k = 0;
-            refScan(nt, [&](size_t, size_t at, size_t e, long long n, int) {
+            refScan(nt, [&](size_t, size_t, size_t e, long long, int) {
                 r.append(nt, last, e - last);
-                if (t.slot[k] >= 0) r += " + D" + std::to_string(t.slot[k]);
-                (void)n;
+                if (int m = merged[(size_t)t.slot[k]]; m >= 0) r += " + D" + std::to_string(m);
                 k++;
                 last = e;
             });
@@ -5900,13 +5920,14 @@ private:
                 if (!hit) out += r[i++];
             }
             chunks.push_back(std::move(out));
-            auto add = [&](size_t u, const std::vector<long long>& d) {
+            auto add = [&](size_t u, const std::vector<long long>* d) {
                 evName_[(size_t)us[u].i] = nm;
+                if (!nd) return;   // the same signals in every copy
                 evAt_[(size_t)us[u].i] = (int)evDT_.size();
-                for (long long x : d) evDT_.push_back((int)x);
+                for (int m = 0; m < nd; m++) evDT_.push_back(d ? (int)(*d)[(size_t)rep[(size_t)m]] : 0);
             };
-            add(t.u, std::vector<long long>((size_t)t.nslot, 0));
-            for (auto& [u, d] : t.mem) add(u, d);
+            add(t.u, nullptr);
+            for (auto& [u, d] : t.mem) add(u, &d);
         }
         if (std::getenv("MSIM_WHYSHARE"))
             std::fprintf(stderr, "shared event code: %zu of %zu bytes are calls to another instance's copy\n", evSaved_, evTotal_);

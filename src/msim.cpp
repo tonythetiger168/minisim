@@ -2033,13 +2033,28 @@ static bool weakPorts(const LowerResult& lowered) {
     for (auto& m : lowered.portStr) if (weak[(size_t)m.src]) return true;
     return false;
 }
+// Is the C++ compiler gcc (precompiled headers found next to the header)?
+static bool isGcc(const std::string& cc) {
+    static std::map<std::string, bool> known;
+    if (auto it = known.find(cc); it != known.end()) return it->second;
+    std::string out;
+    if (FILE* p = popen((shq(cc) + " --version 2>/dev/null").c_str(), "r")) {
+        char b[256];
+        while (std::fgets(b, sizeof b, p)) out += b;
+        pclose(p);
+    }
+    return known[cc] = out.find("clang") == std::string::npos && out.find("Free Software Foundation") != std::string::npos;
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
-                       const std::string& opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
+                       std::string opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
                        uint64_t seed, const std::string& covPath) {
     // -upf: the power-aware runtime runs in simv too (codegen.hpp Codegen::upf);
     // the runtime sees every signal, so no private ones.
     const bool upf = upfrt::rt().on;
+    const bool optAuto = opt.empty();
+    if (optAuto) opt = "-O2";
     std::vector<CodegenSig> sigs;
     for (auto& g : S.sigs) {
         sigs.push_back({g.name, g.w, g.net, (int)g.drv.size()});
@@ -2247,18 +2262,31 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // over a gigabyte, held while the compiler runs beside this process).
     if (!files.empty()) std::string().swap(src);
     if (!files.empty()) {
+        // A large design (OpenTitan: 140 MB of C++) builds at -O1 unless -O<n>
+        // was given: gcc takes half the time, and its event-driven functions
+        // spend their time in the kernel, not in their own code.
+        if (optAuto) {
+            size_t total = 0;
+            for (auto& f : files) total += f.second.size();
+            if (total > (48u << 20)) opt = "-O1";
+        }
         std::string cflags = " -std=c++20 " + opt + " -I" + shq(inc) + fstC;
         // Signal numbers resolved at link time (codegen.hpp relocText): absolute
         // symbols as displacements and immediates, so no PIE.
         const bool reloc = files[0].second.find("#define MSIM_RELOC 1") != std::string::npos;
         if (reloc) cflags += " -fno-pie";
         if (mix.on) cflags += " -fPIC";
-        stamp = cflags + fstL + "\n" + stamp;
+        // The parts hold process functions only: no exception passes through
+        // them (the kernel's errors print and exit), and without an unwinding
+        // cleanup for every Val temporary gcc takes a third less time.
+        const std::string partFlags = upf ? "" : " -fno-exceptions";
+        stamp = cflags + partFlags + fstL + "\n" + stamp;
         bool sameFlags = slurp(dir + "/simv.stamp") == stamp;
         bool hdrSame = slurp(dir + "/design.hpp") == files[0].second;
         std::filesystem::remove(dir + "/simv.stamp", ec);
         std::vector<std::string> jobs, objs;
         std::vector<double> jobMB;   // the compiler's estimated memory for each job
+        int partJobs = 0;
         const size_t hdrSize = files[0].second.size();
         for (auto& [name, text] : files) {
             std::string path = dir + "/" + name;
@@ -2273,7 +2301,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             objs.push_back(obj);
             if (same && hdrSame && sameFlags && std::filesystem::exists(obj, ec)) continue;
             std::filesystem::remove(obj, ec);
-            jobs.push_back(shq(cc) + cflags + " -c " + shq(path) + " -o " + shq(obj));
+            jobs.push_back(shq(cc) + cflags + (name.rfind("part", 0) == 0 ? partFlags : std::string()) + " -c " + shq(path) + " -o " + shq(obj));
+            partJobs += name.rfind("part", 0) == 0;
             // design.cpp of a split build is mostly tables: about 60 MB of
             // compiler memory per MB (1024 PicoRV32 cores: 78 MB, 4.6 GB), not
             // the 600 of code. Estimated as code, it ran alone for half an hour
@@ -2304,6 +2333,20 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             std::string unit;
             while (mi >> k >> kb >> unit)
                 if (k == "MemAvailable:") { budget = kb / 1024 * 0.85; break; }
+        }
+        // Every part starts by compiling design.hpp, the kernel with it (8 s
+        // at -O2): gcc reads it precompiled instead (design.hpp.gch next to
+        // it, built with the parts' flags) when there are enough parts.
+        {
+            const std::string gch = dir + "/design.hpp.gch";
+            if (partJobs >= 4 && isGcc(cc)) {
+                if (!(hdrSame && sameFlags && std::filesystem::exists(gch, ec))) {
+                    std::filesystem::remove(gch, ec);
+                    std::string c = shq(cc) + cflags + partFlags + " -x c++-header " + shq(dir + "/design.hpp") + " -o " + shq(gch);
+                    if (std::system(c.c_str()) != 0) std::filesystem::remove(gch, ec);   // the parts build without it
+                }
+            } else
+                std::filesystem::remove(gch, ec);
         }
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
@@ -3231,7 +3274,7 @@ static int msimMain(int argc, char** argv) {
     bool xAssign0 = false, xInitial0 = false;   // -x-assign 0, -x-initial 0
     int threads = defaultThreads();
     bool threadsGiven = false;
-    std::string buildDir = "msim.d", opt = "-O2";
+    std::string buildDir = "msim.d", opt;   // -O<n>; none: runCompiled picks
     std::string cc = std::getenv("CXX") ? std::getenv("CXX") : "c++";
     protfront::Options prot;
     std::string upfPath, powerTop;
