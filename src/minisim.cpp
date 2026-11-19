@@ -2377,8 +2377,21 @@ struct Sim {
         do { id += char('!' + i % 94); i /= 94; } while (i);
         return id;
     }
+    // msim -compile drops a copy a = b and reads b (msim.cpp substituteWires):
+    // a waveform still shows a, with b's value. mirrors[b] lists such a.
+    vector<vector<int>> mirrors;
+    void addMirror(int a, int b) {
+        if ((size_t)b >= mirrors.size()) mirrors.resize((size_t)b + 1);
+        mirrors[(size_t)b].push_back(a);
+    }
+    void syncMirrors() {
+        for (size_t b = 0; b < mirrors.size(); b++)
+            for (int a : mirrors[b]) sigs[(size_t)a].val = sigs[b].val;
+    }
     void dump(int s) { dump(s, sigs[s].val); }
     void dump(int s, const Val& v) {
+        if (__builtin_expect(!mirrors.empty(), 0) && (size_t)s < mirrors.size())
+            for (int a : mirrors[(size_t)s]) { sigs[(size_t)a].val = v; dump(a, v); }
         if (sigs[s].hide) return;
 #ifdef MINISIM_FST
         if (fst) {
@@ -2412,6 +2425,7 @@ struct Sim {
     }
     // Every dumped signal, as X ($dumpoff) or its value ($dumpon, $dumpall).
     void dumpBlock(const char* kw, bool asX) {
+        syncMirrors();
         stamp();
         if (!fst) { vbuf += kw; vbuf += '\n'; }
         for (size_t i = 0; i < sigs.size(); i++) {
@@ -3218,6 +3232,7 @@ struct Sim {
                     if (string b = base(g.name); !b.empty() && count[b] <= dumpArrays) g.hide = false;
         }
         observed = true;   // every change is written: the cycle domain uses set()
+        syncMirrors();
         bool asFst = vcdPath.size() > 4 && vcdPath.compare(vcdPath.size() - 4, 4, ".fst") == 0;
 #ifdef MINISIM_FST
         if (asFst) {

@@ -1818,6 +1818,171 @@ static void mergeCombCycles(LowerResult& lowered) {
     lowered.procs = std::move(keep);
 }
 
+// msim -compile: a continuous assign that copies one whole signal into
+// another of the same width (a = b; port connections, clock and reset
+// buffers, feed-throughs: OpenTitan has about 100,000) costs a process run
+// and a kernel write per change of b, and a delta cycle for every reader.
+// Each reader of a reads b instead, and the assign goes, as Verilator's
+// assignment substitution does. Only when a has no other writer and every
+// place that reads it is a process (or a subroutine, a final block) msim
+// can rewrite: designs with clocking blocks, concurrent assertions,
+// covergroups, timing checks, paths or dumps keep their assigns.
+// a's own value is no longer updated (nothing reads it).
+// MSIM_NOWIRESUB turns it off; MSIM_WHYWIRESUB reports the count.
+static void substituteWires(LowerResult& lowered) {
+    const bool dbg = std::getenv("MSIM_WHYWIRESUB") != nullptr;
+    {
+        const char* why = !concAsserts().empty() ? "concurrent assertions" : !clockings().empty() ? "clocking blocks"
+                        : !cgDefs().empty() || !cgInsts().empty() ? "covergroups" : !timingChecks().empty() ? "timing checks"
+                        : !pathRecs().empty() ? "specify paths" : !gateRecs().empty() ? "gate delays"
+                        : !sampleClocks().empty() || !shadowPairs().empty() ? "sampled values"
+                        : nullptr;
+        if (why) { if (dbg) std::cerr << "wire substitution: off (" << why << ")\n"; return; }
+    }
+    const size_t ns = S.sigs.size();
+    std::vector<char> bad(ns, 0);   // nonzero: why (below)   // written, or named in a way msim does not rewrite
+    std::vector<int> cand(ns, -1);  // a -> the process with the assign a = b
+    int why = 0;   // MSIM_WHYWIRESUB: the first reason a copy stays
+    auto mark = [&](int s) { if (s >= 0 && (size_t)s < ns && !bad[(size_t)s]) bad[(size_t)s] = (char)why; };
+    auto range = [&](const ArrShape* a) {
+        if (!a) return;
+        for (int64_t k = 0; k < a->count; k++) mark((int)(a->base + k));
+    };
+    why = 1; for (auto& t : vifTab()) for (int s : t) mark(s);
+    why = 2; for (auto& [s, k] : lowered.netKinds) mark(s);
+    for (auto& [s, k] : lowered.freeVars) mark(s);
+    why = 3; for (auto& d : lowered.trans) { mark(d.a); mark(d.b); }   // switches, strengths, net delays: the kernel's
+    for (auto& d : lowered.mos) { mark(d.out); mark(d.src); }
+    {   // a one-bit port connection is a switch only when its source can be weak (msimMain, 23.3.3.7)
+        std::vector<char> weak(ns, 0);
+        for (auto& [s, k] : lowered.netKinds) if (k != NR_WIRE && (size_t)s < ns) weak[(size_t)s] = 1;
+        for (auto& d : lowered.mos) if ((size_t)d.out < ns) weak[(size_t)d.out] = 1;
+        for (auto& d : lowered.trans) { if ((size_t)d.a < ns) weak[(size_t)d.a] = 1; if ((size_t)d.b < ns) weak[(size_t)d.b] = 1; }
+        for (auto& lp : lowered.procs)
+            for (auto& i : lp.prog.code)
+                if (i.drv >= 0 && i.sig >= 0 && (size_t)i.sig < ns && (i.s0 != STR_STRONG || i.s1 != STR_STRONG)) weak[(size_t)i.sig] = 1;
+        for (bool more = true; more;) {
+            more = false;
+            for (auto& d : lowered.portStr)
+                if ((size_t)d.src < ns && (size_t)d.out < ns && weak[(size_t)d.src] && !weak[(size_t)d.out]) { weak[(size_t)d.out] = 1; more = true; }
+        }
+        for (auto& d : lowered.portStr) if ((size_t)d.src < ns && weak[(size_t)d.src]) { mark(d.out); mark(d.src); }
+    }
+    for (auto& [s, d] : lowered.netDelays) mark(s);
+    for (auto& d : lowered.trireg) mark(d.sig);
+    std::function<void(const E&)> ex = [&](const E& e) {
+        if (!e) return;
+        why = 4; if (e->op != Op::Ref || e->at) mark(e->sig);
+        why = 5; range(e->arr.get());
+        ex(e->at);
+        for (auto& k : e->kids) ex(k);
+    };
+    auto isCand = [&](const LoweredProc& lp) -> const Instr* {
+        const Prog& p = lp.prog;
+        if (lp.program >= 0 || lp.reactive || p.code.size() != 3 || !p.roots.empty() || !p.spans.empty()) return nullptr;
+        const Instr& a = p.code[0];
+        if (a.k != IK::Assign || p.code[1].k != IK::WaitEdge || p.code[2].k != IK::Jmp || p.code[2].target != 0) return nullptr;
+        if (a.sig < 0 || (size_t)a.sig >= ns || a.hi >= 0 || a.bidx || a.arr || !a.aidx.empty() || a.de || a.delay || !a.dly.empty() ||
+            !a.dlyE.empty() || a.gate >= 0 || a.udp || a.tmp || a.xq || a.dyn >= 0 || a.s0 != STR_STRONG || a.s1 != STR_STRONG) return nullptr;
+        if (!a.e || a.e->op != Op::Ref || a.e->at || a.e->arr || !a.e->kids.empty()) return nullptr;
+        int b = a.e->sig;
+        if (b < 0 || (size_t)b >= ns || b == a.sig) return nullptr;
+        const auto& A = S.sigs[(size_t)a.sig];
+        const auto& B = S.sigs[(size_t)b];
+        if (A.w != B.w || A.val.real || B.val.real || A.kind != NR_WIRE || A.fl || B.fl) return nullptr;
+        if (a.drv >= 0 ? A.drv.size() != 1 : !A.drv.empty()) return nullptr;
+        return &a;
+    };
+    std::unordered_set<const Prog*> seen;
+    std::function<void(const Prog&, const Instr*)> scan = [&](const Prog& p, const Instr* own) {
+        for (auto& in : p.code) {
+            if (&in == own) continue;
+            if (in.k == IK::Dump) { std::fill(bad.begin(), bad.end(), 9); return; }
+            why = 6 + (in.k == IK::Assign || in.k == IK::Nba); if (in.k != IK::WaitEdge) { mark(in.sig); for (auto& [sg, ed] : in.events) mark(sg); }
+            why = 8; mark(in.dsrc); mark(in.dres); mark(in.dkey); mark(in.dyn);
+            for (auto& [slot, s] : in.dinit) mark(s);
+            why = 5; range(in.arr.get());
+            ex(in.e); ex(in.bidx); ex(in.de); ex(in.fd);
+            for (auto& x : in.args) ex(x);
+            for (auto& x : in.aidx) ex(x);
+            for (auto& x : in.dlyE) ex(x);
+            for (auto& [slot, x] : in.init) ex(x);
+            if (in.callee && seen.insert(in.callee).second) scan(*in.callee, nullptr);
+            for (auto* b : in.branches) if (b && seen.insert(b).second) scan(*b, nullptr);
+        }
+    };
+    std::vector<const Instr*> own(lowered.procs.size(), nullptr);
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        own[i] = isCand(lowered.procs[i]);
+        if (own[i]) { int a = own[i]->sig; if (cand[(size_t)a] >= 0) bad[(size_t)a] = 10; else cand[(size_t)a] = (int)i; }
+        scan(lowered.procs[i].prog, own[i]);
+    }
+    for (auto& lp : lowered.finals) scan(lp.prog, nullptr);
+    for (auto& sp : lowered.subs) if (sp && seen.insert(sp.get()).second) scan(*sp, nullptr);
+    std::vector<int> alias(ns, -1);
+    for (size_t a = 0; a < ns; a++)
+        if (cand[a] >= 0 && !bad[a]) alias[a] = own[(size_t)cand[a]]->e->sig;
+    auto root = [&](int a) {
+        int r = a;
+        for (size_t n = 0; alias[(size_t)r] >= 0; n++) { r = alias[(size_t)r]; if (n > ns) return -1; }   // a loop of copies
+        return r;
+    };
+    {
+        std::vector<char> loop(ns, 0);   // found first, so that clearing one does not leave the others a root
+        for (size_t a = 0; a < ns; a++) if (alias[a] >= 0 && root((int)a) < 0) loop[a] = 1;
+        for (size_t a = 0; a < ns; a++) if (loop[a]) alias[a] = -1;
+    }
+    std::vector<int> rootOf(ns, -1);
+    size_t n = 0;
+    for (size_t a = 0; a < ns; a++) if (alias[a] >= 0) { rootOf[a] = root((int)a); n++; S.addMirror((int)a, rootOf[a]); }
+    if (dbg) {
+        static const char* whyName[] = {"", "virtual interface", "net kind", "switch or net delay", "read other than whole", "array element", "named by a statement",
+                                        "written elsewhere", "container", "$dumpvars", "two copies into it"};
+        size_t by[11] = {};
+        for (size_t a = 0; a < ns; a++) if (cand[a] >= 0 && bad[a] > 0 && bad[a] < 11) by[(size_t)bad[a]]++;
+        for (int k = 1; k < 11; k++) if (by[k]) std::cerr << "wire substitution: " << by[k] << " kept: " << whyName[k] << "\n";
+    }
+    if (dbg) std::cerr << "wire substitution: " << n << " of " << std::count_if(cand.begin(), cand.end(), [](int c) { return c >= 0; }) << " copies\n";
+    if (!n) return;
+    std::unordered_set<const Expr*> done;
+    std::function<void(const E&)> rw = [&](const E& e) {
+        if (!e || !done.insert(e.get()).second) return;
+        if (e->op == Op::Ref && e->sig >= 0 && (size_t)e->sig < ns && rootOf[(size_t)e->sig] >= 0) e->sig = rootOf[(size_t)e->sig];
+        rw(e->at);
+        for (auto& k : e->kids) rw(k);
+    };
+    auto rwSig = [&](int& s) { if (s >= 0 && (size_t)s < ns && rootOf[(size_t)s] >= 0) s = rootOf[(size_t)s]; };
+    std::unordered_set<const Prog*> seen2;
+    std::function<void(Prog&)> fix = [&](Prog& p) {
+        for (auto& in : p.code) {
+            if (in.k == IK::WaitEdge) {
+                rwSig(in.sig);
+                for (auto& [s, ed] : in.events) rwSig(s);
+                // a and b in one list: one event
+                std::sort(in.events.begin(), in.events.end());
+                in.events.erase(std::unique(in.events.begin(), in.events.end()), in.events.end());
+            }
+            rw(in.e); rw(in.bidx); rw(in.de); rw(in.fd);
+            for (auto& x : in.args) rw(x);
+            for (auto& x : in.aidx) rw(x);
+            for (auto& x : in.dlyE) rw(x);
+            for (auto& [slot, x] : in.init) rw(x);
+            if (in.callee && seen2.insert(in.callee).second) fix(const_cast<Prog&>(*in.callee));
+            for (auto* b : in.branches) if (b && seen2.insert(b).second) fix(const_cast<Prog&>(*b));
+        }
+    };
+    std::vector<LoweredProc> keep;
+    keep.reserve(lowered.procs.size());
+    for (size_t i = 0; i < lowered.procs.size(); i++) {
+        if (own[i] && rootOf[(size_t)own[i]->sig] >= 0) continue;
+        keep.push_back(std::move(lowered.procs[i]));
+    }
+    lowered.procs = std::move(keep);
+    for (auto& lp : lowered.procs) fix(lp.prog);
+    for (auto& lp : lowered.finals) fix(lp.prog);
+    for (auto& sp : lowered.subs) if (sp && seen2.insert(sp.get()).second) fix(*sp);
+}
+
 static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
     size_t n = lowered.procs.size();
     Plan p;
@@ -2082,6 +2247,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             sigs.back().zeroWide = z;
         }
     }
+    for (size_t b = 0; b < S.mirrors.size(); b++)
+        for (int a : S.mirrors[b]) sigs[(size_t)a].mirror = (int)b;
     std::vector<CodegenProc> procs;
     const bool gateDyn = !gateRecs().empty() && (vpi::st().active || !sdfRequests().empty() || sdfAtRunTime());
     for (size_t i = 0; i < lowered.procs.size(); i++) {
@@ -4208,11 +4375,7 @@ static int msimMain(int argc, char** argv) {
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOSEQTMP")) localizeSeqBlocking(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
-    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCYCMERGE"))
-        mergeCombCycles(lowered);
-    phaseMark("seq rewrites/cycles");
-    Plan pl = plan(lowered, staticComb, staticSeq);
-    phaseMark("plan");
+    // Fallbacks to the interpreter, before the rewrites only -compile makes.
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
         std::cerr << "msim: -compile: the design has protected code; using the interpreter\n";
@@ -4242,6 +4405,13 @@ static int msimMain(int argc, char** argv) {
         std::cerr << "msim: -compile: " << (vcdSva ? "assertions" : "power states") << " in the waveform need the interpreter; using it\n";
         compiled = false;
     }
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOWIRESUB"))
+        substituteWires(lowered);
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCYCMERGE"))
+        mergeCombCycles(lowered);
+    phaseMark("seq rewrites/cycles");
+    Plan pl = plan(lowered, staticComb, staticSeq);
+    phaseMark("plan");
     if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCONST")) {
         size_t nk = propagateConstants(lowered, pl);
         if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constants: %zu signals\n", nk);

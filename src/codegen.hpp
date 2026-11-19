@@ -81,6 +81,7 @@ struct CodegenSig {
     // string member, 6.20.2): its text, set right after S.sig.
     bool strInit = false;
     std::string strText;
+    int mirror = -1;   // a copy msim dropped (substituteWires): the signal it reads, for waveforms
 };
 
 // msim -compile: the DPI-C libraries simv loads (the user's C files built
@@ -911,6 +912,14 @@ public:
                      "    for (auto& e : SIV) { Val& g = S.sigs[e.s].val; g.v = e.v; g.x = e.x; g.z = e.z; }\n";
             for (size_t s = 0; s < sigs.size(); s++)
                 if (sigs[s].strInit) o << "    S.sigs[" << s << "].val = mkstr(" << quote(sigs[s].strText) << ");\n";
+            {
+                std::string mr;
+                for (size_t s = 0; s < sigs.size(); s++)
+                    if (sigs[s].mirror >= 0) mr += "{" + std::to_string(s) + ", " + std::to_string(sigs[s].mirror) + "}, ";
+                if (!mr.empty())
+                    o << "    static const struct { int a, b; } SMIR[] = {" << mr << "};\n"
+                         "    for (auto& e : SMIR) S.addMirror(e.a, e.b);\n";
+            }
             // A delayed driver is x until its first update arrives (10.3.3,
             // 28.16), with its own strengths, as msim sets it up.
             std::set<int> dlyNets;
@@ -945,7 +954,9 @@ public:
         }
         for (int i : byRank)
             if (i < 0) throw CodegenUnsupported("gap in the combinational ranks");
-        if (!dom.empty() && !byRank.empty()) {
+        // With no comb units (every copy dropped, msim.cpp substituteWires) the
+        // pass still runs after a testbench write to a private signal: syncP.
+        if (!dom.empty()) {
             std::vector<int> ins;
             for (int i : byRank) ins.insert(ins.end(), procs[i].combIns.begin(), procs[i].combIns.end());
             std::sort(ins.begin(), ins.end());
