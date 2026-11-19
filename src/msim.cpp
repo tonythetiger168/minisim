@@ -1934,7 +1934,7 @@ static void substituteWires(LowerResult& lowered) {
     }
     std::vector<int> rootOf(ns, -1);
     size_t n = 0;
-    for (size_t a = 0; a < ns; a++) if (alias[a] >= 0) { rootOf[a] = root((int)a); n++; }
+    for (size_t a = 0; a < ns; a++) if (alias[a] >= 0) { rootOf[a] = root((int)a); n++; S.addMirror((int)a, rootOf[a]); }
     if (dbg) {
         static const char* whyName[] = {"", "virtual interface", "net kind", "switch or net delay", "read other than whole", "array element", "named by a statement",
                                         "written elsewhere", "container", "$dumpvars", "two copies into it"};
@@ -2247,6 +2247,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             sigs.back().zeroWide = z;
         }
     }
+    for (size_t b = 0; b < S.mirrors.size(); b++)
+        for (int a : S.mirrors[b]) sigs[(size_t)a].mirror = (int)b;
     std::vector<CodegenProc> procs;
     const bool gateDyn = !gateRecs().empty() && (vpi::st().active || !sdfRequests().empty() || sdfAtRunTime());
     for (size_t i = 0; i < lowered.procs.size(); i++) {
@@ -4373,13 +4375,7 @@ static int msimMain(int argc, char** argv) {
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL")) unrollSeqLoops(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOARRFIX")) fixArrayNbas(lowered);
     if (staticSeq && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOSEQTMP")) localizeSeqBlocking(lowered);   // -cov counts each branch once   // -no-static-comb keeps them, as the reference
-    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOWIRESUB"))
-        substituteWires(lowered);
-    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCYCMERGE"))
-        mergeCombCycles(lowered);
-    phaseMark("seq rewrites/cycles");
-    Plan pl = plan(lowered, staticComb, staticSeq);
-    phaseMark("plan");
+    // Fallbacks to the interpreter, before the rewrites only -compile makes.
     // Generated C++ would hold the protected design in the clear.
     if (compiled && pc.any()) {
         std::cerr << "msim: -compile: the design has protected code; using the interpreter\n";
@@ -4409,6 +4405,13 @@ static int msimMain(int argc, char** argv) {
         std::cerr << "msim: -compile: " << (vcdSva ? "assertions" : "power states") << " in the waveform need the interpreter; using it\n";
         compiled = false;
     }
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !vcdPath && !std::getenv("MSIM_NOWIRESUB"))
+        substituteWires(lowered);
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCYCMERGE"))
+        mergeCombCycles(lowered);
+    phaseMark("seq rewrites/cycles");
+    Plan pl = plan(lowered, staticComb, staticSeq);
+    phaseMark("plan");
     if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCONST")) {
         size_t nk = propagateConstants(lowered, pl);
         if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constants: %zu signals\n", nk);
