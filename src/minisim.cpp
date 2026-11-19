@@ -838,6 +838,7 @@ struct Sim {
         int id = (int)seqs.size();
         seqs.push_back({fn, ctx});
         seqPend.push_back(0);
+        seqEpoch.push_back(0);
         if (seqOf.size() < sigs.size()) seqOf.resize(sigs.size());
         for (auto& [sg, e] : ev) seqOf[sg].push_back({id, e});
     }
@@ -855,6 +856,25 @@ struct Sim {
             for (uint64_t b = seqBits[w]; b; b &= b - 1) seqq.push_back((int)(w * 64 + (size_t)__builtin_ctzll(b)));
         std::fill(seqBits.begin(), seqBits.begin() + (ptrdiff_t)W, 0);
     }
+    // A clocked function's NBA to a register nothing else writes (codegen:
+    // CodegenSig::soleNba) is left out when it would not change the value:
+    // most registers keep theirs on most edges (OpenTitan: 99% of its NBAs),
+    // and an update that changes nothing has no effect at all. Not when a
+    // process runs again before the NBA region with an NBA of its first run
+    // still queued (a glitch on its clock): the second run's value must
+    // still replace that one.
+    bool nbaNoSkip = false;
+    uint32_t nbaEpoch = 1;          // the NBA regions so far
+    vector<uint32_t> seqEpoch;      // per clocked process: the NBA region its queued NBAs wait for
+    bool nbaKeep(int s, const Val& nv) const {
+        if (nbaNoSkip) return true;
+        const Sig& g = sigs[(size_t)s];
+        const Val& cur = g.val;
+        if (g.w > 64 || (g.fl & (SF_HELD | SF_PART | SF_PATHV)) || !cur.hi.empty() || nv.real || nv.str || cur.real || cur.str) return true;
+        const uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
+        const uint64_t x = nv.x & m;   // as set() masks it
+        return (nv.v & m & ~x) != (cur.v & m & ~cur.x) || x != (cur.x & m) || (nv.z & m) != (cur.z & m);
+    }
     uint64_t seqRun = 0;   // counts runSeqs: the compiled clock groups of one run share a twoNow() (codegen dseq)
     void runSeqs() {
         seqRun++;
@@ -870,6 +890,7 @@ struct Sim {
         if (domFn)
             for (size_t k = 0; k < seqq.size(); k++) nDom += dom(k);
         const bool anyDom = nDom > 0;
+        for (int id : seqq) nbaNoSkip |= seqEpoch[(size_t)id] == nbaEpoch;
         if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
             for (size_t k = 0; k < seqq.size(); k++) {
                 uint64_t t = prof::Profiler::nowNs();
@@ -893,9 +914,11 @@ struct Sim {
         }
         for (size_t k = 0; k < seqq.size(); k++) {
             seqPend[seqq[k]] = 0;
+            if (!seqBufs[k].empty()) seqEpoch[(size_t)seqq[k]] = nbaEpoch;
             nbaq.insert(nbaq.end(), std::make_move_iterator(seqBufs[k].begin()), std::make_move_iterator(seqBufs[k].end()));   // the buffer is cleared before its next use
         }
         seqq.clear();
+        nbaNoSkip = false;
     }
 
     // ---- compiled cycle domain (msim -compile, codegen.hpp) ----
@@ -3368,7 +3391,7 @@ struct Sim {
     // final blocks run in the same time, in one pass (9.2.3).
     void runFinal(const vector<Task>& ts) {
         if (ts.empty()) return;
-        wheel.clear(); laterNba.clear(); laterDrv.clear(); active.clear(); inactive.clear(); nbaq.clear();
+        wheel.clear(); laterNba.clear(); laterDrv.clear(); active.clear(); inactive.clear(); nbaq.clear(); nbaEpoch++;
         observedQ.clear(); reactive.clear(); reInactive.clear(); reNbaq.clear(); defObs.clear(); defFin.clear();
         for (int id : seqq) seqPend[id] = 0;
         seqq.clear();
@@ -3431,6 +3454,7 @@ MSIM_KDEF void Sim::run(uint64_t end, bool start) {
                 // Swap, not move: both buffers keep their capacity across slots.
                 nbaRun.clear();
                 nbaRun.swap(nbaq);
+                nbaEpoch++;
                 timedNba();
             } else if (rare || !postq.empty()) {           // observed, reactive set, postponed
                 if (!slotTail()) break;                    // then, and only then, time advances
