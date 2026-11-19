@@ -1470,6 +1470,10 @@ struct Sim {
                 }
             if (!linked && P[k].dstIface) sigs[(size_t)P[k].dst].fl |= SF_PATHV;   // 25.6
         }
+        // No path: pathIn stays empty, which the fast writes (bitEdgeOk,
+        // setBitsV) test for. Sized, it sent every one-bit edge and every
+        // in-place bit write through set() and a whole-vector copy.
+        if (P.empty()) { pathIn.clear(); pathIn.shrink_to_fit(); lastChg.clear(); lastChg.shrink_to_fit(); }
         for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
         for (auto& [sg, sh] : shadowOf) timedOut[(size_t)sg] = 1;
         // Like a net delay, a delayed net with drivers is x until its first
