@@ -113,6 +113,7 @@ set(CASES
   "examples/wiresub.sv"
   "examples/boxnet.sv"
   "examples/combring.sv"
+  "examples/romfold.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -246,6 +247,15 @@ foreach(c IN LISTS CASES)
     file(READ ${OUT}/c${n}/design.cpp gen)
     if(NOT gen MATCHES "S\\.combs\\[combBase \\+ \\(size_t\\)k\\]\\.onCycle = true")
       message(FATAL_ERROR "${c}: the ring's blocks are not marked as on a cycle")
+    endif()
+  endif()
+  # Parameter array reads at constant indices are folded (no AREAD left).
+  if(c STREQUAL "examples/romfold.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    string(REGEX MATCHALL "DSL\\(" dsl "${gen}")
+    list(LENGTH dsl ndsl)   # 1: the helper's definition
+    if(gen MATCHES "AREAD\\(AS" OR ndsl GREATER 1)
+      message(FATAL_ERROR "${c}: parameter array reads or constant +: selects are left at run time")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).
