@@ -555,7 +555,11 @@ indices that unrolling and inlining made constant (Keccak's
 (`MSIM_NOROMFOLD`). A run of one-bit copies `x[b] = y[j]`, `x[b+1] =
 y[j+1]`, ... (SHA-3's `bitarray_to_box`, unrolled: 1600 of them) becomes one
 copy of up to 64 bits (`MSIM_NOBITRUNS`): OpenTitan's 300 us from 55 s to
-45 s. `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
+45 s. A register that only NBAs of one clocked process write, at most one
+of them per run (`if (!rst_ni) q <= '0; else q <= d;`), gets no NBA when the
+new value equals the old one (`MSIM_NONBASKIP`): 99% of OpenTitan's NBAs
+changed nothing, and its boot to `TEST PASSED` went from 346 s to 283 s of
+run time. `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
 step, and the signals they change, then stops.
 
 ### Static combinational schedule

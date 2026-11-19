@@ -114,6 +114,7 @@ set(CASES
   "examples/boxnet.sv"
   "examples/combring.sv"
   "examples/romfold.sv"
+  "-no-cycle examples/nbaskip.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -257,6 +258,15 @@ foreach(c IN LISTS CASES)
     list(LENGTH dsl ndsl)   # 1: the helper's definition
     if(gen MATCHES "AREAD\\(AS" OR ndsl GREATER 1)
       message(FATAL_ERROR "${c}: parameter array reads or constant +: selects are left at run time")
+    endif()
+  endif()
+  # Unchanged NBAs of sole-writer registers are left out (Sim::nbaKeep): q, c and e's two.
+  if(c STREQUAL "-no-cycle examples/nbaskip.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    string(REGEX MATCHALL "S\\.nbaKeep\\(" keep "${gen}")
+    list(LENGTH keep nkeep)
+    if(NOT nkeep EQUAL 4)
+      message(FATAL_ERROR "${c}: ${nkeep} NBAs checked by nbaKeep (expected 4: q, c and e's two)")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).

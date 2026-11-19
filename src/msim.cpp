@@ -2381,6 +2381,113 @@ static bool isGcc(const std::string& cc) {
     return known[cc] = out.find("clang") == std::string::npos && out.find("Free Software Foundation") != std::string::npos;
 }
 
+// msim -compile: the registers that only NBAs of one clocked process write,
+// at most one of them on each run of it (OpenTitan's `if (!rst_ni) q <= '0;
+// else q <= d;`): CodegenSig::soleNba. Its clocked function then leaves an
+// NBA out when it would not change the value (Sim::nbaKeep): nothing else can
+// queue a different value for the register or change it before the NBA
+// region. Every process, final block and subroutine is looked at (a fork
+// branch, an action block and a DPI-C export are subroutines too); anything
+// else that may write a signal (VPI, -upf, timing check notifiers,
+// std::randomize) turns it off. MSIM_NONBASKIP=1: off.
+static void soleNbaTargets(const LowerResult& lowered, std::vector<CodegenSig>& sigs) {
+    if (std::getenv("MSIM_NONBASKIP") || vpi::st().active || upfrt::rt().on || (timingChecksOn() && !timingChecks().empty())) return;
+    const size_t n = sigs.size();
+    std::vector<char> bad(n, 0);
+    std::vector<const Prog*> owner(n, nullptr);
+    std::vector<uint32_t> first(n, 0);
+    std::unordered_map<int, std::vector<size_t>> more;   // a register with 2+ NBAs: their pcs
+    auto mark = [&](int s) {
+        if (s >= 0 && (size_t)s < n) bad[(size_t)s] = 1;
+    };
+    auto markArr = [&](const ArrShape* a) {
+        if (a)
+            for (int e = 0; e < a->count; e++) mark(a->base + e);
+    };
+    bool off = false;
+    auto scan = [&](const Prog& p) {
+        for (size_t pc = 0; pc < p.code.size(); pc++) {
+            const Instr& i = p.code[pc];
+            markArr(i.arr.get());
+            for (auto& a : i.dact) markArr(a.arr.get());   // a DPI-C call's array actuals
+            mark(i.dres);
+            mark(i.dkey);
+            mark(i.dyn);
+            if (i.k == IK::Vpi || (i.k == IK::Randomize && (!i.e || (i.rc && i.rc->objTmp >= 0)))) off = true;
+            switch (i.k) {   // `sig` is not a write target in these
+                case IK::WaitEdge: case IK::Disable: case IK::Assert: case IK::CycleWait: case IK::Dump:
+                case IK::AssertCtl: case IK::Jmp: case IK::JmpIfNot: case IK::Display: case IK::Strobe:
+                case IK::Monitor: case IK::Finish: case IK::Exit: case IK::Ret: case IK::Call: case IK::Fork:
+                case IK::WaitFork: case IK::DisableFork: case IK::WaitDelay:
+                    continue;
+                default: break;
+            }
+            const int s = i.sig;
+            if (s < 0 || (size_t)s >= n) continue;
+            const bool plain = i.k == IK::Nba && i.hi < 0 && !i.arr && !i.bidx && i.aidx.empty() && i.drv < 0 &&
+                               i.dyn < 0 && !i.nbaLater;
+            if (!plain || (owner[(size_t)s] && owner[(size_t)s] != &p)) { bad[(size_t)s] = 1; continue; }
+            if (!owner[(size_t)s]) { owner[(size_t)s] = &p; first[(size_t)s] = (uint32_t)pc; continue; }
+            auto& v = more[s];
+            if (v.empty()) v.push_back(first[(size_t)s]);
+            v.push_back(pc);
+        }
+    };
+    for (auto& p : lowered.procs) scan(p.prog);
+    for (auto& p : lowered.finals) scan(p.prog);
+    for (auto& p : lowered.subs) scan(*p);
+    for (auto& f : lowered.dpi) {   // C writes output arguments and results
+        mark(f->retSig);
+        for (auto& a : f->args) {
+            mark(a.sig);
+            markArr(a.sarr.get());
+        }
+    }
+    if (off) return;
+    // Several NBAs to one register: none may follow another on a path through
+    // the process body (code[1 .. size-2] of a clocked process, as codegen
+    // emitSeq has it; it must jump forward only).
+    std::vector<char> seen;
+    for (auto& [s, pcs] : more) {
+        if (bad[(size_t)s]) continue;
+        const Prog& p = *owner[(size_t)s];
+        const size_t end = p.code.size() ? p.code.size() - 1 : 0;
+        for (size_t a : pcs) {
+            if (a < 1 || a >= end) { bad[(size_t)s] = 1; break; }
+            seen.assign(end + 1, 0);
+            std::vector<size_t> st{a};
+            seen[a] = 1;
+            while (!st.empty() && !bad[(size_t)s]) {
+                size_t pc = st.back();
+                st.pop_back();
+                const Instr& i = p.code[pc];
+                size_t nx[3];
+                int k = 0;
+                if (i.k == IK::Jmp) nx[k++] = i.target;
+                else if (i.k == IK::JmpIfNot) {
+                    nx[k++] = pc + 1, nx[k++] = i.target;
+                    if (i.xt != Instr::NOX) nx[k++] = i.xt;
+                } else if (i.k != IK::Ret && i.k != IK::Finish && i.k != IK::Exit) nx[k++] = pc + 1;
+                for (int q = 0; q < k; q++) {
+                    size_t t = nx[q];
+                    if (t >= end) continue;   // the end of the body
+                    if (t <= pc) { bad[(size_t)s] = 1; break; }   // a jump back
+                    if (seen[t]) continue;
+                    seen[t] = 1;
+                    st.push_back(t);
+                }
+            }
+            for (size_t b : pcs)
+                if (b != a && b < seen.size() && seen[b]) bad[(size_t)s] = 1;
+            if (bad[(size_t)s]) break;
+        }
+    }
+    size_t k = 0;
+    for (size_t s = 0; s < n; s++)
+        if (owner[s] && !bad[s] && !sigs[s].net && sigs[s].drivers == 0 && sigs[s].w <= 64 && sigs[s].mirror < 0) sigs[s].soleNba = true, k++;
+    if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "sole NBA targets: %zu registers\n", k);
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        std::string opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -2411,6 +2518,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     }
     for (size_t b = 0; b < S.mirrors.size(); b++)
         for (int a : S.mirrors[b]) sigs[(size_t)a].mirror = (int)b;
+    soleNbaTargets(lowered, sigs);
     std::vector<CodegenProc> procs;
     const bool gateDyn = !gateRecs().empty() && (vpi::st().active || !sdfRequests().empty() || sdfAtRunTime());
     for (size_t i = 0; i < lowered.procs.size(); i++) {

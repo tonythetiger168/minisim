@@ -82,6 +82,10 @@ struct CodegenSig {
     bool strInit = false;
     std::string strText;
     int mirror = -1;   // a copy msim dropped (substituteWires): the signal it reads, for waveforms
+    // A register whose only write in the whole design is one whole-signal NBA
+    // (msim.cpp soleNbaTargets): a clocked function skips that NBA when it
+    // would not change the value (Sim::nbaKeep).
+    bool soleNba = false;
 };
 
 // msim -compile: the DPI-C libraries simv loads (the user's C files built
@@ -128,7 +132,7 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
-        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
+        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); soleNba_.push_back(g.soleNba); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
         {
             // Array shapes numbered by base signal: the instances of a module
             // then have theirs at a constant distance, as shared code needs.
@@ -1232,7 +1236,7 @@ private:
     bool scratch(int s) const { return s >= 0 && (size_t)s < scratch_.size() && scratch_[(size_t)s]; }
     // Private signals of the cycle domain (see privateSigs): kept in plain
     // static variables P<s> instead of S.sigs, like Verilator's model members.
-    std::vector<char> priv_, sigNet_, clock_;
+    std::vector<char> priv_, sigNet_, clock_, soleNba_;
     // `always @*` arming processes (msim.cpp rotateAtStar: wait once on the
     // block's inputs, then set its $atstar flag) that wait on private
     // signals: the waits on those never wake (a private signal changes in
@@ -3069,7 +3073,7 @@ private:
     // calls f(at, len, N) for each.
     template <class F> static void refScan(const std::string& t, F&& f) {
         static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
-                                    "S.get(", "S.set(", "S.setOneBit(", "S.setBitsV(", "S.poke(", "R(", "int s = ",   // dynTarget
+                                    "S.get(", "S.set(", "S.setOneBit(", "S.setBitsV(", "S.poke(", "S.nbaKeep(", "R(", "int s = ",   // dynTarget
                                     "SIGN(",   // a commit list entry's signal (C1E)
                                     "nb.push_back({"};   // an NBA of a clocked function (emitSeq)
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
@@ -5779,6 +5783,13 @@ private:
         // A virtual interface's member (25.9) is a relative id as a frame's
         // variable is: R() resolves it in the interpreter only.
         for (auto& i : p.code) noFrames(i);
+        // Each NBA runs at most once per call (no jump goes back): one that
+        // would not change its register can be left out (Sim::nbaKeep).
+        bool fwd = !std::getenv("MSIM_NONBASKIP");
+        for (size_t pc = 1; pc < end && fwd; pc++) {
+            const Instr& i = p.code[pc];
+            if ((i.k == IK::Jmp || i.k == IK::JmpIfNot) && (i.target <= pc || (i.xt != Instr::NOX && i.xt <= pc))) fwd = false;
+        }
         for (size_t pc = 1; pc < end; pc++) {
             const Instr& i = p.code[pc];
             o << L(pc) << ":" << CH(&p, pc);
@@ -5786,6 +5797,8 @@ private:
                 case IK::Nba:
                     if (i.drv >= 0 || i.dyn >= 0 || i.nbaLater || isRel(i.sig)) throw CodegenUnsupported("NBA kind in a clocked process");
                     if (i.arr || i.bidx) o << dynTarget(i, fast(i.e), " nb.push_back({s, v, hi, lo});");
+                    else if (fwd && i.hi < 0 && i.sig >= 0 && (size_t)i.sig < soleNba_.size() && soleNba_[(size_t)i.sig])
+                        o << " { Val v_ = " << fast(i.e) << "; if (S.nbaKeep(" << i.sig << ", v_)) nb.push_back({" << i.sig << ", std::move(v_), -1, 0}); }\n";
                     else o << " nb.push_back({" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
                     break;
                 case IK::JmpIfNot: o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, L(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, L(i.xt))); break;
