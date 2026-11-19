@@ -2142,7 +2142,7 @@ static void execComb(const void* ctx) {
 // take v, in the re-NBA region, `skew` ticks after the clocking event (14.16).
 inline Task cbLater(int s, Val v, int hi, int lo, uint64_t d) {
     co_await Delay{d};
-    S.reNbaq.push_back({s, v, hi, lo});
+    S.reNbaq.push_back({s, v, hi, lo, true});
     S.rare = true;
 }
 // An output with an edge skew: at the next such edge of the clock, then the
@@ -2150,7 +2150,7 @@ inline Task cbLater(int s, Val v, int hi, int lo, uint64_t d) {
 inline Task cbAtEdge(int s, Val v, int hi, int lo, int clk, int edge, uint64_t d) {
     co_await Wait{clk, (Edge)edge};
     if (d) co_await Delay{d};
-    S.reNbaq.push_back({s, v, hi, lo});
+    S.reNbaq.push_back({s, v, hi, lo, true});
     S.rare = true;
 }
 static void cbSchedule(ClockingRT& c, int out, const Val& v, int hi, int lo) {
@@ -2164,7 +2164,7 @@ static void cbSchedule(ClockingRT& c, int out, const Val& v, int hi, int lo) {
             int dhi = p.lo + (b - pl), dlo = p.lo + (a - pl);
             if (dlo == 0 && dhi == S.sigs[p.sig].w - 1) dhi = -1;
             if (o.edgeSig >= 0) S.spawn(cbAtEdge(p.sig, part, dhi, dlo, o.edgeSig, o.edge, o.skew));
-            else if (o.skew == 0) { S.reNbaq.push_back({p.sig, part, dhi, dlo}); S.rare = true; }
+            else if (o.skew == 0) { S.reNbaq.push_back({p.sig, part, dhi, dlo, true}); S.rare = true; }
             else S.spawn(cbLater(p.sig, part, dhi, dlo, o.skew));
         }
         pl += p.w;
