@@ -2296,6 +2296,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         CodegenProc c{&lowered.procs[i].prog, lowered.procs[i].kind, pl.rank[i], pl.ins[i]};
         c.combLevel = pl.level[i];
+        c.combOnCycle = !pl.onCycle.empty() && pl.onCycle[i];
         c.seq = pl.seq[i];
         c.seqEv = pl.ev[i];
         c.loops = lowered.procs[i].loops;
