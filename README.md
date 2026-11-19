@@ -552,7 +552,10 @@ had sent every one-bit edge and in-place bit write through the general
 indices that unrolling and inlining made constant (Keccak's
 `PiRotate[x][y]` in a function's loop) is the element's value, and an
 `a[i +: w]` select at a constant `i` a fixed part select
-(`MSIM_NOROMFOLD`). `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
+(`MSIM_NOROMFOLD`). A run of one-bit copies `x[b] = y[j]`, `x[b+1] =
+y[j+1]`, ... (SHA-3's `bitarray_to_box`, unrolled: 1600 of them) becomes one
+copy of up to 64 bits (`MSIM_NOBITRUNS`): OpenTitan's 300 us from 55 s to
+45 s. `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
 step, and the signals they change, then stops.
 
 ### Static combinational schedule

@@ -229,17 +229,19 @@ foreach(c IN LISTS CASES)
     endif()
   endif()
   # A function with nested loops behind a net: unrolled, inlined, and its
-  # wide local written bit by bit in place.
+  # one-bit copies merged into one copy per 16-bit lane (msim.cpp
+  # mergeBitRuns), which then go to the lanes' own storage.
   if(c STREQUAL "examples/boxnet.sv")
-    file(GLOB srcs ${OUT}/c${n}/*.cpp)
-    set(gen "")
-    foreach(f ${srcs})
-      file(READ ${f} t)
-      string(APPEND gen "${t}")
-    endforeach()
-    if(NOT gen MATCHES "S\\.setBitsV\\([^;]*, 0, 0\\);")
-      message(FATAL_ERROR "${c}: the unrolled bit writes do not go in place")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env MSIM_WHYCONST=1 ${MSIM} -compile -O1 -cc /bin/false -o ${OUT}/c${n}b ${files}
+                    OUTPUT_QUIET ERROR_VARIABLE berr)
+    if(NOT berr MATCHES "bit runs: 375 one-bit copies merged")
+      message(FATAL_ERROR "${c}: the unrolled bit copies are not merged\n${berr}")
     endif()
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(gen MATCHES "v_insert\\(")
+      message(FATAL_ERROR "${c}: a bit write copies the whole vector")
+    endif()
+  endif()
   endif()
   # The blocks of a comb cycle too large to merge are marked in the compiled
   # schedule (Sim::Comb::onCycle), so only their final writes wake the next.
