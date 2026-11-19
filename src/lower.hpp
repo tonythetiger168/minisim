@@ -5058,7 +5058,7 @@ struct Lowerer {
                     while (leaf->getCanonicalType().kind == SymbolKind::FixedSizeUnpackedArrayType)
                         leaf = &leaf->getCanonicalType().as<FixedSizeUnpackedArrayType>().elementType;
                     int lw = uWidth(*leaf);
-                    if (lw > 0 && (leaf->isIntegral() || leaf->isFloating() || leaf->isString())) {
+                    if (lw > 0 && (leaf->isIntegral() || leaf->isFloating() || leaf->isString() || leaf->isUnpackedStruct())) {
                         E pv = expr(x);
                         for (int top = uWidth(t); top > 0; top -= lw) {
                             auto sl = node(Op::Slice, {pv});
@@ -5906,7 +5906,9 @@ struct Lowerer {
     // container-valued calls a scratch container holding it; -1 if neither.
     bool isDynCall(const slang::ast::Expression& x) {
         const auto& p = peel(x);
-        return stmtDepth && p.kind == slang::ast::ExpressionKind::Call && isDynType(*p.type);
+        // q[i:j] (7.10.1) as a value (printed with %p, a method called on it) is held the same way
+        return stmtDepth && (p.kind == slang::ast::ExpressionKind::Call || p.kind == slang::ast::ExpressionKind::RangeSelect) &&
+               isDynType(*p.type);
     }
     int dynValue(const slang::ast::Expression& x) {
         int d = dynSig(x);
@@ -7360,7 +7362,7 @@ struct Lowerer {
         if (t.kind == TimingControlKind::SignalEvent) {
             const auto& s = t.as<SignalEventControl>();
             if (isGlobalClock(s.expr)) {   // @($global_clock): the global clocking's event (14.14)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $global_clock");
+                if (s.edge != EdgeKind::None) unsupported("an edge on $global_clock");   // iff: checked by the caller (9.4.2.3)
                 collectEvents(globalClocking()->getEvent(), ev);
                 return;
             }
@@ -7372,17 +7374,17 @@ struct Lowerer {
                 return;
             }
             if (const auto* cb = inferredClock(s.expr)) {   // @($inferred_clock) (16.14.7)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on $inferred_clock");
+                if (s.edge != EdgeKind::None) unsupported("an edge on $inferred_clock");   // iff: checked by the caller (9.4.2.3)
                 collectEvents(cb->getEvent(), ev);
                 return;
             }
             if (const auto* cb = clockingRef(s.expr)) {   // @(cb): the clocking block event (14.10)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a clocking block event");
+                if (s.edge != EdgeKind::None) unsupported("an edge on a clocking block event");   // iff: checked by the caller (9.4.2.3)
                 ev.push_back({clockings()[clockingIdx(*cb)].evSig, ANY});
                 return;
             }
             if (peel(s.expr).kind == ExpressionKind::AssertionInstance) {   // @(seq): its end point (9.4.2.4)
-                if (s.edge != EdgeKind::None || s.iffCondition) unsupported("an edge or iff on a sequence event");
+                if (s.edge != EdgeKind::None) unsupported("an edge on a sequence event");   // iff: checked by the caller (9.4.2.3)
                 ev.push_back({seqEventSig(s.expr), ANY});
                 return;
             }
@@ -8941,7 +8943,8 @@ struct Lowerer {
                                 if (et->isFloating()) v = un(Op::AsReal, v);
                                 else if (et->isString()) v = un(Op::AsStr, v);
                             }
-                            pfmtSingular(*et, v, fmt, out);
+                            if (et->isUnpackedStruct() || et->isUnpackedUnion()) pfmtStruct(*et, v, fmt, out);
+                            else pfmtSingular(*et, v, fmt, out);
                         }
                     }
                     fmt += "}";
