@@ -13,6 +13,7 @@
 // $monitor           -> one postponed line per slot if a watched value changed
 // $finish            -> S.finished = true
 // task/function      -> Call / Ret in this coroutine (exec.inc)
+#include <dlfcn.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -588,27 +589,38 @@ struct Sim {
     vector<char> combPend;
     // The pending combinational processes, lowest rank first: one bit per
     // rank. A heap push and pop per wake was a tenth of Ibex's run time.
+    // Pending ranks: a bit per rank and a summary bit per 64-rank word, so
+    // the lowest one is found in two steps however sparse they are
+    // (OpenTitan has ~400,000 ranks, a few of them pending at a time).
     struct RankQ {
-        vector<uint64_t> bits;
+        vector<uint64_t> bits, sum;
         size_t n = 0, lo = 0;   // count; no bit is set below word `lo`
         bool empty() const { return n == 0; }
         size_t size() const { return n; }
         void push(int r) {
             size_t w = (size_t)r >> 6;
-            if (w >= bits.size()) bits.resize(w + 1, 0);
+            if (w >= bits.size()) { bits.resize(w + 1, 0); sum.resize((w >> 6) + 1, 0); }
             uint64_t b = 1ULL << (r & 63);
             if (bits[w] & b) return;
             bits[w] |= b;
+            sum[w >> 6] |= 1ULL << (w & 63);
             n++;
             if (w < lo) lo = w;
         }
         int top() {
-            while (!bits[lo]) lo++;
+            if (!bits[lo]) {
+                size_t s = lo >> 6;
+                uint64_t m = sum[s] & (~0ULL << (lo & 63));
+                while (!m) m = sum[++s];
+                lo = s * 64 + (size_t)__builtin_ctzll(m);
+            }
             return (int)(lo * 64 + (size_t)__builtin_ctzll(bits[lo]));
         }
         void pop() {
             int r = top();
-            bits[(size_t)r >> 6] &= bits[(size_t)r >> 6] - 1;
+            size_t w = (size_t)r >> 6;
+            bits[w] &= bits[w] - 1;
+            if (!bits[w]) sum[w >> 6] &= ~(1ULL << (w & 63));
             if (--n == 0) lo = 0;
         }
     };
@@ -630,6 +642,20 @@ struct Sim {
         if (combPend[r]) return;
         combPend[r] = 1;
         combq.push(r);
+    }
+    // MSIM_LOOPDBG=N: after N comb runs at one time step, list the next
+    // runs (rank, function, changed signals) on stderr and stop.
+    long loopDbg = getenv("MSIM_LOOPDBG") ? atol(getenv("MSIM_LOOPDBG")) : 0;
+    long loopCnt = 0; uint64_t loopAt = ~0ULL; vector<Val> loopSnap;
+    __attribute__((noinline)) void loopTrace(int r) {
+        if (now != loopAt) { loopAt = now; loopCnt = 0; }
+        if (++loopCnt < loopDbg) return;
+        if (loopSnap.empty()) { loopSnap.resize(sigs.size()); for (size_t i = 0; i < sigs.size(); i++) loopSnap[i] = sigs[i].val; }
+        else for (size_t i = 0; i < sigs.size(); i++) if (!sameVal(loopSnap[i], sigs[i].val)) {
+            fprintf(stderr, "   chg %zu %s = v%llx x%llx w%d\n", i, sigs[i].name.c_str(), (unsigned long long)sigs[i].val.v, (unsigned long long)sigs[i].val.x, sigs[i].w); loopSnap[i] = sigs[i].val; }
+        Dl_info di{}; const char* nm = dladdr((void*)combs[r].fn, &di) && di.dli_sname ? di.dli_sname : "?";
+        fprintf(stderr, "loop t=%llu run %ld rank %d %s onCycle=%d level=%d\n", (unsigned long long)now, loopCnt, r, nm, (int)combs[r].onCycle, combs[r].level);
+        if (loopCnt > loopDbg + 3000) { fflush(stderr); _exit(3); }
     }
     void runCombs() {
         while (!combq.empty()) {
@@ -660,6 +686,7 @@ struct Sim {
             });
             for (size_t k = 0; k < combBatch.size(); k++) {
                 int r = combBatch[k];
+                if (__builtin_expect(loopDbg != 0, 0)) loopTrace(r);
                 curComb = r;
                 if (combs[r].onCycle && !combs[r].compute) runDeferred(r);
                 else if (combs[r].compute) combs[r].commit(combs[r].ctx, combVals[k]);

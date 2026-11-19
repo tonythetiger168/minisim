@@ -112,6 +112,7 @@ set(CASES
   "examples/widebits.sv"
   "examples/wiresub.sv"
   "examples/boxnet.sv"
+  "examples/combring.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -237,6 +238,14 @@ foreach(c IN LISTS CASES)
     endforeach()
     if(NOT gen MATCHES "S\\.setBitsV\\([^;]*, 0, 0\\);")
       message(FATAL_ERROR "${c}: the unrolled bit writes do not go in place")
+    endif()
+  endif()
+  # The blocks of a comb cycle too large to merge are marked in the compiled
+  # schedule (Sim::Comb::onCycle), so only their final writes wake the next.
+  if(c STREQUAL "examples/combring.sv")
+    file(READ ${OUT}/c${n}/design.cpp gen)
+    if(NOT gen MATCHES "S\\.combs\\[combBase \\+ \\(size_t\\)k\\]\\.onCycle = true")
+      message(FATAL_ERROR "${c}: the ring's blocks are not marked as on a cycle")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).

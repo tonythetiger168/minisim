@@ -97,6 +97,7 @@ struct CodegenProc {
     int combRank = -1;
     std::vector<int> combIns;
     int combLevel = 0;
+    bool combOnCycle = false;   // on a cycle of comb ranks: Sim::Comb::onCycle (runDeferred)
     // A clocked process (prog.hpp: seqShape): emitted as a function that
     // returns its NBAs, registered with Sim::addSeq on these events.
     bool seq = false;
@@ -999,10 +1000,16 @@ public:
                        std::to_string(off) + ", " + std::to_string(procs[i].combIns.size()) + ", " + evCtx(i) + "},\n";
                 off += procs[i].combIns.size();
             }
+            std::string cyc;   // ranks on a cycle: only their final writes wake readers
+            for (size_t k = 0; k < byRank.size(); k++) if (procs[byRank[k]].combOnCycle) cyc += std::to_string(k) + ",";
             o << "    static const int CINS[] = {" << ins << "0};\n"
                  "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); int lv, at, n; const void* x; } COMBS[] = {\n"
               << tab << "    };\n"
+                 "    const size_t combBase = S.combs.size();\n"
                  "    for (auto& c : COMBS) S.addComb(c.f, c.x, std::vector<int>(CINS + c.at, CINS + c.at + c.n), c.lv, c.v, c.c);\n";
+            if (!cyc.empty())
+                o << "    static const int CYC[] = {" << cyc << "};\n"
+                     "    for (int k : CYC) S.combs[combBase + (size_t)k].onCycle = true;\n";
         }
         // Declaration initializers take effect before anything waits (6.8):
         // logic clk = 0 is no negedge for a clocked process registered below.

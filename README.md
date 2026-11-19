@@ -540,6 +540,15 @@ timing checks, specify paths or a waveform keep all of them
 has 211,285 such copies and loses 206,437: 60 us of simulation from 48 s to
 about 25 s.
 
+The blocks of a comb cycle too large to merge (each writing a default and then
+its value) wake the next block only with their final values, under
+`-compile` as in the interpreter; before, such a ring could wake itself
+forever at one time step. OpenTitan Earl Grey with `-noassert` now boots its
+ROM to `TEST PASSED` (2.36 ms of simulation, about 236,000 cycles) in 931 s
+of run time after a 39 s cached build; Verilator 5.054 takes 106 s on one
+thread. `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
+step, and the signals they change, then stops.
+
 ### Static combinational schedule
 
 Continuous assigns, gates, and straight-line `always_comb` / `always @*`
