@@ -5079,12 +5079,70 @@ struct Lowerer {
     // itself an array value of type t.
     void fillElems(const slang::ast::Type& t0, const slang::ast::Expression& v, std::vector<E>& out) {
         const auto& t = t0.getCanonicalType();
+        // default: '{default: v} or '{k: v, default: w} (10.9.1): a pattern with no type of its own
+        // here, applied to each element of the element type in turn
+        if (v.kind == slang::ast::ExpressionKind::Invalid && v.as<slang::ast::InvalidExpression>().child &&
+            v.as<slang::ast::InvalidExpression>().child->kind == slang::ast::ExpressionKind::StructuredAssignmentPattern) {
+            const auto& sp = v.as<slang::ast::InvalidExpression>().child->as<slang::ast::StructuredAssignmentPatternExpression>();
+            if (!sp.memberSetters.empty() || !sp.typeSetters.empty()) unsupported("this pattern as an array default");
+            if (t.kind != slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+                if (!sp.defaultSetter || !sp.indexSetters.empty()) unsupported("this pattern as an array default");
+                fillElems(t, *sp.defaultSetter, out);
+                return;
+            }
+            const auto& ft = t.as<slang::ast::FixedSizeUnpackedArrayType>();
+            for (int64_t k = 0; k < (int64_t)ft.range.width(); k++) {
+                int64_t idx = ft.range.left >= ft.range.right ? ft.range.left - k : ft.range.left + k;
+                const slang::ast::Expression* e = nullptr;
+                for (const auto& is : sp.indexSetters)
+                    if (constInt(*is.index) == idx) e = is.expr;
+                if (!e) e = sp.defaultSetter;
+                if (!e) unsupported("array pattern without a value for every index");
+                fillElems(ft.elementType, *e, out);
+            }
+            return;
+        }
+        if (t.isUnpackedStruct() && !v.type->isUnpackedStruct() && v.type->isIntegral()) {
+            out.push_back(structFill(t, v));
+            return;
+        }
         if (t.kind != slang::ast::SymbolKind::FixedSizeUnpackedArrayType || v.type->isUnpackedArray()) {
             arrayElems(t, v, out);
             return;
         }
         const auto& ft = t.as<slang::ast::FixedSizeUnpackedArrayType>();
         for (int64_t k = 0; k < (int64_t)ft.range.width(); k++) fillElems(ft.elementType, v, out);
+    }
+    // default: v for an element that is an unpacked struct while v is a
+    // simple value (10.9.1): each member gets v, nested structs and arrays
+    // member by member. The struct's bits, its first member on top.
+    E structFill(const slang::ast::Type& t0, const slang::ast::Expression& v) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        auto leaf = [&](const Type& ft, int w) -> E {
+            if (ft.isUnpackedStruct()) return structFill(ft, v);
+            if (!ft.isIntegral() || !v.type->isIntegral()) unsupported("default: of this kind for a struct element");
+            const Expression& pv = peel(v);
+            if (pv.kind == ExpressionKind::UnbasedUnsizedIntegerLiteral) {   // '0 '1 'x 'z: every bit
+                ExprCtx c;
+                c.w = w;
+                return resize(expr(pv, c), w, false, false);
+            }
+            return resize(expr(v), w, v.type->isSigned(), ft.isSigned());
+        };
+        std::function<E(const Type&)> member = [&](const Type& ft0) -> E {
+            const Type& ft = ft0.getCanonicalType();
+            if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                const auto& a = ft.as<FixedSizeUnpackedArrayType>();
+                std::vector<E> parts((size_t)a.range.width(), member(a.elementType));
+                return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+            }
+            return leaf(ft, uMemberW(ft));
+        };
+        if (!t.isUnpackedStruct()) unsupported("default: of this kind for an element");
+        std::vector<E> parts;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) parts.push_back(member(f.getType()));
+        return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
     }
     // a = <array value>; for a whole fixed-size array. The values are taken
     // before any element is written, so a = '{a[1], a[0]} swaps.
