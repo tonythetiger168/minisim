@@ -374,8 +374,18 @@ static void mergePartialDrivers(LowerResult& lowered) {
                 if (i.k == IK::Force) return;
     for (auto& lp : lowered.procs) {
         auto& code = lp.prog.code;
-        // Only a continuous assign: Assign, wait, jump back.
+        // Only a continuous assign: Assign, wait, jump back; or one that
+        // calls a function first (its arguments and result are assigns
+        // and a call before the driver), as SHA-3's box reshaping is.
+        // MSIM_NOMERGECALLDRV keeps those as drivers.
         bool contAssign = code.size() == 3 && code[0].k == IK::Assign && code[1].k == IK::WaitEdge;
+        static const bool callDrv = !std::getenv("MSIM_NOMERGECALLDRV");
+        if (!contAssign && callDrv && code.size() > 3 && code[code.size() - 2].k == IK::WaitEdge &&
+            code.back().k == IK::Jmp && code.back().target == 0) {
+            contAssign = true;
+            for (size_t k = 0; k + 2 < code.size(); k++)
+                if (code[k].k != IK::Assign && code[k].k != IK::Call) contAssign = false;
+        }
         for (auto& i : code) {
             if (i.k != IK::Assign || i.drv < 0 || i.sig < 0 || (size_t)i.sig >= ns) continue;
             bool ok = contAssign && i.dyn < 0 && i.gate < 0 && !i.arr && i.aidx.empty() && !i.bidx && !i.de && !i.delay && i.dly.empty() &&
@@ -666,7 +676,7 @@ static void xInitialZero() {
 // one bit per pass (for (int i = 0; i < 32; i++) r[i] = a[31 - i]) becomes
 // straight code, which runs without the compare and step of each pass and
 // can be split like any other block.
-static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
+static void unrollSeqLoops(LowerResult& lowered, bool comb = false, bool subsOnly = false) {
     std::set<int> lv(loopVarSigs().begin(), loopVarSigs().end());
     if (lv.empty()) return;
     const bool dbg = std::getenv("MSIM_WHYUNROLL") != nullptr;
@@ -726,15 +736,13 @@ static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
         }
         return c;
     };
+    // Unrolls the loops of `code` from `from` on: i = c; top: if (!(cond))
+    // goto E; body; i = f(i); goto top; E: with a straight body. Returns
+    // how many it unrolled.
     std::set<int> used;
-    for (auto& lp : lowered.procs) {
-        if (lp.program >= 0 || lp.reactive) continue;
-        auto& code = lp.prog.code;
-        size_t n = code.size();
-        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[n - 1].k != IK::Jmp || code[n - 1].target != 0)
-            continue;
-        if (comb ? code[n - 2].k != IK::WaitEdge || code[0].k == IK::WaitEdge : code[0].k != IK::WaitEdge) continue;
-        for (size_t pc = comb ? 0 : 1; pc + 3 < code.size(); pc++) {
+    auto unrollCode = [&](std::vector<Instr>& code, size_t from) -> int {
+        int nUnrolled = 0;
+        for (size_t pc = from; pc + 3 < code.size(); pc++) {
             // i = c; top: if (!(cond)) goto E; body; step: i = f(i); goto top; E:
             const Instr& a = code[pc];
             if (a.k != IK::Assign || !lv.count(a.sig) || !plainW(a)) continue;
@@ -820,9 +828,43 @@ static void unrollSeqLoops(LowerResult& lowered, bool comb = false) {
             code.erase(code.begin() + (long)pc, code.begin() + (long)E);
             code.insert(code.begin() + (long)pc, out.begin(), out.end());
             used.insert(var);
+        nUnrolled++;
             if (dbg) std::cerr << "unrolled " << S.sigs[(size_t)var].name << ": " << iters << " times, " << out.size() << " instructions\n";
             pc += out.size() ? out.size() - 1 : 0;
         }
+        return nUnrolled;
+    };
+    // msim -compile: the loops of a function called without a frame (a
+    // SHA-3 box reshaped bit by bit in three nested loops), innermost
+    // first, so that inlineCombCalls can make it part of the comb block
+    // that calls it. MSIM_NOSUBUNROLL turns it off.
+    if (subsOnly) {
+        std::set<Prog*> callees;
+        std::unordered_set<const Prog*> seen;
+        std::function<void(const Prog&)> walk = [&](const Prog& p) {
+            for (auto& i : p.code) {
+                if (i.k == IK::Call && i.callee && !i.lay && !i.self && i.vslot == -1 && i.init.empty() && i.dinit.empty())
+                    callees.insert(const_cast<Prog*>(i.callee));
+                if (i.callee && seen.insert(i.callee).second) walk(*i.callee);
+                for (auto* b : i.branches) if (b && seen.insert(b).second) walk(*b);
+            }
+        };
+        for (auto& lp : lowered.procs) walk(lp.prog);
+        for (Prog* p : callees) {
+            if (!p->roots.empty() || !p->spans.empty()) continue;
+            for (int k = 0; k < 8 && unrollCode(p->code, 0) > 0; k++) {}
+        }
+        for (int x : used) S.sigs[(size_t)x].hide = true;
+        return;
+    }
+    for (auto& lp : lowered.procs) {
+        if (lp.program >= 0 || lp.reactive) continue;
+        auto& code = lp.prog.code;
+        size_t n = code.size();
+        if (n < 3 || !lp.prog.roots.empty() || !lp.prog.spans.empty() || code[n - 1].k != IK::Jmp || code[n - 1].target != 0)
+            continue;
+        if (comb ? code[n - 2].k != IK::WaitEdge || code[0].k == IK::WaitEdge : code[0].k != IK::WaitEdge) continue;
+        unrollCode(code, comb ? 0 : 1);
         // What is left of an unrolled variable here: constant writes (its
         // initial value at the block's entry) that nothing reads.
         std::set<int> mine;
@@ -4365,6 +4407,9 @@ static int msimMain(int argc, char** argv) {
     if (!vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOEMPTYCALL")) dropEmptyCalls(lowered);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOATSTAR")) rotateAtStar(lowered);
     phaseMark(" empty calls, @*");
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL") &&
+        !std::getenv("MSIM_NOSUBUNROLL"))
+        unrollSeqLoops(lowered, true, true);
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !std::getenv("MSIM_NOINLINE")) inlineCombCalls(lowered);
     phaseMark(" comb calls inlined");
     if (staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOUNROLL"))

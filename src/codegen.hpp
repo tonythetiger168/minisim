@@ -2050,6 +2050,8 @@ private:
         else if (i.drv >= 0)
             o << " S.drive(" << i.sig << ", " << i.drv << ", " << val << ", " << (int)i.s0 << ", " << (int)i.s1
               << ");\n";
+        else if (i.hi >= 0 && sigW_[i.sig] > 64 && i.hi - i.lo < 64 && !std::getenv("MSIM_NOWIDEBITS"))   // in place (Sim::setBitsV)
+            o << " S.setBitsV(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
         else if (i.hi >= 0)
             o << " S.set(" << i.sig << ", v_insert(S.get(" << i.sig << "), " << val << ", " << i.hi << ", " << i.lo
               << "));\n";
@@ -3060,7 +3062,7 @@ private:
     // calls f(at, len, N) for each.
     template <class F> static void refScan(const std::string& t, F&& f) {
         static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
-                                    "S.get(", "S.set(", "S.setOneBit(", "S.poke(", "R(", "int s = ",   // dynTarget
+                                    "S.get(", "S.set(", "S.setOneBit(", "S.setBitsV(", "S.poke(", "R(", "int s = ",   // dynTarget
                                     "SIGN(",   // a commit list entry's signal (C1E)
                                     "nb.push_back({"};   // an NBA of a clocked function (emitSeq)
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
