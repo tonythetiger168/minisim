@@ -893,7 +893,7 @@ struct Sim {
         }
         for (size_t k = 0; k < seqq.size(); k++) {
             seqPend[seqq[k]] = 0;
-            nbaq.insert(nbaq.end(), seqBufs[k].begin(), seqBufs[k].end());
+            nbaq.insert(nbaq.end(), std::make_move_iterator(seqBufs[k].begin()), std::make_move_iterator(seqBufs[k].end()));   // the buffer is cleared before its next use
         }
         seqq.clear();
     }
