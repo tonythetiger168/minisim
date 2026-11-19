@@ -2,8 +2,8 @@
 // bit by bit, as OpenTitan's KMAC does): -compile makes the assign a plain
 // write (msim.cpp mergePartialDrivers), unrolls the function's loops and
 // inlines it into a comb block (unrollSeqLoops subsOnly, inlineCombCalls),
-// and writes each bit of the wide local in place (Sim::setBitsV), also
-// x bits before the state is known.
+// merges its one-bit copies into one copy per lane (mergeBitRuns) and
+// writes them in place, also x bits before the state is known.
 module boxnet;
   localparam int W = 16;
   typedef logic [4:0][4:0][W-1:0] box_t;

@@ -671,6 +671,58 @@ static size_t constSelects(LowerResult& lowered, const Plan& pl) {
     return n;
 }
 
+// A run of one-bit copies x[b] = y[j], x[b+1] = y[j+1], ... (a function
+// that reshapes a vector bit by bit, unrolled and inlined: SHA-3's
+// bitarray_to_box, 1600 of them) becomes one copy of up to 64 bits,
+// x[b+n-1:b] = y[j+n-1:j]. The other instructions of the run become jumps
+// to the next one, so no jump target moves; a run never spans an
+// instruction something jumps to. MSIM_NOBITRUNS: off.
+static size_t mergeBitRuns(LowerResult& lowered, const Plan& pl) {
+    size_t merged = 0;
+    auto one = [](const Instr& i) {
+        return i.k == IK::Assign && i.sig >= 0 && i.hi >= 0 && i.hi == i.lo && !i.bidx && !i.arr && i.aidx.empty() && !i.de && !i.delay &&
+               i.dly.empty() && i.dlyE.empty() && i.drv < 0 && i.gate < 0 && i.dyn < 0 && i.init.empty() && !i.tmp && !i.xq && i.e &&
+               i.e->op == Op::Slice && i.e->hi == i.e->lo && !i.e->at && i.e->kids.size() == 1 && i.e->kids[0] && i.e->kids[0]->op == Op::Ref &&
+               !i.e->kids[0]->at && i.e->kids[0]->sig >= 0 && i.e->kids[0]->sig != i.sig;
+    };
+    for (size_t p = 0; p < lowered.procs.size(); p++) {
+        if (pl.rank[p] < 0 && !pl.seq[p]) continue;
+        auto& code = lowered.procs[p].prog.code;
+        std::vector<char> tgt(code.size() + 1, 0);
+        for (auto& i : code)
+            if (i.k == IK::Jmp || i.k == IK::JmpIfNot) {
+                if (i.target < tgt.size()) tgt[i.target] = 1;
+                if (i.xt != Instr::NOX && i.xt < tgt.size()) tgt[i.xt] = 1;
+            }
+        for (size_t a = 0; a < code.size();) {
+            if (!one(code[a])) { a++; continue; }
+            const int x = code[a].sig, y = code[a].e->kids[0]->sig;
+            size_t b = a + 1;
+            while (b < code.size() && b - a < 64 && !tgt[b] && one(code[b]) && code[b].sig == x && code[b].e->kids[0]->sig == y &&
+                   code[b].lo == code[a].lo + (int)(b - a) && code[b].e->lo == code[a].e->lo + (int)(b - a) &&
+                   code[b].e->kids[0]->sgn == code[a].e->kids[0]->sgn)
+                b++;
+            if (b - a >= 2) {
+                const int n = (int)(b - a);
+                auto e = std::make_shared<Expr>(*code[a].e);
+                e->hi = e->lo + n - 1;
+                code[a].e = e;
+                code[a].hi = code[a].lo + n - 1;
+                for (size_t k = a + 1; k < b; k++) {
+                    uint32_t ln = code[k].line;
+                    code[k] = Instr{};
+                    code[k].k = IK::Jmp;
+                    code[k].target = k + 1;
+                    code[k].line = ln;
+                }
+                merged += (size_t)n - 1;
+            }
+            a = b;
+        }
+    }
+    return merged;
+}
+
 // -x-assign 0 / -x-initial 0 (Verilator's options of the same names): the
 // design runs as a 2-state model would. Every X bit of a literal becomes 0
 // (picorv32 writes 'bx as a don't-care into a dozen registers every cycle,
@@ -4537,6 +4589,10 @@ static int msimMain(int argc, char** argv) {
     if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOCONSTSEL")) {
         size_t n = constSelects(lowered, pl);
         if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "constant selects: %zu writes\n", n);
+    }
+    if (compiled && staticComb && !vpi::st().active && !g_upf && !g_cov && !Lowerer::xpropMode() && !std::getenv("MSIM_NOBITRUNS")) {
+        size_t n = mergeBitRuns(lowered, pl);
+        if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "bit runs: %zu one-bit copies merged\n", n);
     }
     phaseMark("constants/simplify");
     // A testbench's clocked block with $display / $finish: a clocked
