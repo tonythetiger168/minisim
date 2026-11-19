@@ -242,7 +242,6 @@ foreach(c IN LISTS CASES)
       message(FATAL_ERROR "${c}: a bit write copies the whole vector")
     endif()
   endif()
-  endif()
   # The blocks of a comb cycle too large to merge are marked in the compiled
   # schedule (Sim::Comb::onCycle), so only their final writes wake the next.
   if(c STREQUAL "examples/combring.sv")
