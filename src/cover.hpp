@@ -117,6 +117,7 @@ struct CgDef {
     std::vector<CgCpDef> cps;
     std::vector<CgCrossDef> crosses;
     std::vector<int> insts;         // instance ids, in creation order
+    std::map<std::pair<int, int>, int64_t> typeSet;   // (item or -1, option): type_option written by the program (19.7)
     bool inClass = false;           // embedded in a class (19.4): new() passes `this` last
 };
 inline std::vector<CgDef>& cgDefs() { static std::vector<CgDef> v; return v; }
@@ -177,7 +178,8 @@ struct CgInst {
     std::vector<int> refSigs;
     bool on = true;
     int64_t opt[CO_N] = {};
-    std::vector<std::vector<int64_t>> cpOpt, crOpt;   // per coverpoint / cross: weight, goal, at_least, auto_bin_max
+    // per coverpoint / cross: weight, goal, at_least, auto_bin_max, type_option.weight, type_option.goal
+    std::vector<std::vector<int64_t>> cpOpt, crOpt;
     std::vector<CgCpInst> cps;
     std::vector<CgCrossInst> crosses;
     FrameP self;                     // a class's covergroup (19.4): the object it samples

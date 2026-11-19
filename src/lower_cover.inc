@@ -513,6 +513,55 @@ E cgNew(const slang::ast::Expression& e, std::span<const slang::ast::Expression*
     }
     return sysFnNode(SF_CG, std::move(ks), CG_NEW);
 }
+// x.option.f, x.cp.option.f, g::type_option.f, option.f inside the group
+// (19.7): {handle or def id, item, option id, flags} for CG_GETOPT and
+// CG_SETOPT, or an empty vector when e is not one. Flags: bit 0 a handle.
+std::vector<E> cgOptRef(const slang::ast::Expression& e) {
+    using namespace slang::ast;
+    if (e.kind != ExpressionKind::MemberAccess) return {};
+    const auto& m = e.as<MemberAccessExpression>();
+    const Expression& v = m.value();
+    const Symbol* prop = nullptr;
+    const Expression* outer = nullptr;   // what the option is read through
+    if (v.kind == ExpressionKind::MemberAccess) {
+        prop = &v.as<MemberAccessExpression>().member;
+        outer = &v.as<MemberAccessExpression>().value();
+    } else if (v.kind == ExpressionKind::NamedValue)
+        prop = &v.as<NamedValueExpression>().symbol;
+    if (!prop || prop->kind != SymbolKind::ClassProperty || (prop->name != "option" && prop->name != "type_option"))
+        return {};
+    const Symbol& owner = prop->getParentScope()->asSymbol();
+    if (owner.kind != SymbolKind::CovergroupBody && owner.kind != SymbolKind::Coverpoint &&
+        owner.kind != SymbolKind::CoverCross)
+        return {};
+    bool type = prop->name == "type_option";
+    const Symbol* g = &owner;
+    while (g->kind != SymbolKind::CovergroupType) g = &g->getParentScope()->asSymbol();
+    int d = cgDefOf(g->as<CovergroupType>());
+    int item = -1;
+    if (owner.kind != SymbolKind::CovergroupBody) {
+        const CgDef& def = cgDefs()[d];
+        for (size_t k = 0; k < def.cps.size(); k++)
+            if (def.cps[k].name == owner.name && owner.kind == SymbolKind::Coverpoint) item = (int)k;
+        for (size_t k = 0; k < def.crosses.size(); k++)
+            if (def.crosses[k].name == owner.name && owner.kind == SymbolKind::CoverCross) item = (int)(def.cps.size() + k);
+        if (item < 0) unsupported("an option of this coverage item");
+        // x.cp.option: the handle is what the coverpoint is read through
+        if (outer && outer->kind == ExpressionKind::MemberAccess) outer = &outer->as<MemberAccessExpression>().value();
+        else outer = nullptr;
+    }
+    int id = cgOptId(m.member.name, type);
+    if (id < 0 || id == CO_NAME || id == CO_COMMENT || id == CO_TYPE_COMMENT)
+        unsupported("reading or writing this coverage option");
+    if (item >= 0 && !(id == CO_WEIGHT || id == CO_GOAL || id == CO_AT_LEAST || id == CO_AUTO_BIN_MAX ||
+                       id == CO_TYPE_WEIGHT || id == CO_TYPE_GOAL))
+        unsupported("reading or writing this coverage option of a coverpoint or cross");
+    bool handle = outer != nullptr;
+    if (!handle && !type) unsupported("option of the covergroup instance from here");
+    E h = handle ? expr(*outer) : konst(mk((uint64_t)d, 32));
+    return {h, konst(mk((uint64_t)(int64_t)item, 32)), konst(mk((uint64_t)id, 32)),
+            konst(mk(handle ? 1 : 0, 32)), konst(mk((uint64_t)d, 32))};
+}
 // A predefined covergroup, coverpoint or cross method (19.8), or null.
 E cgCall(const slang::ast::CallExpression& call) {
     using namespace slang::ast;
