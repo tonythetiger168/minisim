@@ -474,6 +474,39 @@ static size_t propagateConstants(LowerResult& lowered, const Plan& pl) {
     }
     std::vector<char> known(ns, 0);
     std::vector<uint64_t> kv(ns, 0);
+    // The elements of a parameter array read at a run-time index (lower.hpp
+    // paramArray: "P$rom[k]", set once at time 0). After loops are unrolled
+    // and functions inlined, most such reads have constant indices
+    // (Keccak's PiRotate[x][y] in a function's loop): those read the
+    // element's value. MSIM_NOROMFOLD: off.
+    std::vector<char> rom(ns, 0);
+    std::vector<uint64_t> romV(ns, 0);
+    size_t nRom = 0;
+    static const bool romFold = !std::getenv("MSIM_NOROMFOLD");
+    for (size_t i = 0; romFold && i < lowered.procs.size(); i++) {
+        if (lowered.procs[i].kind != "init" || pl.rank[i] >= 0 || pl.seq[i]) continue;
+        for (const Instr& a : lowered.procs[i].prog.code) {
+            if (a.k != IK::Assign || a.sig < 0 || (size_t)a.sig >= ns || a.hi >= 0 || a.arr || a.bidx || !a.aidx.empty() || writes[a.sig] != 1) continue;
+            const Sig& g = S.sigs[a.sig];
+            if (g.name.find("$rom[") == std::string::npos || g.w < 1 || g.w > 64 || g.val.real || g.val.str || g.fl || !g.drv.empty()) continue;
+            if (!a.e || a.e->op != Op::Const || a.e->k.x || a.e->k.z || a.e->k.real || a.e->k.str || !a.e->k.hi.empty()) continue;
+            Val v = a.e->k;
+            uint64_t m = g.w >= 64 ? ~0ULL : (1ULL << g.w) - 1;
+            if (v.w < g.w && v.sgn && v.w < 64 && ((v.v >> (v.w - 1)) & 1)) v.v |= ~0ULL << v.w;
+            romV[a.sig] = v.v & m;
+            rom[a.sig] = 1;
+            nRom++;
+        }
+    }
+    // The width of an expression, where it is plain (a signal, a select).
+    auto widthOf = [&](const E& e) -> int {
+        if (!e) return -1;
+        if (e->op == Op::Ref && !e->at && e->sig >= 0 && (size_t)e->sig < ns) return S.sigs[e->sig].w;
+        if (e->op == Op::DynSlice) return e->hi;
+        if (e->op == Op::Slice) return e->hi - e->lo + 1;
+        if (e->op == Op::Const) return e->k.w;
+        return -1;
+    };
     auto pure = [](Op o) {
         switch (o) {
             case Op::Not: case Op::And: case Op::Or: case Op::Xor: case Op::Add: case Op::Sub: case Op::Mul:
@@ -496,6 +529,41 @@ static size_t propagateConstants(LowerResult& lowered, const Plan& pl) {
             return konst(k);
         }
         if (e->op == Op::Const || e->at) return e;
+        if (e->op == Op::ArrRead && nRom && e->arr) {   // P$rom[i][j] at constant indices
+            std::vector<int64_t> idx;
+            std::vector<E> ks;
+            bool allK = true;
+            for (auto& k : e->kids) {
+                E f = fold(k);
+                if (!f || f->op != Op::Const || f->k.x || f->k.z || f->k.real || f->k.str || !f->k.hi.empty()) { allK = false; break; }
+                idx.push_back(v_to_i64(f->k));
+            }
+            if (allK) {
+                int64_t off = e->arr->offset(idx);
+                int64_t sg = off < 0 ? -1 : e->arr->base + off;
+                if (sg >= 0 && (size_t)sg < ns && rom[(size_t)sg]) {
+                    Val k = make(romV[(size_t)sg], 0, e->arr->elemW);
+                    k.sgn = e->arr->sgn;
+                    return konst(k);
+                }
+            }
+        }
+        if (e->op == Op::DynSlice && e->kids.size() == 2 && romFold) {   // a[i +: w] at a constant i: a[i+w-1:i]
+            E a = fold(e->kids[0]), i = fold(e->kids[1]);
+            int W = widthOf(a);
+            if (i && i->op == Op::Const && !i->k.x && !i->k.z && !i->k.real && !i->k.str && i->k.hi.empty() && W > 0) {
+                int64_t st = v_to_i64(i->k);
+                if (e->lo) st = st - e->hi + 1;
+                if (st >= 0 && st + e->hi <= W) {
+                    auto n = std::make_shared<Expr>(*e);
+                    n->op = Op::Slice;
+                    n->kids = {a};
+                    n->lo = (int)st;
+                    n->hi = (int)st + e->hi - 1;
+                    return n;
+                }
+            }
+        }
         std::vector<E> kids;
         bool changed = false, allConst = !e->kids.empty();
         kids.reserve(e->kids.size());
@@ -543,7 +611,7 @@ static size_t propagateConstants(LowerResult& lowered, const Plan& pl) {
             again = true;
         }
     }
-    if (!nk) return 0;
+    if (!nk && !nRom) return 0;
     for (size_t i = 0; i < lowered.procs.size(); i++) {
         if (pl.rank[i] < 0 && !pl.seq[i]) continue;
         for (auto& in : lowered.procs[i].prog.code) {

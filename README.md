@@ -548,7 +548,11 @@ ROM to `TEST PASSED` (2.36 ms of simulation, about 236,000 cycles) in 931 s
 of run time after a 39 s cached build; Verilator 5.054 takes 106 s on one
 thread. A design without specify paths no longer sizes the path tables, which
 had sent every one-bit edge and in-place bit write through the general
-`set()`: OpenTitan's 300 us from 127 s to 75 s. `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
+`set()`: OpenTitan's 300 us from 127 s to 75 s. A parameter array read at
+indices that unrolling and inlining made constant (Keccak's
+`PiRotate[x][y]` in a function's loop) is the element's value, and an
+`a[i +: w]` select at a constant `i` a fixed part select
+(`MSIM_NOROMFOLD`). `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
 step, and the signals they change, then stops.
 
 ### Static combinational schedule
