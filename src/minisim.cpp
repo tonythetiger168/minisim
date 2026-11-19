@@ -841,10 +841,24 @@ struct Sim {
         if (seqOf.size() < sigs.size()) seqOf.resize(sigs.size());
         for (auto& [sg, e] : ev) seqOf[sg].push_back({id, e});
     }
+    // The woken processes in process order. A clock edge of an SoC wakes
+    // thousands, in sorted runs per clock signal: through a bitset of the
+    // process ids it takes one pass (std::sort was 15% of OpenTitan's run).
+    vector<uint64_t> seqBits;
+    void sortSeqq() {
+        if (seqq.size() < 64) { std::sort(seqq.begin(), seqq.end()); return; }
+        const size_t W = (seqs.size() + 63) >> 6;
+        if (seqBits.size() < W) seqBits.resize(W, 0);
+        for (int id : seqq) seqBits[(size_t)id >> 6] |= 1ULL << (id & 63);
+        seqq.clear();
+        for (size_t w = 0; w < W; w++)
+            for (uint64_t b = seqBits[w]; b; b &= b - 1) seqq.push_back((int)(w * 64 + (size_t)__builtin_ctzll(b)));
+        std::fill(seqBits.begin(), seqBits.begin() + (ptrdiff_t)W, 0);
+    }
     uint64_t seqRun = 0;   // counts runSeqs: the compiled clock groups of one run share a twoNow() (codegen dseq)
     void runSeqs() {
         seqRun++;
-        if (!std::is_sorted(seqq.begin(), seqq.end())) std::sort(seqq.begin(), seqq.end());
+        if (!std::is_sorted(seqq.begin(), seqq.end())) sortSeqq();
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
         // The compiled cycle domain's clock groups (one dseq each) share the
         // NBA slots and their list: those run one after another, here.
