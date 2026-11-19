@@ -111,6 +111,7 @@ set(CASES
   "examples/nomix.sv"
   "examples/widebits.sv"
   "examples/wiresub.sv"
+  "examples/boxnet.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -223,6 +224,19 @@ foreach(c IN LISTS CASES)
                     OUTPUT_QUIET ERROR_VARIABLE werr)
     if(NOT werr MATCHES "wire substitution: 16 of 19 copies")
       message(FATAL_ERROR "${c}: copies not substituted as expected\n${werr}")
+    endif()
+  endif()
+  # A function with nested loops behind a net: unrolled, inlined, and its
+  # wide local written bit by bit in place.
+  if(c STREQUAL "examples/boxnet.sv")
+    file(GLOB srcs ${OUT}/c${n}/*.cpp)
+    set(gen "")
+    foreach(f ${srcs})
+      file(READ ${f} t)
+      string(APPEND gen "${t}")
+    endforeach()
+    if(NOT gen MATCHES "S\\.setBitsV\\([^;]*, 0, 0\\);")
+      message(FATAL_ERROR "${c}: the unrolled bit writes do not go in place")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).
