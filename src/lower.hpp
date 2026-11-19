@@ -5079,12 +5079,70 @@ struct Lowerer {
     // itself an array value of type t.
     void fillElems(const slang::ast::Type& t0, const slang::ast::Expression& v, std::vector<E>& out) {
         const auto& t = t0.getCanonicalType();
+        // default: '{default: v} or '{k: v, default: w} (10.9.1): a pattern with no type of its own
+        // here, applied to each element of the element type in turn
+        if (v.kind == slang::ast::ExpressionKind::Invalid && v.as<slang::ast::InvalidExpression>().child &&
+            v.as<slang::ast::InvalidExpression>().child->kind == slang::ast::ExpressionKind::StructuredAssignmentPattern) {
+            const auto& sp = v.as<slang::ast::InvalidExpression>().child->as<slang::ast::StructuredAssignmentPatternExpression>();
+            if (!sp.memberSetters.empty() || !sp.typeSetters.empty()) unsupported("this pattern as an array default");
+            if (t.kind != slang::ast::SymbolKind::FixedSizeUnpackedArrayType) {
+                if (!sp.defaultSetter || !sp.indexSetters.empty()) unsupported("this pattern as an array default");
+                fillElems(t, *sp.defaultSetter, out);
+                return;
+            }
+            const auto& ft = t.as<slang::ast::FixedSizeUnpackedArrayType>();
+            for (int64_t k = 0; k < (int64_t)ft.range.width(); k++) {
+                int64_t idx = ft.range.left >= ft.range.right ? ft.range.left - k : ft.range.left + k;
+                const slang::ast::Expression* e = nullptr;
+                for (const auto& is : sp.indexSetters)
+                    if (constInt(*is.index) == idx) e = is.expr;
+                if (!e) e = sp.defaultSetter;
+                if (!e) unsupported("array pattern without a value for every index");
+                fillElems(ft.elementType, *e, out);
+            }
+            return;
+        }
+        if (t.isUnpackedStruct() && !v.type->isUnpackedStruct() && v.type->isIntegral()) {
+            out.push_back(structFill(t, v));
+            return;
+        }
         if (t.kind != slang::ast::SymbolKind::FixedSizeUnpackedArrayType || v.type->isUnpackedArray()) {
             arrayElems(t, v, out);
             return;
         }
         const auto& ft = t.as<slang::ast::FixedSizeUnpackedArrayType>();
         for (int64_t k = 0; k < (int64_t)ft.range.width(); k++) fillElems(ft.elementType, v, out);
+    }
+    // default: v for an element that is an unpacked struct while v is a
+    // simple value (10.9.1): each member gets v, nested structs and arrays
+    // member by member. The struct's bits, its first member on top.
+    E structFill(const slang::ast::Type& t0, const slang::ast::Expression& v) {
+        using namespace slang::ast;
+        const Type& t = t0.getCanonicalType();
+        auto leaf = [&](const Type& ft, int w) -> E {
+            if (ft.isUnpackedStruct()) return structFill(ft, v);
+            if (!ft.isIntegral() || !v.type->isIntegral()) unsupported("default: of this kind for a struct element");
+            const Expression& pv = peel(v);
+            if (pv.kind == ExpressionKind::UnbasedUnsizedIntegerLiteral) {   // '0 '1 'x 'z: every bit
+                ExprCtx c;
+                c.w = w;
+                return resize(expr(pv, c), w, false, false);
+            }
+            return resize(expr(v), w, v.type->isSigned(), ft.isSigned());
+        };
+        std::function<E(const Type&)> member = [&](const Type& ft0) -> E {
+            const Type& ft = ft0.getCanonicalType();
+            if (ft.kind == SymbolKind::FixedSizeUnpackedArrayType) {
+                const auto& a = ft.as<FixedSizeUnpackedArrayType>();
+                std::vector<E> parts((size_t)a.range.width(), member(a.elementType));
+                return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
+            }
+            return leaf(ft, uMemberW(ft));
+        };
+        if (!t.isUnpackedStruct()) unsupported("default: of this kind for an element");
+        std::vector<E> parts;
+        for (const auto& f : t.as<Scope>().membersOfType<FieldSymbol>()) parts.push_back(member(f.getType()));
+        return parts.size() == 1 ? parts[0] : node(Op::Concat, std::move(parts));
     }
     // a = <array value>; for a whole fixed-size array. The values are taken
     // before any element is written, so a = '{a[1], a[0]} swaps.
@@ -7156,6 +7214,11 @@ struct Lowerer {
             }
             case ExpressionKind::MemberAccess: {    // s.f
                 const auto& m = e.as<MemberAccessExpression>();
+                if (auto k = cgOptRef(e); !k.empty()) {   // x.option.f, g::type_option.f (19.7)
+                    int w = (int)e.type->getBitWidth();
+                    bool sg = e.type->isSigned();
+                    return sized(resize(sysFnNode(SF_CG, std::move(k), CG_GETOPT), w, false, sg), w, sg, ctx);
+                }
                 if (vifAccess(e)) {   // v.x, v.cb.x (25.9)
                     if (m.member.kind == SymbolKind::Subroutine) unsupported("a task or function call through a virtual interface");
                     E r = ref(-1, e.type->isSigned());
@@ -11348,6 +11411,14 @@ struct Lowerer {
         if (ex.kind == ExpressionKind::Assignment) {
             const auto& a = ex.as<AssignmentExpression>();
             if (syncDrive(a) || vifSyncDrive(a)) return;   // cb.v <= e, v.cb.v <= e (14.16, 25.9)
+            if (auto k = cgOptRef(peel(a.left())); !k.empty()) {   // x.option.f = v (19.7)
+                if (a.isNonBlocking() || a.timingControl || a.isCompound()) unsupported("this write to a coverage option");
+                k.push_back(resize(expr(a.right()), 64, a.right().type->isSigned(), true));
+                Instr i; i.k = IK::Assign; i.sig = fresh(64);
+                i.e = sysFnNode(SF_CG, std::move(k), CG_SETOPT);
+                prog.emit(i);
+                return;
+            }
             if (const Expression& l = peel(a.left()); a.left().type->isEvent() && ValueExpressionBase::isKind(l.kind) &&
                 eventPtr().count(&l.as<ValueExpressionBase>().symbol)) {   // e2 = e1: e2 names e1's event from now on (6.17)
                 auto p = eventPtr().find(&l.as<ValueExpressionBase>().symbol);

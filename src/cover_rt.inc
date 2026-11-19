@@ -1116,6 +1116,19 @@ inline void buildCross(const CgDef& d, CgInst& in, const CgCrossDef& xd, CgCross
         xi.cls[t] = ill ? -3 : ign ? -2 : !xi.userOf[t].empty() ? xi.userOf[t][0] : -1;
     }
 }
+// The slot of a coverpoint or cross option in an instance (19.7).
+inline int64_t& cgItemOpt(CgInst& in, int item, int id) {
+    int nc = (int)in.cps.size();
+    auto& o = item < nc ? in.cpOpt[item] : in.crOpt[item - nc];
+    switch (id) {
+        case CO_WEIGHT: return o[0];
+        case CO_GOAL: return o[1];
+        case CO_AT_LEAST: return o[2];
+        case CO_AUTO_BIN_MAX: return o[3];
+        case CO_TYPE_WEIGHT: return o[4];
+        default: return o[5];   // CO_TYPE_GOAL
+    }
+}
 inline Val cgNew(const std::vector<Val>& a) {
     int d = (int)a[0].v;
     const CgDef& def = cgDefs()[d];
@@ -1139,10 +1152,14 @@ inline Val cgNew(const std::vector<Val>& a) {
     in.opt[CO_TYPE_WEIGHT] = optOr(def.opts, CO_TYPE_WEIGHT, 1);
     in.opt[CO_TYPE_GOAL] = optOr(def.opts, CO_TYPE_GOAL, 100);
     in.opt[CO_TYPE_MERGE] = optOr(def.opts, CO_TYPE_MERGE, 0);
+    in.opt[CO_TYPE_STROBE] = optOr(def.opts, CO_TYPE_STROBE, 0);
+    in.opt[CO_TYPE_DISTRIBUTE_FIRST] = optOr(def.opts, CO_TYPE_DISTRIBUTE_FIRST, 0);
+    for (auto& [k, v] : def.typeSet) if (k.first < 0) in.opt[k.second] = v;
     for (const auto& c : def.cps) {
         std::vector<int64_t> o{optOr(c.opts, CO_WEIGHT, 1), optOr(c.opts, CO_GOAL, in.opt[CO_GOAL]),
                                optOr(c.opts, CO_AT_LEAST, in.opt[CO_AT_LEAST]),
-                               optOr(c.opts, CO_AUTO_BIN_MAX, in.opt[CO_AUTO_BIN_MAX])};
+                               optOr(c.opts, CO_AUTO_BIN_MAX, in.opt[CO_AUTO_BIN_MAX]),
+                               optOr(c.opts, CO_TYPE_WEIGHT, 1), optOr(c.opts, CO_TYPE_GOAL, 100)};
         in.cpOpt.push_back(o);
         CgCpInst ci;
         double iv = 1.0;   // type_option.real_interval (19.7.1)
@@ -1152,11 +1169,14 @@ inline Val cgNew(const std::vector<Val>& a) {
     }
     for (const auto& x : def.crosses) {
         in.crOpt.push_back({optOr(x.opts, CO_WEIGHT, 1), optOr(x.opts, CO_GOAL, in.opt[CO_GOAL]),
-                            optOr(x.opts, CO_AT_LEAST, in.opt[CO_AT_LEAST]), 0});
+                            optOr(x.opts, CO_AT_LEAST, in.opt[CO_AT_LEAST]), 0,
+                            optOr(x.opts, CO_TYPE_WEIGHT, 1), optOr(x.opts, CO_TYPE_GOAL, 100)});
         CgCrossInst xi;
         buildCross(def, in, x, xi);
         in.crosses.push_back(std::move(xi));
     }
+    for (auto& [k, v] : def.typeSet)
+        if (k.first >= 0) cgItemOpt(in, k.first, k.second) = v;
     cgInsts().push_back(std::move(in));
     int id = (int)cgInsts().size() - 1;
     cgDefs()[d].insts.push_back(id);
@@ -1287,6 +1307,11 @@ inline int64_t itemWeight(const CgInst& in, int item) {
     int nc = (int)in.cps.size();
     return item < nc ? in.cpOpt[item][0] : in.crOpt[item - nc][0];
 }
+// type_option.weight of an item: its weight in merged type coverage (19.7.1)
+inline int64_t itemTypeWeight(const CgInst& in, int item) {
+    int nc = (int)in.cps.size();
+    return item < nc ? in.cpOpt[item][4] : in.crOpt[item - nc][4];
+}
 // Type coverage with merge_instances (19.11.3): the bins of all instances,
 // joined by name; a bin is covered when its summed count reaches the
 // largest at_least.
@@ -1335,13 +1360,13 @@ inline double typeCoverage(const CgDef& d, int item, double* covered = nullptr, 
             if (total) *total += c.second;
             return c;
         };
-        if (item >= 0) return cgPct(one(item), itemWeight(first, item));
+        if (item >= 0) return cgPct(one(item), itemTypeWeight(first, item));
         double num = 0, den = 0;
         for (int it = 0; it < nitems; it++) {
             auto c = one(it);
             if (c.second == 0) continue;
-            num += itemWeight(first, it) * c.first / c.second;
-            den += itemWeight(first, it);
+            num += itemTypeWeight(first, it) * c.first / c.second;
+            den += itemTypeWeight(first, it);
         }
         return den == 0 ? (first.opt[CO_TYPE_WEIGHT] ? 0.0 : 100.0) : 100.0 * num / den;
     }
@@ -1424,6 +1449,37 @@ inline Val hook(int op, const std::vector<Val>& a) {
             } else
                 typeCoverage(cgDefs()[a[0].v], item, &cov, &tot);
             return make((uint64_t)(int64_t)(a[3].v ? tot : cov), 0, 32, 0);
+        }
+        case CG_GETOPT: {   // kids: handle or def, item, option, 1 for a handle, def (19.7)
+            int item = (int)(int32_t)a[1].v, id = (int)a[2].v;
+            CgDef& d = cgDefs()[a[4].v];
+            CgInst* in = a[3].v ? &instOf(a[0]) : d.insts.empty() ? nullptr : &cgInsts()[d.insts[0]];
+            if (!in) {   // no instance yet: what one would start with
+                auto t = d.typeSet.find({item, id});
+                if (t != d.typeSet.end()) return make((uint64_t)t->second, 0, 64, 0);
+                const auto& os = item < 0 ? d.opts : item < (int)d.cps.size() ? d.cps[item].opts
+                                                                                 : d.crosses[item - d.cps.size()].opts;
+                int64_t dflt = id == CO_TYPE_WEIGHT ? 1 : id == CO_TYPE_GOAL ? 100 : 0;
+                return make((uint64_t)optOr(os, id, dflt), 0, 64, 0);
+            }
+            return make((uint64_t)(item < 0 ? in->opt[id] : cgItemOpt(*in, item, id)), 0, 64, 0);
+        }
+        case CG_SETOPT: {   // kids as CG_GETOPT, then the value
+            int item = (int)(int32_t)a[1].v, id = (int)a[2].v;
+            int64_t v = (int64_t)a[5].v;
+            if (a[3].v && id < CO_TYPE_WEIGHT) {
+                CgInst& in = instOf(a[0]);
+                (item < 0 ? in.opt[id] : cgItemOpt(in, item, id)) = v;
+            } else {   // a type option: every instance shares it
+                if (a[3].v) instOf(a[0]);   // a null handle is still an error
+                CgDef& d = cgDefs()[a[4].v];
+                d.typeSet[{item, id}] = v;
+                for (int i : d.insts) {
+                    CgInst& in = cgInsts()[(size_t)i];
+                    (item < 0 ? in.opt[id] : cgItemOpt(in, item, id)) = v;
+                }
+            }
+            return make(0, 0, 64, 0);
         }
         case CG_GLOBAL: {   // $get_coverage (19.9): the types, weighted by type_option.weight
             double num = 0, den = 0;
