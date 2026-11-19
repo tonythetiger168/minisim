@@ -954,7 +954,9 @@ public:
         }
         for (int i : byRank)
             if (i < 0) throw CodegenUnsupported("gap in the combinational ranks");
-        if (!dom.empty() && !byRank.empty()) {
+        // With no comb units (every copy dropped, msim.cpp substituteWires) the
+        // pass still runs after a testbench write to a private signal: syncP.
+        if (!dom.empty()) {
             std::vector<int> ins;
             for (int i : byRank) ins.insert(ins.end(), procs[i].combIns.begin(), procs[i].combIns.end());
             std::sort(ins.begin(), ins.end());
@@ -6581,8 +6583,6 @@ inline std::string codegen(const std::vector<CodegenSig>& sigs, const std::vecto
         }
     }
     std::set<int> noPriv;
-    for (size_t s = 0; s < sigs.size(); s++)   // a waveform reads them in S.sigs (Sim::mirrors)
-        if (sigs[s].mirror >= 0) noPriv.insert(sigs[s].mirror);
     for (int pass = 0;; pass++) {
         Codegen g;
         g.files = split;
