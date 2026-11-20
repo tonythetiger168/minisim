@@ -5410,6 +5410,8 @@ private:
                  "        if (late) { DAHEAD = false; combAll(nullptr); }\n"
                  "        if (!t || cdirty.exchange(false)) scanP();\n"
                  "        DAHEAD = false;\n"
+                 // As fcommit: the @* blocks whose inputs the pass changed run now.
+              << (armIns_.empty() ? "" : "        if (ARMLEFT) armChk();\n") <<
                  "        if (S.observed) syncP();\n"
                  "        return;\n    }\n"
                  "    { const bool t = twoNow(); const bool tune = !S.observed && !g_cov; const int use = tune ? S.domainTune[1].pick(S.threads) : 1;\n"
