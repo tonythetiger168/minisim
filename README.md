@@ -509,6 +509,18 @@ files -> 141 MB in 37 files (80% of the process code shared), and the C++
 build from about 4 to 5 hours (10 of 69 files done after 50 minutes) to
 27 minutes; Verilator 5.054 takes about 3 minutes for its 211 MB.
 
+A design of a million signals also needs: the startup tables (signal names,
+partitions, wait lists, initial values) as LEB128 byte strings rather than
+C++ initializers; a clocked function of more than 256 KB split where no
+jump crosses (`splitSeq`, a jump out of a piece returns a code); and, once
+msim holds more than 2 GB, the C++ build and the run in a fresh msim
+(`msim -compile-plan`, `MSIM_NOEXEC=1` keeps the old way), so the compilers
+get the memory elaboration used. XiangShan MinimalConfig (hello, 2,402
+cycles, 4 cores, 16 GB): before, gcc ran out of memory on `design.cpp`
+alone (over 13.6 GB) and on one 38 MB clocked function; now 870 MB of C++
+build in 1 h 45 min and simv runs in 101 s (154 s on one thread; the
+interpreter 258 s, Verilator 5.054 9 s).
+
 What -compile leaves to msim's interpreter (mixed mode) is listed by
 `MSIM_WHYMIX=1`. A named `initial` block that no `disable` names, a clocked
 block with a `$display` (run as an ordinary process), and an automatic task

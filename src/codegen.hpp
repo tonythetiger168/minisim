@@ -261,8 +261,11 @@ public:
         {   // the helpers are chunks of their own: they spread over the files
             std::vector<std::string> out;
             out.reserve(chunks.size());
+            const char* om = std::getenv("MSIM_OUTLINEMIN");   // tests: outline small functions too
+            const size_t outMin = om ? std::strtoull(om, nullptr, 10) : kOutlineMin;
             for (auto& c : chunks) {
-                if (c.size() > kOutlineMin) for (auto& h : outlineRuns(c)) out.push_back(std::move(h));
+                if (c.size() > outMin) for (auto& h : splitSeq(c)) out.push_back(std::move(h));
+                if (c.size() > outMin) for (auto& h : outlineRuns(c)) out.push_back(std::move(h));
                 if (!c.empty()) out.push_back(std::move(c));
             }
             chunks = std::move(out);
@@ -797,6 +800,15 @@ public:
                  "}\n\n";
         if (upf) o << "#define UPF_RT_NO_DESIGN\n#include \"upf_rt.inc\"\n\n";   // msim -upf: the power-aware runtime
         if (!compileDpiLibs().empty()) o << "#include \"svdpi.h\"\nextern \"C\" {\n#include \"svdpi_bits.inc\"\n}\n\n";
+        // Large startup tables are byte strings of LEB128 numbers (blob()):
+        // the C++ compiler holds a string literal as one object, an
+        // initializer as one per element.
+        o << "struct MsimLeb {\n"
+             "    const unsigned char* p;\n"
+             "    uint64_t u() { uint64_t r = 0; for (int sh = 0;; sh += 7) { unsigned b = *p++; r |= (uint64_t)(b & 127) << sh; if (!(b & 128)) return r; } }\n"
+             "    long long s() { uint64_t v = u(); return (long long)(v >> 1) ^ -(long long)(v & 1); }\n"
+             "    std::vector<int> list() { std::vector<int> v(u()); for (auto& x : v) x = (int)s(); return v; }\n"
+             "};\n\n";
         // Mixed mode: no main. msim has made the signals and set them up,
         // parsed the options and runs the simulation; the library registers
         // its processes and functions with msim's kernel (msim.cpp runCompiled).
@@ -860,7 +872,28 @@ public:
                 ix = std::stoll(n.substr(lb + 1, n.size() - lb - 2));
                 return true;
             };
-            o << "    static const struct { const char* n; int w; bool net; int drv; int cnt, lo, step; } SIGS[] = {\n";
+            // One byte string, not a table of rows: a million signals
+            // (XiangShan) made a 120 MB initializer that the C++ compiler
+            // could not hold in memory. Each row is the name as the length
+            // it shares with the previous one plus the rest (front coding),
+            // then width, net, drivers and, for a run of array elements,
+            // count, first index and step, as LEB128 numbers.
+            std::string blob, prev;
+            auto vu = [&](uint64_t v) { leb(blob, v); };
+            auto vs = [&](long long v) { lebS(blob, v); };
+            auto row = [&](const std::string& n, size_t s, size_t cnt, long long lo, int step) {
+                size_t k = 0;
+                while (k < n.size() && k < prev.size() && n[k] == prev[k]) k++;
+                vu(k);
+                vu(n.size() - k);
+                blob.append(n, k, std::string::npos);
+                prev = n;
+                vu((uint64_t)sigs[s].w);
+                vu(sigs[s].net ? 1 : 0);
+                vu((uint64_t)sigs[s].drivers);
+                vu(cnt);
+                if (cnt) { vs(lo); vs(step); }
+            };
             for (size_t s = 0; s < sigs.size();) {
                 std::string b0, b1;
                 long long i0 = 0, i1 = 0;
@@ -872,58 +905,98 @@ public:
                            elem(e, b1, i1) && b1 == b0 && i1 == i0 + (long long)(e - s) * step)
                         e++;
                 }
-                if (e - s >= 4)
-                    o << "        {" << quote(b0) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ", " << sigs[s].drivers
-                      << ", " << (e - s) << ", " << i0 << ", " << step << "},\n";
+                if (e - s >= 4) row(b0, s, e - s, i0, step);
                 else {
                     e = s + 1;
-                    o << "        {" << quote(sigs[s].name) << ", " << sigs[s].w << ", " << (sigs[s].net ? "true" : "false") << ", "
-                      << sigs[s].drivers << ", 0, 0, 0},\n";
+                    row(sigs[s].name, s, 0, 0, 0);
                 }
                 s = e;
             }
-            o << "    };\n"
-                 "    for (auto& r : SIGS)\n"
-                 "        for (int k = 0; k < std::max(r.cnt, 1); k++) {\n"
-                 "            int s = r.cnt ? S.sig(std::string(r.n) + \"[\" + std::to_string(r.lo + k * r.step) + \"]\", r.w, r.net) : S.sig(r.n, r.w, r.net);\n"
-                 "            for (int d = 0; d < r.drv; d++) S.newDriver(s);\n"
-                 "        }\n";
+            o << "    static const char SIGB[] =\n" << blobText(blob) << ";\n"
+                 "    {\n"
+                 "        MsimLeb r{(const unsigned char*)SIGB};\n"
+                 "        const unsigned char* end = r.p + sizeof SIGB - 1;\n"
+                 "        auto vu = [&] { return r.u(); };\n"
+                 "        auto vs = [&] { return r.s(); };\n"
+                 "        std::string n;\n"
+                 "        while (r.p < end) {\n"
+                 "            size_t keep = vu(), add = vu();\n"
+                 "            n.resize(keep);\n"
+                 "            n.append((const char*)r.p, add);\n"
+                 "            r.p += add;\n"
+                 "            int w = (int)vu();\n"
+                 "            bool net = vu() != 0;\n"
+                 "            int drv = (int)vu(), cnt = (int)vu();\n"
+                 "            long long lo = 0, step = 0;\n"
+                 "            if (cnt) { lo = vs(); step = vs(); }\n"
+                 "            for (int k = 0; k < std::max(cnt, 1); k++) {\n"
+                 "                int s = cnt ? S.sig(n + \"[\" + std::to_string(lo + k * step) + \"]\", w, net) : S.sig(n, w, net);\n"
+                 "                for (int d = 0; d < drv; d++) S.newDriver(s);\n"
+                 "            }\n"
+                 "        }\n"
+                 "    }\n";
             // Initial values; runs of signals that start at 0 are one row
             // {first, count}.
+            // Signal numbers as the distance from the previous row.
             std::string iv, iz;
+            size_t ivAt = 0, izAt = 0;
             for (size_t s = 0; s < sigs.size();) {
                 auto zero = [&](size_t k) { return sigs[k].init && !sigs[k].v && !sigs[k].x && !sigs[k].z; };
                 if (zero(s)) {
                     size_t e = s + 1;
                     while (e < sigs.size() && zero(e)) e++;
-                    iz += "{" + std::to_string(s) + ", " + std::to_string(e - s) + "}, ";
+                    leb(iz, s - izAt);
+                    leb(iz, e - s);
+                    izAt = e;
                     s = e;
                     continue;
                 }
-                if (sigs[s].init) iv += "        {" + std::to_string(s) + ", " + std::to_string(sigs[s].v) + "ULL, " + std::to_string(sigs[s].x) + "ULL, " + std::to_string(sigs[s].z) + "ULL},\n";
+                if (sigs[s].init) {
+                    leb(iv, s - ivAt);
+                    leb(iv, sigs[s].v);
+                    leb(iv, sigs[s].x);
+                    leb(iv, sigs[s].z);
+                    ivAt = s;
+                }
                 s++;
             }
             if (!iz.empty())
-                o << "    static const struct { int s, n; } SIZ[] = {" << iz << "};\n"
-                     "    for (auto& e : SIZ) for (int s = e.s; s < e.s + e.n; s++) { Val& g = S.sigs[s].val; g.v = g.x = g.z = 0; }\n";
+                o << "    {\n        static const char B[] =\n" << blobText(iz) << ";\n"
+                     "        MsimLeb r{(const unsigned char*)B};\n"
+                     "        for (size_t s = 0; r.p < (const unsigned char*)B + sizeof B - 1;) {\n"
+                     "            s += r.u();\n"
+                     "            for (size_t e = s + r.u(); s < e; s++) { Val& g = S.sigs[s].val; g.v = g.x = g.z = 0; }\n"
+                     "        }\n    }\n";
             std::string zw;
-            for (size_t s = 0; s < sigs.size(); s++)
-                if (sigs[s].zeroWide) zw += std::to_string(s) + ", ";
+            for (size_t s = 0, at = 0; s < sigs.size(); s++)
+                if (sigs[s].zeroWide) { leb(zw, s - at); at = s; }
             if (!zw.empty())
-                o << "    static const int SZW[] = {" << zw << "};\n"
-                     "    for (int s : SZW) { Val& g = S.sigs[s].val; g.v = g.x = g.z = 0; for (auto& h : g.hi) h.v = h.x = h.z = 0; }\n";
+                o << "    {\n        static const char B[] =\n" << blobText(zw) << ";\n"
+                     "        MsimLeb r{(const unsigned char*)B};\n"
+                     "        for (size_t s = 0; r.p < (const unsigned char*)B + sizeof B - 1;) {\n"
+                     "            s += r.u();\n"
+                     "            Val& g = S.sigs[s].val; g.v = g.x = g.z = 0; for (auto& h : g.hi) h.v = h.x = h.z = 0;\n"
+                     "        }\n    }\n";
             if (!iv.empty())
-                o << "    static const struct { int s; uint64_t v, x, z; } SIV[] = {\n" << iv << "    };\n"
-                     "    for (auto& e : SIV) { Val& g = S.sigs[e.s].val; g.v = e.v; g.x = e.x; g.z = e.z; }\n";
+                o << "    {\n        static const char B[] =\n" << blobText(iv) << ";\n"
+                     "        MsimLeb r{(const unsigned char*)B};\n"
+                     "        for (size_t s = 0; r.p < (const unsigned char*)B + sizeof B - 1;) {\n"
+                     "            s += r.u();\n"
+                     "            Val& g = S.sigs[s].val; g.v = r.u(); g.x = r.u(); g.z = r.u();\n"
+                     "        }\n    }\n";
             for (size_t s = 0; s < sigs.size(); s++)
                 if (sigs[s].strInit) o << "    S.sigs[" << s << "].val = mkstr(" << quote(sigs[s].strText) << ");\n";
             {
                 std::string mr;
-                for (size_t s = 0; s < sigs.size(); s++)
-                    if (sigs[s].mirror >= 0) mr += "{" + std::to_string(s) + ", " + std::to_string(sigs[s].mirror) + "}, ";
+                for (size_t s = 0, at = 0; s < sigs.size(); s++)
+                    if (sigs[s].mirror >= 0) { leb(mr, s - at); lebS(mr, (long long)sigs[s].mirror - (long long)s); at = s; }
                 if (!mr.empty())
-                    o << "    static const struct { int a, b; } SMIR[] = {" << mr << "};\n"
-                         "    for (auto& e : SMIR) S.addMirror(e.a, e.b);\n";
+                    o << "    {\n        static const char B[] =\n" << blobText(mr) << ";\n"
+                         "        MsimLeb r{(const unsigned char*)B};\n"
+                         "        for (long long s = 0; r.p < (const unsigned char*)B + sizeof B - 1;) {\n"
+                         "            s += (long long)r.u();\n"
+                         "            S.addMirror((int)s, (int)(s + r.s()));\n"
+                         "        }\n    }\n";
             }
             // A delayed driver is x until its first update arrives (10.3.3,
             // 28.16), with its own strengths, as msim sets it up.
@@ -988,15 +1061,15 @@ public:
             o << "});\n";
         }
         if (!evDT_.empty()) {   // shareEv: each process's distances
-            o << "    static const int DT[] = {";
-            for (size_t k = 0; k < evDT_.size(); k++) o << (k ? "," : "") << evDT_[k];
-            o << "};\n";
+            std::vector<int> v(evDT_.begin(), evDT_.end());
+            o << intTable("DT", v);
         }
         if (dom.empty() && !byRank.empty()) {   // the ranks: functions, wait lists in CINS
-            std::string ins, tab;
+            std::string tab;
+            std::vector<int> ins;
             size_t off = 0;
             for (int i : byRank) {
-                for (int x : procs[i].combIns) ins += std::to_string(x) + ",";
+                ins.insert(ins.end(), procs[i].combIns.begin(), procs[i].combIns.end());
                 bool one = oneAssign(*procs[i].prog);
                 const std::string nm = evName_.size() > (size_t)i && !evName_[i].empty() ? evName_[i] : std::to_string(i);
                 tab += "        {comb" + nm + ", " + (one ? "combv" + nm : "nullptr") + ", " +
@@ -1006,7 +1079,8 @@ public:
             }
             std::string cyc;   // ranks on a cycle: only their final writes wake readers
             for (size_t k = 0; k < byRank.size(); k++) if (procs[byRank[k]].combOnCycle) cyc += std::to_string(k) + ",";
-            o << "    static const int CINS[] = {" << ins << "0};\n"
+            ins.push_back(0);
+            o << intTable("CINS", ins) <<
                  "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); int lv, at, n; const void* x; } COMBS[] = {\n"
               << tab << "    };\n"
                  "    const size_t combBase = S.combs.size();\n"
@@ -1079,16 +1153,22 @@ public:
         }
         if (!dom.empty()) o << "    S.fastInit();\n";
         if (parts.on && dom.empty()) {
-            auto list = [&](const std::vector<int>& v) {
-                std::string r = "{";
-                for (size_t j = 0; j < v.size(); j++) r += (j ? ", " : "") + std::to_string(v[j]);
-                return r + "}";
-            };
-            o << "    S.buildPartitions({";
-            for (size_t r = 0; r < parts.outs.size(); r++) o << (r ? ", " : "") << list(parts.outs[r]);
-            o << "}, {";
-            for (size_t r = 0; r < parts.ins.size(); r++) o << (r ? ", " : "") << list(parts.ins[r]);
-            o << "}, " << list(parts.targets) << ");\n";
+            std::string b;
+            auto list = [&](const std::vector<int>& v) { leb(b, v.size()); for (int x : v) lebS(b, x); };
+            leb(b, parts.outs.size());
+            for (auto& v : parts.outs) list(v);
+            leb(b, parts.ins.size());
+            for (auto& v : parts.ins) list(v);
+            list(parts.targets);
+            o << "    {\n"
+                 "        static const char PB[] =\n" << blobText(b) << ";\n"
+                 "        MsimLeb r{(const unsigned char*)PB};\n"
+                 "        std::vector<std::vector<int>> outs(r.u());\n"
+                 "        for (auto& v : outs) v = r.list();\n"
+                 "        std::vector<std::vector<int>> ins(r.u());\n"
+                 "        for (auto& v : ins) v = r.list();\n"
+                 "        S.buildPartitions(outs, ins, r.list());\n"
+                 "    }\n";
         }
         if (cov) {
             o << "    g_condHits.assign(" << g_condHits.size() << ", 0);\n    S.fsmWatch({";
@@ -1320,6 +1400,31 @@ private:
         return o.str();
     }
 
+    static void leb(std::string& b, uint64_t v) {
+        do { b += (char)((v & 127) | (v > 127 ? 128 : 0)); v >>= 7; } while (v);
+    }
+    static void lebS(std::string& b, long long v) { leb(b, ((uint64_t)v << 1) ^ (uint64_t)(v >> 63)); }
+    // static int NAME[n], filled from a byte string at startup (each number
+    // as the signed distance from the one before it): its address is a
+    // constant for the tables that point into it.
+    static std::string intTable(const char* name, const std::vector<int>& v) {
+        std::string b;
+        long long at = 0;
+        for (int x : v) { lebS(b, (long long)x - at); at = x; }
+        return std::string("    static int ") + name + "[" + std::to_string(std::max<size_t>(v.size(), 1)) + "];\n"
+               "    {\n        static const char B[] =\n" + blobText(b) + ";\n"
+               "        MsimLeb r{(const unsigned char*)B};\n"
+               "        long long at = 0;\n"
+               "        for (size_t k = 0; k < " + std::to_string(v.size()) + "; k++) " + name + "[k] = (int)(at += r.s());\n"
+               "    }\n";
+    }
+    // A byte string as string literals of 4 KB each (adjacent literals are one).
+    static std::string blobText(const std::string& b) {
+        std::string r;
+        for (size_t k = 0; k < b.size(); k += 4096) r += "        " + quote(b.substr(k, 4096)) + "\n";
+        if (b.empty()) r = "        \"\"\n";
+        return r;
+    }
     static std::string quote(const std::string& s) {
         std::string r = "\"";
         for (unsigned char c : s) {
@@ -5830,6 +5935,116 @@ private:
     // signal writes go to helper functions of kOutlineRun statements each.
     // A label something jumps to starts a new run (the call keeps it).
     static constexpr size_t kOutlineMin = 256u << 10, kOutlineRun = 1000;
+    // A clocked function (emitSeq) whose jumps all go forward splits where no
+    // jump crosses: each piece is a function of its own, a jump to the end of
+    // its piece returns, and the function calls the pieces in order.
+    // XiangShan's TileLink fixers are blocks of 24,000 "if (c) r <= e;":
+    // conditions between the NBAs leave no straight run for outlineRuns, and
+    // one function of 25 MB took gcc over ten minutes and 9 GB.
+    static constexpr size_t kSplitPiece = 128u << 10;
+    static std::vector<std::string> splitSeq(std::string& t) {
+        std::vector<std::string> helpers;
+        static const std::string pre = "static void ", sfx = "(const void*, std::vector<Sim::NbaItem>& nb) {";
+        size_t sigAt = 0;
+        for (;;) {   // the signature: after the comment lines
+            if (t.compare(sigAt, pre.size(), pre) == 0) break;
+            if (t.compare(sigAt, 2, "//") != 0) return helpers;
+            sigAt = t.find('\n', sigAt);
+            if (sigAt == std::string::npos) return helpers;
+            sigAt++;
+        }
+        size_t sigEnd = t.find('\n', sigAt);
+        if (sigEnd == std::string::npos || sigEnd < sigAt + pre.size() + sfx.size() || t.compare(sigEnd - sfx.size(), sfx.size(), sfx) != 0)
+            return helpers;
+        const std::string name = t.substr(sigAt + pre.size(), sigEnd - sfx.size() - sigAt - pre.size());
+        for (char c : name) if (!(std::isalnum((unsigned char)c) || c == '_')) return helpers;
+        // The body: one "s_<n>: ..." line per instruction, labels rising,
+        // the last "s_<end>: return;", then "}".
+        struct Ln { size_t a, e; long long n; };
+        std::vector<Ln> ls;
+        size_t at = sigEnd + 1;
+        for (;;) {
+            size_t nl = t.find('\n', at);
+            if (nl == std::string::npos) return helpers;
+            if (nl == at + 1 && t[at] == '}') { at = nl + 1; break; }
+            if (t.compare(at, 2, "s_") != 0) return helpers;
+            char* e = nullptr;
+            long long n = std::strtoll(t.c_str() + at + 2, &e, 10);
+            if (!e || *e != ':' || (!ls.empty() && n <= ls.back().n)) return helpers;
+            ls.push_back({at, nl, n});
+            at = nl + 1;
+        }
+        if (ls.size() < 3 || t.compare(ls.back().a, ls.back().e - ls.back().a, "s_" + std::to_string(ls.back().n) + ": return;") != 0)
+            return helpers;
+        const std::string rest = t.substr(at);   // whatever follows the function
+        const char* pe = std::getenv("MSIM_SPLITPIECE");   // tests: small pieces
+        const size_t piece = pe ? std::strtoull(pe, nullptr, 10) : kSplitPiece;
+        // A piece starts where the size says, and where a jump from an
+        // earlier piece lands. A jump out of a piece returns its code, and the
+        // function goes on there.
+        std::unordered_map<long long, size_t> lineOf;
+        for (size_t k = 0; k < ls.size(); k++) lineOf[ls[k].n] = k;
+        std::vector<std::vector<std::pair<size_t, long long>>> jumps(ls.size());   // (offset of "goto", label)
+        for (size_t k = 0; k + 1 < ls.size(); k++) {
+            std::string_view ln(t.data() + ls[k].a, ls[k].e - ls[k].a);
+            for (const char* bad : {"co_", "return", " D_", "x_)", "x_,"})
+                if (ln.find(bad) != std::string_view::npos) return helpers;
+            for (size_t g = ln.find("goto s_"); g != std::string_view::npos; g = ln.find("goto s_", g + 7)) {
+                long long n = std::strtoll(std::string(ln.substr(g + 7, 20)).c_str(), nullptr, 10);
+                if (n <= ls[k].n || !lineOf.count(n)) return helpers;   // a loop
+                jumps[k].push_back({g, n});
+            }
+        }
+        std::vector<size_t> cuts{0};
+        std::set<long long> pend, need;
+        size_t bytes = 0;
+        for (size_t k = 0; k + 1 < ls.size(); k++) {
+            const long long n = ls[k].n;
+            if (k > cuts.back() && (need.count(n) || bytes >= piece)) {
+                for (long long x : pend) if (x > n) need.insert(x);
+                pend.clear();
+                cuts.push_back(k);
+                bytes = 0;
+            }
+            for (auto& j : jumps[k]) pend.insert(j.second);
+            bytes += ls[k].e - ls[k].a + 1;
+        }
+        if (cuts.size() < 2) return helpers;
+        const long long endN = ls.back().n;
+        std::string body = t.substr(0, sigEnd + 1);
+        for (size_t c = 0; c < cuts.size(); c++) {
+            size_t from = cuts[c], to = c + 1 < cuts.size() ? cuts[c + 1] : ls.size() - 1;
+            std::map<long long, int> exits;
+            std::string h = name + "_p" + std::to_string(c);
+            std::string f = "static int " + h + "(std::vector<Sim::NbaItem>& nb) {\n";
+            for (size_t k = from; k < to; k++) {
+                size_t last = ls[k].a;
+                for (auto& [g, n] : jumps[k]) {
+                    if (n < ls[to].n) continue;   // inside the piece
+                    auto it = exits.emplace(n, (int)exits.size() + 1).first;
+                    size_t ga = ls[k].a + g, ge = ga + 7 + std::to_string(n).size();
+                    f.append(t, last, ga - last);
+                    f += "return " + std::to_string(it->second);
+                    last = ge;
+                }
+                f.append(t, last, ls[k].e + 1 - last);
+            }
+            f += "    return 0;\n}\n\n";
+            helpers.push_back(std::move(f));
+            body += "s_" + std::to_string(ls[from].n) + ":";
+            if (exits.empty()) body += " " + h + "(nb);\n";
+            else {
+                body += " switch (" + h + "(nb)) {";
+                for (auto& [n, code] : exits)
+                    body += " case " + std::to_string(code) + ": " + (n == endN ? std::string("return;") : "goto s_" + std::to_string(n) + ";");
+                body += " default: break; }\n";
+            }
+        }
+        body.append(t, ls.back().a, ls.back().e - ls.back().a + 1);
+        body += "}\n" + rest;
+        t = std::move(body);
+        return helpers;
+    }
     // Returns the helpers, one per element, and leaves t calling them.
     static std::vector<std::string> outlineRuns(std::string& t) {
         std::vector<std::string> helpers;
@@ -5860,6 +6075,13 @@ private:
             at = nl + 1;
         }
         if (sigAt == std::string::npos || name.empty()) return helpers;
+        // A clocked process's NBAs go to its list nb: helpers take it along
+        // (XiangShan: one block of 24,000 NBAs, 38 MB of C++ in one function).
+        const bool nbOk = [&] {
+            static const std::string sfx = "std::vector<Sim::NbaItem>& nb) {";
+            size_t nl = t.find('\n', sigAt);
+            return nl != std::string::npos && nl >= sigAt + sfx.size() && t.compare(nl - sfx.size(), sfx.size(), sfx) == 0;
+        }();
         // A line that may move: "<label>: S.set(...);" and friends, naming
         // nothing local to the function.
         auto movable = [&](size_t a, size_t nl, size_t& stmt) {
@@ -5872,10 +6094,20 @@ private:
             bool ok = false;
             for (const char* p : {"S.set(", "S.setOneBit(", "S.poke(", "S.drive("})
                 if (t.compare(b, std::strlen(p), p) == 0) { ok = true; break; }
-            if (!ok || t[nl - 1] != ';') return false;
-            std::string_view ln(t.data() + stmt, nl - stmt);
+            bool nbLine = false;
+            if (!ok && nbOk)
+                for (const char* p : {"nb.push_back({", "{ Val v_ = "})
+                    if (t.compare(b, std::strlen(p), p) == 0) { ok = nbLine = true; break; }
+            if (!ok || !(t[nl - 1] == ';' || (nbLine && t[nl - 1] == '}'))) return false;
+            std::string_view ln(t.data() + b, nl - b);
             for (const char* bad : {"goto", "co_", "rs.", "ctl", "nb.", "return", "x_", "frs", "fr->", "lr"})
-                if (ln.find(bad) != std::string_view::npos) return false;
+                if (ln.find(bad) != std::string_view::npos && !(nbLine && !std::strcmp(bad, "nb."))) return false;
+            if (nbLine) {   // its own nb only: no other name that ends in nb
+                for (size_t q = ln.find("nb."); q != std::string_view::npos; q = ln.find("nb.", q + 3))
+                    if (q && idc(ln[q - 1])) return false;
+                for (const char* bad : {"v_ =", "v_)"})
+                    if (ln.find(bad) != std::string_view::npos && ln.substr(0, 11) != "{ Val v_ = ") return false;
+            }
             return true;
         };
         std::string body;
@@ -5887,11 +6119,11 @@ private:
             } else
                 for (size_t k = 0; k < run.size(); k += kOutlineRun) {
                     std::string h = name + "_o" + std::to_string(nh++);
-                    std::string f = "static void " + h + "() {\n";
+                    std::string f = "static void " + h + (nbOk ? "(std::vector<Sim::NbaItem>& nb) {\n" : "() {\n");
                     for (size_t j = k; j < std::min(run.size(), k + kOutlineRun); j++) f += run[j].second + "\n";
                     f += "}\n\n";
                     helpers.push_back(std::move(f));
-                    body += run[k].first + ": " + h + "();\n";
+                    body += run[k].first + ": " + h + (nbOk ? "(nb);\n" : "();\n");
                 }
             run.clear();
         };
