@@ -38,7 +38,8 @@ struct JitCtx {
     uint64_t link;     // 48: the rel32 to patch for the next block, or 0
     uint64_t sspan;    // 56: stores: ad - cb < sspan
     uint64_t th;       // 64: tohost (stores within 8 bytes of it leave)
-    uint64_t reason;   // 72: 0 go on with the next block, 1 run the interpreter, 2 run the counting version
+    uint64_t reason;   // 72: 0 go on with the next block, 1 run the interpreter, 2 run the counting version,
+                       // low byte 3: a page cache miss (Machine::jitRunPg)
     void* jtab;        // 80: the indirect-jump table
     void* dl;          // 88: with paging: the hart's load page cache (Hart::dl)
     void* ds;          // 96: and its store page cache (Hart::ds)
@@ -46,6 +47,8 @@ struct JitCtx {
     uint8_t* resv;     // 112: with paging: the hart's LR reservation (Hart::resv)
     uint64_t* resvAddr;  // 120: and its address
     uint64_t* mstatus;   // 128: the hart's mstatus (CSRRCI on sstatus)
+    uint64_t miss;       // 136: a load or store's address that missed the page cache
+    uint8_t* resume;     // 144: where to go back into its block once it is filled
 };
 
 struct Jit {
@@ -69,7 +72,18 @@ struct Jit {
     // (a TLB flush) or its privilege changes. A block links straight to
     // another only within its own page.
     struct PgBlock { uint64_t pa; uint8_t* code; uint8_t* step; };
-    std::unordered_map<uint64_t, PgBlock> pg;
+    // by virtual and physical address: harts in different address spaces
+    // (or one, process after process) keep a block each for a va that maps
+    // different code
+    struct PgKey {
+        uint64_t va, pa;
+        bool operator==(const PgKey&) const = default;
+    };
+    struct PgKeyHash {
+        size_t operator()(const PgKey& k) const { return std::hash<uint64_t>()(k.va ^ (k.pa * 0x9e3779b97f4a7c15ull)); }
+    };
+    std::unordered_map<PgKey, PgBlock, PgKeyHash> pg;
+    std::unordered_map<uint64_t, uint8_t> pgCold;  // va: looked for once, not translated yet
     JtEntry* jtPg = nullptr;
     std::vector<uint32_t> jtPgUsed;
     uint32_t pgFpGen = ~0u;
@@ -83,6 +97,12 @@ struct Jit {
     // paged code: `pg`, the blocks and the buffer are here, each hart's
     // indirect-jump table in its own Jit (a view), emptied with these.
     std::vector<Jit*> views;
+    // The shared one: each page's bytes when its first block was translated
+    // (stale: a later block found them changed). FENCE.I on one hart drops
+    // the page's blocks only if the page differs from them now (the other
+    // harts' FENCE.I find the same change later; Machine::jitSync).
+    struct Snap { std::unique_ptr<uint8_t[]> b; bool stale = false; };
+    std::unordered_map<uint64_t, Snap> pgSnap;
     uint32_t pgGen = 0;  // a view's: the hart's codeGen the shared one was last synced to
     void clearPgJt() {
         clearJt(jtPg, jtPgUsed);
@@ -124,6 +144,8 @@ struct Jit {
         blocks.clear();
         steps.clear();
         pg.clear();
+        pgCold.clear();
+        pgSnap.clear();
         pgByPage.clear();
         barePages.clear();
         clearJt(jt, jtUsed);
@@ -139,10 +161,10 @@ struct Jit {
             auto it = pgByPage.find(pgn);
             if (it == pgByPage.end()) continue;
             for (uint64_t va : it->second) {
-                auto b = pg.find(va);
-                if (b != pg.end() && (b->second.pa >> 12) == pgn) pg.erase(b);
+                pg.erase(PgKey{va, pgn << 12 | (va & 0xfff)});
             }
             pgByPage.erase(it);
+            pgSnap.erase(pgn);
             any = true;
         }
         if (any) clearPgJt();

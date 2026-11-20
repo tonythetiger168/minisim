@@ -71,7 +71,7 @@ void usage() {
         "  PROGRAM            an RV32 or RV64 ELF executable (or -elf FILE)\n"
         "  -platform FILE     the platform in JSON (default: the built-in virt32 board)\n"
         "  -harts N           number of harts (overrides the platform)\n"
-        "  -threads N         threads for the harts (default: every CPU; -j N too)\n"
+        "  -threads N         parallel rounds on N threads (default: every CPU; -j N too)\n"
         "  -quantum N         cycles each hart runs between synchronisations (default 1000;\n"
         "                     10000 with -serial)\n"
         "  -mhz F             hart clock in MHz (default 100)\n"
@@ -80,8 +80,10 @@ void usage() {
         "  -trace FILE        commit log, one line per instruction (spike's format)\n"
         "  -nojit             interpret only (no translation to host code)\n"
         "  -serial            harts take turns on one thread, a quantum each, with no\n"
-        "                     write buffers (fastest for an SMP OS; another\n"
-        "                     interleaving than the parallel rounds)\n"
+        "                     write buffers (the default with several harts; the\n"
+        "                     fastest for an SMP OS)\n"
+        "  -parallel          harts run in parallel rounds on several threads, with\n"
+        "                     write buffers (another interleaving; also with -threads)\n"
         "Booting an operating system (as QEMU's -bios, -kernel, -initrd, -append, -dtb):\n"
         "  -bios FILE         firmware run first, in machine mode (OpenSBI fw_dynamic)\n"
         "  -kernel FILE       kernel (a raw Image or an ELF) the firmware starts in supervisor mode\n"
@@ -123,7 +125,7 @@ struct Options {
     unsigned threads = par::defaultThreads();
     long long quantum = -1, maxCycles = 0;
     double mhz = 0;
-    bool map = false, quiet = false, nojit = false, serial = false;
+    bool map = false, quiet = false, nojit = false, serial = false, parallel = false, threadsGiven = false;
     bool haveInput = false;
 };
 
@@ -175,7 +177,12 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     double mt = pl.get("mtime_hz") ? pl.get("mtime_hz")->num() : 1e7;
     m.tick_ps = std::max<uint64_t>(1, (uint64_t)(1e12 / mt + 0.5));
     if (o.nojit) m.jit = false;
+    // Several harts take turns unless the platform file, -parallel or
+    // -threads asks for parallel rounds: turns run on the translator, rounds
+    // (with write buffers) on the interpreter, about 10 times slower.
+    m.serial = nh > 1;
     if (pl.get("serial")) m.serial = pl.get("serial")->u64() != 0;
+    if (o.parallel || o.threadsGiven) m.serial = false;
     if (o.serial) m.serial = true;
     // Taking turns costs a switch per quantum per hart (no thread waits for
     // another), so -serial goes 10 times as far between them by default.
@@ -501,7 +508,7 @@ int main(int argc, char** argv) {
             std::cout << "mvplat " << MINISIM_VERSION << " (" << MINISIM_GIT << ")\n";
             return 0;
         }
-        if (par::threadsArg(argc, argv, i, o.threads, "mvplat")) continue;
+        if (par::threadsArg(argc, argv, i, o.threads, "mvplat")) { o.threadsGiven = true; continue; }
         if (s == "-platform") o.platform = next("a JSON file");
         else if (s == "-elf") o.elf = next("an ELF file");
         else if (s == "-harts") o.harts = (int)integer("a number");
@@ -527,6 +534,7 @@ int main(int argc, char** argv) {
         else if (s == "-q") o.quiet = true;
         else if (s == "-nojit") o.nojit = true;
         else if (s == "-serial") o.serial = true;
+        else if (s == "-parallel") o.parallel = true;
         else if (!s.empty() && s[0] == '-') {
             int used = 0;
             try {

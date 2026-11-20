@@ -147,8 +147,9 @@ A quantum ends early at the next timer compare and at the next callback an
 mvp model has armed, so timer interrupts and model delays arrive on time
 whatever the quantum.
 
-**Several harts, several threads.** Harts run in parallel, one per thread
-(`-threads N`, default every CPU). Each hart's stores go to its own write
+**Several harts, several threads.** With `-parallel` (or `-threads N`, or
+`"serial": false` in the platform file) harts run in parallel rounds, one
+per thread (`-threads N`, default every CPU). Each hart's stores go to its own write
 buffer during a round and are written back in hart order at its end;
 accesses with side effects (peripheral registers, atomics, LR/SC, HTIF) wait
 for the ordered phase of the round and happen in hart order there. The run
@@ -156,8 +157,9 @@ therefore does not depend on the thread count or on the operating system's
 scheduler: the console, the commit log and the profile are the same, byte
 for byte, on 1 thread and on 64. The test suite checks exactly that.
 
-**`-serial`** (or `"serial": true` in the platform file) runs the harts
-another way: they take turns on one thread, each running to the end of the
+**Taking turns** is the default with several harts (`-serial`, or
+`"serial": true` in the platform file, says so explicitly): the harts take
+turns on one thread, each running to the end of the
 quantum, and store to memory directly, with no write buffers and no
 ordered phase. That is another interleaving than the parallel rounds give
 (each hart sees the others' stores of earlier turns at once), still the
@@ -170,7 +172,8 @@ than once per hart, and the quantum is 10000 cycles unless `-quantum` or
 the platform file says otherwise (a turn costs a switch; with no thread
 waiting on another, longer turns are cheaper). Linux on 2 harts boots to
 the BusyBox shell and powers off in about 1.4 s with `-serial`, level with
-QEMU 8.2's virt board, against 20 s in rounds. A hart's LR reservation
+QEMU 8.2's virt board, against 20 s in parallel rounds, which is why turns
+are the default. A hart's LR reservation
 ends with its turn (an SC after the other harts ran fails, and the loop
 around it tries again).
 
@@ -449,7 +452,8 @@ for it.
 | `-harts N` | override the platform's hart count |
 | `-threads N`, `-j N` | threads for the harts (default: every CPU) |
 | `-quantum N` | cycles between synchronisations (default 1000; 10000 with `-serial`) |
-| `-serial` | harts take turns on one thread, no write buffers (see above) |
+| `-serial` | harts take turns on one thread, no write buffers (the default with several harts; see above) |
+| `-parallel` | parallel rounds with write buffers, on `-threads` threads (also implied by `-threads`) |
 | `-mhz F` | hart clock |
 | `-max-cycles N` | stop after N cycles, exit code 4 |
 | `-input TEXT` | what the first UART receives |
