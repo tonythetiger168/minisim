@@ -114,6 +114,7 @@ set(CASES
   "examples/boxnet.sv"
   "examples/combring.sv"
   "examples/romfold.sv"
+  "examples/fusepar.sv"
   "-no-cycle examples/nbaskip.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
