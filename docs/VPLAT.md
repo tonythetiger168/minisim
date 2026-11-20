@@ -177,6 +177,28 @@ are the default. A hart's LR reservation
 ends with its turn (an SC after the other harts ran fails, and the loop
 around it tries again).
 
+**At once on several threads** (`-mt`): each hart runs on a host thread of
+its own, the way QEMU's MTTCG does, storing to memory directly and running
+translated code, with no write buffers. AMOs are host atomics (`lock xadd`,
+`xchg`, or a `lock cmpxchg` loop), and SC succeeds when the word still holds
+the value LR read (a `lock cmpxchg`), so LR/SC loops work between harts that
+really run at once. The harts share one translation of their paged code as
+when taking turns: a lock guards its tables, a hart remembers the blocks it
+has looked up so that only a block new to it takes the lock, jumps between
+blocks are patched with one aligned store, and the buffer is emptied only
+with every other hart stopped between slices. A round is 1000000 cycles
+unless `-quantum` says otherwise (it paces the devices and ends at the next
+timer compare), and within it each hart runs slices of 10000 cycles, so an
+interrupt another hart raises (an IPI) is taken within a slice. A hart in
+WFI sleeps on its thread until an interrupt comes or every other hart has
+reached the end of the round. A run is not the same twice: the
+interleaving is the host's. On a 4-CPU host four harts each running their
+own loop finish in half the time they take in turns; Linux's boot, which
+mostly waits on hart 0, gains nothing from it there (about 1.3 s on 2 harts
+and 1.7 s on 4, against 1.2 s and 1.4 s in turns). A program that waits for
+the other harts to arrive must count them (`tests/vplat/smp.c` built with
+`-DNHARTS=4`): with `-mt` one may start long after another.
+
 ## The platform file
 
 JSON, with `//` and `/* */` comments. Numbers may be written as strings, in
@@ -454,6 +476,7 @@ for it.
 | `-quantum N` | cycles between synchronisations (default 1000; 10000 when the harts take turns) |
 | `-serial` | harts take turns on one thread, no write buffers (the default with several harts; see above) |
 | `-parallel` | parallel rounds with write buffers, on `-threads` threads (also implied by `-threads`) |
+| `-mt` | each hart on a thread of its own at once, translated, AMOs as host atomics (QEMU's MTTCG; not the same twice; see above) |
 | `-mhz F` | hart clock |
 | `-max-cycles N` | stop after N cycles, exit code 4 |
 | `-input TEXT` | what the first UART receives |

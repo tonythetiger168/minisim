@@ -6,9 +6,12 @@
 #define ITER 2000
 #define MAXH 64
 
-static volatile uint32_t atomic_count, locked_count, lock, done, go;
-static volatile uint32_t per_hart[MAXH];
-static volatile uint32_t mailbox;
+// In .data, not .bss: hart 0 clears .bss at start (crt0.S), and with harts on
+// real threads (mvplat -mt) another hart may already have counted itself in.
+#define SHARED __attribute__((section(".data")))
+static volatile uint32_t atomic_count SHARED, locked_count SHARED, lock SHARED, done SHARED, go SHARED;
+static volatile uint32_t per_hart[MAXH] SHARED;
+static volatile uint32_t mailbox SHARED;
 
 void exit(int code) {
     if (csr_read(mhartid) == 0) exit_(code);
@@ -34,8 +37,13 @@ int main(int hart) {
         mailbox = 0x1234;
         __asm__ volatile("fence" ::: "memory");
     }
+#ifdef NHARTS
+    // Harts on host threads (mvplat -mt) may start far apart: wait for all.
+    while (__atomic_load_n(&go, __ATOMIC_ACQUIRE) < NHARTS) {}
+#else
     // Let every hart arrive (each hart is started at the same time).
     for (volatile int i = 0; i < 2000; i++) {}
+#endif
     uint32_t n = nharts();
     for (int i = 0; i < ITER; i++) {
         __atomic_fetch_add(&atomic_count, 1, __ATOMIC_RELAXED);

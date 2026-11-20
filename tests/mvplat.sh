@@ -70,6 +70,15 @@ done
 cmp -s ser1.log ser2.log && ok "-serial: the same run twice" || bad "-serial: two runs differ"
 "$MVPLAT" "$E/smp64.elf" -harts 4 -q -trace ser3.log > /dev/null 2>&1
 cmp -s ser1.log ser3.log && ok "several harts take turns by default (the same as -serial)" || bad "the default with several harts is not -serial"
+# -mt: each hart on a thread of its own, at once; AMOs and LR/SC as host
+# atomics (smpmt64 waits for all four harts: they may start far apart).
+for o in "" "-threads 2" -nojit "-quantum 1000"; do
+  for i in 1 2 3; do
+    "$MVPLAT" "$E/smpmt64.elf" -harts 4 -mt -q $o > mt.out 2>&1; rc=$?
+    grep -q "harts 4 atomic 8000 locked 8000" mt.out && [ $rc = 0 ] || break
+  done
+  expect "-mt $o: atomics and LR/SC across threads (3 runs)" 0 mt.out "harts 4 atomic 8000 locked 8000"
+done
 
 # The V extension: clang's vectorized loops agree with its scalar ones
 # (RV32 and RV64, at the smallest and largest VLEN), and single
@@ -256,6 +265,10 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
     -append "console=ttyS0 rdinit=/init" -harts 4 -q > linux_serial.out 2>&1; rc=$?
   expect "Linux on 4 harts (taking turns, the default)" 0 linux_serial.out "mvplat-init: powering off"
   grep -q "smp: Brought up 1 node, 4 CPUs" linux_serial.out && ok "Linux -serial brought up 4 harts" || bad "Linux -serial SMP bring-up"
+  "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd "$E/initramfs64.cpio" \
+    -append "console=ttyS0 rdinit=/init" -harts 4 -mt -q > linux_mt.out 2>&1; rc=$?
+  expect "Linux on 4 harts with -mt (a thread each, one shared translator)" 0 linux_mt.out "mvplat-init: powering off"
+  grep -q "smp: Brought up 1 node, 4 CPUs" linux_mt.out && ok "Linux -mt brought up 4 harts" || bad "Linux -mt SMP bring-up"
   grep -q "^Linux version" linux.out && grep -q "smp: Brought up 1 node, 2 CPUs" linux.out &&
     ok "Linux brought up both harts and printed /proc/version" || bad "Linux SMP bring-up"
   # An rv64gc user space (floating point included): BusyBox's shell runs

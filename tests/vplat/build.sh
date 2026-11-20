@@ -16,6 +16,8 @@ CC64="${CLANG:-clang} --target=riscv64-unknown-elf -march=rv64imac -mabi=lp64 -m
 for p in hello irq smp virtio svpbmt jit smc; do
   $CC64 crt0.S $p.c -o "$out/${p}64.elf"
 done
+# smp.c for four harts on host threads (mvplat -mt): it waits for all four.
+$CC64 -DNHARTS=4 crt0.S smp.c -o "$out/smpmt64.elf"
 # The V extension: vkern.c's loops scalar and vectorized by clang (vec),
 # and single instructions against scalar models (vops), RV32 and RV64.
 VF="-O3 -g0 -nostdlib -ffreestanding -fno-builtin -fno-math-errno"
