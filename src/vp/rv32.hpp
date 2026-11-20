@@ -178,14 +178,49 @@ struct Hart {
         fpVpn = ~0ull;
         flushFetchPages();
         flushDataPages();
+        supers.clear();
+        superMany = false;
+    }
+    // The superpages (and Svnapot 64 KiB pages) translations came from since
+    // the last full flush, as va >> their size's shift; past 32 of them,
+    // superMany. SFENCE.VMA at an address none of them holds only has the
+    // 4 KiB page at va to drop.
+    struct Super { uint64_t key; uint8_t sh; };
+    std::vector<Super> supers;
+    bool superMany = false;
+    void noteSuper(uint64_t va, unsigned sh) {
+        for (const Super& e : supers)
+            if (e.sh == sh && e.key == va >> sh) return;
+        if (supers.size() < 32) supers.push_back({va >> sh, (uint8_t)sh});
+        else superMany = true;
     }
     // SFENCE.VMA with an address (RV64): what came from the leaf entry that
-    // maps va, which may be a superpage up to 1 GiB (512 GiB, 256 TiB with
-    // Sv48, Sv57), so everything in va's 1 GiB with Sv39. Translated code
-    // finds the fetch pages dropped here in fpRegions (Machine::jitRunPg).
-    std::vector<uint64_t> fpRegions;  // va >> rsh of each
+    // maps va. Unless va is in a superpage something was translated through
+    // (supers), that is only va's own 4 KiB page; else it may be a superpage
+    // up to 1 GiB (512 GiB, 256 TiB with Sv48, Sv57), so everything in va's
+    // 1 GiB with Sv39. Translated code finds the fetch pages dropped here in
+    // fpRegions (Machine::jitRunPg).
+    std::vector<Super> fpRegions;  // va >> sh of each
     void flushTlbAt(uint64_t va) {
         const unsigned levels = (unsigned)(satp >> 60) - 5;  // Sv39: 3
+        bool inSuper = superMany;
+        for (const Super& e : supers) inSuper |= e.key == va >> e.sh;
+        if (!inSuper) {  // a 4 KiB page, if anything cached it
+            const uint64_t vpn = (va >> 12) & ((1ull << (9 * levels)) - 1), pg = va >> 12;
+            Tlb& t = tlb[vpn & (TLB_SIZE - 1)];
+            if (t.valid && t.vpn == vpn) t.valid = false;
+            fpVpn = ~0ull;
+            FetchPage& f = fp[pg & (FP_SIZE - 1)];
+            if (f.vpn == pg) f.vpn = ~0ull;
+            const uint64_t tagMask = (1ull << 52) - 1;
+            for (DataPage* c : {dl, ds}) {
+                DataPage& e = c[pg & (DP_SIZE - 1)];
+                if (e.tag != ~0ull && (e.tag & tagMask) == (pg & tagMask)) e.tag = ~0ull;
+            }
+            if (fpRegions.size() < 16) fpRegions.push_back({pg, 12});
+            else { fpRegions.clear(); flushFetchPages(); }
+            return;
+        }
         const unsigned rsh = 12 + 9 * (levels - 1);          // the largest superpage
         const uint64_t r = va >> rsh, vmask = (1ull << (9 * levels)) - 1;
         const uint64_t tr = ((va >> 12) & vmask) >> (rsh - 12);
@@ -199,7 +234,7 @@ struct Hart {
             if (e.tag != ~0ull && ((e.tag & tagMask) >> (rsh - 12)) == (r & (tagMask >> (rsh - 12)))) e.tag = ~0ull;
         for (auto& e : ds)
             if (e.tag != ~0ull && ((e.tag & tagMask) >> (rsh - 12)) == (r & (tagMask >> (rsh - 12)))) e.tag = ~0ull;
-        if (fpRegions.size() < 16) fpRegions.push_back(r);
+        if (fpRegions.size() < 16) fpRegions.push_back({r, (uint8_t)rsh});
         else { fpRegions.clear(); flushFetchPages(); }
     }
     // Pages of plain memory that loads (dl) and stores (ds) with paging on
@@ -213,9 +248,14 @@ struct Hart {
     // also catches an access across two pages.
     struct DataPage { uint64_t tag = ~0ull; uint8_t* host = nullptr; };
     static uint64_t dpTag(uint64_t va, uint32_t ctx) { return va >> 12 | (uint64_t)ctx << 52; }
-    static constexpr unsigned DP_SIZE = 256;
+    static constexpr unsigned DP_SIZE = 2048;
     DataPage dl[DP_SIZE], ds[DP_SIZE];
+    // The tags carry an epoch (Machine::dataCtx, bits 56..63): a flush
+    // starts a new one, and only every 254th empties the arrays.
+    uint32_t dpEpoch = 1;
     void flushDataPages() {
+        if (++dpEpoch < 255) return;
+        dpEpoch = 1;
         for (auto& e : dl) e.tag = ~0ull;
         for (auto& e : ds) e.tag = ~0ull;
     }
@@ -231,7 +271,6 @@ struct Hart {
     FetchPage fp[FP_SIZE];
     uint32_t fpGen = 0;  // counts the flushes below
     void flushFetchPages() { for (auto& e : fp) e.vpn = ~0ull; fpGen++; }
-    unsigned fpRegionShift() const { return 12 + 9 * ((unsigned)(satp >> 60) - 6); }
     // The active PMP entries, decoded from the CSRs in priority order
     // (Machine::pmpDecode). pmpLock: some entry binds machine mode too.
     struct PmpRegion { uint64_t lo, hi; uint8_t cfg; };
