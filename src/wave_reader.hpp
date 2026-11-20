@@ -567,6 +567,20 @@ struct Reader {
             ready[w] = 0;
         }
     }
+    // The same, by wave index.
+    void release(const std::vector<int>& ws) {
+        if (!lazy) return;
+        std::lock_guard<std::mutex> lk(mu);
+        for (int wi : ws) {
+            if (wi < 0 || (size_t)wi >= waves.size()) continue;
+            size_t w = (size_t)wi;
+            std::vector<Change>().swap(waves[w].ch);
+#ifdef MINISIM_FST
+            if (w < pools.size()) std::string().swap(pools[w]);
+#endif
+            ready[w] = 0;
+        }
+    }
     // The width of a signal, without reading its changes (0: not in the file).
     int widthOf(const std::string& name) const {
         auto it = byName.find(name);
