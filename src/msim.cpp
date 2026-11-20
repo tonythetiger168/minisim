@@ -2818,16 +2818,15 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::error_code ec;
     // Several files (codegen split a large design): each compiles on its own
     // core, and a file the same as last time keeps its object.
-    std::vector<std::pair<std::string, std::string>> files;
+    // The files are views into src, freed once they are written: a copy
+    // of each held a large design's C++ twice.
+    std::vector<std::pair<std::string, std::string_view>> files;
     for (size_t at = src.rfind(kFileMark, 0) == 0 ? 0 : std::string::npos; at != std::string::npos;) {
         size_t nl = src.find('\n', at), next = src.find(std::string("\n") + kFileMark, nl);
         std::string name = src.substr(at + std::strlen(kFileMark), nl - at - std::strlen(kFileMark));
-        files.push_back({name, src.substr(nl + 1, next == std::string::npos ? std::string::npos : next + 1 - (nl + 1))});
+        files.push_back({name, std::string_view(src).substr(nl + 1, next == std::string::npos ? std::string::npos : next + 1 - (nl + 1))});
         at = next == std::string::npos ? next : next + 1;
     }
-    // The split text is all in `files`: drop the whole (a large design's is
-    // over a gigabyte, held while the compiler runs beside this process).
-    if (!files.empty()) std::string().swap(src);
     if (!files.empty()) {
         // A large design (OpenTitan: 140 MB of C++) builds at -O1 unless -O<n>
         // was given: gcc takes half the time, and its event-driven functions
@@ -2882,7 +2881,8 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         }
         // Written: the texts are not needed again, and the memory they and
         // codegen's buffers held goes back to the system for the compilers.
-        for (auto& f : files) std::string().swap(f.second);
+        for (auto& f : files) f.second = {};
+        std::string().swap(src);
         malloc_trim(0);
         // Remove parts left from an earlier, larger split.
         for (int k = (int)files.size() - 2;; k++) {

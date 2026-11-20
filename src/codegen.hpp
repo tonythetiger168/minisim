@@ -297,7 +297,8 @@ public:
         nf = std::max(nf, 1);
         if (nf > 1) {
             for (auto& c : cycFns) chunks.push_back(std::move(c));
-            cyc.clear();
+            std::vector<std::string>().swap(cycFns);
+            std::string().swap(cyc);
         }
         const char* SV = nf > 1 ? "inline " : "static ";
 
@@ -1193,8 +1194,8 @@ public:
         }
         if (outFiles.empty()) return o.str();
         // Files after one another, each after a marker line msim splits on.
-        std::string all = std::string(kFileMark) + "design.hpp\n" + outFiles[0];
         std::string dcpp = rename.empty() ? o.str() : mapIdents(o.str(), [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; });
+        o.str(std::string());
         if (size_t a = dcpp.find(std::string(kMacroMark) + "{\n"), b = dcpp.find(std::string(kMacroMark) + "}\n"); a != std::string::npos && b != std::string::npos && a < b) {
             size_t a2 = a + std::strlen(kMacroMark) + 2, b2 = b + std::strlen(kMacroMark) + 2;
             std::unordered_set<std::string> used;
@@ -1210,8 +1211,23 @@ public:
             }
             dcpp = dcpp.substr(0, a) + keep + dcpp.substr(b2);
         }
-        all += std::string(kFileMark) + "design.cpp\n" + dcpp;
-        for (size_t f = 1; f < outFiles.size(); f++) all += std::string(kFileMark) + "part" + std::to_string(f - 1) + ".cpp\n" + outFiles[f];
+        // Each piece is freed as it is appended (a large design's C++ is
+        // gigabytes).
+        size_t total = dcpp.size() + 64 * (outFiles.size() + 1);
+        for (auto& f : outFiles) total += f.size();
+        std::string all;
+        all.reserve(total);
+        all += std::string(kFileMark) + "design.hpp\n";
+        all += outFiles[0];
+        std::string().swap(outFiles[0]);
+        all += std::string(kFileMark) + "design.cpp\n";
+        all += dcpp;
+        std::string().swap(dcpp);
+        for (size_t f = 1; f < outFiles.size(); f++) {
+            all += std::string(kFileMark) + "part" + std::to_string(f - 1) + ".cpp\n";
+            all += outFiles[f];
+            std::string().swap(outFiles[f]);
+        }
         return all;
     }
 
