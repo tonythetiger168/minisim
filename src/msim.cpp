@@ -2305,6 +2305,97 @@ static bool needMix(const char* what) {
     if (!g_mixForce) g_mixForce = what;
     return true;
 }
+// This process's resident memory in GB (Linux /proc).
+static double rssGB() {
+    std::ifstream f("/proc/self/status");
+    for (std::string k; f >> k;)
+        if (k == "VmRSS:") { long kb = 0; f >> kb; return kb / 1048576.0; }
+    return 0;
+}
+// From this size msim -compile hands the C++ build to a fresh msim (runPlan).
+static constexpr double kExecGB = 2.0;
+// msim has work after simv ends (-saif, -result): it does not hand over.
+static bool g_workAfterRun = false;
+// The C++ compiles of a split build, each on its own core. The compiler
+// takes about 0.6 GB per MB of a large generated file: four of them at once
+// ran a 16 GB machine out of memory (16 Ibex cores). Jobs start while their
+// estimates fit in the memory free now; one always runs.
+static bool runJobs(const std::vector<std::string>& jobs, const std::vector<double>& jobMB) {
+    double budget = 0;
+    {
+        std::ifstream mi("/proc/meminfo");
+        std::string k;
+        double kb;
+        std::string unit;
+        while (mi >> k >> kb >> unit)
+            if (k == "MemAvailable:") { budget = kb / 1024 * 0.85; break; }
+    }
+    std::atomic<size_t> next{0};
+    std::atomic<bool> failed{false};
+    std::vector<std::thread> pool;
+    std::mutex memMu;
+    std::condition_variable memCv;
+    double inUse = 0;
+    int running = 0;
+    for (int t = 0; t < std::min<int>(maxThreads(), (int)jobs.size()); t++)
+        pool.emplace_back([&] {
+            for (size_t j; (j = next++) < jobs.size();) {
+                {
+                    std::unique_lock<std::mutex> lk(memMu);
+                    memCv.wait(lk, [&] { return budget <= 0 || running == 0 || inUse + jobMB[j] <= budget; });
+                    inUse += jobMB[j];
+                    running++;
+                }
+                if (std::system(jobs[j].c_str()) != 0) { failed = true; std::cerr << "msim: -compile: C++ build failed: " << jobs[j] << "\n"; }
+                {
+                    std::lock_guard<std::mutex> lk(memMu);
+                    inUse -= jobMB[j];
+                    running--;
+                }
+                memCv.notify_all();
+            }
+        });
+    for (auto& t : pool) t.join();
+    return !failed;
+}
+// msim -compile-plan <file>: the end of a large msim -compile in a fresh
+// process (runCompiled wrote the plan, then ran this): compile, link,
+// record the build, run simv.
+static int runPlan(const char* path) {
+    std::ifstream f(path);
+    std::map<std::string, std::string> kv;
+    std::vector<std::string> jobs;
+    std::vector<double> jobMB;
+    for (std::string ln; std::getline(f, ln);) {
+        size_t tab = ln.find('\t');
+        if (tab == std::string::npos) continue;
+        std::string k = ln.substr(0, tab), v = ln.substr(tab + 1);
+        if (k == "J") {
+            size_t t2 = v.find('\t');
+            jobMB.push_back(std::atof(v.substr(0, t2).c_str()));
+            jobs.push_back(v.substr(t2 + 1));
+        } else kv[k] = v;
+    }
+    if (!f.eof() || kv["EXE"].empty()) { std::cerr << "msim: cannot read " << path << "\n"; return 1; }
+    const std::string dir = kv["DIR"], exe = kv["EXE"], kobj = kv["KOBJ"];
+    std::error_code ec;
+    if (!kv["G"].empty() && std::system(kv["G"].c_str()) != 0) std::filesystem::remove(kv["GCH"], ec);
+    if (!runJobs(jobs, jobMB)) return 1;
+    phaseMark("C++ compile");
+    std::string link = kv["LINK"];
+    if (!kobj.empty()) link += " " + shq(kobj);
+    link += kv["FSTL"] + " -o " + shq(exe);
+    if (std::system(link.c_str()) != 0) { std::cerr << "msim: -compile: link failed: " << link << "\n"; return 1; }
+    std::ofstream(dir + "/simv.kobj") << kobj;
+    std::filesystem::rename(dir + "/simv.stamp.next", dir + "/simv.stamp", ec);
+    std::filesystem::remove(path, ec);
+    phaseMark("simv built");
+    if (int fd = std::atoi(kv["LOCK"].c_str()); fd > 2) ::close(fd);   // the build lock (runCompiled)
+    std::cout.flush();
+    int st = std::system(kv["RUN"].c_str());
+    if (st == -1) return 1;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
 static std::string kernelObject(const std::string& cc, const std::string& cflags, const std::string& inc, const std::string& dir) {
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const std::string& t) { for (unsigned char c : t) { h ^= c; h *= 1099511628211ULL; } h ^= 0xff; h *= 1099511628211ULL; };
@@ -2711,6 +2802,19 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         stamp += std::string(k) + " " + std::to_string(ec ? 0 : std::filesystem::file_size(p, ec)) + " " +
                  std::to_string(ec ? 0 : (long long)t.time_since_epoch().count()) + "\n";
     }
+    // simv's command line: run-time inputs go to simv, so one build serves
+    // every seed and plusarg.
+    auto runCmd = [&] {
+        std::string run = shq(exe);
+        if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
+        if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
+        if (vcdPath && S.dumpArrays) run += " -vcd-arrays " + std::to_string(S.dumpArrays);
+        run += " -threads " + std::to_string(threads);
+        if (g_pin >= 0) run += g_pin ? " -pin" : " -no-pin";
+        if (seed) run += " -seed " + std::to_string(seed);
+        for (auto& a : plusArgs()) run += " " + shq("+" + a);
+        return run;
+    };
     std::error_code ec;
     // Several files (codegen split a large design): each compiles on its own
     // core, and a file the same as last time keeps its object.
@@ -2784,19 +2888,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             std::filesystem::remove(old + ".cpp", ec);
             std::filesystem::remove(old + ".o", ec);
         }
-        // The compiler takes about 0.6 GB per MB of a large generated file:
-        // four of them at once ran a 16 GB machine out of memory (16 Ibex
-        // cores). Jobs start while their estimates fit in the memory free
-        // now; one always runs.
-        double budget = 0;
-        {
-            std::ifstream mi("/proc/meminfo");
-            std::string k;
-            double kb;
-            std::string unit;
-            while (mi >> k >> kb >> unit)
-                if (k == "MemAvailable:") { budget = kb / 1024 * 0.85; break; }
-        }
+        std::string gchCmd;   // design.hpp precompiled, when it must be built
         // Every part starts by compiling design.hpp, the kernel with it (8 s
         // at -O2): gcc reads it precompiled instead (design.hpp.gch next to
         // it, built with the parts' flags) when there are enough parts.
@@ -2805,44 +2897,43 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             if (partJobs >= 4 && isGcc(cc)) {
                 if (!(hdrSame && sameFlags && std::filesystem::exists(gch, ec))) {
                     std::filesystem::remove(gch, ec);
-                    std::string c = shq(cc) + cflags + partFlags + " -x c++-header " + shq(dir + "/design.hpp") + " -o " + shq(gch);
-                    if (std::system(c.c_str()) != 0) std::filesystem::remove(gch, ec);   // the parts build without it
+                    gchCmd = shq(cc) + cflags + partFlags + " -x c++-header " + shq(dir + "/design.hpp") + " -o " + shq(gch);
                 }
             } else
                 std::filesystem::remove(gch, ec);
         }
-        std::atomic<size_t> next{0};
-        std::atomic<bool> failed{false};
-        std::vector<std::thread> pool;
-        std::mutex memMu;
-        std::condition_variable memCv;
-        double inUse = 0;
-        int running = 0;
-        for (int t = 0; t < std::min<int>(maxThreads(), (int)jobs.size()); t++)
-            pool.emplace_back([&] {
-                for (size_t j; (j = next++) < jobs.size();) {
-                    {
-                        std::unique_lock<std::mutex> lk(memMu);
-                        memCv.wait(lk, [&] { return budget <= 0 || running == 0 || inUse + jobMB[j] <= budget; });
-                        inUse += jobMB[j];
-                        running++;
-                    }
-                    if (std::system(jobs[j].c_str()) != 0) { failed = true; std::cerr << "msim: -compile: C++ build failed: " << jobs[j] << "\n"; }
-                    {
-                        std::lock_guard<std::mutex> lk(memMu);
-                        inUse -= jobMB[j];
-                        running--;
-                    }
-                    memCv.notify_all();
-                }
-            });
-        for (auto& t : pool) t.join();
+        std::string linkCmd = shq(cc) + " " + opt + (reloc ? " -no-pie" : "") + (mix.on ? " -shared" : "");
+        for (auto& o : objs) linkCmd += " " + shq(o);
+        // A large design: msim holds what it elaborated (XiangShan: 11 GB)
+        // while the compilers need the memory. It writes the rest of the work
+        // to a plan and becomes a fresh msim that runs it (runPlan).
+        if (!mix.on && !g_cov && !upf && !g_workAfterRun && !jobs.empty() && !std::getenv("MSIM_NOEXEC") &&
+            rssGB() >= (std::getenv("MSIM_EXECGB") ? std::atof(std::getenv("MSIM_EXECGB")) : kExecGB)) {   // tests: MSIM_EXECGB=0
+            if (!kernelReady()) return 1;
+            std::string plan = dir + "/build.plan";
+            {
+                std::ofstream f(plan);
+                f << "DIR\t" << dir << "\nEXE\t" << exe << "\nKOBJ\t" << kobj << "\nLINK\t" << linkCmd << "\nFSTL\t" << fstL
+                  << "\nLOCK\t" << lockFd << "\nRUN\t" << runCmd() << "\n";
+                if (!gchCmd.empty()) f << "GCH\t" << dir + "/design.hpp.gch" << "\nG\t" << gchCmd << "\n";
+                for (size_t j = 0; j < jobs.size(); j++) f << "J\t" << jobMB[j] << "\t" << jobs[j] << "\n";
+                std::ofstream(dir + "/simv.stamp.next") << stamp;
+                if (!f) { std::cerr << "msim: cannot write " << plan << "\n"; return 1; }
+            }
+            std::cout.flush();
+            std::cerr.flush();
+            std::string self = std::filesystem::read_symlink("/proc/self/exe", ec).string();
+            const char* av[] = {"msim", "-compile-plan", plan.c_str(), nullptr};
+            ::execv(self.c_str(), const_cast<char* const*>(av));
+            std::cerr << "msim: cannot run " << self << ": " << std::strerror(errno) << "\n";   // goes on here
+        }
+        if (!gchCmd.empty() && std::system(gchCmd.c_str()) != 0) std::filesystem::remove(dir + "/design.hpp.gch", ec);   // the parts build without it
+        const bool failed = !runJobs(jobs, jobMB);
         phaseMark("C++ compile");
         if (failed) return 1;
         if (!kernelReady()) return 1;   // a new kernel object relinks (simv.kobj)
         if (!jobs.empty() || !std::filesystem::exists(exe, ec) || slurp(dir + "/simv.kobj") != kobj) {
-            std::string link = shq(cc) + " " + opt + (reloc ? " -no-pie" : "") + (mix.on ? " -shared" : "");
-            for (auto& o : objs) link += " " + shq(o);
+            std::string link = linkCmd;
             if (!kobj.empty()) link += " " + shq(kobj);
             link += fstL + " -o " + shq(exe);
             if (std::system(link.c_str()) != 0) { std::cerr << "msim: -compile: link failed: " << link << "\n"; return 1; }
@@ -2886,15 +2977,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             std::cerr << "msim: -compile: mixed mode for " << mixWhy << " (msim runs the simulation)\n";
         return -2;
     }
-    std::string run = shq(exe);
-    if (maxTime != ~0ULL) run += " -maxtime " + std::to_string(maxTime);
-    if (vcdPath) run += " -vcd " + shq(*vcdPath) + " -vcdtop " + shq(S.vcdTop);
-    if (vcdPath && S.dumpArrays) run += " -vcd-arrays " + std::to_string(S.dumpArrays);
-    run += " -threads " + std::to_string(threads);
-    if (g_pin >= 0) run += g_pin ? " -pin" : " -no-pin";
-    // Run-time inputs go to simv, so one build serves every seed and plusarg.
-    if (seed) run += " -seed " + std::to_string(seed);
-    for (auto& a : plusArgs()) run += " " + shq("+" + a);
+    std::string run = runCmd();
     // -upf: the bound power intent, per run (parallel runs share the build);
     // MSIM_KEEP_SNAP keeps it, to run simv by hand.
     std::string snap = dir + "/upf.snap." + std::to_string(::getpid());
@@ -3668,6 +3751,7 @@ static void usage() {
 
 static int msimMain(int argc, char** argv);
 int main(int argc, char** argv) {
+    if (argc == 3 && !std::strcmp(argv[1], "-compile-plan")) return runPlan(argv[2]);
     phaseMark("start");
     return runres::finish(msimMain(argc, argv));
 }
@@ -4714,6 +4798,7 @@ static int msimMain(int argc, char** argv) {
     if (compiled) {
         runres::R().phase = 1;   // the compiled program writes its own output: no UVM counts, no -maxtime check
         runres::R().compiledMode = true;
+        g_workAfterRun = !saifPath.empty() || !runres::R().path.empty();
         int st = runCompiled(lowered, buildDir, cc, opt, vcdPath, maxTime, plC, threads, staticPart, twoState, cycle,
                              seed, covPath);
         if (st >= 0) {

@@ -116,6 +116,7 @@ set(CASES
   "examples/romfold.sv"
   "examples/fusepar.sv"
   "-no-cycle examples/nbaskip.sv"
+  "-no-cycle examples/bigseq.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
@@ -149,8 +150,16 @@ foreach(c IN LISTS CASES)
   if(NOT r3 EQUAL 0 OR NOT want STREQUAL lev)
     message(FATAL_ERROR "${c}: static combinational schedule differs\n--- event-driven\n${want}--- levelized\n${lev}")
   endif()
+  if(c MATCHES "bigseq")
+    set(ENV{MSIM_OUTLINEMIN} 1)
+    set(ENV{MSIM_SPLITPIECE} 1500)
+    set(ENV{MSIM_EXECGB} 0)   # the C++ build in a fresh msim (msim.cpp runPlan)
+  endif()
   execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/c${n} ${files}
                   OUTPUT_VARIABLE got RESULT_VARIABLE r2 ERROR_VARIABLE err)
+  unset(ENV{MSIM_OUTLINEMIN})
+  unset(ENV{MSIM_SPLITPIECE})
+  unset(ENV{MSIM_EXECGB})
   if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0)
     message(FATAL_ERROR "${c}: exit ${r1} (interpreter) / ${r2} (-compile)\n${err}")
   endif()
@@ -268,6 +277,19 @@ foreach(c IN LISTS CASES)
     list(LENGTH keep nkeep)
     if(NOT nkeep EQUAL 5)
       message(FATAL_ERROR "${c}: ${nkeep} NBAs checked by nbaKeep (expected 5: q, c, w and e's two)")
+    endif()
+  endif()
+  # A large clocked block splits into pieces (codegen.hpp splitSeq) and its
+  # straight runs of NBAs move to helpers that take the NBA list (outlineRuns).
+  if(c STREQUAL "-no-cycle examples/bigseq.sv")
+    file(GLOB srcs ${OUT}/c${n}/*.cpp)
+    set(gen "")
+    foreach(f ${srcs})
+      file(READ ${f} t)
+      string(APPEND gen "${t}")
+    endforeach()
+    if(NOT gen MATCHES "s_[0-9]+: seq[0-9a-f_op]+\\(nb\\);")
+      message(FATAL_ERROR "${c}: the clocked block was not split or outlined")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).
