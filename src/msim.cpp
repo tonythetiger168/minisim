@@ -2875,7 +2875,10 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
             // the 600 of code. Estimated as code, it ran alone for half an hour
             // while every part waited.
             const bool tables = name == "design.cpp" && files.size() > 2;
-            jobMB.push_back(300 + (tables ? 80.0 : 600.0) * (text.size() + hdrSize) / 1e6 * (cflags.find("-O0") == std::string::npos ? 1 : 0.5));
+            // -O1 (a large design's default): XiangShan's parts took 0.22 GB
+            // per MB (2.4 GB for 11 MB), counted here as 0.36.
+            const double optF = cflags.find("-O0") != std::string::npos ? 0.5 : cflags.find("-O1") != std::string::npos ? 0.6 : 1;
+            jobMB.push_back(300 + (tables ? 80.0 : 600.0) * (text.size() + hdrSize) / 1e6 * optF);
         }
         // Written: the texts are not needed again, and the memory they and
         // codegen's buffers held goes back to the system for the compilers.
