@@ -1302,7 +1302,7 @@ private:
         // running alone, which is when translated code runs
         if (op == 0x0f && f3 == 0) return J_FENCE;
         if (pg && op == 0x0f && f3 == 2 && (insn >> 20) == 4 && !((insn >> 7) & 31)) return J_CBOZ;
-        if (pg && op == 0x2f && (f3 == 2 || f3 == 3)) {
+        if (op == 0x2f && (f3 == 2 || f3 == 3)) {
             switch (insn >> 27) {
                 case 0x00: case 0x01: case 0x04: case 0x08: case 0x0c: case 0x10: case 0x14: case 0x18: case 0x1c:
                     return J_AMO;
@@ -1425,10 +1425,16 @@ private:
                 else if (k == J_CBOZ) imm = 0;
                 else if (k == J_ZU || k == J_ZB) imm = zbbOp(insn);
                 // CSRRCI on sstatus in supervisor mode: clears SIE at most
-                // (bits 0 to 4), which never lets an interrupt in
-                if (!k && pg && h.priv == 1 && (insn & 0x707f) == 0x7073 && (insn >> 20) == 0x100) {
-                    k = J_SSC;
-                    imm = (int32_t)((insn >> 15) & 31);
+                // (bits 0 to 4), which never lets an interrupt in; and a
+                // plain read (CSRRS or CSRRC with x0, or CSRRSI with 0)
+                if (!k && pg && h.priv == 1 && (insn >> 20) == 0x100) {
+                    if ((insn & 0x707f) == 0x7073) {
+                        k = J_SSC;
+                        imm = (int32_t)((insn >> 15) & 31);
+                    } else if ((insn & 0xf807f) == 0x2073 || (insn & 0xf807f) == 0x3073 || (insn & 0xf807f) == 0x6073) {
+                        k = J_SSC;
+                        imm = 0;
+                    }
                 }
             }
             if (!k) { toInterp = true; break; }
@@ -1495,8 +1501,10 @@ private:
         // (with paging, r11 is the page cache entry's address)
         static const int poolBare[] = {R::RSI, R::RDI, R::R8, R::R9, R::R10, R::R11, R::RDX};
         static const int poolPg[] = {R::RSI, R::RDI, R::R8, R::R9, R::R10, R::RDX};
-        const int* const pool = pg ? poolPg : poolBare;
-        const unsigned npool = pg ? 6 : 7;
+        bool amo = false;  // (AMOs, LR and SC use r11 too)
+        for (unsigned k = 0; k < n; k++) amo |= ops[k].kind == J_AMO;
+        const int* const pool = pg || amo ? poolPg : poolBare;
+        const unsigned npool = pg || amo ? 6 : 7;
         int hr[33];
         for (int& x : hr) x = -1;
         uint32_t liveIn = 0;
@@ -1688,6 +1696,25 @@ private:
                 J.b(nbytes == 1 ? 0x88 : 0x89);
                 J.memIdx(R::RCX, R::R13, R::RAX);
             };
+            // An AMO's, LR's or SC's word in host memory, in rax (aligned,
+            // else the general path raises the exception).
+            auto amoPtr = [&](bool st, unsigned nbytes) {
+                if (pg) { pageOf(st ? 96 : 88, nbytes, true); return; }
+                addr();
+                J.rex(false, 0, R::RAX); J.b(0xa9); J.d32(nbytes - 1);  // test eax, n - 1
+                bail(R::CC_NE);
+                if (st) {  // not within 8 bytes of tohost
+                    J.movRR(R::RCX, R::RAX);
+                    J.aluC(R::A_SUB, R::RCX, 64);
+                    J.aluI(R::A_ADD, R::RCX, (int32_t)nbytes - 1);
+                    J.aluI(R::A_CMP, R::RCX, (int32_t)(7 + nbytes));
+                    bail(R::CC_B);
+                }
+                J.aluRR(R::A_SUB, R::RAX, R::R14);
+                if (st) J.aluC(R::A_CMP, R::RAX, 56); else J.aluRR(R::A_CMP, R::RAX, R::R15);
+                bail(R::CC_AE);
+                J.aluRR(R::A_ADD, R::RAX, R::R13);
+            };
             const bool term = o.kind >= K_JAL && o.kind <= K_BGEU;
             opAt[k] = J.p;
             if (step && term) J.aluI(R::A_SUB, R::R12, 1);
@@ -1822,7 +1849,7 @@ private:
                         J.rex(true, R::RAX, R::R11); J.b(0x89); J.mem(R::RAX, R::R11, 0);    // resvAddr = a
                         J.ldCtx(R::R11, 112);
                         J.rex(false, 0, R::R11); J.b(0xc6); J.mem(0, R::R11, 0); J.b(1);    // resv = 1
-                        pageOf(88, w ? 8 : 4, true);
+                        amoPtr(false, w ? 8 : 4);
                         J.rex(w, R::RCX, R::RAX); J.b(0x8b); J.mem(R::RCX, R::RAX, 0);
                         if (!w) J.movsxd(R::RCX, R::RCX);
                         put(o.rd, R::RCX);
@@ -1836,7 +1863,7 @@ private:
                         J.ldCtx(R::R11, 112);
                         J.rex(false, 7, R::R11); J.b(0x80); J.mem(7, R::R11, 0); J.b(0);    // cmp byte resv, 0
                         uint8_t* f2 = J.jcc(R::CC_E);
-                        pageOf(96, w ? 8 : 4, true);
+                        amoPtr(true, w ? 8 : 4);
                         ld(R::RCX, o.rs2, w);
                         J.rex(w, R::RCX, R::RAX); J.b(0x89); J.mem(R::RCX, R::RAX, 0);
                         J.aluRR(R::A_XOR, R::RAX, R::RAX, false);
@@ -1850,7 +1877,7 @@ private:
                         put(o.rd);
                         break;
                     }
-                    pageOf(96, w ? 8 : 4, true);
+                    amoPtr(true, w ? 8 : 4);
                     ld(R::RCX, o.rs2, w);
                     int res = R::RCX;
                     if (f5 == 0x01) {        // xchg [rax], rcx
@@ -2058,7 +2085,10 @@ private:
         const uint64_t pieces = (1ull << ((fa & 0xfff) >> 6)) | (1ull << (((fa & 0xfff) + n - 1) >> 6));
         if (it != h.codePages.end()) {
             // decoded from bytes the copy does not hold: it changed already
-            if (!it->second.changed && memcmp(it->second.snap.get() + (fa & 0xfff), &raw, n)) it->second.changed = true;
+            if (!it->second.changed && memcmp(it->second.snap.get() + (fa & 0xfff), &raw, n)) {
+                it->second.changed = true;
+                h.fenceQuiet = false;
+            }
             it->second.used |= pieces;
             return;
         }
@@ -2077,6 +2107,7 @@ private:
         }
         memcpy(cp.snap.get(), cp.host, 4096);
         if (memcmp(cp.snap.get() + (fa & 0xfff), &raw, n)) cp.changed = true;
+        if (cp.changed || cp.wr == -1) h.fenceQuiet = false;
         h.codePages.emplace(pg, std::move(cp));
     }
     void noteInsn(Hart& h, uint64_t fa, uint32_t raw, unsigned len) {
@@ -2106,7 +2137,11 @@ private:
             return;
         }
         h.fencePart++;
-        bool any = false;
+        // Every page watched and unchanged at the last FENCE.I, and nothing
+        // written to a watched page since: nothing to look at.
+        const uint64_t tw = WriteWatch::writes();
+        if (h.fenceQuiet && tw == h.fenceWrites) return;
+        bool any = false, quiet = true;
         for (auto it = h.codePages.begin(); it != h.codePages.end();) {
             Hart::CodePage& c = it->second;
             // not written since it was last compared (or read-only)
@@ -2129,6 +2164,7 @@ private:
                 changed = memcmp(c.snap.get() + o, c.host + o, 64) != 0;
             }
             if (!changed) {
+                if (c.wr == -1) quiet = false;  // not watched: compared every time
                 ++it;
                 continue;
             }
@@ -2145,6 +2181,8 @@ private:
             it = h.codePages.erase(it);
         }
         if (any) h.dcGen++;
+        h.fenceQuiet = quiet;
+        h.fenceWrites = tw;
     }
     // Run translated code from pc until something needs the fast loop.
     void jitRun(Hart& h, uint64_t* r, uint64_t& pc, uint64_t& left, uint8_t* cp, uint64_t cb, uint64_t span,
@@ -2153,7 +2191,8 @@ private:
         if (!jp) { jit = false; return; }
         Jit& J = *jp;
         jitSync(h, J);
-        JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt, nullptr, nullptr, 0};
+        JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt, nullptr, nullptr, 0,
+                 (uint8_t*)&h.resv, &h.resvAddr, &h.mstatus};
         uint8_t* code = J.find(pc);
         if (!code && !(code = jitCompile(J, h, pc))) return;
         for (;;) {

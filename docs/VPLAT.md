@@ -539,7 +539,8 @@ with an address empties only that address's 4 KiB page, unless the
 address lies in a superpage something was translated through since the
 last full flush; then everything in its 1 GiB, the largest page that can
 map it with Sv39). Loads, stores,
-the AMOs, LR and SC (one hart, or taking turns) and CBO.ZERO look their page up in the
+the AMOs, LR and SC (one hart, or taking turns; in machine mode too, with
+the range check) and CBO.ZERO look their page up in the
 hart's data page caches (2048 pages each, emptied in O(1) by an epoch in
 the tags) inline. A load or store that misses fills the cache from the
 TLB or a page walk and goes back into its block; a device, a fault, an
@@ -548,7 +549,8 @@ block is translated the second time its pc is looked for, so a pc where
 a turn or an interrupt left off once costs no translation. Harts taking
 turns share the translations; FENCE.I on one hart drops a page's only if
 the page differs from what they were translated from. CSRRCI on sstatus in
-supervisor mode (clearing SIE, which lets no interrupt in) is translated;
+supervisor mode (clearing SIE, which lets no interrupt in) and plain reads
+of sstatus (CSRRS or CSRRC with x0, CSRRSI with 0) are translated;
 other CSR instructions leave. The budget is checked once per block; when
 the quantum ends inside a block, a counting copy of that block runs the
 rest exactly, so a run retires the same instructions on the same cycles
