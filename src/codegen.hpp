@@ -1132,13 +1132,18 @@ public:
                     if (i < evPlain_.size() && evPlain_[i]) {
                         const std::string nm = !evName_[i].empty() ? evName_[i] : std::to_string(i);
                         tab += "        {nullptr, nullptr, 0, 0, " + std::to_string(late) + ", " + evCtx((int)i) + ", proc" + nm + "},\n";
-                    } else
-                        tab += "        {nullptr, proc" + std::to_string(i) + ", 0, 0, " + std::to_string(late) + ", nullptr, nullptr},\n";
+                    } else {
+                        int ck = -1;
+                        uint64_t half = 0;
+                        const bool fc = toggleClock(*procs[i].prog, ck, half);
+                        tab += "        {nullptr, proc" + std::to_string(i) + ", 0, 0, " + std::to_string(late) + ", nullptr, nullptr" +
+                               (fc ? ", " + std::to_string(ck + 1) + ", " + std::to_string(half) + "ULL" : std::string()) + "},\n";
+                    }
                 }
             }
             if (n) {
                 o << "    static const std::pair<int, Edge> SEV[] = {" << evs << "{0, ANY}};\n"
-                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; const void* x; void (*f)(const void*); } PROCS[] = {\n"
+                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; const void* x; void (*f)(const void*); int ck; unsigned long long half; } PROCS[] = {\n"
                   << tab << "    };\n"
                      "    std::vector<Task> held;\n    bool init1 = false;\n"
                      "    auto mk = [](const auto& p) { return p.p ? p.p() : evOnce(p.f, p.x); };\n"
@@ -1148,7 +1153,7 @@ public:
                      "        else if (p.late == 2 && !init1) {\n"
                      "            init1 = true;\n            Task t = mk(p);\n"
                      "            for (auto& h : held) S.spawn(h);\n            held.clear();\n            S.spawn(t);\n"
-                     "        } else S.spawn(mk(p));\n"
+                     "        } else { Task t = mk(p); S.spawn(t); if (p.ck) S.addFastClock(t.h, p.ck - 1, p.half); }\n"
                      "    for (auto& h : held) S.spawn(h);\n";
             }
         }
@@ -2894,6 +2899,30 @@ private:
         std::string r = " switch ((uint64_t)(" + u + ") & " + M(widthOf(sel)) + ") {";
         for (auto& [key, body] : arms) r += " case " + std::to_string(key) + "ULL: goto " + lab(body) + ";";
         return r + " default: goto " + lab(k) + "; }\n";
+    }
+    // A testbench clock: `always #h clk = ~clk` (or an initial block that
+    // ends in `forever #h clk = ~clk`) on a one-bit signal. The kernel
+    // flips it itself when it is all that happens at a time step
+    // (Sim::addFastClock), without resuming the coroutine.
+    bool toggleClock(const Prog& p, int& sig, uint64_t& half) const {
+        static const bool off = std::getenv("MSIM_NOFASTCLK") != nullptr;
+        const auto& c = p.code;
+        if (off || c.size() < 3) return false;
+        const size_t k = c.size() - 3;
+        const Instr &d = c[k], &a = c[k + 1], &j = c[k + 2];
+        if (d.k != IK::WaitDelay || d.de || d.delay == 0) return false;
+        if (j.k != IK::Jmp || j.target != k) return false;
+        if (a.k != IK::Assign || a.hi >= 0 || a.bidx || a.arr || !a.aidx.empty() || a.tmp || a.drv >= 0 || a.de || !a.dlyE.empty()) return false;
+        if (a.sig < 0 || (size_t)a.sig >= sigW_.size() || sigW_[a.sig] != 1) return false;
+        const E& e = a.e;
+        if (!e || (e->op != Op::Not && e->op != Op::LogNot) || e->kids.size() != 1) return false;
+        const E& r = e->kids[0];
+        if (!r || r->op != Op::Ref || r->sig != a.sig || r->at) return false;
+        for (size_t q = 0; q < k; q++)   // the part before the loop runs once, at time 0, without waiting
+            if (c[q].k != IK::Assign) return false;
+        sig = a.sig;
+        half = d.delay;
+        return true;
     }
     static bool combBranches(const Prog& p) {
         for (auto& i : p.code) {

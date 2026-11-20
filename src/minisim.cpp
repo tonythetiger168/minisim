@@ -326,6 +326,24 @@ struct Wheel {
         b.pop_back();
     }
     void clear() { b.clear(); }
+    // The earliest bucket, moved to time t (> its own): its handles wait again.
+    void retimeFront(uint64_t t) {
+        Bucket bk = std::move(b.back());
+        b.pop_back();
+        size_t lo = 0, hi = b.size();
+        while (lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            if (b[mid].first > t) lo = mid + 1; else hi = mid;
+        }
+        if (lo < b.size() && b[lo].first == t) {
+            b[lo].second.insert(b[lo].second.end(), bk.second.begin(), bk.second.end());
+            bk.second.clear();
+            spare.push_back(std::move(bk.second));
+            return;
+        }
+        bk.first = t;
+        b.insert(b.begin() + (ptrdiff_t)lo, std::move(bk));
+    }
 };
 
 struct Sim {
@@ -1228,6 +1246,34 @@ struct Sim {
     uint64_t xAt = ~0ULL;   // the last time step in which bit 0 of a signal changed from or to x (kept with edgeTrack)
     int sig(const string& n, int w, bool net = false);   // kernel object (MSIM_KDEF below)
     void spawn(Task t) { all.push_back(t.h); wheel[now].push_back(t.h); }
+    // msim -compile: a testbench clock process (codegen toggleClock), after
+    // time 0 always waiting at its `#half clk = ~clk` loop. When it is all
+    // that happens at a time step, run() flips the clock and puts the process
+    // back in the wheel itself. MSIM_NOFASTCLK at run time turns it off.
+    struct FastClock { void* h; int s; uint64_t half; };
+    vector<FastClock> fastClocks;
+    void addFastClock(coroutine_handle<Task::promise_type> h, int s, uint64_t half) {
+        static const bool off = getenv("MSIM_NOFASTCLK") != nullptr;
+        if (!off) fastClocks.push_back({h.address(), s, half});
+    }
+    // The clock flip of a time step with nothing else in it, as the process would do it.
+    bool fastTick(Wheel::Bucket* it) {
+        if (it->second.size() != 1 || it->first == 0) return false;
+        const void* h = it->second[0].address();
+        const FastClock* c = nullptr;
+        for (const FastClock& f : fastClocks) if (f.h == h) { c = &f; break; }
+        if (!c || !dead.empty() || vpiRegion || !freeVars.empty() || !shadows.empty() || !laterNba.empty() || !laterDrv.empty() ||
+            !combq.empty() || !active.empty() || !seqq.empty() || !nbaq.empty() || prof::P().on)
+            return false;
+        const uint64_t nb = ~sigs[c->s].val.v & 1;
+        if (!bitEdgeOk(c->s, nb)) return false;
+        now = it->first;
+        g_simTime = now;
+        wheel.retimeFront(now + c->half);
+        ++resumeN;
+        bitEdge(c->s, nb);
+        return true;
+    }
     // Resolved nets: each continuous driver owns a slot (starts as Z).
     // s0/s1 are that driver's strength spec. Omitted means strong0 and strong1,
     // which is the default for a continuous assign with no strength written.
@@ -3457,6 +3503,7 @@ MSIM_KDEF void Sim::run(uint64_t end, bool start) {
     while (!wheel.empty() && !finished) {
         auto it = wheel.begin();
         if (it->first > end) break;
+        if (fastClocks.empty() || !fastTick(it)) {
         uint64_t t = it->first;
         bool any = laterNba.count(t) > 0 || laterDrv.count(t) > 0 || !combq.empty() || (vpiRegion && vpiAt.count(t)) ||
                    !active.empty() || !seqq.empty() || !nbaq.empty();   // work queued between slots (msim -i: force, deposit)
@@ -3476,6 +3523,7 @@ MSIM_KDEF void Sim::run(uint64_t end, bool start) {
         if (auto ln = laterNba.find(now); ln != laterNba.end()) {
             for (auto& n : ln->second) nbaq.push_back(n);
             laterNba.erase(ln);
+        }
         }
         for (;;) {                                         // one time slot
             if (!active.empty()) {                         // active
