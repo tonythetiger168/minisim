@@ -8,6 +8,19 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: the translator runs machine-mode AMOs, LR and SC (taking turns
+  or one hart) and plain reads of sstatus in supervisor mode (CSRRS/CSRRC
+  with x0, CSRRSI with 0). FENCE.I returns at once when every code page is
+  watched and no watched page was written since the last one.
+- mvplat: several harts take turns by default (what `-serial` did); the
+  parallel rounds with write buffers, about 10 times slower under Linux,
+  need `-parallel`, `-threads N` or `"serial": false`. Faster SMP Linux
+  (a longer `-quantum`, such as 50000, gains 5-10% more): data page caches of
+  2048 pages emptied by an epoch; a load or store that misses fills the
+  cache and goes back into its translated block; SFENCE.VMA with an address
+  drops only its 4 KiB page unless it lies in a superpage; machine-mode code
+  no longer empties the harts' shared translations; FENCE.I on one hart
+  keeps shared translations of a page that is unchanged. Extension ABI 16.
 - mvplat: SFENCE.VMA with an address (RV64) drops only what came from
   that address's 1 GiB (Sv39; the largest page that can map it) from the
   TLB, the fetch and data page caches and the translator's jump table,

@@ -293,6 +293,11 @@ static __attribute__((noinline, used)) void supervisor(void) {
         if (i & 1) __asm__ volatile("csrrci %0, sstatus, 2" : "=r"(o));
         else __asm__ volatile("csrrci %0, sstatus, 0" : "=r"(o));
         hs = mix(hs, o);
+        // plain reads (translated too)
+        if (i % 5 == 0) __asm__ volatile("csrr %0, sstatus" : "=r"(o));
+        else if (i % 5 == 1) __asm__ volatile("csrrc %0, sstatus, x0" : "=r"(o));
+        else __asm__ volatile("csrrsi %0, sstatus, 0" : "=r"(o));
+        hs = mix(hs, o);
         if (i % 3 == 0) __asm__ volatile("csrsi sstatus, 2");
     }
     puts_("sstatus checksum ");

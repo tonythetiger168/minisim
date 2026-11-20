@@ -68,6 +68,8 @@ done
 "$MVPLAT" "$E/smp64.elf" -harts 4 -serial -q -trace ser1.log > /dev/null 2>&1
 "$MVPLAT" "$E/smp64.elf" -harts 4 -serial -q -trace ser2.log > /dev/null 2>&1
 cmp -s ser1.log ser2.log && ok "-serial: the same run twice" || bad "-serial: two runs differ"
+"$MVPLAT" "$E/smp64.elf" -harts 4 -q -trace ser3.log > /dev/null 2>&1
+cmp -s ser1.log ser3.log && ok "several harts take turns by default (the same as -serial)" || bad "the default with several harts is not -serial"
 
 # The V extension: clang's vectorized loops agree with its scalar ones
 # (RV32 and RV64, at the smallest and largest VLEN), and single
@@ -102,7 +104,7 @@ cmp -s jit.out jit_nojit.out && cmp -s jit.out jit_q7.out && \
   [ "$(grep -o '[0-9]* instructions' jit_count.out)" = "$(grep -o '[0-9]* instructions' jit_count_nojit.out)" ] \
   && ok "translator: the same checksum and instruction count as -nojit, and with a 7-cycle quantum" \
   || bad "translator: differs from -nojit"
-for o in "" -nojit "-quantum 7" "-harts 2" "-harts 2 -serial"; do
+for o in "" -nojit "-quantum 7" "-harts 2" "-harts 2 -parallel"; do
   "$MVPLAT" "$E/smc64.elf" -q $o > smc.out 2>&1; rc=$?
   expect "self-modifying code and FENCE.I, machine and supervisor mode (Sv39, an alias) ${o:-(translated)}" 0 smc.out "checks passed, all"
 done
@@ -248,11 +250,11 @@ fi
 if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
   printf '%s\n' '{"devices": [{"type":"finisher","base":"0x100000"},{"type":"clint","base":"0x2000000"},{"type":"plic","base":"0xc000000"},{"type":"uart16550","base":"0x10000000","irq":10},{"type":"ram","base":"0x80000000","size":"512M"}]}' > linux.json
   "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd "$E/initramfs64.cpio" \
-    -append "console=ttyS0 rdinit=/init" -harts 2 -q > linux.out 2>&1; rc=$?
-  expect "Linux boots to /init on 2 harts and powers off" 0 linux.out "mvplat-init: powering off"
+    -append "console=ttyS0 rdinit=/init" -harts 2 -parallel -q > linux.out 2>&1; rc=$?
+  expect "Linux boots to /init on 2 harts in parallel rounds and powers off" 0 linux.out "mvplat-init: powering off"
   "$MVPLAT" -platform linux.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd "$E/initramfs64.cpio" \
-    -append "console=ttyS0 rdinit=/init" -harts 4 -serial -q > linux_serial.out 2>&1; rc=$?
-  expect "Linux on 4 harts, -serial" 0 linux_serial.out "mvplat-init: powering off"
+    -append "console=ttyS0 rdinit=/init" -harts 4 -q > linux_serial.out 2>&1; rc=$?
+  expect "Linux on 4 harts (taking turns, the default)" 0 linux_serial.out "mvplat-init: powering off"
   grep -q "smp: Brought up 1 node, 4 CPUs" linux_serial.out && ok "Linux -serial brought up 4 harts" || bad "Linux -serial SMP bring-up"
   grep -q "^Linux version" linux.out && grep -q "smp: Brought up 1 node, 2 CPUs" linux.out &&
     ok "Linux brought up both harts and printed /proc/version" || bad "Linux SMP bring-up"
