@@ -667,6 +667,18 @@ struct Sim {
                 combPend[r] = 0;
                 combBatch.push_back(r);
             }
+            // One process at this level (the domain's comb pass, the clock
+            // cone): run it, without the batch's buffers and the pool.
+            if (combBatch.size() == 1 && !loopDbg && !prof::P().on && !noDomFast) [[likely]] {
+                const int r = combBatch[0];
+                const Comb& c = combs[r];
+                curComb = r;
+                if (c.onCycle && !c.compute) runDeferred(r);
+                else if (c.compute) c.commit(c.ctx, c.compute(c.ctx));
+                else c.fn(c.ctx);
+                curComb = -1;
+                continue;
+            }
             combVals.resize(combBatch.size());
             if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
                 for (int r : combBatch) {
@@ -881,10 +893,35 @@ struct Sim {
         return (nv.v & m & ~x) != (cur.v & m & ~cur.x) || x != (cur.x & m) || (nv.z & m) != (cur.z & m);
     }
     uint64_t seqRun = 0;   // counts runSeqs: the compiled clock groups of one run share a twoNow() (codegen dseq)
+    // MSIM_NODOMFAST: the general paths of runSeqs and runCombs for every batch.
+    const bool noDomFast = getenv("MSIM_NODOMFAST") != nullptr;
     void runSeqs() {
         seqRun++;
         if (!std::is_sorted(seqq.begin(), seqq.end())) sortSeqq();
         if (seqBufs.size() < seqq.size()) seqBufs.resize(seqq.size());
+        // Only the compiled cycle domain's clock groups (a clock edge of a
+        // -compile run): one after another into one list, as below.
+        if (fastSeqId >= 0 && !prof::P().on && !noDomFast) [[likely]] {
+            const auto domFn = seqs[fastSeqId].fn;
+            bool all = true;
+            for (int id : seqq) all &= seqs[id].fn == domFn;
+            if (all) {
+                for (int id : seqq) nbaNoSkip |= seqEpoch[(size_t)id] == nbaEpoch;
+                auto& b = seqBufs[0];
+                b.clear();
+                for (int id : seqq) {
+                    const size_t n0 = b.size();
+                    seqs[id].fn(seqs[id].ctx, b);
+                    seqPend[id] = 0;
+                    if (b.size() != n0) seqEpoch[(size_t)id] = nbaEpoch;
+                }
+                if (nbaq.empty()) nbaq.swap(b);
+                else nbaq.insert(nbaq.end(), std::make_move_iterator(b.begin()), std::make_move_iterator(b.end()));
+                seqq.clear();
+                nbaNoSkip = false;
+                return;
+            }
+        }
         // The compiled cycle domain's clock groups (one dseq each) share the
         // NBA slots and their list: those run one after another, here.
         // Counted once: with -compile most batches are the domain's, and then
