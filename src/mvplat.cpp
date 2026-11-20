@@ -73,7 +73,7 @@ void usage() {
         "  -harts N           number of harts (overrides the platform)\n"
         "  -threads N         parallel rounds on N threads (default: every CPU; -j N too)\n"
         "  -quantum N         cycles each hart runs between synchronisations (default 1000;\n"
-        "                     10000 when the harts take turns)\n"
+        "                     10000 when the harts take turns, 1000000 with -mt)\n"
         "  -mhz F             hart clock in MHz (default 100)\n"
         "  -max-cycles N      stop after N cycles (exit code 4)\n"
         "  -input TEXT        characters the first UART receives\n"
@@ -84,6 +84,9 @@ void usage() {
         "                     fastest for an SMP OS)\n"
         "  -parallel          harts run in parallel rounds on several threads, with\n"
         "                     write buffers (another interleaving; also with -threads)\n"
+        "  -mt                each hart on a thread of its own, at once, storing to memory\n"
+        "                     directly and translated, as QEMU's MTTCG: the fastest for\n"
+        "                     harts that compute in parallel; a run is not the same twice\n"
         "Booting an operating system (as QEMU's -bios, -kernel, -initrd, -append, -dtb):\n"
         "  -bios FILE         firmware run first, in machine mode (OpenSBI fw_dynamic)\n"
         "  -kernel FILE       kernel (a raw Image or an ELF) the firmware starts in supervisor mode\n"
@@ -125,7 +128,7 @@ struct Options {
     unsigned threads = par::defaultThreads();
     long long quantum = -1, maxCycles = 0;
     double mhz = 0;
-    bool map = false, quiet = false, nojit = false, serial = false, parallel = false, threadsGiven = false;
+    bool map = false, quiet = false, nojit = false, serial = false, parallel = false, threadsGiven = false, mt = false;
     bool haveInput = false;
 };
 
@@ -184,9 +187,12 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     if (pl.get("serial")) m.serial = pl.get("serial")->u64() != 0;
     if (o.parallel || o.threadsGiven) m.serial = false;
     if (o.serial) m.serial = true;
+    if (o.mt && nh > 1) { m.mt = true; m.serial = false; }
     // Taking turns costs a switch per quantum per hart (no thread waits for
     // another), so turns go 10 times as far between them by default.
-    m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : m.serial ? 10000 : 1000;
+    // With -mt a hart sees another's interrupt within a slice (10000 cycles),
+    // so the quantum only paces the devices and can be longer still.
+    m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : m.mt ? 1000000 : m.serial ? 10000 : 1000;
     if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
     if (!m.quantum) throw std::runtime_error("the quantum must be at least one cycle");
     uint64_t reset = pl.get("reset") ? pl.get("reset")->u64() : 0x80000000u;
@@ -535,6 +541,7 @@ int main(int argc, char** argv) {
         else if (s == "-nojit") o.nojit = true;
         else if (s == "-serial") o.serial = true;
         else if (s == "-parallel") o.parallel = true;
+        else if (s == "-mt") o.mt = true;
         else if (!s.empty() && s[0] == '-') {
             int used = 0;
             try {

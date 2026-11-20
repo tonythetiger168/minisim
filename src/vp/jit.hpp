@@ -49,6 +49,7 @@ struct JitCtx {
     uint64_t* mstatus;   // 128: the hart's mstatus (CSRRCI on sstatus)
     uint64_t miss;       // 136: a load or store's address that missed the page cache
     uint8_t* resume;     // 144: where to go back into its block once it is filled
+    uint64_t* resvVal;   // 152: -mt: the value LR read (Hart::resvVal)
 };
 
 struct Jit {
@@ -104,9 +105,13 @@ struct Jit {
     struct Snap { std::unique_ptr<uint8_t[]> b; bool stale = false; };
     std::unordered_map<uint64_t, Snap> pgSnap;
     uint32_t pgGen = 0;  // a view's: the hart's codeGen the shared one was last synced to
+    uint32_t dropSeen = 0;
+    // a view's, with -mt: the shared blocks this hart has looked up, so that
+    // only a block new to it takes the shared one's lock
+    std::unordered_map<PgKey, uint8_t*, PgKeyHash> pgMine;  // a view's, with -mt: the shared one's drops its table was emptied for
     void clearPgJt() {
         clearJt(jtPg, jtPgUsed);
-        for (Jit* v : views) clearJt(v->jtPg, v->jtPgUsed);
+        for (Jit* v : views) { clearJt(v->jtPg, v->jtPgUsed); v->pgMine.clear(); }
     }
 
     Jit() {
@@ -153,9 +158,10 @@ struct Jit {
         flushes++;
     }
     // Code in these physical pages changed (FENCE.I found it so).
-    void dropPages(const std::vector<uint64_t>& pages) {
+    // all: empty the views' tables too (with -mt each hart empties its own).
+    bool dropPages(const std::vector<uint64_t>& pages, bool all = true) {
         for (uint64_t pgn : pages)
-            if (barePages.count(pgn)) { flush(); return; }
+            if (barePages.count(pgn)) { flush(); return true; }
         bool any = false;
         for (uint64_t pgn : pages) {
             auto it = pgByPage.find(pgn);
@@ -167,7 +173,8 @@ struct Jit {
             pgSnap.erase(pgn);
             any = true;
         }
-        if (any) clearPgJt();
+        if (any && all) clearPgJt();
+        return any;
     }
     void setJtPg(uint64_t pc, uint8_t* code) {
         JtEntry& e = jtPg[(pc >> 1) & (JT - 1)];
@@ -192,7 +199,10 @@ struct Jit {
     }
     static void patch(uint64_t site, uint8_t* to) {
         int32_t rel = (int32_t)(to - (uint8_t*)(site + 4));
-        memcpy((void*)site, &rel, 4);
+        // aligned (see Machine::jitCompile's chain): one store, so a hart
+        // running the jump on another thread sees the old target or the new
+        if (!(site & 3)) __atomic_store_n((int32_t*)site, rel, __ATOMIC_RELEASE);
+        else memcpy((void*)site, &rel, 4);
     }
 
     // ---------------------------------------------------------------- emitter

@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat `-mt`: each hart on a host thread of its own, at once (as QEMU's
+  MTTCG): AMOs and LR/SC as host atomics, one shared translation of paged
+  code, rounds of 1000000 cycles with 10000-cycle slices so IPIs arrive
+  within a slice, harts in WFI asleep on their threads. Parallel work runs
+  twice as fast on a 4-CPU host; Linux's boot does not gain there (it waits
+  on hart 0). `tests/vplat/smp.c` keeps its shared counters out of .bss and
+  has a `-DNHARTS` build (`smpmt64.elf`) for harts that start apart.
 - mvplat: the translator runs machine-mode AMOs, LR and SC (taking turns
   or one hart) and plain reads of sstatus in supervisor mode (CSRRS/CSRRC
   with x0, CSRRSI with 0). FENCE.I returns at once when every code page is

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <string>
@@ -87,6 +88,12 @@ public:
     // interleaving than the parallel rounds', also the same on every run,
     // and each hart runs on the fast loop and the translator.
     bool serial = false;
+    // -mt: several harts at once on several threads, each a quantum per
+    // round, storing to memory directly and running translated code, as
+    // QEMU's MTTCG does. Atomics are the host's; LR/SC compares values.
+    // Faster on several cores; a run is not the same twice.
+    bool mt = false;
+    uint64_t mtSlice = 10000;  // -mt: cycles a hart runs between looks at its interrupts
 
     // Debugger state.
     std::set<uint64_t> breakpoints;
@@ -104,7 +111,8 @@ public:
     uint64_t tickPs() const override { return tick_ps; }
     uint64_t cyclePs() const override { return cycle_ps; }
     void requestExit(int code) override {
-        if (!exit_) { exit_ = true; exitCode_ = code; }
+        if (!exit_) { exitCode_ = code; exit_ = true; }
+        mtNotify();
     }
     void irqChanged() override { irqDirty_ = true; }
     // DMA: plain memory directly (the harts see code changed this way after
@@ -220,7 +228,7 @@ public:
                 if (d->memory() && ((d->base | d->size) & 4095))
                     throw std::runtime_error("'" + d->name + "': with more than one hart, memory must start and end on a 4 KiB boundary");
         updateIrqs();
-        if (harts.size() > 1 && threads > 1 && !serial) {
+        if (harts.size() > 1 && threads > 1 && (!serial || mt)) {
             pool_ = std::make_unique<par::Pool>(std::min<unsigned>(threads, (unsigned)harts.size()));
             pool_->spin(20000);
         }
@@ -259,6 +267,7 @@ public:
                 break;
             }
             if (harts.size() == 1) runOne(*harts[0], end);
+            else if (mt) runMt(end);
             else if (serial) runSerial(end);
             else runRound(end);
             if (exit_) break;
@@ -302,6 +311,7 @@ public:
             h.mip = mip;
             if (h.wfi && (h.mip & h.mie)) h.wfi = false;
         }
+        if (mt) mtNotify();
     }
 
     // ------------------------------------------------------------ CSRs
@@ -911,6 +921,8 @@ public:
         if (merge_) cutAfter(h);
         uint64_t t = 0;
         Who w{h.id, h.cycle, true};
+        std::unique_lock<std::mutex> lk(devMu_, std::defer_lock);
+        if (mt) lk.lock();
         Acc r = d->read(a - d->base, n, t, w);
         if (r == Acc::Ok) { v = t; d->nread++; }
         return r;
@@ -927,6 +939,8 @@ public:
         if (merge_) cutAfter(h);
         Who w{h.id, h.cycle, true};
         if (n < 8) v &= (1ull << (8 * n)) - 1;
+        std::unique_lock<std::mutex> lk(devMu_, std::defer_lock);
+        if (mt) lk.lock();
         Acc r = d->write(a - d->base, n, v, w);
         if (r == Acc::Ok) d->nwrite++;
         return r;
@@ -966,6 +980,8 @@ public:
     Acc ramWrite(Hart& h, uint64_t a, unsigned n, uint64_t v) {
         if (tohost && a + n > tohost && a < tohost + 8) {
             if (h.par) return Acc::Pending;
+            std::unique_lock<std::mutex> lk(devMu_, std::defer_lock);
+            if (mt) lk.lock();
             memcpy(h.cPtr + (a - h.cBase), &v, n);
             htif(h);
             return Acc::Ok;
@@ -1092,6 +1108,62 @@ public:
         return devWrite(h, a, n, v);
     }
     // An AMO needs write permission for its read too.
+    // -mt: where an atomic access of n bytes at a is in host memory (plain
+    // memory, allowed as a whole), or null: r says a fault, else the access
+    // takes the locked general path (a device, PMP, ...).
+    uint8_t* mtHost(Hart& h, uint64_t a, unsigned n, bool st, Acc& r) {
+        r = Acc::Ok;
+        if (dataXlat(h)) {
+            uint8_t* p = nullptr;
+            if (!dataPage(h, a, st, p, r)) { r = Acc::Ok; return nullptr; }
+            return p;
+        }
+        if (h.pmpLock || dataPriv(h) != 3) return nullptr;
+        Device* d = bus.find(a);
+        if (!d || !d->memory() || a + n > d->base + d->size || (st && !d->writable()) ||
+            (tohost && a + n > tohost && a < tohost + 8))
+            return nullptr;
+        return d->memory() + (a - d->base);
+    }
+    // -mt: an AMO (f5) of a T at p with operand b (AMOCAS: expected c), as
+    // one host atomic; the old value.
+    template <class T> static uint64_t mtAmo(uint8_t* p, unsigned f5, uint64_t b, uint64_t c) {
+        using S = std::make_signed_t<T>;
+        T* const q = (T*)p;
+        const T v = (T)b;
+        if (f5 == 0x01) return (uint64_t)__atomic_exchange_n(q, v, __ATOMIC_SEQ_CST);
+        if (f5 == 0x00) return (uint64_t)__atomic_fetch_add(q, v, __ATOMIC_SEQ_CST);
+        if (f5 == 0x04) return (uint64_t)__atomic_fetch_xor(q, v, __ATOMIC_SEQ_CST);
+        if (f5 == 0x08) return (uint64_t)__atomic_fetch_or(q, v, __ATOMIC_SEQ_CST);
+        if (f5 == 0x0c) return (uint64_t)__atomic_fetch_and(q, v, __ATOMIC_SEQ_CST);
+        if (f5 == 0x05) {
+            T e = (T)c;
+            __atomic_compare_exchange_n(q, &e, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            return (uint64_t)e;
+        }
+        T old = __atomic_load_n(q, __ATOMIC_SEQ_CST), w;
+        do {
+            switch (f5) {
+                case 0x10: w = (S)old < (S)v ? old : v; break;
+                case 0x14: w = (S)old > (S)v ? old : v; break;
+                case 0x18: w = old < v ? old : v; break;
+                default: w = old > v ? old : v; break;
+            }
+        } while (!__atomic_compare_exchange_n(q, &old, w, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        return (uint64_t)old;
+    }
+    template <class T> static bool mtCas(uint8_t* p, uint64_t expect, uint64_t v) {
+        T e = (T)expect;
+        return __atomic_compare_exchange_n((T*)p, &e, (T)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    template <class F> static uint64_t bySize(unsigned n, F&& f) {
+        switch (n) {
+            case 1: return f((uint8_t)0);
+            case 2: return f((uint16_t)0);
+            case 4: return f((uint32_t)0);
+            default: return f((uint64_t)0);
+        }
+    }
     Acc amoCheck(Hart& h, uint64_t a) {
         if (!dataXlat(h)) return Acc::Ok;
         uint64_t pa;
@@ -1327,7 +1399,7 @@ private:
     // kernel's code is the same for each).
     Jit* jitForPg(Hart& h) {
         Jit* v = jitFor(h);
-        if (!v || !serial || harts.size() < 2) return v;
+        if (!v || !(serial || mt) || harts.size() < 2) return v;
         if (!pgShared_) {
             pgShared_.reset(new Jit);
             if (pgShared_->failed) return nullptr;
@@ -1344,12 +1416,25 @@ private:
     // pg: from the paged run loop, where v is a view of the shared one (only
     // a view's pgGen says what the shared one was synced to)
     void jitSync(Hart& h, Jit& v, bool pg = false) {
-        Jit* s = serial && harts.size() > 1 ? pgShared_.get() : nullptr;
+        Jit* s = (serial || mt) && harts.size() > 1 ? pgShared_.get() : nullptr;
         if (v.gen != h.codeGen) { v.flush(); v.gen = h.codeGen; }
-        if (s && pg && v.pgGen != h.codeGen) { s->flush(); v.pgGen = h.codeGen; }
+        if (s && pg && v.pgGen != h.codeGen) {
+            if (mt) mtExclusive([&] { s->flush(); });
+            else s->flush();
+            v.pgGen = h.codeGen;
+        }
+        // -mt: another hart dropped shared blocks; this hart's table may
+        // still point at them
+        if (s && mt && v.dropSeen != pgDropGen_.load(std::memory_order_acquire)) {
+            v.dropSeen = pgDropGen_.load(std::memory_order_acquire);
+            Jit::clearJt(v.jtPg, v.jtPgUsed);
+            v.pgMine.clear();
+        }
         if (!h.codeChanged.empty()) {
             v.dropPages(h.codeChanged);
             if (s) {
+                std::unique_lock<std::mutex> lk(jitMu_, std::defer_lock);
+                if (mt) lk.lock();
                 std::vector<uint64_t> gone;
                 for (uint64_t pg : h.codeChanged) {
                     auto it = s->pgSnap.find(pg);
@@ -1360,6 +1445,8 @@ private:
                             // translated from what is there now: kept, so this
                             // hart's FENCE.I has to watch the page again (all of it)
                             noteCode(h, pg << 12, hp[0] | (uint32_t)hp[1] << 8, 2);
+                            std::unique_lock<std::mutex> cl(h.codeMu, std::defer_lock);
+                            if (mt) cl.lock();
                             auto c = h.codePages.find(pg);
                             if (c != h.codePages.end()) c->second.used = ~0ull;
                             continue;
@@ -1367,7 +1454,12 @@ private:
                     }
                     gone.push_back(pg);
                 }
-                s->dropPages(gone);
+                if (!mt) s->dropPages(gone);
+                else if (s->dropPages(gone, false)) {
+                    Jit::clearJt(v.jtPg, v.jtPgUsed);
+                    v.pgMine.clear();
+                    v.dropSeen = ++pgDropGen_;
+                }
             }
             h.codeChanged.clear();
         }
@@ -1420,7 +1512,7 @@ private:
             uint8_t k = fastKind(insn, true, imm);
             if (!k) {
                 k = jitKind(insn, pg);
-                if (k == J_AMO && harts.size() > 1 && !serial) k = K_NONE;  // AMOs break other harts' reservations
+                if (k == J_AMO && harts.size() > 1 && !serial && !mt) k = K_NONE;  // AMOs break other harts' reservations
                 if (k == J_AMO) imm = (int32_t)((insn >> 27) | ((insn >> 12) & 7) << 8);  // funct5, width
                 else if (k == J_CBOZ) imm = 0;
                 else if (k == J_ZU || k == J_ZB) imm = zbbOp(insn);
@@ -1448,7 +1540,10 @@ private:
             if (k >= K_JAL && k <= K_BGEU) { ctl = true; break; }
         }
         if (!pg && !n && p - cb >= region) return nullptr;
-        if (J.used + 16384 > Jit::BUF) J.flush();
+        if (J.used + 16384 > Jit::BUF) {
+            if (mt && &J == pgShared_.get()) return nullptr;  // emptied with the others stopped (jitRunPg)
+            J.flush();
+        }
         if (pg && n && &J == pgShared_.get()) {  // the bytes it was translated from (Jit::pgSnap)
             Jit::Snap& sn = J.pgSnap[pa0 >> 12];
             if (!sn.b) {
@@ -1572,7 +1667,12 @@ private:
             if (hr[rd] >= 0) { J.movRR(hr[rd], reg); dirty |= 1u << rd; }
             else J.stg(rd, reg);
         };
-        auto chain = [&](uint64_t to) { links[nl++] = Link{J.jmp(), to}; };
+        auto chain = [&](uint64_t to) {
+            // -mt: a jump another hart may run while it is patched: its
+            // displacement 4-aligned, written in one store (Jit::patch)
+            if (mt) while (((uintptr_t)J.p + 1) & 3) J.b(0x90);
+            links[nl++] = Link{J.jmp(), to};
+        };
         // Go to the block at rax through the indirect-jump table, or leave
         // for the run loop to find it.
         auto jtLook = [&] {
@@ -1851,6 +1951,10 @@ private:
                         J.rex(false, 0, R::R11); J.b(0xc6); J.mem(0, R::R11, 0); J.b(1);    // resv = 1
                         amoPtr(false, w ? 8 : 4);
                         J.rex(w, R::RCX, R::RAX); J.b(0x8b); J.mem(R::RCX, R::RAX, 0);
+                        if (mt) {  // the value, for SC to compare
+                            J.ldCtx(R::R11, 152);
+                            J.rex(true, R::RCX, R::R11); J.b(0x89); J.mem(R::RCX, R::R11, 0);
+                        }
                         if (!w) J.movsxd(R::RCX, R::RCX);
                         put(o.rd, R::RCX);
                         break;
@@ -1864,12 +1968,23 @@ private:
                         J.rex(false, 7, R::R11); J.b(0x80); J.mem(7, R::R11, 0); J.b(0);    // cmp byte resv, 0
                         uint8_t* f2 = J.jcc(R::CC_E);
                         amoPtr(true, w ? 8 : 4);
-                        ld(R::RCX, o.rs2, w);
-                        J.rex(w, R::RCX, R::RAX); J.b(0x89); J.mem(R::RCX, R::RAX, 0);
+                        uint8_t* f3 = nullptr;
+                        if (mt) {  // stores only if the word still holds what LR read
+                            J.movRR(R::R11, R::RAX);
+                            J.ldCtx(R::RCX, 152);
+                            J.rex(true, R::RAX, R::RCX); J.b(0x8b); J.mem(R::RAX, R::RCX, 0);
+                            ld(R::RCX, o.rs2, w);
+                            J.b(0xf0); J.rex(w, R::RCX, R::R11); J.b(0x0f); J.b(0xb1); J.mem(R::RCX, R::R11, 0);  // lock cmpxchg
+                            f3 = J.jcc(R::CC_NE);
+                        } else {
+                            ld(R::RCX, o.rs2, w);
+                            J.rex(w, R::RCX, R::RAX); J.b(0x89); J.mem(R::RCX, R::RAX, 0);
+                        }
                         J.aluRR(R::A_XOR, R::RAX, R::RAX, false);
                         uint8_t* done = J.jmp();
                         Jit::fix(f1, J.p);
                         Jit::fix(f2, J.p);
+                        if (f3) Jit::fix(f3, J.p);
                         J.movI(R::RAX, 1);
                         Jit::fix(done, J.p);
                         J.ldCtx(R::R11, 112);
@@ -1878,6 +1993,32 @@ private:
                         break;
                     }
                     amoPtr(true, w ? 8 : 4);
+                    if (mt && f5 != 0x01) {  // host atomics: lock xadd, or a lock cmpxchg loop
+                        if (f5 == 0x00) {
+                            ld(R::RCX, o.rs2, w);
+                            J.b(0xf0); J.rex(w, R::RCX, R::RAX); J.b(0x0f); J.b(0xc1); J.mem(R::RCX, R::RAX, 0);
+                            if (!w) J.movsxd(R::RCX, R::RCX);
+                            put(o.rd, R::RCX);
+                            break;
+                        }
+                        J.movRR(R::R11, R::RAX);
+                        J.rex(w, R::RAX, R::R11); J.b(0x8b); J.mem(R::RAX, R::R11, 0);   // rax = old
+                        uint8_t* again = J.p;
+                        ld(R::RCX, o.rs2, w);
+                        static const uint8_t cmovm[4] = {0x4c, 0x4f, 0x42, 0x47};
+                        if (f5 == 0x04) J.aluRR(R::A_XOR, R::RCX, R::RAX, w);
+                        else if (f5 == 0x08) J.aluRR(R::A_OR, R::RCX, R::RAX, w);
+                        else if (f5 == 0x0c) J.aluRR(R::A_AND, R::RCX, R::RAX, w);
+                        else {  // rcx = rs2; if old (cc) rs2, rcx = old
+                            J.aluRR(R::A_CMP, R::RAX, R::RCX, w);
+                            J.rex(w, R::RCX, R::RAX); J.b(0x0f); J.b(cmovm[(f5 - 0x10) >> 2]); J.modrr(R::RCX, R::RAX);
+                        }
+                        J.b(0xf0); J.rex(w, R::RCX, R::R11); J.b(0x0f); J.b(0xb1); J.mem(R::RCX, R::R11, 0);  // lock cmpxchg
+                        Jit::fix(J.jcc(R::CC_NE), again);
+                        if (!w) J.movsxd(R::RAX, R::RAX);
+                        put(o.rd, R::RAX);
+                        break;
+                    }
                     ld(R::RCX, o.rs2, w);
                     int res = R::RCX;
                     if (f5 == 0x01) {        // xchg [rax], rcx
@@ -2079,6 +2220,8 @@ private:
     // An instruction of n bytes (raw) was decoded from physical address fa:
     // record its page for FENCE.I (see Hart::codePages).
     void noteCode(Hart& h, uint64_t fa, uint32_t raw, unsigned n) {
+        std::unique_lock<std::mutex> cl(h.codeMu, std::defer_lock);
+        if (mt) cl.lock();
         if (h.codeUntracked) return;
         const uint64_t pg = fa >> 12;
         auto it = h.codePages.find(pg);
@@ -2131,6 +2274,8 @@ private:
     std::unordered_map<Device*, int> wrIds_;
     // FENCE.I: forget what was decoded from pages that changed.
     void fenceI(Hart& h) {
+        std::unique_lock<std::mutex> cl(h.codeMu, std::defer_lock);
+        if (mt) cl.lock();
         if (h.codeUntracked || (h.par && !h.ov.empty())) {
             h.flushDecoded();
             h.fenceFull++;
@@ -2192,7 +2337,7 @@ private:
         Jit& J = *jp;
         jitSync(h, J);
         JitCtx c{r, left, cp, cb, span, pc, 0, sspan, th, 0, J.jt, nullptr, nullptr, 0,
-                 (uint8_t*)&h.resv, &h.resvAddr, &h.mstatus};
+                 (uint8_t*)&h.resv, &h.resvAddr, &h.mstatus, 0, nullptr, &h.resvVal};
         uint8_t* code = J.find(pc);
         if (!code && !(code = jitCompile(J, h, pc))) return;
         for (;;) {
@@ -2227,6 +2372,12 @@ private:
         if (!jp) { jit = false; return; }
         Jit& J = *jp;   // blocks
         Jit& V = *vp_;  // this hart's indirect-jump table
+        // -mt with the shared translator: its tables under jitMu_, and its
+        // buffer emptied only with every other hart stopped
+        const bool sh = mt && &J == pgShared_.get();
+        const size_t room = 16384 * (harts.size() + 1);
+        if (sh && __atomic_load_n(&J.used, __ATOMIC_RELAXED) + room > Jit::BUF)
+            mtExclusive([&] { if (J.used + room > Jit::BUF) J.flush(); });
         jitSync(h, V, true);
         if (V.pgFpGen != h.fpGen || V.pgPriv != h.priv) {
             Jit::clearJt(V.jtPg, V.jtPgUsed);
@@ -2257,7 +2408,7 @@ private:
         }
         static_assert(sizeof(Hart::DataPage) == 16 && offsetof(Hart::DataPage, tag) == 0, "the translator's page cache lookup");
         JitCtx c{r, left, nullptr, 0, 0, pc, 0, 0, 0, 0, V.jtPg, h.dl, h.ds, (uint64_t)dataCtx(h) << 52,
-                 (uint8_t*)&h.resv, &h.resvAddr, &h.mstatus};
+                 (uint8_t*)&h.resv, &h.resvAddr, &h.mstatus, 0, nullptr, &h.resvVal};
         auto look = [&](uint64_t v, bool stepv) -> uint8_t* {
             if (!stepv) {
                 const Jit::JtEntry& t = V.jtPg[(v >> 1) & (Jit::JT - 1)];
@@ -2266,6 +2417,12 @@ private:
             const Hart::FetchPage& e = h.fp[(v >> 12) & (Hart::FP_SIZE - 1)];
             if (e.vpn != v >> 12 || e.priv != h.priv) return nullptr;
             const uint64_t pa = e.pa | (v & 0xfff);
+            if (sh && !stepv) {
+                auto m = V.pgMine.find(Jit::PgKey{v, pa});
+                if (m != V.pgMine.end()) { V.setJtPg(v, m->second); return m->second; }
+            }
+            std::unique_lock<std::mutex> lk(jitMu_, std::defer_lock);
+            if (sh) lk.lock();
             auto it = J.pg.find(Jit::PgKey{v, pa});
             uint8_t* code = nullptr;
             if (it != J.pg.end() && it->second.pa == pa) code = stepv ? it->second.step : it->second.code;
@@ -2273,7 +2430,10 @@ private:
             // turn or an interrupt left off once does not get a block
             if (!code && !stepv && ++J.pgCold[v] < 2) return nullptr;
             if (!code) code = jitCompile(J, h, v, stepv, true, pa);
-            if (code && !stepv) V.setJtPg(v, code);
+            if (code && !stepv) {
+                V.setJtPg(v, code);
+                if (sh) V.pgMine[Jit::PgKey{v, pa}] = code;
+            }
             return code;
         };
         // A load or store that missed the page cache: fill it and go back
@@ -2315,7 +2475,11 @@ private:
             const uint64_t fl = J.flushes;
             code = look(c.pc, false);
             if (!code) break;
-            if (c.link && J.flushes == fl) Jit::patch(c.link, code);
+            if (c.link && J.flushes == fl) {
+                std::unique_lock<std::mutex> lk(jitMu_, std::defer_lock);
+                if (sh) lk.lock();
+                Jit::patch(c.link, code);
+            }
         }
         pc = c.pc;
         left = c.left;
@@ -2677,17 +2841,53 @@ private:
         }
     }
     void breakReservations(Hart& h, uint64_t a) {
+        if (mt) return;  // SC compares values there
         for (auto& o : harts)
             if (o.get() != &h && o->resv && (o->resvAddr & ~7ull) == (a & ~7ull)) o->resv = false;
     }
 
-    bool exit_ = false;
+    std::atomic<bool> exit_{false};
     int exitCode_ = 0;
     bool merge_ = false;            // run() merged quanta (one hart, nothing timed)
     uint64_t cut_ = UINT64_MAX;     // where merged quanta end after a device access
     std::vector<std::unique_ptr<Jit>> jits_;  // by hart id, made on first use
     std::unique_ptr<Jit> pgShared_;           // -serial: paged code, for every hart (jitForPg)
-    bool irqDirty_ = false;
+    std::atomic<bool> irqDirty_{false};
+    std::mutex devMu_;  // -mt: devices, HTIF and the interrupt lines, one hart at a time
+    std::mutex amoMu_;
+    std::mutex jitMu_;  // -mt: the shared translator's tables and buffer (jitRunPg, jitSync)
+    std::atomic<uint32_t> pgDropGen_{0};  // -mt: shared blocks dropped (Jit::dropSeen)
+    // -mt: one hart at a time may stop the others (mtExclusive); they wait
+    // between slices (mtPark). active_: harts in runMt's body, not waiting.
+    std::mutex stwMu_;
+    std::atomic<bool> stopReq_{false};
+    // -mt: harts in WFI sleep on this; bumped when an interrupt line, the
+    // running count or exit changes
+    std::atomic<uint32_t> mtWake_{0};
+    void mtNotify() {
+        if (!inMt_) return;
+        mtWake_.fetch_add(1);
+        mtWake_.notify_all();
+    }
+    std::atomic<int> active_{0};
+    bool inMt_ = false;
+    void mtPark() {
+        if (!stopReq_.load()) return;
+        active_--;
+        for (unsigned sp = 0; stopReq_.load();)
+            if (++sp < 4096) mtRelax(); else std::this_thread::yield();
+        active_++;
+    }
+    template <class F> void mtExclusive(F&& f) {
+        if (!inMt_) { f(); return; }
+        while (!stwMu_.try_lock()) { mtPark(); mtRelax(); }
+        stopReq_.store(true);
+        for (unsigned sp = 0; active_.load() > 1;)
+            if (++sp < 4096) mtRelax(); else std::this_thread::yield();
+        f();
+        stopReq_.store(false);
+        stwMu_.unlock();
+    }  // -mt: atomics that are not one host atomic (a device, a register pair)
     uint64_t gcycle_ = 0;
     uint64_t consoleBytes_ = 0;
     std::unique_ptr<par::Pool> pool_;
@@ -2763,6 +2963,96 @@ private:
             h.resv = false;
             if (exit_) break;
         }
+    }
+
+    // -mt: every hart runs its quantum at once, on the pool's threads.
+    // -mt: every hart on its own host thread for the whole round. A round
+    // ends at the quantum or the next timer compare, so it can be long; within
+    // it each hart runs slices of mtSlice cycles, so an interrupt another hart
+    // raises (an IPI) is seen within a slice. A hart in WFI waits on its own
+    // thread for an interrupt and then takes up the time the others have got
+    // to, or the round's end once no hart is running.
+    void runMt(uint64_t end) {
+        for (auto& hp : harts) jitForPg(*hp);  // made here, not by the workers
+        std::atomic<unsigned> running{0};
+        std::atomic<uint64_t> front{gcycle_};
+        auto pub = [&](uint64_t c) {
+            uint64_t f = front.load(std::memory_order_relaxed);
+            while (f < c && !front.compare_exchange_weak(f, c, std::memory_order_relaxed)) {}
+        };
+        // A hart only waits in WFI when every hart has a thread of its own;
+        // with fewer threads it would hold up the harts queued behind it.
+        const bool own = pool_ && pool_->size() >= harts.size();
+        // Every hart starts the round together: a worker thread can take tens
+        // of microseconds to wake, millions of instructions to the others.
+        std::atomic<unsigned> arrived{0};
+        auto body = [&](size_t i) {
+            Hart& h = *harts[i];
+            h.stop = Stop::Budget;
+            // Each hart counts itself in before the start, so a hart another
+            // wakes before its own thread gets here is counted once.
+            bool run = h.cycle < end && !(__atomic_load_n(&h.wfi, __ATOMIC_ACQUIRE) &&
+                                          !(__atomic_load_n(&h.mip, __ATOMIC_RELAXED) & __atomic_load_n(&h.mie, __ATOMIC_RELAXED)));
+            if (run) running++;
+            active_++;
+            struct Out { std::atomic<int>& a; ~Out() { a--; } } out{active_};
+            if (own) {
+                arrived++;
+                for (unsigned sp = 0; arrived.load(std::memory_order_acquire) < harts.size();)
+                    if (++sp < 4096) mtRelax(); else std::this_thread::yield();
+            }
+            if (h.cycle >= end) return;
+            for (;;) {
+                mtPark();
+                if (exit_) { h.stop = Stop::Exit; break; }
+                if (__atomic_load_n(&h.wfi, __ATOMIC_ACQUIRE)) {
+                    if (!own) { h.cycle = std::max(h.cycle, end); break; }
+                    if (run) { run = false; if (--running == 0) mtNotify(); }
+                    // waiting: not running translated code, so mtExclusive
+                    // does not wait for it
+                    active_--;
+                    for (unsigned spins = 0;;) {
+                        const uint32_t w = mtWake_.load();
+                        if (!__atomic_load_n(&h.wfi, __ATOMIC_ACQUIRE) || exit_) break;
+                        if (__atomic_load_n(&h.mip, __ATOMIC_RELAXED) & __atomic_load_n(&h.mie, __ATOMIC_RELAXED)) break;
+                        if (!running.load()) break;
+                        if (++spins < 256) mtRelax();
+                        else mtWake_.wait(w);
+                    }
+                    active_++;
+                    mtPark();
+                    if (exit_) { h.stop = Stop::Exit; break; }
+                    if (__atomic_load_n(&h.wfi, __ATOMIC_ACQUIRE) &&
+                        !(__atomic_load_n(&h.mip, __ATOMIC_RELAXED) & __atomic_load_n(&h.mie, __ATOMIC_RELAXED))) {
+                        h.cycle = std::max(h.cycle, end);  // nobody is left to wake it
+                        break;
+                    }
+                    run = true;
+                    running++;
+                    h.cycle = std::max(h.cycle, std::min(front.load(std::memory_order_relaxed), end));
+                }
+                if (h.cycle >= end) break;
+                Stop s = exec(h, std::min(end, h.cycle + mtSlice));
+                pub(h.cycle);
+                if (s != Stop::Budget) { h.stop = s; break; }
+            }
+            if (run && --running == 0) mtNotify();
+        };
+        inMt_ = true;
+        if (pool_) pool_->run(harts.size(), body);
+        else for (size_t i = 0; i < harts.size(); i++) body(i);
+        inMt_ = false;
+        flushTrace();
+        if (irqDirty_) updateIrqs();
+        for (auto& hp : harts)
+            if (hp->stop == Stop::Break) { breakHart(*hp); hp->stop = Stop::Budget; }
+    }
+    static void mtRelax() {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#else
+        std::this_thread::yield();
+#endif
     }
 
     // Several harts: rounds of a parallel phase and an ordered phase.
@@ -3219,6 +3509,40 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
                     return n == 1 ? (uint64_t)(int64_t)(int8_t)t : n == 2 ? (uint64_t)(int64_t)(int16_t)t : n == 4 ? W(t) : t;
                 };
                 const unsigned xw = rv64 ? 8 : 4;
+                // -mt: one host atomic on plain memory; anything else with
+                // the other harts' atomics held off
+                std::unique_lock<std::mutex> amoLk(amoMu_, std::defer_lock);
+                if (mt && !(cas && n > xw)) {
+                    Acc r;
+                    uint8_t* const hp = mtHost(h, a, n, f5 != 2, r);
+                    if (!hp && r != Acc::Ok) MEMFAIL(r, f5 == 2 ? 5 : 7, a);
+                    if (hp) {
+                        const uint64_t nm = n == 8 ? ~0ull : (1ull << (8 * n)) - 1;
+                        if (f5 == 2) {                                  // LR
+                            if (rs2) ILLEGAL();
+                            v = bySize(n, [&](auto t) { return (uint64_t)__atomic_load_n((decltype(t)*)hp, __ATOMIC_SEQ_CST); });
+                            RD(ext(v));
+                            h.resv = true; h.resvAddr = a; h.resvVal = v;
+                            memAcc = true; memA = a; memN = n;
+                            break;
+                        }
+                        if (f5 == 3) {                                  // SC: stores if the value is still there
+                            const uint64_t nv = x[rs2];
+                            bool ok = h.resv && h.resvAddr == a &&
+                                      bySize(n, [&](auto t) { return (uint64_t)mtCas<decltype(t)>(hp, h.resvVal, nv); });
+                            h.resv = false;
+                            RD(ok ? 0 : 1);
+                            if (ok) { memAcc = true; memW = true; memA = a; memN = n; memV = nv & nm; }
+                            break;
+                        }
+                        const uint64_t b = x[rs2], c = cas ? x[rd] : 0;
+                        v = ext(bySize(n, [&](auto t) { return mtAmo<decltype(t)>(hp, f5, b, c); }));
+                        RD(v);
+                        memAcc = true; memW = true; memA = a; memN = n;
+                        break;
+                    }
+                }
+                if (mt) amoLk.lock();
                 if (cas && n > xw) {                                   // AMOCAS on a register pair
                     if ((rd & 1) || (rs2 & 1)) ILLEGAL();
                     Acc r = amoCheck(h, a);
@@ -3585,7 +3909,10 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
         }
         // An interrupt source may have changed (a CSR write, an MMIO write):
         // the caller re-evaluates between instructions in the ordered phase.
-        if (irqDirty_ && !h.par) { updateIrqs(); }
+        if (irqDirty_ && !h.par) {
+            if (mt) { std::lock_guard<std::mutex> l(devMu_); updateIrqs(); }
+            else updateIrqs();
+        }
         continue;
     next_insn:
         if (h.stepping) { h.stepping = false; h.stopSig = 5; return Stop::Break; }

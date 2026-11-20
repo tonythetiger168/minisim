@@ -11,6 +11,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 
 #include <cstdint>
 #include <cstdlib>
@@ -280,6 +281,7 @@ struct Hart {
     bool wfi = false;
     bool resv = false;
     uint64_t resvAddr = 0;
+    uint64_t resvVal = 0;  // -mt: the value LR read; SC stores only if it is still there
 
     // Run state.
     bool par = false;       // in the parallel phase of a round
@@ -346,6 +348,9 @@ struct Hart {
     };
     static constexpr size_t CODE_PAGES = 2048;
     std::unordered_map<uint64_t, CodePage> codePages;
+    // -mt: a block of the shared translator notes its page in every hart's
+    // codePages, from whichever thread translated it
+    std::mutex codeMu;
     bool codeUntracked = false;
     uint64_t fenceFull = 0, fencePart = 0, fencePages = 0;
     // The last FENCE.I left every code page watched and unchanged, and the
