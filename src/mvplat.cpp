@@ -73,7 +73,7 @@ void usage() {
         "  -harts N           number of harts (overrides the platform)\n"
         "  -threads N         parallel rounds on N threads (default: every CPU; -j N too)\n"
         "  -quantum N         cycles each hart runs between synchronisations (default 1000;\n"
-        "                     10000 with -serial)\n"
+        "                     10000 when the harts take turns)\n"
         "  -mhz F             hart clock in MHz (default 100)\n"
         "  -max-cycles N      stop after N cycles (exit code 4)\n"
         "  -input TEXT        characters the first UART receives\n"
@@ -185,7 +185,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
     if (o.parallel || o.threadsGiven) m.serial = false;
     if (o.serial) m.serial = true;
     // Taking turns costs a switch per quantum per hart (no thread waits for
-    // another), so -serial goes 10 times as far between them by default.
+    // another), so turns go 10 times as far between them by default.
     m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : m.serial ? 10000 : 1000;
     if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
     if (!m.quantum) throw std::runtime_error("the quantum must be at least one cycle");

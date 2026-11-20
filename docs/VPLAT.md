@@ -140,7 +140,7 @@ after a trap, `vsetvl` corners, the estimates) against scalar models; both
 on RV32 and RV64; together they use 226 distinct vector instruction forms.
 The vector loops run under Linux too, in three processes at once.
 
-**Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000, 10000 with `-serial`) on
+**Time.** Each hart runs a quantum of cycles (`-quantum`, default 1000 in parallel rounds, 10000 when the harts take turns) on
 its own and then the platform synchronises: devices see time move and
 interrupts are re-evaluated. This is SystemC TLM-2.0's temporal decoupling.
 A quantum ends early at the next timer compare and at the next callback an
@@ -451,7 +451,7 @@ for it.
 | `-elf FILE` | the program (or give it as the first plain argument) |
 | `-harts N` | override the platform's hart count |
 | `-threads N`, `-j N` | threads for the harts (default: every CPU) |
-| `-quantum N` | cycles between synchronisations (default 1000; 10000 with `-serial`) |
+| `-quantum N` | cycles between synchronisations (default 1000; 10000 when the harts take turns) |
 | `-serial` | harts take turns on one thread, no write buffers (the default with several harts; see above) |
 | `-parallel` | parallel rounds with write buffers, on `-threads` threads (also implied by `-threads`) |
 | `-mhz F` | hart clock |
@@ -535,11 +535,19 @@ virtual pc through the fetch page record and translated from the physical
 address the pc has then (so another mapping of the same code gets its own
 translation); it links straight only to blocks in its own page, and goes
 to others through the table, which is emptied with the TLB (SFENCE.VMA
-with an address empties only what lies in that address's 1 GiB, the
-largest page that can map it with Sv39). Loads, stores,
-the AMOs, LR and SC (one hart, or `-serial`) and CBO.ZERO look their page up in the
-hart's data page caches inline; a miss, a device, an access across a page
-or a misaligned AMO leaves for the general path. CSRRCI on sstatus in
+with an address empties only that address's 4 KiB page, unless the
+address lies in a superpage something was translated through since the
+last full flush; then everything in its 1 GiB, the largest page that can
+map it with Sv39). Loads, stores,
+the AMOs, LR and SC (one hart, or taking turns) and CBO.ZERO look their page up in the
+hart's data page caches (2048 pages each, emptied in O(1) by an epoch in
+the tags) inline. A load or store that misses fills the cache from the
+TLB or a page walk and goes back into its block; a device, a fault, an
+access across a page or a misaligned AMO leaves for the general path. A
+block is translated the second time its pc is looked for, so a pc where
+a turn or an interrupt left off once costs no translation. Harts taking
+turns share the translations; FENCE.I on one hart drops a page's only if
+the page differs from what they were translated from. CSRRCI on sstatus in
 supervisor mode (clearing SIE, which lets no interrupt in) is translated;
 other CSR instructions leave. The budget is checked once per block; when
 the quantum ends inside a block, a counting copy of that block runs the
