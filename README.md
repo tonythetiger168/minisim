@@ -559,7 +559,7 @@ copy of up to 64 bits (`MSIM_NOBITRUNS`): OpenTitan's 300 us from 55 s to
 of them per run (`if (!rst_ni) q <= '0; else q <= d;`), gets no NBA when the
 new value equals the old one (`MSIM_NONBASKIP`): 99% of OpenTitan's NBAs
 changed nothing, and its boot to `TEST PASSED` went from 346 s to 283 s of
-run time. `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
+run time (277 s once registers wider than 64 bits are included). `MSIM_LOOPDBG=N` lists the comb blocks run after N runs at one time
 step, and the signals they change, then stops.
 
 ### Static combinational schedule

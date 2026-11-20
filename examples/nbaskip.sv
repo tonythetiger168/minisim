@@ -2,7 +2,7 @@
 // register, when that NBA is the register's only write in the design
 // (msim.cpp soleNbaTargets, Sim::nbaKeep; MSIM_NONBASKIP=1: off). Most
 // registers keep their value on most edges: 99% of OpenTitan's NBAs.
-// e has two NBAs on exclusive branches (a reset and a value): also checked.
+// w is wider than 64 bits. e has two NBAs on exclusive branches (a reset and a value): also checked.
 // The cases where leaving one out would be wrong must still print the same:
 //  - r: two NBAs in one process (a default, then an override),
 //  - b: also written by a task (a blocking write between the edge and the NBA region),
@@ -12,11 +12,13 @@ module nbaskip;
   reg clk = 0, clk2 = 0, d = 0;
   reg [7:0] q, r = 0, b, c, e;
   reg [3:0] cnt = 0;
+  reg [99:0] w;
   always @(posedge clk) q <= cnt[1] ? 8'd5 : 8'd0;
   always @(posedge clk) begin r <= r; if (cnt[0]) r <= r + 8'd1; end
   always @(posedge clk) b <= 8'd7;
   always @(posedge clk) if (cnt[3:1] == 3'd0) e <= 8'd1; else e <= 8'd2;
   always @(posedge clk) cnt <= cnt + 4'd1;
+  always @(posedge clk) w <= {cnt[3:2], 98'h1};
   always @(posedge clk2) c <= {7'd0, d};
   task poke_b; b = 8'd9; endtask
   initial begin
@@ -26,5 +28,5 @@ module nbaskip;
     #1 $display("q=%0d r=%0d b=%0d c=%0d e=%0d (c: want 0)", q, r, b, c, e);
     $finish;
   end
-  always @(q or r or b or e) $display("%0t q=%0d r=%0d b=%0d e=%0d", $time, q, r, b, e);
+  always @(q or r or b or e or w) $display("%0t q=%0d r=%0d b=%0d e=%0d w=%h", $time, q, r, b, e, w);
 endmodule

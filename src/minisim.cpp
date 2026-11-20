@@ -870,7 +870,12 @@ struct Sim {
         if (nbaNoSkip) return true;
         const Sig& g = sigs[(size_t)s];
         const Val& cur = g.val;
-        if (g.w > 64 || (g.fl & (SF_HELD | SF_PART | SF_PATHV)) || !cur.hi.empty() || nv.real || nv.str || cur.real || cur.str) return true;
+        if ((g.fl & (SF_HELD | SF_PART | SF_PATHV)) || nv.real || nv.str || cur.real || cur.str) return true;
+        if (g.w > 64 || !cur.hi.empty()) {   // as set() compares a wide value
+            Val m = maskWidth(nv, g.w);
+            m.sgn = false;
+            return !(m == cur);
+        }
         const uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
         const uint64_t x = nv.x & m;   // as set() masks it
         return (nv.v & m & ~x) != (cur.v & m & ~cur.x) || x != (cur.x & m) || (nv.z & m) != (cur.z & m);
