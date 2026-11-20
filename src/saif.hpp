@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -35,6 +36,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <sys/stat.h>
 
 #include "parallel.hpp"
 #include "wave_reader.hpp"
@@ -191,6 +193,22 @@ void scan(const wave::Wave& w, uint64_t start, uint64_t end, Bit* out, F&& toggl
     for (int j = 0; j < width; j++) close(j, std::max(end, st[j].last));
 }
 
+// One Sig per name of the waveform; aliases share their wave's bits.
+inline void sigsFrom(const wave::Reader& r, Db& db, const std::vector<uint32_t>& base) {
+    for (auto& [name, w] : r.byName) {
+        Sig s{base[(size_t)w], r.waves[(size_t)w].width, w};
+        // "[7:0]", "[0:7]", "[11:4]": the declared range, when it fits the width
+        if (auto it = r.range.find(name); it != r.range.end()) {
+            int m = 0, l = 0;
+            if (std::sscanf(it->second.c_str(), " [ %d : %d ]", &m, &l) == 2 && std::abs(m - l) + 1 == s.width) {
+                s.msb = m;
+                s.step = m >= l ? -1 : 1;
+            }
+        }
+        db.sigs[name] = s;
+    }
+}
+
 // Sums a loaded waveform into the Db: one run of bits per signal, every name
 // of an aliased signal pointing at the same run.
 inline void fromWave(const wave::Reader& r, Db& db, unsigned threads) {
@@ -207,21 +225,54 @@ inline void fromWave(const wave::Reader& r, Db& db, unsigned threads) {
     db.bits.resize((size_t)total);
     db.start = start;
     db.duration = (double)(r.end > start ? r.end - start : 0);
-    for (auto& [name, w] : r.byName) {
-        Sig s{base[(size_t)w], r.waves[(size_t)w].width, w};
-        // "[7:0]", "[0:7]", "[11:4]": the declared range, when it fits the width
-        if (auto it = r.range.find(name); it != r.range.end()) {
-            int m = 0, l = 0;
-            if (std::sscanf(it->second.c_str(), " [ %d : %d ]", &m, &l) == 2 && std::abs(m - l) + 1 == s.width) {
-                s.msb = m;
-                s.step = m >= l ? -1 : 1;
-            }
-        }
-        db.sigs[name] = s;
-    }
+    sigsFrom(r, db, base);
     par::parallelFor(r.waves.size(), threads, [&](size_t w) {
         scan(r.waves[w], start, r.end, db.bits.data() + base[w], [](int, uint64_t, bool) {});
     });
+}
+
+// The same, for a lazy reader: the waves are fetched, summed and dropped a
+// group at a time, so only one group's changes are in memory. Each wave is
+// scanned from its own first change, and the time before it (at x) is added
+// once the run's start is known: the numbers are the ones fromWave gives.
+inline void fromWaveGroups(wave::Reader& r, Db& db, unsigned threads, size_t groups) {
+    db.tick = r.timescale.empty() ? 1e-9 : parseTimescale(r.timescale);
+    const size_t nw = r.waves.size();
+    std::vector<uint32_t> base(nw);
+    uint64_t total = db.bits.size();
+    for (size_t w = 0; w < nw; w++) {
+        base[w] = (uint32_t)total;
+        total += (uint64_t)std::max(0, r.waves[w].width);
+    }
+    if (total > UINT32_MAX) throw Error("the waveform has more bits than a power run can hold");
+    db.bits.resize((size_t)total);
+    std::vector<uint64_t> first(nw, UINT64_MAX);
+    for (size_t g = 0; g < groups; g++) {
+        std::vector<int> ws;
+        for (size_t w = nw * g / groups; w < nw * (g + 1) / groups; w++) ws.push_back((int)w);
+        r.fetch(ws);
+        par::parallelFor(ws.size(), threads, [&](size_t k) {
+            const wave::Wave& wv = r.waves[(size_t)ws[k]];
+            if (wv.ch.empty()) return;
+            first[(size_t)ws[k]] = wv.ch[0].t;
+            scan(wv, wv.ch[0].t, r.end, db.bits.data() + base[(size_t)ws[k]], [](int, uint64_t, bool) {});
+        });
+        r.release(ws);
+    }
+    uint64_t start = *std::min_element(first.begin(), first.end());
+    if (start == UINT64_MAX) start = 0;
+    db.start = start;
+    db.duration = (double)(r.end > start ? r.end - start : 0);
+    par::parallelFor(nw, threads, [&](size_t w) {
+        int width = std::max(0, r.waves[w].width);
+        Bit* out = db.bits.data() + base[w];
+        if (first[w] == UINT64_MAX) {   // no changes: x from the start on, as scan() has it
+            for (int j = 0; j < width; j++) out[j].tx += (double)(std::max(r.end, start) - start);
+            return;
+        }
+        for (int j = 0; j < width; j++) out[j].tx += (double)(first[w] - start);
+    });
+    sigsFrom(r, db, base);
 }
 
 // ------------------------------------------------------------------ SAIF
@@ -543,8 +594,12 @@ inline void write(const Db& db, std::ostream& os, const std::string& design, con
     }
     auto esc = [](const std::string& s) {
         std::string o;
-        for (char c : s) {
-            if (c == '[' || c == ']' || c == '/' || c == '(' || c == ')' || c == '\\' || c == '"') o += '\\';
+        for (size_t i = 0; i < s.size(); i++) {
+            char c = s[i];
+            // a SAIF identifier is letters, digits and _, not starting with a
+            // digit; any other character (q[3], an escaped Verilog name such
+            // as \1'b0 or \a.b) is escaped
+            if ((!std::isalnum((unsigned char)c) && c != '_') || (i == 0 && std::isdigit((unsigned char)c))) o += '\\';
             o += c;
         }
         return o;
@@ -624,8 +679,25 @@ inline void load(const std::string& path, Db& db, unsigned threads = 1, wave::Re
     wave::Reader local;
     wave::Reader& r = keep ? *keep : local;
     std::string err;
+    // Every value change in memory is 16 bytes plus its bits: a long
+    // gate-level run expands far past its file (a 200 MB FST of 120k cycles
+    // of a 30k-cell core is about 14 GB). Without `keep` nothing has to stay,
+    // so a large file is summed a group of signals at a time.
+    struct stat sb;
+    uint64_t bytes = stat(path.c_str(), &sb) == 0 ? (uint64_t)sb.st_size : 0;
+    // MINISIM_SAIF_GROUPS=<n> forces n passes, for tests on small files.
+    const char* force = std::getenv("MINISIM_SAIF_GROUPS");
+    size_t forced = force ? (size_t)std::strtoul(force, nullptr, 10) : 0;
+    if (!keep && (forced > 1 || bytes > (16u << 20))) local.lazy = true;
     if (!r.open(path, threads, err)) throw Error(err);
-    fromWave(r, db, threads);
+    if (!r.lazy) {
+        fromWave(r, db, threads);
+        return;
+    }
+    // About 8 MB of FST (it is compressed, about 50x) or 256 MB of VCD per pass.
+    uint64_t per = r.isFst ? (8ull << 20) : (256ull << 20);
+    size_t groups = forced > 1 ? forced : (size_t)std::max<uint64_t>(1, (bytes + per - 1) / per);
+    fromWaveGroups(r, db, threads, std::min(groups, std::max<size_t>(1, r.waves.size())));
 }
 
 }  // namespace saif

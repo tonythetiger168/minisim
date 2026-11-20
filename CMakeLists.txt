@@ -540,6 +540,14 @@ if(MINISIM_WITH_SLANG)
   add_test(NAME saif_forward
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -P ${CMAKE_SOURCE_DIR}/tests/saif_fwd.cmake)
+  # A large waveform summed into SAIF a group of signals at a time.
+  set(_saif_fmts vcd)
+  if(MINISIM_WITH_FST)
+    set(_saif_fmts vcd,fst)
+  endif()
+  add_test(NAME saif_group
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR} -DFORMATS=${_saif_fmts}
+                   -P ${CMAKE_SOURCE_DIR}/tests/saif_group.cmake)
 
   add_test(NAME mdebug
            COMMAND ${CMAKE_COMMAND} -DMDEBUG=$<TARGET_FILE:mdebug> -DMSIM=$<TARGET_FILE:msim>

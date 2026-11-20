@@ -401,6 +401,14 @@ Spec references are IEEE 1800-2023 clauses.
 - mlint: the formal-assisted checks are about 6x faster (Ibex: 0.43 s to 0.07 s, the whole run 0.55 s to 0.2 s) with the same findings: a case's items are checked in one pass, independent path conditions are not multiplied in, and case-item matches are remembered per block. `-set formal.fast=0` gives the plain search, which the tests compare against.
 
 ### Fixed
+- SAIF from a long waveform (`msim -saif`, power tools' `-write_saif`) no
+  longer needs every value change in memory: a large FST or VCD is summed a
+  group of signals at a time (a 207 MB gate-level FST of 118,746 cycles went
+  from over 16 GB to 4.3 GB, the SAIF identical). `MINISIM_SAIF_GROUPS=<n>`
+  forces n passes. Test `saif_group`.
+- SAIF names that are not SAIF identifiers are escaped in full, a leading
+  digit included: the tie net `\1'b0` of a routed netlist was written as
+  `1'b0`, which OpenSTA's `read_saif` stops at as a syntax error.
 - msim: an event control in a class on a bit or part select of a virtual
   interface or class member (`@(posedge vif.state[0])`), mixed with other
   items, failed with "unsupported event on non-signal". It now waits on
