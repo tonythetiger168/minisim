@@ -2484,7 +2484,7 @@ static void soleNbaTargets(const LowerResult& lowered, std::vector<CodegenSig>& 
     }
     size_t k = 0;
     for (size_t s = 0; s < n; s++)
-        if (owner[s] && !bad[s] && !sigs[s].net && sigs[s].drivers == 0 && sigs[s].w <= 64 && sigs[s].mirror < 0) sigs[s].soleNba = true, k++;
+        if (owner[s] && !bad[s] && !sigs[s].net && sigs[s].drivers == 0 && sigs[s].mirror < 0) sigs[s].soleNba = true, k++;
     if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "sole NBA targets: %zu registers\n", k);
 }
 

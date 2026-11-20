@@ -260,13 +260,13 @@ foreach(c IN LISTS CASES)
       message(FATAL_ERROR "${c}: parameter array reads or constant +: selects are left at run time")
     endif()
   endif()
-  # Unchanged NBAs of sole-writer registers are left out (Sim::nbaKeep): q, c and e's two.
+  # Unchanged NBAs of sole-writer registers are left out (Sim::nbaKeep): q, c, w and e's two.
   if(c STREQUAL "-no-cycle examples/nbaskip.sv")
     file(READ ${OUT}/c${n}/design.cpp gen)
     string(REGEX MATCHALL "S\\.nbaKeep\\(" keep "${gen}")
     list(LENGTH keep nkeep)
-    if(NOT nkeep EQUAL 4)
-      message(FATAL_ERROR "${c}: ${nkeep} NBAs checked by nbaKeep (expected 4: q, c and e's two)")
+    if(NOT nkeep EQUAL 5)
+      message(FATAL_ERROR "${c}: ${nkeep} NBAs checked by nbaKeep (expected 5: q, c, w and e's two)")
     endif()
   endif()
   # DPI-C imports are called from simv itself (codegen.hpp dpiCall).
