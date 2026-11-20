@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- mvplat: the translator runs machine-mode AMOs, LR and SC (taking turns
+  or one hart) and plain reads of sstatus in supervisor mode (CSRRS/CSRRC
+  with x0, CSRRSI with 0). FENCE.I returns at once when every code page is
+  watched and no watched page was written since the last one.
 - mvplat: several harts take turns by default (what `-serial` did); the
   parallel rounds with write buffers, about 10 times slower under Linux,
   need `-parallel`, `-threads N` or `"serial": false`. Faster SMP Linux

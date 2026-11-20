@@ -348,6 +348,10 @@ struct Hart {
     std::unordered_map<uint64_t, CodePage> codePages;
     bool codeUntracked = false;
     uint64_t fenceFull = 0, fencePart = 0, fencePages = 0;
+    // The last FENCE.I left every code page watched and unchanged, and the
+    // watched pages had seen fenceWrites writes then (Machine::fenceI).
+    bool fenceQuiet = false;
+    uint64_t fenceWrites = 0;
     // The fast loop's basic blocks: runs of decoded instructions ending at a
     // jump or branch, each a list of handlers with their operands. A block
     // holds for the decoded-cache generation it was built in.

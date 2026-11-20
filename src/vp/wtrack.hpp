@@ -65,6 +65,9 @@ public:
     static const uint8_t* base(int id) { return state().r[id].base; }
     static uint32_t gen(int id, size_t pg) { return state().r[id].gen[pg].load(std::memory_order_acquire); }
     static bool readOnly(int id, size_t pg) { return state().r[id].ro[pg].load(std::memory_order_acquire) != 0; }
+    // Writes to watched pages so far, in every region: unchanged, no page
+    // was written.
+    static uint64_t writes() { return total().load(std::memory_order_acquire); }
     // Make the page read-only (again); false if that failed.
     static bool watch(int id, size_t pg) {
 #if MVPLAT_WTRACK
@@ -87,6 +90,7 @@ public:
                 for (size_t p = 0; p < s.r[i].pages; p++) {
                     s.r[i].ro[p].store(0);
                     s.r[i].gen[p].fetch_add(1);
+                    total().fetch_add(1);
                 }
     }
 
@@ -112,6 +116,10 @@ private:
         static State s;
         return s;
     }
+    static std::atomic<uint64_t>& total() {
+        static std::atomic<uint64_t> t{0};
+        return t;
+    }
 #if MVPLAT_WTRACK
     static bool install() {
         State& s = state();
@@ -136,6 +144,7 @@ private:
                 Lock l;
                 if (r.ro[pg].exchange(0, std::memory_order_acq_rel)) {
                     r.gen[pg].fetch_add(1, std::memory_order_acq_rel);
+                    total().fetch_add(1, std::memory_order_acq_rel);
                     mprotect(r.base + pg * 4096, 4096, PROT_READ | PROT_WRITE);
                 }
                 return;  // the store runs again, and succeeds
