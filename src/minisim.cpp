@@ -1321,7 +1321,14 @@ struct Sim {
     // seconds of malloc work after the last time step).
     bool leakAtExit = false;
     ~Sim() {
-        if (leakAtExit) { closeWaves(); return; }
+        if (leakAtExit) {
+            closeWaves();
+            (void)new decltype(sigs)(std::move(sigs));   // a million signals on a large SoC
+            (void)new decltype(combOf)(std::move(combOf));
+            (void)new decltype(seqOf)(std::move(seqOf));
+            (void)new decltype(waiters)(std::move(waiters));
+            return;
+        }
         for (auto h : all) h.destroy();
         for (void* p : oneShot) Handle::from_address(p).destroy();
         closeWaves();
