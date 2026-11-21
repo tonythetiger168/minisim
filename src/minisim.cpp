@@ -1134,6 +1134,22 @@ struct Sim {
         }
         set(s, hi >= 0 ? v_insert(get(s), nv, hi, lo) : nv);
     }
+    // The clocked processes waiting on s for this edge. A clock wakes many:
+    // grow the queue once and fill it, rather than a push_back per process.
+    void queueSeqs(int s, bool pos, bool neg) {
+        if ((size_t)s >= seqOf.size() || seqOf[s].empty()) return;
+        const auto& so = seqOf[s];
+        const size_t base = seqq.size();
+        seqq.resize(base + so.size());
+        int* out = seqq.data() + base;
+        size_t k = 0;
+        for (auto& [id, e] : so)
+            if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
+                seqPend[id] = 1;
+                out[k++] = id;
+            }
+        seqq.resize(base + k);
+    }
     void bitEdge(int s, uint64_t n) {
         Sig& g = sigs[s];
         if (__builtin_expect(combDefer, 0)) deferNote(s);
@@ -1142,12 +1158,7 @@ struct Sim {
         const bool pos = n == 1, neg = !pos;
         if ((size_t)s < combOf.size() && !combDefer)
             for (int r : combOf[s]) if (r != curComb) markComb(r);
-        if ((size_t)s < seqOf.size())
-            for (auto& [id, e] : seqOf[s])
-                if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
-                    seqPend[id] = 1;
-                    seqq.push_back(id);
-                }
+        queueSeqs(s, pos, neg);
     }
     __attribute__((always_inline)) void fwdv(int s, int d, uint64_t v, int s0, int s1) {
         Sig& g = sigs[s];
@@ -3330,12 +3341,7 @@ struct Sim {
 #endif
                     markComb(r);
                 }
-        if ((size_t)s < seqOf.size())
-            for (auto& [id, e] : seqOf[s])
-                if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
-                    seqPend[id] = 1;
-                    seqq.push_back(id);
-                }
+        queueSeqs(s, pos, neg);
     }
 
     void runObserved();
