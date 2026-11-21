@@ -887,6 +887,80 @@ inline bool combShape(const Prog& p, CombShape& c) {
         if (w.edge != ANY) return false;
         c.ins.push_back(w.sig);
     }
+    // A block that computes a signal it writes from that signal's old value,
+    // one it does not wait on (always @(q) n = n + 1, a counter), is not a
+    // function of its inputs: running it again when no input changed (as the
+    // cycle domain's comb pass does) would change its result. Such a block
+    // stays a process. Found per assignment to S that reads S where S is not
+    // yet written on every path (a forward dataflow over the body). Reading
+    // an output that keeps its old value on some path (a latch) is
+    // idempotent and stays a function.
+    {
+        std::vector<int> cand;   // outputs not waited on that some assignment to them reads
+        std::function<bool(const E&, int)> reads = [&](const E& e, int sg) -> bool {
+            if (!e) return false;
+            if (e->sig == sg) return true;
+            if (reads(e->at, sg)) return true;
+            for (auto& q : e->kids) if (reads(q, sg)) return true;
+            return false;
+        };
+        auto instrReads = [&](const Instr& a, int sg) {
+            if (reads(a.e, sg) || reads(a.bidx, sg) || reads(a.de, sg) || reads(a.fd, sg) || reads(a.self, sg)) return true;
+            for (auto& x : a.args) if (reads(x, sg)) return true;
+            for (auto& x : a.aidx) if (reads(x, sg)) return true;
+            return false;
+        };
+        for (int o : c.outs) {
+            if (std::find(c.ins.begin(), c.ins.end(), o) != c.ins.end()) continue;
+            for (size_t i = 0; i + 2 < n; i++) {
+                const Instr& a = p.code[i];
+                if (a.k == IK::Assign && !a.tmp && a.sig == o && instrReads(a, o)) { cand.push_back(o); break; }
+            }
+            if (cand.size() >= 64) break;
+        }
+        if (!cand.empty()) {
+            const size_t body = n - 2;
+            const uint64_t all = cand.size() >= 64 ? ~0ULL : ((1ULL << cand.size()) - 1);
+            std::vector<uint64_t> in(body + 1, all);   // definitely written on entry to i
+            std::vector<char> reached(body + 1, 0);
+            in[0] = 0; reached[0] = 1;
+            auto gen = [&](size_t i) {
+                const Instr& a = p.code[i];
+                uint64_t g = 0;
+                if (a.k == IK::Assign && !a.tmp && !a.bidx && a.hi < 0)
+                    for (size_t k = 0; k < cand.size(); k++) if (cand[k] == a.sig) g |= 1ULL << k;
+                return g;
+            };
+            for (bool changed = true; changed;) {
+                changed = false;
+                for (size_t i = 0; i < body; i++) {
+                    if (!reached[i]) continue;
+                    const uint64_t out = in[i] | gen(i);
+                    const Instr& a = p.code[i];
+                    auto flow = [&](size_t t) {
+                        if (t > body) return;
+                        const uint64_t v = reached[t] ? (in[t] & out) : out;
+                        if (!reached[t] || v != in[t]) { in[t] = v; reached[t] = 1; changed = true; }
+                    };
+                    if (a.k == IK::Jmp) flow(a.target);
+                    else {
+                        flow(i + 1);
+                        if (a.k == IK::JmpIfNot) { flow(a.target); if (a.xt != Instr::NOX) flow(a.xt); }
+                    }
+                }
+            }
+            for (size_t i = 0; i < body; i++) {
+                const Instr& a = p.code[i];
+                if (!reached[i] || a.k != IK::Assign || a.tmp) continue;
+                for (size_t k = 0; k < cand.size(); k++)
+                    if (cand[k] == a.sig && !(in[i] >> k & 1) && instrReads(a, a.sig)) {
+                        static const bool why = std::getenv("MSIM_WHYIMPURE") != nullptr;
+                        if (why) std::fprintf(stderr, "not a comb function (computes an output from its old value): line %d\n", a.line);
+                        return false;
+                    }
+            }
+        }
+    }
     return true;
 }
 // Topological order of the given combinational processes (indices into cs).
