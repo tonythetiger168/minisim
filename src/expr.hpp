@@ -68,7 +68,7 @@ struct Limb {
 // almost always empty, and copying an empty one must cost no more than two
 // stores: a std::vector here made Val's copy constructor and assignment
 // about a fifth of a -compile run. Only the operations Val uses.
-// Limb arrays of up to 8 limbs (512 bits) come from per-thread free lists:
+// Limb arrays of up to 32 limbs (2048 bits) come from per-thread free lists:
 // wide expressions build and drop many short-lived values (a concatenation
 // of slices copies each operand), and malloc / free were about 13% of an
 // OpenTitan -compile run. Values made on a worker thread are often dropped
@@ -76,7 +76,7 @@ struct Limb {
 // of kLimbBatch blocks to a shared stack (one spin lock per batch), and an
 // empty list takes a batch back from it. Nothing goes back to the system.
 struct LimbFree { LimbFree* next; LimbFree* batch; };   // fits in one Limb
-inline constexpr uint32_t kLimbPool = 8, kLimbBatch = 256;
+inline constexpr uint32_t kLimbPool = 32, kLimbBatch = 256;
 struct LimbLocal { LimbFree* head[kLimbPool] = {}; uint32_t n[kLimbPool] = {}; };
 inline thread_local LimbLocal limbLocal_ __attribute__((tls_model("initial-exec")));
 struct LimbShared {
@@ -1262,9 +1262,9 @@ inline Val v_concat(const std::vector<Val>& parts) {
     }
     Val r = make(0, 0, total);
     int off = 0;
-    for (int i = (int)parts.size() - 1; i >= 0; i--) {
+    for (int i = (int)parts.size() - 1; i >= 0; i--) {   // in place: no copy of r per part
         if (parts[i].w <= 0) continue;
-        r = v_insert(r, parts[i], off + parts[i].w - 1, off);
+        copyBits(r, off, parts[i], 0, parts[i].w);
         off += parts[i].w;
     }
     return r;
