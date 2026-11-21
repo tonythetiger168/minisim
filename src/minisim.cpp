@@ -1316,7 +1316,12 @@ struct Sim {
         curComb = saved;
     }
 
+    // Set at the end of a normal run: the process exits next, so the
+    // coroutine frames are left to the OS (on OpenTitan, freeing them took
+    // seconds of malloc work after the last time step).
+    bool leakAtExit = false;
     ~Sim() {
+        if (leakAtExit) { closeWaves(); return; }
         for (auto h : all) h.destroy();
         for (void* p : oneShot) Handle::from_address(p).destroy();
         closeWaves();

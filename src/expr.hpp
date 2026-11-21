@@ -386,13 +386,16 @@ inline Val clipRead(const Val& src, int w) {
     if (w <= 64) return make(src.v, src.x, w, src.z);
     Val a;
     a.w = w;
-    a.hi.resize(limbCount(w) - 1);
-    for (int i = 0; i < limbCount(w); i++) {
-        uint64_t m = limbMask(w, i);
-        uint64_t x = limbX(src, i) & m;
-        uint64_t v = limbV(src, i) & m & ~x;
-        uint64_t z = limbZ(src, i) & x;
-        setLimb(a, i, v, x, z);
+    const int n = limbCount(w);
+    a.hi.resize((size_t)n - 1);
+    a.x = src.x; a.v = src.v & ~a.x; a.z = src.z & a.x;
+    const int have = std::min(n - 1, (int)src.hi.size());   // missing source limbs stay 0
+    Limb* d = &a.hi[0];
+    const Limb* q = have > 0 ? &src.hi[0] : nullptr;
+    for (int i = 0; i < have; i++) d[i] = Limb{q[i].v & ~q[i].x, q[i].x, q[i].z & q[i].x};
+    if (const uint64_t m = limbMask(w, n - 1); m != ~0ULL) {
+        Limb& t = d[n - 2];
+        t.x &= m; t.v &= m; t.z &= m;
     }
     return a;
 }

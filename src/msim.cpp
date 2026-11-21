@@ -5063,5 +5063,14 @@ static int msimMain(int argc, char** argv) {
         std::cerr << "msim: cannot write " << prof::P().path << "\n";
         return 1;
     }
+    // The process exits next: leave the elaborated design, the slang
+    // compilation and the kernel's process frames to the OS instead of
+    // freeing them one by one (seconds on a large design).
+    // MSIM_FREEATEXIT=1 frees them, for leak checkers.
+    if (!std::getenv("MSIM_FREEATEXIT")) {
+        (void)new LowerResult(std::move(lowered));
+        (void)comp.release();
+        S.leakAtExit = true;
+    }
     return S.exitCode;
 }
