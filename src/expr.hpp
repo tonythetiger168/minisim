@@ -49,6 +49,7 @@
 #include <initializer_list>
 #include <deque>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -70,24 +71,62 @@ struct Limb {
 // Limb arrays of up to 8 limbs (512 bits) come from per-thread free lists:
 // wide expressions build and drop many short-lived values (a concatenation
 // of slices copies each operand), and malloc / free were about 13% of an
-// OpenTitan -compile run. A block freed by another thread just joins that
-// thread's list. Nothing goes back to the system.
-struct LimbFree { LimbFree* next; };
-inline constexpr uint32_t kLimbPool = 8;
-inline thread_local LimbFree* limbFree_[kLimbPool] __attribute__((tls_model("initial-exec"))) = {};
+// OpenTitan -compile run. Values made on a worker thread are often dropped
+// on the main one, so a list that grows past 2 * kLimbBatch hands a batch
+// of kLimbBatch blocks to a shared stack (one spin lock per batch), and an
+// empty list takes a batch back from it. Nothing goes back to the system.
+struct LimbFree { LimbFree* next; LimbFree* batch; };   // fits in one Limb
+inline constexpr uint32_t kLimbPool = 8, kLimbBatch = 256;
+struct LimbLocal { LimbFree* head[kLimbPool] = {}; uint32_t n[kLimbPool] = {}; };
+inline thread_local LimbLocal limbLocal_ __attribute__((tls_model("initial-exec")));
+struct LimbShared {
+    std::atomic<bool> lock{false};
+    LimbFree* batches = nullptr;   // linked through LimbFree::batch, each kLimbBatch long
+};
+inline LimbShared limbShared_[kLimbPool];
+inline void limbSpin(std::atomic<bool>& l) { while (l.exchange(true, std::memory_order_acquire)) while (l.load(std::memory_order_relaxed)) {} }
+__attribute__((noinline)) inline LimbFree* limbRefill(uint32_t c) {
+    LimbShared& sh = limbShared_[c];
+    if (!sh.batches) return nullptr;   // a stale look is fine: checked again under the lock
+    limbSpin(sh.lock);
+    LimbFree* b = sh.batches;
+    if (b) sh.batches = b->batch;
+    sh.lock.store(false, std::memory_order_release);
+    if (b) { limbLocal_.head[c] = b->next; limbLocal_.n[c] = kLimbBatch - 1; }
+    return b;
+}
+__attribute__((noinline)) inline void limbSpill(uint32_t c) {
+    LimbLocal& L = limbLocal_;
+    LimbFree* b = L.head[c];
+    LimbFree* t = b;
+    for (uint32_t i = 1; i < kLimbBatch; i++) t = t->next;
+    L.head[c] = t->next;
+    L.n[c] -= kLimbBatch;
+    t->next = nullptr;
+    LimbShared& sh = limbShared_[c];
+    limbSpin(sh.lock);
+    b->batch = sh.batches;
+    sh.batches = b;
+    sh.lock.store(false, std::memory_order_release);
+}
 inline Limb* limbAlloc(uint32_t n) {   // uninitialized
     if (n <= kLimbPool) {
-        LimbFree*& f = limbFree_[n - 1];
-        if (f) { LimbFree* b = f; f = b->next; return reinterpret_cast<Limb*>(b); }
+        LimbLocal& L = limbLocal_;
+        const uint32_t c = n - 1;
+        if (LimbFree* b = L.head[c]) { L.head[c] = b->next; L.n[c]--; return reinterpret_cast<Limb*>(b); }
+        if (LimbFree* b = limbRefill(c)) return reinterpret_cast<Limb*>(b);
     }
     return static_cast<Limb*>(::operator new(sizeof(Limb) * n));
 }
 inline void limbRelease(Limb* p, uint32_t n) {
     if (!p) return;
     if (n <= kLimbPool) {
+        LimbLocal& L = limbLocal_;
+        const uint32_t c = n - 1;
         LimbFree* b = reinterpret_cast<LimbFree*>(p);
-        b->next = limbFree_[n - 1];
-        limbFree_[n - 1] = b;
+        b->next = L.head[c];
+        L.head[c] = b;
+        if (++L.n[c] >= 2 * kLimbBatch) limbSpill(c);
         return;
     }
     ::operator delete(p);
