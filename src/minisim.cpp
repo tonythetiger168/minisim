@@ -479,7 +479,7 @@ struct Sim {
     // thread count or on timing. -threads 1 runs the same code serially.
     int threads = 1;
     static constexpr size_t kMinParallel = 32;
-    static inline thread_local bool tlInPar = false;   // inside a parallelFor task
+    static inline thread_local bool tlInPar __attribute__((tls_model("initial-exec"))) = false;   // inside a parallelFor task; initial-exec: design.so reads it without a __tls_get_addr call
     Pool pool;
     // `use`: run on at most this many threads (0: `threads`).
     template <class F>
@@ -769,7 +769,7 @@ struct Sim {
     vector<int> combLocal;     // rank -> index in its partition's `combs`
     vector<int> partsBusy;
     vector<NbaItem> nbaSerial;
-    static inline thread_local Part* tlPart = nullptr;
+    static inline thread_local Part* tlPart __attribute__((tls_model("initial-exec"))) = nullptr;
     // `seqTargets`: the fixed NBA targets of each clocked process (an NBA whose
     // target is chosen at run time falls back to the serial path by itself).
     void buildPartitions(const vector<vector<int>>& combOuts, const vector<vector<int>>& combIns,
