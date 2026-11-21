@@ -1329,6 +1329,16 @@ public:
     }
     // JmpIfNot on the Val expression `val`: `no` is the statement that jumps
     // when it is not true, `unk` the one for an unknown value (Instr::xt).
+    // jmpIfNot with the condition split (split()): when none of its bits
+    // is unknown, a plain 64-bit test instead of a Val and truth().
+    // MSIM_NOSPLITJ=1: the Val form everywhere.
+    std::string jmpIfNotSplit(const Instr& i, const std::string& no, const std::string& unk) {
+        static const bool off = std::getenv("MSIM_NOSPLITJ") != nullptr;
+        std::string g, u, sl;
+        if (off || !split(i.e, g, u, sl)) return jmpIfNot(i, fast(i.e), no, unk);
+        if (g.empty()) return " if (!(" + u + ")) " + no + "\n";
+        return " if (__builtin_expect(" + g + ", 1)) { if (!(" + u + ")) " + no + " } else {" + jmpIfNot(i, sl, no, unk) + " }\n";
+    }
     static std::string jmpIfNot(const Instr& i, const std::string& val, const std::string& no, const std::string& unk) {
         if (i.xt == Instr::NOX) return " if (truth(" + val + ") != 1) " + no + "\n";
         return " switch (truth(" + val + ")) { case 1: break; case 2: " + unk + " default: " + no + " }\n";
@@ -5959,7 +5969,7 @@ private:
                         o << " { Val v_ = " << fast(i.e) << "; if (S.nbaKeep(" << i.sig << ", v_)) nb.push_back({" << i.sig << ", std::move(v_), -1, 0}); }\n";
                     else o << " nb.push_back({" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << "});\n";
                     break;
-                case IK::JmpIfNot: o << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, L(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, L(i.xt))); break;
+                case IK::JmpIfNot: o << jmpIfNotSplit(i, jumpTo(&p, pc, L(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, L(i.xt))); break;
                 case IK::Jmp: o << " goto " << L(i.target) << ";\n"; break;
                 case IK::Assign:   // a temporary of its own (Instr::tmp)
                     o << " S.poke(" << i.sig << ", " << fast(i.e) << ", " << i.hi << ", " << i.lo << ");\n";
@@ -6406,7 +6416,7 @@ private:
         for (; pc < p.code.size(); pc++) {
             const Instr& i = p.code[pc];
             if (i.k == IK::JmpIfNot) {
-                o << L(pc) << ":" << CH(&p, pc) << jmpIfNot(i, fast(i.e), jumpTo(&p, pc, L(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, L(i.xt)));
+                o << L(pc) << ":" << CH(&p, pc) << jmpIfNotSplit(i, jumpTo(&p, pc, L(i.target)), i.xt == Instr::NOX ? "" : jumpTo(&p, pc, L(i.xt)));
                 continue;
             }
             if (i.k == IK::Jmp) { o << L(pc) << ":" << CH(&p, pc) << " goto " << L(i.target) << ";\n"; continue; }
