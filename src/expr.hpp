@@ -473,12 +473,18 @@ inline Val xfill(int w, bool sgn = false) { Val a = allx(w); a.sgn = sgn; return
 inline int wmax(const Val& a, const Val& b) { return a.w > b.w ? a.w : b.w; }
 
 // 0, 1, or 2 (= X). v is already 0 under X bits, so a known 1 in any limb is true.
-inline int truth(const Val& a) {
-    if (a.v) return 1;
+[[gnu::noinline]] inline int truthWide(const Val& a) {
     for (const auto& h : a.hi) if (h.v) return 1;
     if (a.x) return 2;
     for (const auto& h : a.hi) if (h.x) return 2;
     return 0;
+}
+// Always inline: compiled conditions call it everywhere, and a large design
+// built at -O1 would otherwise call it out of line.
+[[gnu::always_inline]] inline int truth(const Val& a) {
+    if (a.v) return 1;
+    if (__builtin_expect(a.hi.empty(), 1)) return a.x ? 2 : 0;
+    return truthWide(a);
 }
 inline Val from_truth(int t) { return t == 2 ? allx(1) : mk(t, 1); }
 

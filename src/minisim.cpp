@@ -913,7 +913,20 @@ struct Sim {
     bool nbaNoSkip = false;
     uint32_t nbaEpoch = 1;          // the NBA regions so far
     vector<uint32_t> seqEpoch;      // per clocked process: the NBA region its queued NBAs wait for
-    bool nbaKeep(int s, const Val& nv) const {
+    // Inline: every compiled NBA asks it, and a large design built at -O1
+    // would call it out of line. The narrow case here, the rest in nbaKeepAll.
+    [[gnu::always_inline]] bool nbaKeep(int s, const Val& nv) const {
+        const Sig& g = sigs[(size_t)s];
+        const Val& cur = g.val;
+        if (__builtin_expect(!nbaNoSkip && g.w <= 64 && !(g.fl & (SF_HELD | SF_PART | SF_PATHV)) && !nv.real && !nv.str && !cur.real && !cur.str &&
+                             cur.hi.empty(), 1)) {
+            const uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
+            const uint64_t x = nv.x & m;   // as set() masks it
+            return (nv.v & m & ~x) != (cur.v & m & ~cur.x) || x != (cur.x & m) || (nv.z & m) != (cur.z & m);
+        }
+        return nbaKeepAll(s, nv);
+    }
+    [[gnu::noinline]] bool nbaKeepAll(int s, const Val& nv) const {
         if (nbaNoSkip) return true;
         const Sig& g = sigs[(size_t)s];
         const Val& cur = g.val;
