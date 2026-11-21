@@ -312,6 +312,18 @@ inline void copyBits(Val& dst, int dstBit, const Val& src, int srcBit, int n) {
     }
 }
 // Mask to w the way set() does: drop bits past w, do not clear v under x.
+// maskWidth(nv, w) == cur, without building the masked copy (a wide NBA or
+// write that leaves the value as it was: most of them in a large design).
+inline bool sameAsMasked(const Val& nv, const Val& cur, int w) {
+    const int n = w <= 64 ? 1 : limbCount(w);
+    for (int i = 0; i < n; i++) {
+        const uint64_t m = limbMask(w, i);
+        if ((limbV(nv, i) & m) != limbV(cur, i) || (limbX(nv, i) & m) != limbX(cur, i) || (limbZ(nv, i) & m) != limbZ(cur, i)) return false;
+    }
+    for (int i = n; i <= (int)cur.hi.size(); i++)
+        if (limbV(cur, i) | limbX(cur, i) | limbZ(cur, i)) return false;
+    return true;
+}
 inline Val maskWidth(Val nv, int w) {
     if (w <= 64) {
         uint64_t m = mask(w);
