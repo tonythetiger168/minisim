@@ -3,12 +3,15 @@
 // q's changes) is not a function of its inputs. The cycle domain's comb
 // pass re-runs every comb function on each clock edge, so this one must
 // stay a process: n counts the 3 changes of q, not 20 clock edges. A latch
-// (keeps its old value on one path) and an always_comb with defaults stay
-// comb functions.
+// (keeps its old value on one path), an always_comb with defaults, one that
+// reads another bit it wrote (e[1] = ~e[0]) and one that updates bits it
+// wrote before (s[7:0] ^= ...) stay comb functions.
 module selfcount;
   logic clk = 0;
   logic [7:0] q, d, l, m;
   logic en;
+  logic [1:0] e;
+  logic [15:0] s;
   int n = 0;
   always #5 clk = ~clk;
   always_ff @(posedge clk) q <= d;
@@ -18,6 +21,15 @@ module selfcount;
     if (q[0]) m = q + 1; else m = 0;
     m = m + 2;   // reads m after it is written on every path
   end
+  always_comb begin
+    e[0] = ^q;
+    e[1] = (|q) & ~e[0];
+  end
+  always_comb begin
+    s[7:0] = q ^ d;
+    s[7:0] ^= 8'h5a;
+    s[15:8] = s[7:0] + 1;
+  end
   initial begin
     d = 0; en = 1;
     repeat (10) @(negedge clk);
@@ -25,7 +37,7 @@ module selfcount;
     repeat (5) @(negedge clk);
     en = 0; d = 6;
     repeat (5) @(negedge clk);
-    $display("n=%0d l=%0d m=%0d", n, l, m);
+    $display("n=%0d l=%0d m=%0d e=%b s=%h", n, l, m, e, s);
     $finish;
   end
 endmodule

@@ -897,14 +897,21 @@ inline bool combShape(const Prog& p, CombShape& c) {
     // idempotent and stays a function.
     {
         std::vector<int> cand;   // outputs not waited on that some assignment to them reads
+        // Whether a reads bits of sg that it also writes (err[1] = ~err[0]
+        // reads another bit: not its own old value).
+        int wlo = -1, whi = -1;
         std::function<bool(const E&, int)> reads = [&](const E& e, int sg) -> bool {
             if (!e) return false;
+            if (e->op == Op::Slice && !e->kids.empty() && e->kids[0] && e->kids[0]->op == Op::Ref && e->kids[0]->sig == sg && !e->kids[0]->at &&
+                e->lo >= 0 && e->hi >= e->lo)
+                return whi < 0 || (e->lo <= whi && wlo <= e->hi);
             if (e->sig == sg) return true;
             if (reads(e->at, sg)) return true;
             for (auto& q : e->kids) if (reads(q, sg)) return true;
             return false;
         };
         auto instrReads = [&](const Instr& a, int sg) {
+            if (a.hi >= 0 && !a.bidx) { wlo = a.lo; whi = a.hi; } else { wlo = whi = -1; }
             if (reads(a.e, sg) || reads(a.bidx, sg) || reads(a.de, sg) || reads(a.fd, sg) || reads(a.self, sg)) return true;
             for (auto& x : a.args) if (reads(x, sg)) return true;
             for (auto& x : a.aidx) if (reads(x, sg)) return true;
@@ -919,23 +926,35 @@ inline bool combShape(const Prog& p, CombShape& c) {
             if (cand.size() >= 64) break;
         }
         if (!cand.empty()) {
+            // Facts: "bits [lo:hi] of cand k are written" (lo < 0: all of it),
+            // one per whole signal and per constant part written.
+            struct Key { int sig, lo, hi; };
+            std::vector<Key> keys;
+            for (int o : cand) keys.push_back({o, -1, -1});
+            for (size_t i = 0; i + 2 < n && keys.size() < 64; i++) {
+                const Instr& a = p.code[i];
+                if (a.k != IK::Assign || a.tmp || a.bidx || a.hi < 0 || std::find(cand.begin(), cand.end(), a.sig) == cand.end()) continue;
+                bool dup = false;
+                for (auto& k : keys) dup |= k.sig == a.sig && k.lo == a.lo && k.hi == a.hi;
+                if (!dup) keys.push_back({a.sig, a.lo, a.hi});
+            }
             const size_t body = n - 2;
-            const uint64_t all = cand.size() >= 64 ? ~0ULL : ((1ULL << cand.size()) - 1);
-            std::vector<uint64_t> in(body + 1, all);   // definitely written on entry to i
+            const uint64_t all = keys.size() >= 64 ? ~0ULL : ((1ULL << keys.size()) - 1);
+            std::vector<uint64_t> in(body + 1, all);   // facts that hold on entry to i, on every path
             std::vector<char> reached(body + 1, 0);
             in[0] = 0; reached[0] = 1;
-            auto gen = [&](size_t i) {
+            std::vector<uint64_t> genOf(body, 0);
+            for (size_t i = 0; i < body; i++) {
                 const Instr& a = p.code[i];
-                uint64_t g = 0;
-                if (a.k == IK::Assign && !a.tmp && !a.bidx && a.hi < 0)
-                    for (size_t k = 0; k < cand.size(); k++) if (cand[k] == a.sig) g |= 1ULL << k;
-                return g;
-            };
+                if (a.k != IK::Assign || a.tmp || a.bidx) continue;
+                for (size_t k = 0; k < keys.size(); k++)
+                    if (keys[k].sig == a.sig && (a.hi < 0 || (keys[k].lo >= 0 && a.lo <= keys[k].lo && keys[k].hi <= a.hi))) genOf[i] |= 1ULL << k;
+            }
             for (bool changed = true; changed;) {
                 changed = false;
                 for (size_t i = 0; i < body; i++) {
                     if (!reached[i]) continue;
-                    const uint64_t out = in[i] | gen(i);
+                    const uint64_t out = in[i] | genOf[i];
                     const Instr& a = p.code[i];
                     auto flow = [&](size_t t) {
                         if (t > body) return;
@@ -951,13 +970,16 @@ inline bool combShape(const Prog& p, CombShape& c) {
             }
             for (size_t i = 0; i < body; i++) {
                 const Instr& a = p.code[i];
-                if (!reached[i] || a.k != IK::Assign || a.tmp) continue;
-                for (size_t k = 0; k < cand.size(); k++)
-                    if (cand[k] == a.sig && !(in[i] >> k & 1) && instrReads(a, a.sig)) {
-                        static const bool why = std::getenv("MSIM_WHYIMPURE") != nullptr;
-                        if (why) std::fprintf(stderr, "not a comb function (computes an output from its old value): line %d\n", a.line);
-                        return false;
-                    }
+                if (!reached[i] || a.k != IK::Assign || a.tmp || std::find(cand.begin(), cand.end(), a.sig) == cand.end()) continue;
+                bool written = false;   // the bits it writes were written before, on every path
+                for (size_t k = 0; k < keys.size() && !written; k++)
+                    if ((in[i] >> k & 1) && keys[k].sig == a.sig &&
+                        (keys[k].lo < 0 || (a.hi >= 0 && !a.bidx && keys[k].lo <= a.lo && a.hi <= keys[k].hi))) written = true;
+                if (!written && instrReads(a, a.sig)) {
+                    static const bool why = std::getenv("MSIM_WHYIMPURE") != nullptr;
+                    if (why) std::fprintf(stderr, "not a comb function (computes an output from its old value): %s:%d\n", a.file < g_covFiles.size() ? g_covFiles[a.file].c_str() : "?", a.line);
+                    return false;
+                }
             }
         }
     }
