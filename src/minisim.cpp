@@ -881,13 +881,50 @@ struct Sim {
     vector<char> seqPend;
     vector<int> seqq;
     vector<vector<NbaItem>> seqBufs;
+    vector<vector<pair<int, Edge>>> seqEv;          // process -> what it waits on
     void addSeq(void (*fn)(const void*, vector<NbaItem>&), const void* ctx, const vector<pair<int, Edge>>& ev) {
         int id = (int)seqs.size();
         seqs.push_back({fn, ctx});
         seqPend.push_back(0);
         seqEpoch.push_back(0);
+        seqEv.push_back(ev);
         if (seqOf.size() < sigs.size()) seqOf.resize(sigs.size());
         for (auto& [sg, e] : ev) seqOf[sg].push_back({id, e});
+    }
+    // Clocked processes that wait on the same events (every flop of a clock
+    // domain with the same reset: thousands in an SoC) always wake
+    // together. Each such set becomes one process at the place of its first
+    // member that runs the members in order, so an edge wakes, queues and
+    // dispatches one entry instead of each flop. MSIM_NOSEQGROUP=1: off.
+    struct SeqGroup { vector<Seq> m; };
+    vector<std::unique_ptr<SeqGroup>> seqGroups;
+    bool seqsGrouped = false;
+    static void seqGroupRun(const void* c, vector<NbaItem>& nb) {
+        for (const Seq& m : static_cast<const SeqGroup*>(c)->m) m.fn(m.ctx, nb);
+    }
+    void groupSeqs() {
+        seqsGrouped = true;
+        static const bool off = std::getenv("MSIM_NOSEQGROUP") != nullptr;
+        if (off || prof::P().on || seqs.size() < 8) return;
+        std::map<vector<pair<int, Edge>>, vector<int>> by;
+        for (size_t id = 0; id < seqs.size() && id < seqEv.size(); id++) {
+            if ((int)id == fastSeqId || seqEv[id].empty()) continue;
+            auto k = seqEv[id];
+            std::sort(k.begin(), k.end());
+            k.erase(std::unique(k.begin(), k.end()), k.end());
+            by[std::move(k)].push_back((int)id);
+        }
+        vector<char> gone(seqs.size(), 0);
+        for (auto& [k, ids] : by) {
+            if (ids.size() < 4) continue;
+            auto g = std::make_unique<SeqGroup>();
+            for (int id : ids) g->m.push_back(seqs[(size_t)id]);
+            seqs[(size_t)ids[0]] = {seqGroupRun, g.get()};
+            for (size_t j = 1; j < ids.size(); j++) gone[(size_t)ids[j]] = 1;
+            for (auto& [sg, e] : k)
+                std::erase_if(seqOf[(size_t)sg], [&](const pair<int, Edge>& q) { return gone[(size_t)q.first] != 0; });
+            seqGroups.push_back(std::move(g));
+        }
     }
     // The woken processes in process order. A clock edge of an SoC wakes
     // thousands, in sorted runs per clock signal: through a bitset of the
@@ -977,6 +1014,25 @@ struct Sim {
             for (size_t k = 0; k < seqq.size(); k++) nDom += dom(k);
         const bool anyDom = nDom > 0;
         for (int id : seqq) nbaNoSkip |= seqEpoch[(size_t)id] == nbaEpoch;
+        // A batch for one thread (as parallelTuned would run it): one list
+        // for all, as the domain's batches above, instead of a buffer per
+        // process (a clock edge of a large event-driven design wakes
+        // thousands; their buffers were a cache miss each).
+        if (!anyDom && (seqq.size() < kMinParallel || threads <= 1 || tlInPar) && !prof::P().on && !noDomFast) [[likely]] {
+            auto& b = seqBufs[0];
+            b.clear();
+            for (int id : seqq) {
+                const size_t n0 = b.size();
+                seqs[id].fn(seqs[id].ctx, b);
+                seqPend[id] = 0;
+                if (b.size() != n0) seqEpoch[(size_t)id] = nbaEpoch;
+            }
+            if (nbaq.empty()) nbaq.swap(b);
+            else nbaq.insert(nbaq.end(), std::make_move_iterator(b.begin()), std::make_move_iterator(b.end()));
+            seqq.clear();
+            nbaNoSkip = false;
+            return;
+        }
         if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
             for (size_t k = 0; k < seqq.size(); k++) {
                 uint64_t t = prof::Profiler::nowNs();
@@ -3588,6 +3644,7 @@ struct Sim {
 #ifndef MINISIM_CLIENT
 MSIM_KDEF void Sim::run(uint64_t end, bool start) {
     if (start) { dumpCli = !vcdPath.empty(); header(); dumpvars(); if (hasViews()) rare = true; }
+    if (!seqsGrouped) groupSeqs();
     if (!combq.empty()) wheel[now];  // a design of only combinational logic still gets its time-0 slot
     while (!wheel.empty() && !finished) {
         auto it = wheel.begin();
