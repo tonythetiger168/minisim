@@ -918,11 +918,7 @@ struct Sim {
         const Sig& g = sigs[(size_t)s];
         const Val& cur = g.val;
         if ((g.fl & (SF_HELD | SF_PART | SF_PATHV)) || nv.real || nv.str || cur.real || cur.str) return true;
-        if (g.w > 64 || !cur.hi.empty()) {   // as set() compares a wide value
-            Val m = maskWidth(nv, g.w);
-            m.sgn = false;
-            return !(m == cur);
-        }
+        if (g.w > 64 || !cur.hi.empty()) return !sameAsMasked(nv, cur, g.w);   // as set() compares a wide value
         const uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
         const uint64_t x = nv.x & m;   // as set() masks it
         return (nv.v & m & ~x) != (cur.v & m & ~cur.x) || x != (cur.x & m) || (nv.z & m) != (cur.z & m);
@@ -3208,7 +3204,8 @@ struct Sim {
                 if (v == (cur.v & m & ~cur.x) && x == (cur.x & m) && z == (cur.z & m)) return;
                 if (!nv.real && !nv.str) { commitNarrow(s, v, x, z); return; }
             }
-        }
+        } else if (g.w > 64 && !(g.fl & (SF_HELD | SF_PART | SF_PATHV)) && tlPart == nullptr && sameAsMasked(nv, g.val, g.w))
+            return;   // a wide write that changes nothing: no masked copy
         setChanged(s, std::move(nv));
     }
     // A constant part select write, v[hi:lo] = p: set(s, v_insert(get(s), p,

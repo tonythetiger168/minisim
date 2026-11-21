@@ -67,17 +67,43 @@ struct Limb {
 // almost always empty, and copying an empty one must cost no more than two
 // stores: a std::vector here made Val's copy constructor and assignment
 // about a fifth of a -compile run. Only the operations Val uses.
+// Limb arrays of up to 8 limbs (512 bits) come from per-thread free lists:
+// wide expressions build and drop many short-lived values (a concatenation
+// of slices copies each operand), and malloc / free were about 13% of an
+// OpenTitan -compile run. A block freed by another thread just joins that
+// thread's list. Nothing goes back to the system.
+struct LimbFree { LimbFree* next; };
+inline constexpr uint32_t kLimbPool = 8;
+inline thread_local LimbFree* limbFree_[kLimbPool] __attribute__((tls_model("initial-exec"))) = {};
+inline Limb* limbAlloc(uint32_t n) {   // uninitialized
+    if (n <= kLimbPool) {
+        LimbFree*& f = limbFree_[n - 1];
+        if (f) { LimbFree* b = f; f = b->next; return reinterpret_cast<Limb*>(b); }
+    }
+    return static_cast<Limb*>(::operator new(sizeof(Limb) * n));
+}
+inline void limbRelease(Limb* p, uint32_t n) {
+    if (!p) return;
+    if (n <= kLimbPool) {
+        LimbFree* b = reinterpret_cast<LimbFree*>(p);
+        b->next = limbFree_[n - 1];
+        limbFree_[n - 1] = b;
+        return;
+    }
+    ::operator delete(p);
+}
+
 class LimbVec {
     Limb* p_ = nullptr;
     uint32_t n_ = 0;
     void copyFrom(const LimbVec& o) {
         n_ = o.n_;
-        p_ = n_ ? new Limb[n_] : nullptr;
+        p_ = n_ ? limbAlloc(n_) : nullptr;
         for (uint32_t i = 0; i < n_; i++) p_[i] = o.p_[i];
     }
 public:
     LimbVec() = default;
-    LimbVec(std::initializer_list<Limb> l) : p_(l.size() ? new Limb[l.size()] : nullptr), n_((uint32_t)l.size()) {
+    LimbVec(std::initializer_list<Limb> l) : p_(l.size() ? limbAlloc((uint32_t)l.size()) : nullptr), n_((uint32_t)l.size()) {
         uint32_t i = 0;
         for (const Limb& x : l) p_[i++] = x;
     }
@@ -87,25 +113,25 @@ public:
         if (this == &o) return *this;
         if (!n_ && !o.n_) return *this;
         if (n_ == o.n_) { for (uint32_t i = 0; i < n_; i++) p_[i] = o.p_[i]; return *this; }
-        delete[] p_;
+        limbRelease(p_, n_);
         p_ = nullptr; n_ = 0;
         if (o.n_) copyFrom(o);
         return *this;
     }
     LimbVec& operator=(LimbVec&& o) noexcept {
-        if (this != &o) { delete[] p_; p_ = o.p_; n_ = o.n_; o.p_ = nullptr; o.n_ = 0; }
+        if (this != &o) { limbRelease(p_, n_); p_ = o.p_; n_ = o.n_; o.p_ = nullptr; o.n_ = 0; }
         return *this;
     }
-    ~LimbVec() { delete[] p_; }
+    ~LimbVec() { limbRelease(p_, n_); }
     size_t size() const { return n_; }
     bool empty() const { return n_ == 0; }
-    void clear() { delete[] p_; p_ = nullptr; n_ = 0; }
+    void clear() { limbRelease(p_, n_); p_ = nullptr; n_ = 0; }
     void resize(size_t n) {   // new limbs are zero
         if (n == n_) return;
         if (n == 0) { clear(); return; }
-        Limb* q = new Limb[n];
-        for (size_t i = 0; i < n && i < n_; i++) q[i] = p_[i];
-        delete[] p_;
+        Limb* q = limbAlloc((uint32_t)n);
+        for (size_t i = 0; i < n; i++) q[i] = i < n_ ? p_[i] : Limb{};
+        limbRelease(p_, n_);
         p_ = q; n_ = (uint32_t)n;
     }
     Limb& operator[](size_t i) { return p_[i]; }
@@ -286,6 +312,18 @@ inline void copyBits(Val& dst, int dstBit, const Val& src, int srcBit, int n) {
     }
 }
 // Mask to w the way set() does: drop bits past w, do not clear v under x.
+// maskWidth(nv, w) == cur, without building the masked copy (a wide NBA or
+// write that leaves the value as it was: most of them in a large design).
+inline bool sameAsMasked(const Val& nv, const Val& cur, int w) {
+    const int n = w <= 64 ? 1 : limbCount(w);
+    for (int i = 0; i < n; i++) {
+        const uint64_t m = limbMask(w, i);
+        if ((limbV(nv, i) & m) != limbV(cur, i) || (limbX(nv, i) & m) != limbX(cur, i) || (limbZ(nv, i) & m) != limbZ(cur, i)) return false;
+    }
+    for (int i = n; i <= (int)cur.hi.size(); i++)
+        if (limbV(cur, i) | limbX(cur, i) | limbZ(cur, i)) return false;
+    return true;
+}
 inline Val maskWidth(Val nv, int w) {
     if (w <= 64) {
         uint64_t m = mask(w);
