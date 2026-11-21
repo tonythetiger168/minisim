@@ -121,6 +121,8 @@ set(CASES
   "examples/widesame.sv"
   "-no-cycle examples/widesame.sv"
   "examples/selfcount.sv"
+  "-no-cycle examples/seqgroup.sv"
+  "examples/seqgroup.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
