@@ -5069,6 +5069,7 @@ static int msimMain(int argc, char** argv) {
     // MSIM_FREEATEXIT=1 frees them, for leak checkers.
     if (!std::getenv("MSIM_FREEATEXIT")) {
         (void)new LowerResult(std::move(lowered));
+        (void)new Plan(std::move(pl));
         (void)comp.release();
         S.leakAtExit = true;
     }
