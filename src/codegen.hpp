@@ -1335,9 +1335,13 @@ public:
     std::string jmpIfNotSplit(const Instr& i, const std::string& no, const std::string& unk) {
         static const bool off = std::getenv("MSIM_NOSPLITJ") != nullptr;
         std::string g, u, sl;
-        if (off || !split(i.e, g, u, sl)) return jmpIfNot(i, fast(i.e), no, unk);
+        if (off || !split(i.e, g, u, sl, true)) return jmpIfNot(i, fast(i.e), no, unk);
         if (g.empty()) return " if (!(" + u + ")) " + no + "\n";
-        return " if (__builtin_expect(" + g + ", 1)) { if (!(" + u + ")) " + no + " } else {" + jmpIfNot(i, sl, no, unk) + " }\n";
+        // The unknown case out of line: a large clocked function (a CPU's
+        // reorder buffer, thousands of conditions) would otherwise carry a
+        // 4-state copy of every condition, and gcc's memory grows with it.
+        const std::string cold = "[&]() __attribute__((noinline, cold)) -> Val { return " + sl + "; }()";
+        return " if (__builtin_expect(" + g + ", 1)) { if (!(" + u + ")) " + no + " } else {" + jmpIfNot(i, cold, no, unk) + " }\n";
     }
     static std::string jmpIfNot(const Instr& i, const std::string& val, const std::string& no, const std::string& unk) {
         if (i.xt == Instr::NOX) return " if (truth(" + val + ") != 1) " + no + "\n";
@@ -2133,10 +2137,11 @@ private:
     // The expression as a Val, with the 2-state fast path when it applies.
     // The 2-state path in parts: `guard` true (or empty: always) means `u64`
     // is the value, else `slow`. False when there is no 2-state path.
-    bool split(const E& e, std::string& guard, std::string& u64, std::string& slow) {
+    // plainSlow: `slow` stays ex(e), without slow4()'s inline 4-state form.
+    bool split(const E& e, std::string& guard, std::string& u64, std::string& slow, bool plainSlow = false) {
         slow = ex(e);
         if (!twoState) return false;
-        slow = slow4(e, slow);
+        if (!plainSlow) slow = slow4(e, slow);
         FastInfo fi{};
         std::vector<int> refs;
         fxOor_.clear();
