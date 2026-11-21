@@ -977,6 +977,25 @@ struct Sim {
             for (size_t k = 0; k < seqq.size(); k++) nDom += dom(k);
         const bool anyDom = nDom > 0;
         for (int id : seqq) nbaNoSkip |= seqEpoch[(size_t)id] == nbaEpoch;
+        // A batch for one thread (as parallelTuned would run it): one list
+        // for all, as the domain's batches above, instead of a buffer per
+        // process (a clock edge of a large event-driven design wakes
+        // thousands; their buffers were a cache miss each).
+        if (!anyDom && (seqq.size() < kMinParallel || threads <= 1 || tlInPar) && !prof::P().on && !noDomFast) [[likely]] {
+            auto& b = seqBufs[0];
+            b.clear();
+            for (int id : seqq) {
+                const size_t n0 = b.size();
+                seqs[id].fn(seqs[id].ctx, b);
+                seqPend[id] = 0;
+                if (b.size() != n0) seqEpoch[(size_t)id] = nbaEpoch;
+            }
+            if (nbaq.empty()) nbaq.swap(b);
+            else nbaq.insert(nbaq.end(), std::make_move_iterator(b.begin()), std::make_move_iterator(b.end()));
+            seqq.clear();
+            nbaNoSkip = false;
+            return;
+        }
         if (prof::P().on) [[unlikely]] {   // msim -profile: one at a time, each timed
             for (size_t k = 0; k < seqq.size(); k++) {
                 uint64_t t = prof::Profiler::nowNs();
