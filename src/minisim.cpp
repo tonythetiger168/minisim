@@ -615,9 +615,10 @@ struct Sim {
         size_t n = 0, lo = 0;   // count; no bit is set below word `lo`
         bool empty() const { return n == 0; }
         size_t size() const { return n; }
+        __attribute__((noinline)) void grow(size_t w) { bits.resize(w + 1, 0); sum.resize((w >> 6) + 1, 0); }
         void push(int r) {
             size_t w = (size_t)r >> 6;
-            if (w >= bits.size()) { bits.resize(w + 1, 0); sum.resize((w >> 6) + 1, 0); }
+            if (__builtin_expect(w >= bits.size(), 0)) grow(w);
             uint64_t b = 1ULL << (r & 63);
             if (bits[w] & b) return;
             bits[w] |= b;
@@ -656,7 +657,7 @@ struct Sim {
         for (int s : ins) combOf[s].push_back(r);
         markComb(r);  // runs once at time 0, as the process would have
     }
-    void markComb(int r) {
+    __attribute__((always_inline)) void markComb(int r) {
         if (combPend[r]) return;
         combPend[r] = 1;
         combq.push(r);
@@ -679,11 +680,27 @@ struct Sim {
         while (!combq.empty()) {
             int level = combs[combq.top()].level;
             combBatch.clear();
+            bool cyc = false;
             while (!combq.empty() && combs[combq.top()].level == level) {
                 int r = combq.top();
                 combq.pop();
                 combPend[r] = 0;
                 combBatch.push_back(r);
+                cyc |= combs[r].onCycle;
+            }
+            // A batch for one thread: each process computes and writes in
+            // turn. The processes of one level do not read each other (none
+            // is on a comb cycle), so this is what computing them all first
+            // gives, without a Val buffer per process.
+            if (!cyc && !loopDbg && !prof::P().on && !noDomFast && (combBatch.size() < kMinParallel || threads <= 1 || tlInPar)) [[likely]] {
+                for (int r : combBatch) {
+                    const Comb& c = combs[r];
+                    curComb = r;
+                    if (c.compute) c.commit(c.ctx, c.compute(c.ctx));
+                    else c.fn(c.ctx);
+                }
+                curComb = -1;
+                continue;
             }
             // One process at this level (the domain's comb pass, the clock
             // cone): run it, without the batch's buffers and the pool.
@@ -3177,7 +3194,43 @@ struct Sim {
     SrcLoc holdSrc;   // the force / assign statement running holdOn (VPI drivers and loads, 37.16)
     bool vpiNbaPend = false;
     std::map<uint64_t, int> vpiAt;
+    // Most writes store the value the signal already has (an event-driven
+    // comb process re-evaluated because one input changed, an NBA of a
+    // register that keeps its value): that test first, in a small function,
+    // and the rest of set() only for a change.
     void set(int s, Val nv) {
+        const Sig& g = sigs[s];
+        if (__builtin_expect(g.w <= 64 && !(g.fl & (SF_HELD | SF_PART | SF_PATHV)) && nv.hi.empty() && g.val.hi.empty(), 1)) {
+            const uint64_t m = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
+            const uint64_t x = nv.x & m, z = nv.z & m, v = nv.v & m & ~x;
+            const Val& cur = g.val;
+            if (__builtin_expect(!tlPart, 1)) {
+                if (v == (cur.v & m & ~cur.x) && x == (cur.x & m) && z == (cur.z & m)) return;
+                if (!nv.real && !nv.str) { commitNarrow(s, v, x, z); return; }
+            }
+        }
+        setChanged(s, std::move(nv));
+    }
+    // A constant part select write, v[hi:lo] = p: set(s, v_insert(get(s), p,
+    // hi, lo)), with the narrow case done on the words and nothing done
+    // when the bits already hold p.
+    void setPart(int s, const Val& p, int hi, int lo) {
+        const Sig& g = sigs[s];
+        if (__builtin_expect(g.w <= 64 && hi < g.w && lo >= 0 && hi >= lo && p.hi.empty() && g.val.hi.empty() &&
+                             !(g.fl & (SF_HELD | SF_PART | SF_PATHV)), 1)) {
+            const uint64_t wm = g.w >= 64 ? ~0ULL : ((1ULL << g.w) - 1);
+            const uint64_t m = (hi - lo + 1 >= 64 ? ~0ULL : ((1ULL << (hi - lo + 1)) - 1)) << lo;
+            const Val& cur = g.val;
+            const uint64_t cx = cur.x & wm, cz = cur.z & wm, cv = cur.v & wm & ~cx;
+            const uint64_t x = (cx & ~m) | ((p.x << lo) & m), z = (cz & ~m) | ((p.z << lo) & m), v = ((cv & ~m) | ((p.v << lo) & m)) & ~x;
+            if (__builtin_expect(tlPart != nullptr, 0)) { setChanged(s, make(v, x, g.w, z)); return; }
+            if (v == cv && x == cx && z == cz) return;
+            commitNarrow(s, v, x, z);
+            return;
+        }
+        set(s, v_insert(get(s), p, hi, lo));
+    }
+    __attribute__((noinline)) void setChanged(int s, Val nv) {
         Sig& g = sigs[s];
         if (__builtin_expect(g.fl & (SF_HELD | SF_PART | SF_PATHV), 0)) {
             if (g.fl & SF_HELD) return;   // forced: other writes are ignored
@@ -3224,6 +3277,27 @@ struct Sim {
         if (observed) dump(s);   // a VCD or FST open sets observed (dumpvars)
         noteChange(s);  // $monitor: one postponed line if a watched signal changed
         if (__builtin_expect(sigs[s].fl & SF_VPI, 0)) vpiChange(s);   // cbValueChange (38.36.1)
+        wakeOn(s, o, n);
+        if (__builtin_expect(sigs[s].fl & SF_LISTEN, 0)) heldInputChanged(s);
+    }
+    // A narrow (<= 64 bit, no limbs) value that set / setPart found changed:
+    // store the masked words and wake readers. Anything rare (dumps, $monitor,
+    // coverage, -xprop, VPI, held inputs, deferred combs, path delays) goes
+    // the full way through setChanged.
+    void commitNarrow(int s, uint64_t v, uint64_t x, uint64_t z) {
+        Sig& g = sigs[s];
+        if (__builtin_expect(combDefer || g_cov || edgeTrack || observed || !pathIn.empty() || !fmons.empty() || mon.on ||
+                             (g.fl & (SF_VPI | SF_LISTEN)), 0)) {
+            setChanged(s, make(v, x, g.w, z));
+            return;
+        }
+        Val& cur = g.val;
+        const int o = (cur.x & 1) ? 2 : (int)(cur.v & 1), n = (x & 1) ? 2 : (int)(v & 1);
+        cur.v = v; cur.x = x; cur.z = z; cur.w = g.w;
+        cur.sgn = false; cur.real = false; cur.str = false;
+        wakeOn(s, o, n);
+    }
+    void wakeOn(int s, int o, int n) {
         bool pos = (o != 1 && n == 1) || (o == 0 && n != 0);
         bool neg = (o != 0 && n == 0) || (o == 1 && n != 1);
         // Wake matching waiters and compact the rest in place (no allocation).
@@ -3265,7 +3339,6 @@ struct Sim {
                     seqPend[id] = 1;
                     seqq.push_back(id);
                 }
-        if (__builtin_expect(sigs[s].fl & SF_LISTEN, 0)) heldInputChanged(s);
     }
 
     void runObserved();
