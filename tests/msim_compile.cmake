@@ -123,6 +123,8 @@ set(CASES
   "examples/selfcount.sv"
   "-no-cycle examples/seqgroup.sv"
   "examples/seqgroup.sv"
+  "-no-cycle examples/sliceof.sv"
+  "examples/sliceof.sv"
   "-no-cycle examples/quiettmp.sv"
   "examples/quiettmp.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
