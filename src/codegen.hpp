@@ -86,6 +86,10 @@ struct CodegenSig {
     // (msim.cpp soleNbaTargets): a clocked function skips that NBA when it
     // would not change the value (Sim::nbaKeep).
     bool soleNba = false;
+    // A temporary of one process (an inlined function's automatic variable,
+    // "_tf..."), which no other process reads or waits on (msim.cpp
+    // quietTemps): its writes are stores, with no change event.
+    bool quiet = false;
 };
 
 // msim -compile: the DPI-C libraries simv loads (the user's C files built
@@ -132,7 +136,7 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
-        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); soleNba_.push_back(g.soleNba); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
+        for (auto& g : sigs) { quiet_.push_back(g.quiet); sigW_.push_back(g.w); sigNet_.push_back(g.net); soleNba_.push_back(g.soleNba); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
         {
             // Array shapes numbered by base signal: the instances of a module
             // then have theirs at a constant distance, as shared code needs.
@@ -1355,6 +1359,8 @@ private:
     // read follows a write in the same pass, so an X left in one from a pass
     // that did not use it says nothing about 2-state mode.
     std::vector<char> scratch_;
+    std::vector<char> quiet_;   // CodegenSig::quiet
+    bool quiet(int s) const { return s >= 0 && (size_t)s < quiet_.size() && quiet_[(size_t)s]; }
     bool scratch(int s) const { return s >= 0 && (size_t)s < scratch_.size() && scratch_[(size_t)s]; }
     // Private signals of the cycle domain (see privateSigs): kept in plain
     // static variables P<s> instead of S.sigs, like Verilator's model members.
@@ -2194,7 +2200,7 @@ private:
             else o << " S.set(" << t << ", " << val << ");\n";
             return o.str();
         }
-        if ((i.tmp || i.xq) && !isPriv(i.sig)) {   // a temporary of the process, or a quiet -xprop write: no change event
+        if ((i.tmp || i.xq || (quiet(i.sig) && !i.bidx && i.drv < 0)) && !isPriv(i.sig)) {   // a temporary of the process, or a quiet -xprop write: no change event
             o << " S.poke(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
             return o.str();
         }
