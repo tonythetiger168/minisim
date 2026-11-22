@@ -2180,6 +2180,66 @@ static Plan plan(const LowerResult& lowered, bool staticComb, bool staticSeq) {
             for (int x : shapes[a].ins) in += S.sigs[x].name + " ";
             std::cerr << "cycle " << cyc[a] << ": " << lowered.procs[procOf[a]].kind << " writes " << o << "| reads " << in << "\n";
         }
+        // MSIM_WHYLOOP=1: for each cycle, one shortest loop through its
+        // blocks, with the signal bits that close each step (a loop that is
+        // not one bit by bit is a false loop of whole-signal granularity).
+        static const bool whyLoop = std::getenv("MSIM_WHYLOOP") != nullptr;
+        if (whyLoop) {
+            std::map<int, std::vector<size_t>> comps;
+            for (size_t a = 0; a < cyc.size(); a++) if (cyc[a] >= 0) comps[cyc[a]].push_back(a);
+            auto bits = [](int lo, int hi) { return lo < 0 ? std::string("[*]") : "[" + std::to_string(hi) + ":" + std::to_string(lo) + "]"; };
+            for (auto& [id, mem] : comps) {
+                std::set<size_t> in(mem.begin(), mem.end());
+                std::unordered_map<int, std::vector<size_t>> readers;   // signal -> members reading it
+                for (size_t b : mem) {
+                    std::set<int> seen;
+                    for (auto& r : shapes[b].rbits) if (seen.insert(r.sig).second) readers[r.sig].push_back(b);
+                    for (int x : shapes[b].ins) if (seen.insert(x).second) readers[x].push_back(b);
+                }
+                // Edge a -> b through o, with the bits a writes and b reads.
+                auto step = [&](size_t a, auto&& f) {
+                    for (int o : shapes[a].outs) {
+                        auto it = readers.find(o);
+                        if (it == readers.end()) continue;
+                        for (size_t b : it->second) {
+                            bool hit = false, anyR = false;
+                            std::string wb, rb;
+                            for (auto& r : shapes[b].rbits) {
+                                if (r.sig != o) continue;
+                                anyR = true;
+                                for (auto& w : shapes[a].wbits)
+                                    if (w.sig == o && (w.lo < 0 || r.lo < 0 || (w.lo <= r.hi && r.lo <= w.hi))) { hit = true; wb = bits(w.lo, w.hi); rb = bits(r.lo, r.hi); }
+                            }
+                            if (!anyR) { hit = true; wb = "[?]"; rb = "(waits/calls)"; }
+                            if (hit) f(b, o, wb, rb);
+                        }
+                    }
+                };
+                // BFS from the first member back to it.
+                const size_t s0 = mem[0];
+                std::map<size_t, std::tuple<size_t, int, std::string, std::string>> prev;
+                std::deque<size_t> q{s0};
+                bool found = false;
+                while (!q.empty() && !found) {
+                    size_t a = q.front(); q.pop_front();
+                    step(a, [&](size_t b, int o, const std::string& wb, const std::string& rb) {
+                        if (found || prev.count(b)) return;
+                        prev[b] = {a, o, wb, rb};
+                        if (b == s0) found = true; else q.push_back(b);
+                    });
+                }
+                std::cerr << "loop " << id << " (" << mem.size() << " blocks):" << (found ? "" : " no path back") << "\n";
+                if (!found) continue;
+                std::vector<std::string> lines;
+                size_t at = s0;
+                do {
+                    auto& [a, o, wb, rb] = prev[at];
+                    lines.push_back("  " + lowered.procs[procOf[a]].kind + " writes " + S.sigs[o].name + wb + " -> read as " + rb + " by " + lowered.procs[procOf[at]].kind);
+                    at = a;
+                } while (at != s0 && lines.size() < 200);
+                for (auto it = lines.rbegin(); it != lines.rend(); ++it) std::cerr << *it << "\n";
+            }
+        }
         for (size_t r = 0; r < order.size(); r++) {
             size_t i = procOf[order[r]];
             p.rank[i] = (int)r;
