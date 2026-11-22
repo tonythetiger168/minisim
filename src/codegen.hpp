@@ -86,6 +86,10 @@ struct CodegenSig {
     // (msim.cpp soleNbaTargets): a clocked function skips that NBA when it
     // would not change the value (Sim::nbaKeep).
     bool soleNba = false;
+    // A temporary of one process (an inlined function's automatic variable,
+    // "_tf..."), which no other process reads or waits on (msim.cpp
+    // quietTemps): its writes are stores, with no change event.
+    bool quiet = false;
 };
 
 // msim -compile: the DPI-C libraries simv loads (the user's C files built
@@ -132,7 +136,7 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
-        for (auto& g : sigs) { sigW_.push_back(g.w); sigNet_.push_back(g.net); soleNba_.push_back(g.soleNba); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
+        for (auto& g : sigs) { quiet_.push_back(g.quiet); sigW_.push_back(g.w); sigNet_.push_back(g.net); soleNba_.push_back(g.soleNba); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
         {
             // Array shapes numbered by base signal: the instances of a module
             // then have theirs at a constant distance, as shared code needs.
@@ -1355,6 +1359,8 @@ private:
     // read follows a write in the same pass, so an X left in one from a pass
     // that did not use it says nothing about 2-state mode.
     std::vector<char> scratch_;
+    std::vector<char> quiet_;   // CodegenSig::quiet
+    bool quiet(int s) const { return s >= 0 && (size_t)s < quiet_.size() && quiet_[(size_t)s]; }
     bool scratch(int s) const { return s >= 0 && (size_t)s < scratch_.size() && scratch_[(size_t)s]; }
     // Private signals of the cycle domain (see privateSigs): kept in plain
     // static variables P<s> instead of S.sigs, like Verilator's model members.
@@ -2194,8 +2200,8 @@ private:
             else o << " S.set(" << t << ", " << val << ");\n";
             return o.str();
         }
-        if ((i.tmp || i.xq) && !isPriv(i.sig)) {   // a temporary of the process, or a quiet -xprop write: no change event
-            o << " S.poke(" << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
+        if ((i.tmp || i.xq || (quiet(i.sig) && !i.bidx && i.drv < 0)) && !isPriv(i.sig)) {   // a temporary of the process, or a quiet -xprop write: no change event
+            o << (i.tmp || i.xq ? " S.poke(" : " S.pokeQ(") << i.sig << ", " << val << ", " << i.hi << ", " << i.lo << ");\n";
             return o.str();
         }
         if (isPriv(i.sig)) {   // a testbench write to a private reg: the comb logic may read it
@@ -3245,7 +3251,7 @@ private:
     // calls f(at, len, N) for each.
     template <class F> static void refScan(const std::string& t, F&& f) {
         static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
-                                    "S.get(", "S.set(", "S.setOneBit(", "S.setBitsV(", "S.setPart(", "S.poke(", "S.nbaKeep(", "R(", "int s = ",   // dynTarget
+                                    "S.get(", "S.set(", "S.setOneBit(", "S.setBitsV(", "S.setPart(", "S.poke(", "S.pokeQ(", "S.nbaKeep(", "R(", "int s = ",   // dynTarget
                                     "SIGN(",   // a commit list entry's signal (C1E)
                                     "nb.push_back({"};   // an NBA of a clocked function (emitSeq)
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
@@ -6159,7 +6165,7 @@ private:
             size_t b = stmt;
             while (b < nl && t[b] == ' ') b++;
             bool ok = false;
-            for (const char* p : {"S.set(", "S.setOneBit(", "S.setPart(", "S.poke(", "S.drive("})
+            for (const char* p : {"S.set(", "S.setOneBit(", "S.setPart(", "S.poke(", "S.pokeQ(", "S.drive("})
                 if (t.compare(b, std::strlen(p), p) == 0) { ok = true; break; }
             bool nbLine = false;
             if (!ok && nbOk)

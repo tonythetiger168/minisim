@@ -2639,6 +2639,56 @@ static void soleNbaTargets(const LowerResult& lowered, std::vector<CodegenSig>& 
     if (std::getenv("MSIM_WHYCONST")) std::fprintf(stderr, "sole NBA targets: %zu registers\n", k);
 }
 
+// The temporaries of one process each: signals the lowerer made for an
+// inlined function's automatic variables ("_tf..."), hidden from waveforms
+// and VPI, that no other process, final block or wait touches. A write to
+// one is a store (Sim::poke): no other process can see the change, so the
+// change event (Sim::set, wakeOn) is work for nothing. prim_keccak's
+// theta() wrote its 1600-bit result bit by bit through Sim::set: 7% of an
+// OpenTitan run. MSIM_NOQUIETTMP=1: off.
+static void quietTemps(const LowerResult& lowered, std::vector<CodegenSig>& sigs) {
+    if (std::getenv("MSIM_NOQUIETTMP")) return;
+    const size_t ns = S.sigs.size();
+    std::vector<int> owner(ns, -1);   // the process, -1 none, -2 several or other
+    auto touch = [&](int s, int who) {
+        if (s < 0 || (size_t)s >= ns) return;
+        int& o = owner[(size_t)s];
+        o = (o == -1 || o == who) ? who : -2;
+    };
+    std::vector<char> waited(ns, 0);
+    auto scan = [&](const Prog& top, int who) {
+        std::vector<const Prog*> seen, todo{&top};
+        while (!todo.empty()) {
+            const Prog* p = todo.back(); todo.pop_back();
+            if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+            seen.push_back(p);
+            for (const Instr& i : p->code) {
+                touch(i.sig, i.k == IK::Dump ? -2 : who);
+                for (auto& [sg, ed] : i.events) { touch(sg, -2); if (sg >= 0 && (size_t)sg < ns) waited[(size_t)sg] = 1; }
+                if (i.k == IK::WaitEdge && i.sig >= 0 && (size_t)i.sig < ns) waited[(size_t)i.sig] = 1;
+                if (i.arr) for (int k = 0; k < i.arr->count; k++) touch(i.arr->base + k, -2);
+                if (i.k == IK::Call && i.callee) todo.push_back(i.callee);
+                for (const Prog* b : i.branches) todo.push_back(b);
+            }
+            std::vector<int> rd;
+            std::vector<const Prog*> seen2;
+            collectProgRefs(*p, rd, seen2);
+            for (int r : rd) touch(r, who);
+        }
+    };
+    for (size_t pi = 0; pi < lowered.procs.size(); pi++) scan(lowered.procs[pi].prog, (int)pi);
+    for (auto& f : lowered.finals) scan(f.prog, -2);
+    for (auto& sp : lowered.subs) if (sp) scan(*sp, -2);
+    size_t k = 0;
+    for (size_t s = 0; s < ns && s < sigs.size(); s++) {
+        const Sig& g = S.sigs[s];
+        if (owner[s] < 0 || waited[s] || g.net || !g.drv.empty() || g.name.rfind("_tf", 0) != 0) continue;
+        sigs[s].quiet = true;
+        k++;
+    }
+    if (std::getenv("MSIM_WHYQUIET")) std::fprintf(stderr, "quiet temporaries: %zu signals\n", k);
+}
+
 static int runCompiled(const LowerResult& lowered, const std::string& dir, const std::string& cc,
                        std::string opt, const std::optional<std::string>& vcdPath, uint64_t maxTime,
                        const Plan& pl, int threads, bool staticPart, bool twoState, bool cycle,
@@ -2670,6 +2720,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     for (size_t b = 0; b < S.mirrors.size(); b++)
         for (int a : S.mirrors[b]) sigs[(size_t)a].mirror = (int)b;
     soleNbaTargets(lowered, sigs);
+    if (!upf && !vcdPath && !g_cov && !vpi::st().active && !Lowerer::xpropMode() && !std::getenv("MSIM_NOQUIETTMP")) quietTemps(lowered, sigs);
     std::vector<CodegenProc> procs;
     const bool gateDyn = !gateRecs().empty() && (vpi::st().active || !sdfRequests().empty() || sdfAtRunTime());
     for (size_t i = 0; i < lowered.procs.size(); i++) {

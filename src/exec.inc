@@ -395,7 +395,7 @@ static void readMem(const Instr& i) {
                 if (d == 'x' || d == 'X') dig = allx(bits);
                 else if (d == 'z' || d == 'Z' || d == '?') dig = allz(bits);
                 else if (i.hex && isxdigit((unsigned char)d))
-                    dig = mk((uint64_t)std::stoi(std::string(1, d), nullptr, 16), bits);
+                    dig = mk((uint64_t)(d <= '9' ? d - '0' : (d | 0x20) - 'a' + 10), bits);
                 else if (!i.hex && (d == '0' || d == '1')) dig = mk((uint64_t)(d - '0'), bits);
                 else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
                 acc = v_or(v_shl(acc, sh), dig);
@@ -417,7 +417,7 @@ static void readMem(const Instr& i) {
             uint64_t m = (1ULL << bits) - 1;
             if (d == 'x' || d == 'X') x |= m;
             else if (d == 'z' || d == 'Z' || d == '?') { x |= m; z |= m; }
-            else if (i.hex && isxdigit((unsigned char)d)) v |= (uint64_t)std::stoi(std::string(1, d), nullptr, 16);
+            else if (i.hex && isxdigit((unsigned char)d)) v |= (uint64_t)(d <= '9' ? d - '0' : (d | 0x20) - 'a' + 10);
             else if (!i.hex && (d == '0' || d == '1')) v |= (uint64_t)(d - '0');
             else { std::cerr << "$readmem: bad digit '" << d << "' in " << i.fmt << "\n"; return; }
         }

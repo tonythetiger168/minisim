@@ -777,8 +777,35 @@ struct Sim {
     // set() inside a partition task: only this partition reads the signal.
     // Stores a value nothing watches (Instr::tmp): no change detection, no
     // wake-ups, safe from a clocked batch running in parallel.
+    // A quiet temporary (msim.cpp quietTemps): a store, unless a waveform
+    // or $monitor looks (simv -vcd decides at run time), then set().
+    void pokeQ(int s, Val nv, int hi, int lo) {
+        if (__builtin_expect(observed || g_cov, 0)) {
+            if (hi >= 0) setPart(s, nv, hi, lo); else set(s, std::move(nv));
+            return;
+        }
+        poke(s, std::move(nv), hi, lo);
+    }
     void poke(int s, Val nv, int hi, int lo) {
         Sig& g = sigs[s];
+        // Up to 64 bits of a wide temporary (an inlined function's array,
+        // written bit by bit): in place, without copying the whole value.
+        if (hi >= 0 && lo >= 0 && hi >= lo && hi - lo < 64 && hi < g.w && g.w > 64 && nv.hi.empty() && !nv.real && !nv.str &&
+            !g.val.real && !g.val.str && g.val.w == g.w && (int)g.val.hi.size() == (g.w - 1) / 64) {
+            const int n = hi - lo + 1;
+            const uint64_t m = n == 64 ? ~0ULL : (1ULL << n) - 1, x = nv.x & m, z = nv.z & m, v = nv.v & m & ~x;
+            const int l0 = lo >> 6, sh = lo & 63, l1 = hi >> 6;
+            auto put = [&](int l, uint64_t mm, uint64_t V, uint64_t X, uint64_t Z) {
+                uint64_t& pv = l ? g.val.hi[l - 1].v : g.val.v;
+                uint64_t& px = l ? g.val.hi[l - 1].x : g.val.x;
+                uint64_t& pz = l ? g.val.hi[l - 1].z : g.val.z;
+                pv = (pv & ~mm) | V; px = (px & ~mm) | X; pz = (pz & ~mm) | Z;
+            };
+            put(l0, m << sh, v << sh, x << sh, z << sh);
+            if (l1 != l0) put(l1, m >> (64 - sh), v >> (64 - sh), x >> (64 - sh), z >> (64 - sh));
+            g.val.sgn = false;
+            return;
+        }
         // get(): the stored value's own width may not be the signal's yet
         // (a variable never written whole keeps its 1-bit default).
         if (hi >= 0) nv = v_insert(get(s), nv, hi, lo);
