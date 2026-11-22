@@ -2897,7 +2897,7 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     std::string kobj;
     std::thread kthread;
     if (useKernelObject() && !mix.on)
-        kthread = std::thread([&] { kobj = kernelObject(cc, " -std=c++20 " + opt + " -I" + shq(inc) + fstC, inc, dir); });
+        kthread = std::thread([&] { kobj = kernelObject(cc, " -std=c++20 " + opt + (getenv("MSIM_KCFLAGS") ? std::string(" ") + getenv("MSIM_KCFLAGS") : std::string()) + " -I" + shq(inc) + fstC, inc, dir); });
     auto kernelReady = [&]() -> bool {
         if (kthread.joinable()) kthread.join();
         return !useKernelObject() || mix.on || !kobj.empty();

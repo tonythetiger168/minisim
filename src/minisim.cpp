@@ -328,6 +328,9 @@ struct Wheel {
     void clear() { b.clear(); }
     // The earliest bucket, moved to time t (> its own): its handles wait again.
     void retimeFront(uint64_t t) {
+        // Still the earliest (a clock whose next edge comes before anything
+        // else waits): the time changes in place, nothing moves.
+        if (b.size() < 2 || b[b.size() - 2].first > t) { b.back().first = t; return; }
         Bucket bk = std::move(b.back());
         b.pop_back();
         size_t lo = 0, hi = b.size();
