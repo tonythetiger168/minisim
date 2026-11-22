@@ -777,6 +777,15 @@ struct Sim {
     // set() inside a partition task: only this partition reads the signal.
     // Stores a value nothing watches (Instr::tmp): no change detection, no
     // wake-ups, safe from a clocked batch running in parallel.
+    // A quiet temporary (msim.cpp quietTemps): a store, unless a waveform
+    // or $monitor looks (simv -vcd decides at run time), then set().
+    void pokeQ(int s, Val nv, int hi, int lo) {
+        if (__builtin_expect(observed || g_cov, 0)) {
+            if (hi >= 0) setPart(s, nv, hi, lo); else set(s, std::move(nv));
+            return;
+        }
+        poke(s, std::move(nv), hi, lo);
+    }
     void poke(int s, Val nv, int hi, int lo) {
         Sig& g = sigs[s];
         // Up to 64 bits of a wide temporary (an inlined function's array,
