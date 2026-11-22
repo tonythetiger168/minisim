@@ -1235,16 +1235,14 @@ struct Sim {
     void queueSeqs(int s, bool pos, bool neg) {
         if ((size_t)s >= seqOf.size() || seqOf[s].empty()) return;
         const auto& so = seqOf[s];
-        const size_t base = seqq.size();
-        seqq.resize(base + so.size());
-        int* out = seqq.data() + base;
-        size_t k = 0;
+        // reserve, then push_back inline: resize() zero-filled the slots out
+        // of line first (std::vector::_M_default_append), 2% of Ibex.
+        if (seqq.capacity() < seqq.size() + so.size()) seqq.reserve(2 * (seqq.size() + so.size()));
         for (auto& [id, e] : so)
             if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
                 seqPend[id] = 1;
-                out[k++] = id;
+                seqq.push_back(id);
             }
-        seqq.resize(base + k);
     }
     void bitEdge(int s, uint64_t n) {
         Sig& g = sigs[s];
