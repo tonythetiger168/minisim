@@ -3108,7 +3108,8 @@ private:
         // are few; else, or when that clashes, the largest one alone.
         std::vector<int> all;
         // (A multi-core SoC has a gated clock per core: a few groups per core.)
-        if (groups.size() > 1 && groups.size() <= 1024 && !std::getenv("MSIM_ONEGROUP")) {
+        const bool bestAlone = std::getenv("MSIM_BESTALONE") && groups.size() > 64;
+        if (groups.size() > 1 && groups.size() <= 1024 && !std::getenv("MSIM_ONEGROUP") && !bestAlone) {
             for (auto& g : groups) all.insert(all.end(), g.begin(), g.end());
             std::sort(all.begin(), all.end());
             if (clash(all) && !std::getenv("MSIM_NOPRUNE")) {
