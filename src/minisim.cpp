@@ -328,6 +328,9 @@ struct Wheel {
     void clear() { b.clear(); }
     // The earliest bucket, moved to time t (> its own): its handles wait again.
     void retimeFront(uint64_t t) {
+        // Still the earliest (a clock whose next edge comes before anything
+        // else waits): the time changes in place, nothing moves.
+        if (b.size() < 2 || b[b.size() - 2].first > t) { b.back().first = t; return; }
         Bucket bk = std::move(b.back());
         b.pop_back();
         size_t lo = 0, hi = b.size();
@@ -1235,16 +1238,14 @@ struct Sim {
     void queueSeqs(int s, bool pos, bool neg) {
         if ((size_t)s >= seqOf.size() || seqOf[s].empty()) return;
         const auto& so = seqOf[s];
-        const size_t base = seqq.size();
-        seqq.resize(base + so.size());
-        int* out = seqq.data() + base;
-        size_t k = 0;
+        // reserve, then push_back inline: resize() zero-filled the slots out
+        // of line first (std::vector::_M_default_append), 2% of Ibex.
+        if (seqq.capacity() < seqq.size() + so.size()) seqq.reserve(2 * (seqq.size() + so.size()));
         for (auto& [id, e] : so)
             if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
                 seqPend[id] = 1;
-                out[k++] = id;
+                seqq.push_back(id);
             }
-        seqq.resize(base + k);
     }
     void bitEdge(int s, uint64_t n) {
         Sig& g = sigs[s];
