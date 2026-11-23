@@ -399,6 +399,19 @@ inline Val clipRead(const Val& src, int w) {
     }
     return a;
 }
+// v_slice(clipRead(a, ...), hi, lo) for a constant slice of at most 64 bits
+// inside a stored wide signal: read in place, without copying the whole
+// value twice (compiled code's struct field reads, a TL-UL port's a_address).
+inline Val sliceOf(const Val& a, int hi, int lo) {
+    const int w = hi - lo + 1, l0 = lo >> 6, sh = lo & 63;
+    uint64_t v = limbV(a, l0) >> sh, x = limbX(a, l0) >> sh, z = limbZ(a, l0) >> sh;
+    if (sh && sh + w > 64) {
+        v |= limbV(a, l0 + 1) << (64 - sh);
+        x |= limbX(a, l0 + 1) << (64 - sh);
+        z |= limbZ(a, l0 + 1) << (64 - sh);
+    }
+    return make(v & ~x, x, w, z & x);   // clipRead's invariant
+}
 // Widen or truncate. signFill replicates bit (a.w-1) into the new high bits,
 // including when that bit is X or Z. Truncation keeps the low bits.
 inline Val v_slice(Val a, int hi, int lo);

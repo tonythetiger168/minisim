@@ -1360,6 +1360,7 @@ private:
     // that did not use it says nothing about 2-state mode.
     std::vector<char> scratch_;
     std::vector<char> quiet_;   // CodegenSig::quiet
+    const bool noSliceOf_ = std::getenv("MSIM_NOSLICEOF") != nullptr;   // v_slice(R(..)) as before
     bool quiet(int s) const { return s >= 0 && (size_t)s < quiet_.size() && quiet_[(size_t)s]; }
     bool scratch(int s) const { return s >= 0 && (size_t)s < scratch_.size() && scratch_[(size_t)s]; }
     // Private signals of the cycle domain (see privateSigs): kept in plain
@@ -1609,7 +1610,14 @@ private:
             case Op::RedAnd: return f1("v_red_and");
             case Op::RedOr: return f1("v_red_or");
             case Op::RedXor: return f1("v_red_xor");
-            case Op::Slice: return "v_slice(" + k(0) + ", " + std::to_string(e->hi) + ", " + std::to_string(e->lo) + ")";
+            case Op::Slice: {
+                const E& a = e->kids.at(0);
+                // A field of a wide stored signal: read in place (sliceOf).
+                if (a->op == Op::Ref && !a->at && !isRel(a->sig) && !isPriv(a->sig) && a->sig >= 0 && (size_t)a->sig < sigW_.size() &&
+                    sigW_[a->sig] > 64 && e->lo >= 0 && e->hi >= e->lo && e->hi < sigW_[a->sig] && e->hi - e->lo < 64 && !noSliceOf_)
+                    return "sliceOf(S.sigs[" + std::to_string(a->sig) + "].val, " + std::to_string(e->hi) + ", " + std::to_string(e->lo) + ")";
+                return "v_slice(" + k(0) + ", " + std::to_string(e->hi) + ", " + std::to_string(e->lo) + ")";
+            }
             case Op::Index: return f2("v_index");
             case Op::Concat: {
                 if (e->kids.empty()) return "Val{0, 0, 0}";
