@@ -3,15 +3,18 @@
 // file): -compile keeps the elements private and reads them in place.
 module rf(input logic clk, input logic we, input logic [2:0] wa, input logic [7:0] wd,
           input logic [2:0] ra, input logic [2:0] rb, output logic [7:0] rd, output logic [7:0] rq);
-  logic [7:0] r [8];
+  logic [7:0] r [8], s [8];
   for (genvar i = 1; i < 8; i++) begin : g
     logic [7:0] q;
     always_ff @(posedge clk) if (we && wa == i) q <= wd;
     assign r[i] = q;
+    assign s[i] = q ^ 8'(i);
   end
   assign r[0] = 8'h5a;
+  assign s[0] = 8'h33;
   assign rd = r[ra];
-  always_ff @(posedge clk) rq <= r[rb] + 8'd1;   // read by a clocked process too
+  // A clocked reader (it reads the registers' old values): s stays in S.sigs.
+  always_ff @(posedge clk) rq <= s[rb] + 8'd1;
 endmodule
 module arrread;
   logic clk = 0, we; logic [2:0] wa, ra, rb; logic [7:0] wd, rd, rq;

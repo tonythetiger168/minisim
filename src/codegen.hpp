@@ -4089,7 +4089,7 @@ private:
                 range(e->arr.get());
                 for (auto& k : e->kids) ea(k);
             };
-            // A read a[i] in a compiled statement of a domain or comb process
+            // A read a[i] in a compiled statement of a comb process
             // reads the private elements in place ((&P<base>)[i], APRV), so
             // such an array (Ibex's register file mirror rf_reg) may be
             // private: the kernel never reaches it. Each element still has to
@@ -4117,7 +4117,10 @@ private:
                     for (auto* b : in.branches) walk(b, false);
                 }
             };
-            for (size_t i = 0; i < procs.size(); i++) walk(procs[i].prog, mine[i] != 0);
+            // Comb processes only: a clocked process of the domain reads a
+            // register another one writes from its snapshot (snap_, LS_), and
+            // an element read in place would see the new value.
+            for (size_t i = 0; i < procs.size(); i++) walk(procs[i].prog, mine[i] && procs[i].combRank >= 0);
         }
         for (int s : noPriv) if (s >= 0 && (size_t)s < ns) bad[(size_t)s] = 1;
         priv_.assign(ns, 0);
