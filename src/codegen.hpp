@@ -1400,7 +1400,119 @@ private:
                ") & " + m + ", 0, " + std::to_string(sigW_[s]) + ")); }";
     }
     const bool noSetBit_ = std::getenv("MSIM_NOSETBIT") != nullptr;
-    const bool noRegSame_ = std::getenv("MSIM_NOREGSAME") != nullptr;   // regWrite stores without comparing first   // a one-bit write goes through set()
+    const bool noRegSame_ = std::getenv("MSIM_NOREGSAME") != nullptr;
+    // A run of constant part writes of one private register (always_comb
+    // loops: x[i] = y[N-1-i], x[i] = 1'b0, ...) as one word in the 2-state
+    // copy: constant bits, bits moved by one distance, a bit reverse, the
+    // rest one by one. ins[at..] are the candidates in order (the caller
+    // stops them at a jump target); n: how many it took.
+    const bool noBitRun_ = std::getenv("MSIM_NOBITRUN") != nullptr;
+    bool bitRun2(const std::vector<const Instr*>& ins, size_t at, size_t& n, std::string& out) {
+        n = 0;
+        if (noBitRun_ || at >= ins.size()) return false;
+        const Instr& a = *ins[at];
+        const int sg = a.sig;
+        auto ok = [&](const Instr& in) {
+            return in.k == IK::Assign && in.sig == sg && in.hi >= 0 && in.lo >= 0 && in.hi < 64 && in.hi >= in.lo && !in.bidx && !in.arr &&
+                   in.aidx.empty() && in.drv < 0 && isPriv(in.sig) && sigW_[in.sig] <= 64 && in.hi < sigW_[in.sig];
+        };
+        if (!ok(a)) return false;
+        const std::string P_ = "P" + std::to_string(sg);
+        auto readsSelf = [&](const std::string& u) {
+            for (size_t f = u.find(P_); f != std::string::npos; f = u.find(P_, f + 1)) {
+                const size_t e = f + P_.size();
+                if ((f == 0 || !(std::isalnum((unsigned char)u[f - 1]) || u[f - 1] == '_')) && (e >= u.size() || !std::isdigit((unsigned char)u[e]))) return true;
+            }
+            return false;
+        };
+        struct It { int hi, lo; std::string u; };
+        std::vector<It> its;
+        uint64_t tm = 0;
+        for (size_t q = at; q < ins.size(); q++) {
+            const Instr& in = *ins[q];
+            if (!ok(in)) break;
+            std::string g, u, sl;
+            if (!split(in.e, g, u, sl) || readsSelf(u)) break;
+            const int w = in.hi - in.lo + 1;
+            const uint64_t m = (w >= 64 ? ~0ULL : ((1ULL << w) - 1)) << in.lo;
+            if (tm & m) break;   // a bit written twice: the order matters
+            tm |= m;
+            its.push_back({in.hi, in.lo, u});
+        }
+        if (its.size() < 3) return false;
+        n = its.size();
+        // Classify: constants, single bits of a source ((src >> k) & 0x1ULL), the rest.
+        uint64_t cm = 0, cv = 0;
+        std::map<std::string, std::vector<std::pair<int, int>>> bits;   // source -> (k, j)
+        std::vector<std::string> terms;
+        std::map<std::string, uint64_t> dec;   // "SRC\x01EN" -> its bits
+        auto isSrc = [](const std::string& t) {
+            if (t.size() < 3 || t.compare(t.size() - 2, 2, ".v") != 0) return false;
+            for (size_t c = 0; c + 2 < t.size(); c++) if (!(std::isalnum((unsigned char)t[c]) || t[c] == '_')) return false;
+            return true;
+        };
+        for (auto& it : its) {
+            const int w = it.hi - it.lo + 1;
+            const uint64_t m = (w >= 64 ? ~0ULL : ((1ULL << w) - 1)) << it.lo;
+            const std::string& u = it.u;
+            if (u.size() > 5 && u.rfind("0x", 0) == 0 && u.compare(u.size() - 3, 3, "ULL") == 0 && u.find_first_not_of("0123456789abcdefx", 0) == u.size() - 3) {
+                cm |= m; cv |= (std::stoull(u.substr(2, u.size() - 5), nullptr, 16) << it.lo) & m;
+                continue;
+            }
+            if (w == 1) {
+                static const std::string tail = ") & 0x1ULL)";
+                if (u.rfind("((", 0) == 0 && u.size() > tail.size() && u.compare(u.size() - tail.size(), tail.size(), tail) == 0) {
+                    const std::string mid = u.substr(2, u.size() - 2 - tail.size());
+                    const size_t sh = mid.rfind(" >> ");
+                    if (sh != std::string::npos && isSrc(mid.substr(0, sh)) && mid.find_first_not_of("0123456789", sh + 4) == std::string::npos) {
+                        bits[mid.substr(0, sh)].push_back({std::stoi(mid.substr(sh + 4)), it.lo});
+                        continue;
+                    }
+                }
+                if (isSrc(u)) { bits[u].push_back({0, it.lo}); continue; }
+                // A decoder bit: ((uint64_t)(SRC == 0xJULL) != 0 ? EN : 0x0ULL) at bit J.
+                static const std::string dp = "((uint64_t)(", dm = " == 0x", dq = "ULL) != 0 ? ", dt = " : 0x0ULL)";
+                if (u.rfind(dp, 0) == 0 && u.size() > dt.size() && u.compare(u.size() - dt.size(), dt.size(), dt) == 0) {
+                    const size_t a1 = u.find(dm), a2 = a1 == std::string::npos ? a1 : u.find(dq, a1);
+                    if (a2 != std::string::npos) {
+                        const std::string src = u.substr(dp.size(), a1 - dp.size()), num = u.substr(a1 + dm.size(), a2 - a1 - dm.size()),
+                                          en = u.substr(a2 + dq.size(), u.size() - dt.size() - a2 - dq.size());
+                        if (isSrc(src) && isSrc(en) && !num.empty() && num.size() <= 2 && num.find_first_not_of("0123456789abcdef") == std::string::npos &&
+                            std::stoi(num, nullptr, 16) == it.lo) {
+                            dec[src + "\x01" + en] |= 1ULL << it.lo;
+                            continue;
+                        }
+                    }
+                }
+            }
+            terms.push_back("(((uint64_t)(" + u + ") << " + std::to_string(it.lo) + ") & " + hex(m) + ")");
+        }
+        for (auto& [src, kj] : bits) {
+            uint64_t gm = 0;
+            for (auto& [k, j] : kj) gm |= 1ULL << j;
+            bool sameD = true, sameC = true;
+            for (auto& [k, j] : kj) { sameD &= j - k == kj[0].second - kj[0].first; sameC &= j + k == kj[0].second + kj[0].first; }
+            if (kj.size() > 1 && sameD) {
+                const int d = kj[0].second - kj[0].first;
+                terms.push_back("((" + src + (d >= 0 ? " << " + std::to_string(d) : " >> " + std::to_string(-d)) + ") & " + hex(gm) + ")");
+            } else if (kj.size() > 2 && sameC) {
+                const int c = kj[0].second + kj[0].first;   // bit j = source bit c - j: rev64 puts source bit i at 63 - i
+                terms.push_back("((msimRev64(" + src + ")" + (c <= 63 ? " >> " + std::to_string(63 - c) : " << " + std::to_string(c - 63)) + ") & " + hex(gm) + ")");
+            } else
+                for (auto& [k, j] : kj) terms.push_back("(((" + src + " >> " + std::to_string(k) + ") & 1ULL) << " + std::to_string(j) + ")");
+        }
+        for (auto& [k, gm] : dec) {   // bit J of the group: SRC == J and EN
+            const size_t c = k.find('\x01');
+            const std::string src = k.substr(0, c), en = k.substr(c + 1);
+            terms.push_back("(" + src + " < 64 ? ((" + en + " & 1ULL) << " + src + ") & " + hex(gm) + " : 0ULL)");
+        }
+        const uint64_t full = M(sigW_[sg]) == "~0ULL" ? ~0ULL : (1ULL << sigW_[sg]) - 1;
+        out = "    { uint64_t w_ = " + ((tm & full) == full ? std::string("0") : "(" + P_ + ".v & " + hex(~tm & full) + ")") + " | " + hex(cv) + ";";
+        for (auto& t : terms) out += " w_ |= " + t + ";";
+        out += " " + P_ + ".v = w_; }\n";
+        return true;
+    }
+   // regWrite stores without comparing first   // a one-bit write goes through set()
     bool isPriv(int s) const { return s >= 0 && s < (int)priv_.size() && priv_[s]; }
     // Found while emitting: a private signal used where only S.sigs works (an
     // interpreted operator, an assertion). run() ends with CodegenRetry and
@@ -5153,6 +5265,12 @@ private:
                 unitConds.emplace_back();
                 size_t pc = 0;
                 std::vector<char> inChain(cp.code.size() + 1, 0);
+                // bitRun2 in a block: a run never starts or ends inside another
+                // statement's jump target or a segment's edge.
+                std::vector<char> tgtB(cp.code.size() + 2, 0), runDone(cp.code.size() + 1, 0);
+                for (auto& x : cp.code)
+                    if (x.k == IK::Jmp || x.k == IK::JmpIfNot) { if (x.target < tgtB.size()) tgtB[x.target] = 1; if (x.xt != Instr::NOX && x.xt < tgtB.size()) tgtB[x.xt] = 1; }
+                for (auto& sgm : cp.segs) { if (sgm.first < tgtB.size()) tgtB[sgm.first] = 1; if (sgm.second < tgtB.size()) tgtB[sgm.second] = 1; }
                 // One instruction of the block into c4 / c2; false at its end (the wait).
                 auto one = [&](size_t pc, std::string& c4, std::string& c2) {
                     const Instr& in = cp.code[pc];
@@ -5190,6 +5308,18 @@ private:
                     combIns.push_back(&in);
                     unitIns.back().push_back(&in);
                     c4 += L4(pc) + ":" + fassign(in);
+                    if (runDone[pc]) { c2 += L2(pc) + ": ;\n"; return true; }   // written by its run's first statement
+                    if (!noBitRun_) {
+                        std::vector<const Instr*> cand{&in};
+                        for (size_t q = pc + 1; q < cp.code.size() && !tgtB[q] && cp.code[q].k == IK::Assign && cp.code[q].sig == in.sig; q++) cand.push_back(&cp.code[q]);
+                        std::string run;
+                        size_t n = 0;
+                        if (cand.size() >= 3 && bitRun2(cand, 0, n, run)) {
+                            for (size_t q = 1; q < n; q++) runDone[pc + q] = 1;
+                            c2 += L2(pc) + ":" + run;
+                            return true;
+                        }
+                    }
                     c2 += L2(pc) + ":" + stmt2(in);
                     return true;
                 };
@@ -5264,6 +5394,12 @@ private:
                 combStmts2.push_back(c2 + L2(pc) + ": ;\n    }\n");
                 continue;
             }
+            std::vector<const Instr*> line;   // the live assigns, in order (bitRun2)
+            for (const Instr& in : cp.code) {
+                if (in.k != IK::Assign) break;
+                if (!deadIn.count(&in)) line.push_back(&in);
+            }
+            size_t runLeft = 0;
             for (const Instr& in : cp.code) {
                 if (in.k != IK::Assign) break;
                 if (deadIn.count(&in)) { deadStmts.push_back("   " + fassign(in)); continue; }
@@ -5273,7 +5409,32 @@ private:
                 unitProc.push_back(i);
                 unitConds.emplace_back();
                 noteRefs(in.e);
+                if (runLeft) { runLeft--; combStmts2.push_back("    ;\n"); continue; }   // written by the run's first unit
+                std::string run;
+                size_t n = 0;
+                const size_t at = (size_t)(std::find(line.begin(), line.end(), &in) - line.begin());
+                if (bitRun2(line, at, n, run)) { runLeft = n - 1; combStmts2.push_back(run); continue; }
                 combStmts2.push_back(stmt2(in));
+            }
+        }
+        // Generate loops (assign y[k] = x[N-1-k]) are one comb process per
+        // bit: consecutive single-assign units writing parts of one private
+        // register are one word too (bitRun2), written by the run's first unit.
+        if (!noBitRun_) {
+            for (size_t u = 0; u < combStmts2.size();) {
+                auto single = [&](size_t k) {
+                    return k < unitIns.size() && unitIns[k].size() == 1 && unitConds[k].empty() && combStmts2[k] == stmt2(*unitIns[k][0]);
+                };
+                if (!single(u)) { u++; continue; }
+                std::vector<const Instr*> run;
+                for (size_t k = u; k < combStmts2.size() && single(k) && unitIns[k][0]->sig == unitIns[u][0]->sig; k++) run.push_back(unitIns[k][0]);
+                std::string txt;
+                size_t n = 0;
+                if (run.size() >= 3 && bitRun2(run, 0, n, txt)) {
+                    combStmts2[u] = txt;
+                    for (size_t k = 1; k < n; k++) combStmts2[u + k] = "    ;\n";
+                    u += n;
+                } else u++;
             }
         }
         o << "static __thread std::vector<Sim::NbaItem>* DNB;\n";
