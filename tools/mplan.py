@@ -1523,7 +1523,8 @@ def trend_svg(history):
     out.append(f"<line id='cursor' y1='{T}' y2='{H - B}' stroke='var(--muted)' style='display:none'/></svg><div id='tip'></div></div>")
     data = {"w": W, "x": [round(x, 1) for x in xs],
             "s": [{"label": esc(str(p[0])), "time": esc(str(p[1])), "score": round(p[2], 1), "pass": p[3]} for p in pts]}
-    out.append(f"<script type='application/json' id='trend-data'>{json.dumps(data).replace('</', '<\\/')}</script>")
+    blob = json.dumps(data).replace("</", "<\\/")      # no "</script>" inside; a backslash in an f-string needs Python 3.12
+    out.append(f"<script type='application/json' id='trend-data'>{blob}</script>")
     rows = "".join(f"<tr><td>{esc(str(p[0]))}</td><td>{esc(str(p[1]))}</td><td class='num'>{p[2]:.1f}%</td>"
                    f"<td class='num'>{'' if p[3] is None else f'{p[3]:.1f}%'}</td></tr>" for p in pts)
     out.append(f"<details><summary>Snapshots as a table</summary><table><tr><th>Label</th><th>Time</th><th>Plan score</th>"
