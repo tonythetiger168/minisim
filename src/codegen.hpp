@@ -1416,6 +1416,8 @@ private:
     // copy: constant bits, bits moved by one distance, a bit reverse, the
     // rest one by one. ins[at..] are the candidates in order (the caller
     // stops them at a jump target); n: how many it took.
+    const bool noLazyMz_ = std::getenv("MSIM_NOLAZYMEMO") != nullptr;   // the 2-state copy of an asserting comb process compares its inputs every pass
+    std::string mzLazy_, mzVar_;   // the lazy compare of the process being emitted, and its flag
     const bool noBitRun_ = std::getenv("MSIM_NOBITRUN") != nullptr;
     bool bitRun2(const std::vector<const Instr*>& ins, size_t at, size_t& n, std::string& out) {
         n = 0;
@@ -5306,6 +5308,11 @@ private:
                     deadStmts.push_back(c4 + L4(pc) + ": ;\n    }\n");
                     continue;
                 }
+                // The 2-state copy compares the inputs only where an assertion
+                // fails (lazyMz): see below. Not with the blocks of a merged
+                // cycle in functions of their own (their text is shared).
+                const bool lazyMz = combAsserts(cp) && !noLazyMz_ && (cp.segs.empty() || noCySplit_);
+                std::string mzEnd;
                 if (combAsserts(cp)) {   // reports go through the kernel's queues: one thread
                     // The domain evaluates every unit on each pass, but the
                     // process only runs (and reports again) when a signal it
@@ -5347,7 +5354,23 @@ private:
                         return c;
                     };
                     c4 += withEnd(chk, L4(cp.code.size() - 2));
-                    c2 += withEnd(chk2, L2(cp.code.size() - 2));
+                    if (lazyMz) {
+                        // The body is a function of the inputs, so running it
+                        // again changes nothing; only a report may not repeat
+                        // while they are the same. An assertion that fails
+                        // compares them with those of the last report (and
+                        // takes them); a pass that reaches none forgets them.
+                        // That is the eager compare's outcome: a failure with
+                        // the inputs of the last pass that ran fails again.
+                        std::string lz = chk;
+                        lz.replace(lz.find("    { "), 6, "[&]() __attribute__((noinline, cold)) -> bool { ");
+                        lz.replace(lz.find("      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n"), std::string("      if (!ch) goto @END@; }\n    CC" + I_ + "->epoch++;\n").size(),
+                                   "      if (ch) CC" + I_ + "->epoch++; return ch; }()");
+                        mzLazy_ = lz;
+                        mzVar_ = "mz" + I_ + "_";
+                        c2 += "    int8_t " + mzVar_ + " = -1;\n";
+                        mzEnd = " if (" + mzVar_ + " < 0 && CIVA[" + I_ + "]) { CIVA[" + I_ + "] = 0; CC" + I_ + "->epoch++; }";
+                    } else c2 += withEnd(chk2, L2(cp.code.size() - 2));
                     serialOnly = true;
                 }
                 unitIns.emplace_back();
@@ -5389,7 +5412,8 @@ private:
                     if (in.k == IK::Assert) {
                         std::string a = combAssert(i, in);
                         c4 += L4(pc) + ":" + a;
-                        c2 += L2(pc) + ":" + a;
+                        if (lazyMz) c2 += L2(pc) + ": if (" + mzVar_ + " < 0) " + mzVar_ + " = " + mzLazy_ + "; if (" + mzVar_ + ")" + a;
+                        else c2 += L2(pc) + ":" + a;
                         return true;
                     }
                     if (in.k != IK::Assign) return false;
@@ -5481,7 +5505,7 @@ private:
                     if (!one(pc, c4, c2)) break;
                 }
                 combStmts.push_back(c4 + L4(pc) + ": ;\n    }\n");
-                combStmts2.push_back(c2 + L2(pc) + ": ;\n    }\n");
+                combStmts2.push_back(c2 + L2(pc) + ": ;" + mzEnd + "\n    }\n");
                 continue;
             }
             std::vector<const Instr*> line;   // the live assigns, in order (bitRun2)
