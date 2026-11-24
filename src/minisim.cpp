@@ -680,6 +680,20 @@ struct Sim {
         if (loopCnt > loopDbg + 3000) { fflush(stderr); _exit(3); }
     }
     void runCombs() {
+        // One process queued (the domain's comb pass, the clock cone): run
+        // it without the level batch. Another it queues runs below.
+        if (combq.size() == 1 && !loopDbg && !noDomFast && !prof::P().on) [[likely]] {
+            const int r = combq.top();
+            const Comb& c = combs[r];
+            if (!c.onCycle) {
+                combq.pop();
+                combPend[r] = 0;
+                curComb = r;
+                if (c.compute) c.commit(c.ctx, c.compute(c.ctx));
+                else c.fn(c.ctx);
+                curComb = -1;
+            }
+        }
         while (!combq.empty()) {
             int level = combs[combq.top()].level;
             combBatch.clear();
@@ -1014,10 +1028,10 @@ struct Sim {
         // -compile run): one after another into one list, as below.
         if (fastSeqId >= 0 && !prof::P().on && !noDomFast) [[likely]] {
             const auto domFn = seqs[fastSeqId].fn;
-            bool all = true;
-            for (int id : seqq) all &= seqs[id].fn == domFn;
+            bool all = true, skip = false;
+            for (int id : seqq) { all &= seqs[id].fn == domFn; skip |= seqEpoch[(size_t)id] == nbaEpoch; }
             if (all) {
-                for (int id : seqq) nbaNoSkip |= seqEpoch[(size_t)id] == nbaEpoch;
+                nbaNoSkip |= skip;
                 auto& b = seqBufs[0];
                 b.clear();
                 for (int id : seqq) {
@@ -1244,9 +1258,12 @@ struct Sim {
         // reserve, then push_back inline: resize() zero-filled the slots out
         // of line first (std::vector::_M_default_append), 2% of Ibex.
         if (seqq.capacity() < seqq.size() + so.size()) seqq.reserve(2 * (seqq.size() + so.size()));
+        // Bit e of `want`: an edge of kind e (ANY, POS, NEG) wakes its process.
+        const unsigned want = 1u << ANY | (unsigned)pos << POS | (unsigned)neg << NEG;
+        char* const pend = seqPend.data();
         for (auto& [id, e] : so)
-            if (!seqPend[id] && (e == ANY || (e == POS && pos) || (e == NEG && neg))) {
-                seqPend[id] = 1;
+            if ((want >> e & 1) && !pend[id]) {
+                pend[id] = 1;
                 seqq.push_back(id);
             }
     }
