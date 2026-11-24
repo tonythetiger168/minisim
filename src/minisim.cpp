@@ -1167,6 +1167,7 @@ struct Sim {
     // as set() would, when nothing else watches it (no waiter, waveform,
     // $monitor, coverage, force, VPI or path delay). Otherwise set().
     const bool noFwBit = std::getenv("MSIM_NOFWBIT") != nullptr;
+    bool edgeOff = noFwBit;   // bitEdgeOk's design-wide tests in one flag (set where they turn on)
     __attribute__((noinline)) void fwBit(int s, uint64_t n) {
         if (!bitEdgeOk(s, n)) { fwSlow(s, make(n, 0, 1)); return; }
         bitEdge(s, n);
@@ -1175,8 +1176,10 @@ struct Sim {
     // and comb ranks watches the signal: bitEdge does all set() would.
     __attribute__((always_inline)) bool bitEdgeOk(int s, uint64_t n) const {
         const Sig& g = sigs[s];
-        return !(g.fl || g.val.x || g.val.z || g.val.real || g.val.str || !g.val.hi.empty() || g_cov || observed || edgeTrack || tlPart ||
-                 !waiters[s].empty() || !pathIn.empty() || !fmons.empty() || mon.on || (g.val.v & 1) == n || noFwBit);
+        // edgeOff: edgeTrack, a path delay source (pathIn) or MSIM_NOFWBIT.
+        // A $monitor or $fmonitor sets observed.
+        return !(g.fl || g.val.x || g.val.z || g.val.real || g.val.str || !g.val.hi.empty() || g_cov || observed || edgeOff || tlPart ||
+                 !waiters[s].empty() || (g.val.v & 1) == n);
     }
     // A procedural write of a one-bit variable (a testbench clock,
     // `always #5 clk = ~clk`): the direct edge, or set() for anything else.
@@ -1732,6 +1735,7 @@ struct Sim {
         // setBitsV) test for. Sized, it sent every one-bit edge and every
         // in-place bit write through set() and a whole-vector copy.
         if (P.empty()) { pathIn.clear(); pathIn.shrink_to_fit(); lastChg.clear(); lastChg.shrink_to_fit(); }
+        else edgeOff = true;
         for (auto& [sg, d] : icDelay) timedOut[(size_t)sg] = 1;
         for (auto& [sg, sh] : shadowOf) timedOut[(size_t)sg] = 1;
         // Like a net delay, a delayed net with drivers is x until its first
@@ -3924,7 +3928,7 @@ MSIM_KDEF int Sim::sig(const string& n, int w, bool net) {
     size_t dot = n.rfind('.');
     bool elem = n.find('[', dot == string::npos ? 0 : dot + 1) != string::npos;
     sigs.push_back({n, w, init, {}, net, elem || n.find('$') != string::npos});
-    if (n.starts_with("_xp$")) edgeTrack = true;   // a temporary of msim -xprop: the design asks about edges
+    if (n.starts_with("_xp$")) edgeTrack = edgeOff = true;   // a temporary of msim -xprop: the design asks about edges
     waiters.emplace_back();
     return (int)sigs.size() - 1;
 }

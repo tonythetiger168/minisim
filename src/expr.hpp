@@ -402,6 +402,13 @@ inline Val clipRead(const Val& src, int w) {
 // v_slice(clipRead(a, ...), hi, lo) for a constant slice of at most 64 bits
 // inside a stored wide signal: read in place, without copying the whole
 // value twice (compiled code's struct field reads, a TL-UL port's a_address).
+// Bit i to bit 63 - i (msim -compile: a bit-reversing always_comb loop as one word).
+inline uint64_t msimRev64(uint64_t x) {
+    x = __builtin_bswap64(x);
+    x = ((x >> 4) & 0x0f0f0f0f0f0f0f0fULL) | ((x & 0x0f0f0f0f0f0f0f0fULL) << 4);
+    x = ((x >> 2) & 0x3333333333333333ULL) | ((x & 0x3333333333333333ULL) << 2);
+    return ((x >> 1) & 0x5555555555555555ULL) | ((x & 0x5555555555555555ULL) << 1);
+}
 inline Val sliceOf(const Val& a, int hi, int lo) {
     const int w = hi - lo + 1, l0 = lo >> 6, sh = lo & 63;
     uint64_t v = limbV(a, l0) >> sh, x = limbX(a, l0) >> sh, z = limbZ(a, l0) >> sh;

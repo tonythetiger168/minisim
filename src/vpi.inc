@@ -3704,6 +3704,7 @@ inline void imPutDelays(const Obj* o, p_vpi_delay d) {
     }
     if (S.timedOut.size() < S.sigs.size()) S.timedOut.resize(S.sigs.size(), 0);
     if (S.pathIn.size() < S.sigs.size()) S.pathIn.resize(S.sigs.size(), 0);
+    S.edgeOff = true;
     if (S.lastChg.size() < S.sigs.size()) S.lastChg.resize(S.sigs.size(), 0);
     S.timedOut[(size_t)o->sig] = 1;
 }
