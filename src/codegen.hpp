@@ -3978,6 +3978,21 @@ private:
         std::vector<char> mine(procs.size(), 0);
         for (int i : dom) mine[i] = 1;
         for (size_t i = 0; i < procs.size(); i++) if (procs[i].combRank >= 0) mine[i] = 1;
+        // The elements of arrays a comb process reads at a run-time index
+        // (read in place, below): a constant driver may make one private.
+        std::vector<char> arrElem(ns, 0);
+        if (!std::getenv("MSIM_NOPRIVARR")) {
+            std::function<void(const E&)> ae = [&](const E& e) {
+                if (!e) return;
+                if (e->op == Op::ArrRead && e->arr)
+                    for (int64_t k = 0; k < e->arr->count; k++)
+                        if (e->arr->base + k >= 0 && (size_t)(e->arr->base + k) < ns) arrElem[(size_t)(e->arr->base + k)] = 1;
+                for (auto& k : e->kids) ae(k);
+            };
+            for (auto& pr : procs)
+                if (pr.combRank >= 0 && pr.prog)
+                    for (auto& in : pr.prog->code) { ae(in.e); ae(in.bidx); ae(in.de); for (auto& a : in.aidx) ae(a); }
+        }
         int refP = -1;
         std::function<void(const E&)> refs = [&](const E& e) {
             if (!e) return;
@@ -4033,11 +4048,13 @@ private:
             }
             if (armShape(procs[i], sigs)) { arms.push_back((int)i); continue; }   // its wait: armChk
             // A constant continuous assign (assign r[0] = '0): the one driver
-            // runs once at time 0. Its signal may be private, starting with
-            // the constant (PINIT): an array element read in place needs it.
+            // runs once at time 0. An element of an array read in place may
+            // be private, starting with the constant (PINIT). Not any other
+            // signal: an @* block reading it would be armed through armChk,
+            // which then checks a value that never changes on every pass.
             if (!procs[i].seq && procs[i].prog && procs[i].prog->code.size() == 1) {
                 const Instr& in = procs[i].prog->code[0];
-                if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns && in.hi < 0 && !in.arr && in.aidx.empty() && !in.bidx &&
+                if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns && arrElem[(size_t)in.sig] && in.hi < 0 && !in.arr && in.aidx.empty() && !in.bidx &&
                     in.drv >= 0 && sigs[in.sig].drivers == 1 && in.s0 != STR_HIZ && in.s1 != STR_HIZ && in.e && in.e->op == Op::Const &&
                     in.e->k.w == sigs[in.sig].w && in.e->k.w <= 64 && in.e->k.hi.empty() && !in.e->k.real && !in.e->k.str &&
                     !in.e->k.x && !in.e->k.z && !std::getenv("MSIM_NOPRIVARR")) {
