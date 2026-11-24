@@ -1355,6 +1355,7 @@ public:
 private:
     std::vector<int> sigW_;
     std::vector<std::string> sigName_;
+    const char* dbgName(int s) const { return s >= 0 && (size_t)s < sigName_.size() ? sigName_[(size_t)s].c_str() : "?"; }
     // Temporaries of the lowering and of msim's call expansion (_tf...): each
     // read follows a write in the same pass, so an X left in one from a pass
     // that did not use it says nothing about 2-state mode.
@@ -1388,11 +1389,18 @@ private:
     std::string regWrite(int s, const std::string& u) const {
         std::string S_ = std::to_string(s), m = M(sigW_[s]);
         if (sigW_[s] > 64 || sigNet_[s] || clock_[s]) return "S.fwv(" + S_ + ", " + u + ");";
+        // Most writes of a comb pass store what is already there: compare
+        // first (a known value, as fwSlow would find it), then the store.
+        if (!noRegSame_)
+            return "{ const uint64_t nv_ = (" + u + ") & " + m + "; Val& q = S.sigs[" + S_ + "].val; if (__builtin_expect(q.v != nv_ || (q.x | q.z) || q.real || q.str, 0)) { if (__builtin_expect(!obs && S.waiters[" +
+                   S_ + "].empty(), 1)) { q.v = nv_; q.x = 0; q.z = 0; q.real = false; q.str = false; } else S.fwSlow(" + S_ + ", make(nv_, 0, " +
+                   std::to_string(sigW_[s]) + ")); } }";
         return "{ if (__builtin_expect(!obs && S.waiters[" + S_ + "].empty(), 1)) { Val& q = S.sigs[" + S_ + "].val; q.v = (" +
                u + ") & " + m + "; q.x = 0; q.z = 0; q.real = false; q.str = false; } else S.fwSlow(" + S_ + ", make((" + u +
                ") & " + m + ", 0, " + std::to_string(sigW_[s]) + ")); }";
     }
-    const bool noSetBit_ = std::getenv("MSIM_NOSETBIT") != nullptr;   // a one-bit write goes through set()
+    const bool noSetBit_ = std::getenv("MSIM_NOSETBIT") != nullptr;
+    const bool noRegSame_ = std::getenv("MSIM_NOREGSAME") != nullptr;   // regWrite stores without comparing first   // a one-bit write goes through set()
     bool isPriv(int s) const { return s >= 0 && s < (int)priv_.size() && priv_[s]; }
     // Found while emitting: a private signal used where only S.sigs works (an
     // interpreted operator, an assertion). run() ends with CodegenRetry and
@@ -3180,6 +3188,55 @@ private:
     // read the main state machine's registers). Greedy feedback-arc order
     // (Eades, Lin, Smyth 1993), weighted by the writes each order saves;
     // ties keep the original order. MSIM_NOORDER: as found.
+    // The greedy order above can put a process that many others read
+    // before one of its readers. Within each set of processes joined by
+    // read edges (a core's always blocks), when it is small, take the order
+    // that leaves the least weight read after its writer (DP over subsets),
+    // in the places the set had.
+    static void exactOrder(std::vector<int>& ord, const std::map<std::pair<int, int>, long>& w) {
+        std::map<int, int> pos, par;
+        for (size_t i = 0; i < ord.size(); i++) { pos[ord[i]] = (int)i; par[ord[i]] = ord[i]; }
+        std::function<int(int)> root = [&](int x) { return par[x] == x ? x : par[x] = root(par[x]); };
+        for (auto& [e, x] : w)
+            if (pos.count(e.first) && pos.count(e.second)) par[root(e.first)] = root(e.second);
+        std::map<int, std::vector<int>> comp;
+        for (int v : ord) comp[root(v)].push_back(v);
+        for (auto& [r, mem] : comp) {
+            const size_t n = mem.size();
+            if (n < 3 || n > 16) continue;
+            std::vector<std::vector<long>> W(n, std::vector<long>(n, 0));   // W[a][b]: a reads b
+            for (size_t a = 0; a < n; a++)
+                for (size_t b = 0; b < n; b++) {
+                    auto it = w.find({mem[a], mem[b]});
+                    if (it != w.end()) W[a][b] = it->second;
+                }
+            const size_t full = (size_t)1 << n;
+            std::vector<long> f(full, LONG_MAX);
+            std::vector<int8_t> last(full, -1);
+            f[0] = 0;
+            for (size_t S = 0; S < full; S++) {
+                if (f[S] == LONG_MAX) continue;
+                for (size_t v = 0; v < n; v++) {
+                    if (S >> v & 1) continue;
+                    long c = f[S];
+                    for (size_t u = 0; u < n; u++) if (S >> u & 1) c += W[v][u];   // v reads u, which ran first
+                    const size_t T = S | (size_t)1 << v;
+                    if (c < f[T]) { f[T] = c; last[T] = (int8_t)v; }
+                }
+            }
+            long cur = 0;   // the greedy order's cost (mem is in that order)
+            for (size_t a = 0; a < n; a++) for (size_t b = 0; b < a; b++) cur += W[a][b];
+            if (f[full - 1] >= cur) continue;
+            std::vector<int> best;
+            for (size_t S = full - 1; S; S &= ~((size_t)1 << last[S])) best.push_back(mem[(size_t)last[S]]);
+            std::reverse(best.begin(), best.end());
+            std::vector<int> slots;
+            for (int v : mem) slots.push_back(pos[v]);
+            std::sort(slots.begin(), slots.end());
+            for (size_t k = 0; k < n; k++) ord[(size_t)slots[k]] = best[k];
+        }
+    }
+
     void orderDomain(const std::vector<CodegenProc>& procs, const std::vector<CodegenSig>& sigs, std::vector<int>& dom) {
         if (dom.size() < 2 || std::getenv("MSIM_NOORDER")) return;
         const size_t ns = sigs.size();
@@ -3210,6 +3267,7 @@ private:
                 if (wproc[sg] >= 0 && wproc[sg] != q && domGroup_[q] == domGroup_[wproc[sg]]) w[{q, wproc[sg]}] += nsite[sg];
         }
         if (w.empty()) return;
+        static const bool noExact = std::getenv("MSIM_NOEXACTORDER") != nullptr;
         std::map<int, std::vector<int>> byG;   // clock group -> its processes, in order
         std::vector<int> gOrder;
         for (int p : dom) { int g = domGroup_[p]; if (!byG.count(g)) gOrder.push_back(g); byG[g].push_back(p); }
@@ -3244,6 +3302,7 @@ private:
                 drop(best);
             }
             head.insert(head.end(), tail.rbegin(), tail.rend());
+            if (!noExact) exactOrder(head, w);
             sorted[g] = head;
         }
         // Each group's processes back into the places that group had.
@@ -4037,9 +4096,17 @@ private:
             // without building the whole value.
             std::string slowW = "S.fw(" + std::to_string(i.sig) + ", v_insert(S.get(" + std::to_string(i.sig) + "), " + val + ", " +
                                 std::to_string(i.hi) + ", " + std::to_string(i.lo) + "));";
-            if (i.hi - i.lo < 64 && i.lo >= 0 && split(i.e, g, u, sl))
+            if (i.hi - i.lo < 64 && i.lo >= 0 && split(i.e, g, u, sl)) {
+                if (!noRegSame_ && sigW_[i.sig] <= 64 && i.hi < sigW_[i.sig] && !sigNet_[i.sig] && !clock_[i.sig]) {
+                    // A narrow one with no x or z bits: the new word in place, as regWrite.
+                    const std::string S_ = std::to_string(i.sig), mp = "(" + M(i.hi - i.lo + 1) + " << " + std::to_string(i.lo) + ")";
+                    o << " { Val& q = S.sigs[" << S_ << "].val; if (__builtin_expect(" << (g.empty() ? "true" : g) << " && !(q.x | q.z) && !q.real && !q.str, 1)) {"
+                      << " const uint64_t w_ = (q.v & ~" << mp << ") | (((uint64_t)(" << u << ") << " << i.lo << ") & " << mp << ");"
+                      << " if (__builtin_expect(q.v != w_, 0)) S.fwv(" << S_ << ", w_); } else " << slowW << " }\n";
+                } else
                 o << " if (!(" << (g.empty() ? "true" : g) << " && S.samePart(" << i.sig << ", " << i.hi << ", " << i.lo << ", " << u << "))) "
                   << slowW << "\n";
+            }
             else
                 o << " " << slowW << "\n";
         } else
@@ -4576,7 +4643,7 @@ private:
                                     !i.delay && i.dly.empty();
                     // A declaration initializer (logic a = 0) runs before any clock.
                     if (!ok && procs[p].kind == "init" && procs[p].combRank < 0 && !procs[p].seq && i.k == IK::Assign) continue;
-                    if (!ok) { if (dbgW && !bad[i.sig]) std::fprintf(stderr, "WD write %s k=%d proc=%zu %s dom=%d\n", sigName_[i.sig].c_str(), (int)i.k, p, procs[p].kind.c_str(), (int)inDom[p]); bad[i.sig] = 1; continue; }
+                    if (!ok) { if (dbgW && !bad[i.sig]) std::fprintf(stderr, "WD write %s k=%d proc=%zu %s dom=%d\n", dbgName(i.sig), (int)i.k, p, procs[p].kind.c_str(), (int)inDom[p]); bad[i.sig] = 1; continue; }
                     if (wproc[i.sig] < 0) { wproc[i.sig] = (int)p; firstW[i.sig] = (int)pc; }
                     else if (wproc[i.sig] != (int)p) bad[i.sig] = 1;
                 }
@@ -4633,10 +4700,10 @@ private:
                         if (wproc[sg] != (int)p && inDom[p] && domPos[p] >= 0 && domPos[p] < domPos[wproc[sg]] &&
                             domGroup_[p] == domGroup_[wproc[sg]] && !noEarly)
                             return;
-                        if (wproc[sg] != (int)p) { if (!bad[sg] && dbgD) std::fprintf(stderr, "WD other %s w=%d r=%zu %s rank=%d seq=%d dom=%d line=%d\n", sigName_[sg].c_str(), wproc[sg], p, procs[p].kind.c_str(), procs[p].combRank, (int)procs[p].seq, (int)inDom[p], procs[p].prog->code.empty() ? 0 : procs[p].prog->code[0].line); bad[sg] = 1; return; }
+                        if (wproc[sg] != (int)p) { if (!bad[sg] && dbgD) std::fprintf(stderr, "WD other %s w=%d r=%zu %s rank=%d seq=%d dom=%d line=%d\n", dbgName(sg), wproc[sg], p, procs[p].kind.c_str(), procs[p].combRank, (int)procs[p].seq, (int)inDom[p], procs[p].prog->code.empty() ? 0 : procs[p].prog->code[0].line); bad[sg] = 1; return; }
                         const int c = cidx[sg];
                         if (!fwd || (win[pc][(size_t)c / 64] >> (c % 64) & 1)) {
-                            if (!bad[sg] && !selfRd[sg] && dbgD) std::fprintf(stderr, "WD self %s fwd=%d\n", sigName_[sg].c_str(), (int)fwd);
+                            if (!bad[sg] && !selfRd[sg] && dbgD) std::fprintf(stderr, "WD self %s fwd=%d\n", dbgName(sg), (int)fwd);
                             selfRd[sg] = 1;   // read after a write of its own: a snapshot (below), or the commit list
                         }
                     };
