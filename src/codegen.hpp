@@ -4669,6 +4669,80 @@ private:
             auto rw = [&](Expr& x) { if (ok(x.sig) && alias[x.sig] >= 0) x.sig = root(x.sig); };
             for (size_t i = 0; i < procs.size(); i++)
                 if (mine[i]) for (auto& in : procs[i].prog->code) exprs(in, rw);
+            // A private wire one straight comb assign writes (a = E) and one
+            // comb statement reads, once: the reader computes E in its place
+            // and the write goes to combDead below (nothing live reads it),
+            // which runs only while a waveform or $monitor watches. Verilator
+            // inlines these (Ibex: about 190 of them). Not across a merged
+            // comb cycle, not into an asserting process (its memo compares
+            // its inputs). MSIM_NOINLINEWIRE=1: never.
+            size_t nInline = 0;
+            if (!std::getenv("MSIM_NOINLINEWIRE")) {
+                std::vector<int> nref(ns, 0);
+                std::vector<std::pair<Expr*, int>> where(ns, {nullptr, -1});   // the one read, and its process
+                std::function<void(const E&, int)> cnt = [&](const E& e, int pi) {
+                    if (!e) return;
+                    if (e->op == Op::Ref && ok(e->sig)) { nref[e->sig]++; where[e->sig] = {e.get(), pi}; if (e->at) nref[e->sig] += 2; }
+                    if (e->arr) for (int64_t k = 0; k < e->arr->count; k++) if (ok((int)(e->arr->base + k))) nref[(size_t)(e->arr->base + k)] += 2;
+                    if (e->at) cnt(e->at, -1);
+                    for (auto& k : e->kids) cnt(k, pi);
+                };
+                std::unordered_set<const Prog*> seenC;
+                std::function<void(const Prog*, int)> walkC = [&](const Prog* p, int pi) {
+                    if (!p || !seenC.insert(p).second) return;
+                    for (auto& in : p->code) {
+                        const bool rd = pi >= 0 && (in.k == IK::Assign || in.k == IK::JmpIfNot);
+                        cnt(in.e, rd ? pi : -1);
+                        cnt(in.bidx, -1); cnt(in.de, -1); cnt(in.fd, -1);
+                        for (auto& a : in.args) cnt(a, -1);
+                        for (auto& a : in.aidx) cnt(a, -1);
+                        // A comb process of the domain runs on every pass: its wait list is unused.
+                        if (pi < 0) {
+                            for (auto& [sg, ed] : in.events) if (ok(sg)) nref[sg] += 2;
+                            if (in.k != IK::Assign && in.k != IK::Nba && ok(in.sig)) nref[in.sig] += 2;
+                        } else if (in.k != IK::Assign && in.k != IK::Nba && in.k != IK::WaitEdge && in.k != IK::Jmp && in.k != IK::JmpIfNot && ok(in.sig))
+                            nref[in.sig] += 2;
+                        if (in.arr) for (int64_t k = 0; k < in.arr->count; k++) if (ok((int)(in.arr->base + k))) nref[(size_t)(in.arr->base + k)] += 2;
+                        walkC(in.callee, -1);
+                        for (auto* b : in.branches) walkC(b, -1);
+                    }
+                };
+                // Readers: straight or branching comb processes, not asserting, not on a merged cycle.
+                std::vector<char> rdOk(procs.size(), 0);
+                for (int i : byRank) if (i >= 0 && procs[i].prog->segs.empty() && !combAsserts(*procs[i].prog)) rdOk[(size_t)i] = 1;
+                for (size_t i = 0; i < procs.size(); i++) walkC(procs[i].prog, rdOk[i] ? (int)i : -1);
+                std::function<bool(const E&, int)> small = [&](const E& e, int d) {
+                    if (!e || e->at || d > 24) return false;
+                    if (e->op == Op::ArrRead || e->op == Op::SysFn || e->op == Op::CondCov || !e->fmt.empty()) return false;
+                    for (auto& k : e->kids) if (!small(k, d + 1)) return false;
+                    return true;
+                };
+                for (int i : byRank) {
+                    if (i < 0 || combBranches(*procs[i].prog) || !procs[i].prog->segs.empty() || combAsserts(*procs[i].prog)) continue;
+                    for (auto& in : procs[i].prog->code) {
+                        if (in.k != IK::Assign) break;
+                        const int a = in.sig;
+                        if (!ok(a) || !isPriv(a) || keep[a] || nw[a] != 1 || alias[a] >= 0 || nref[a] != 1 || in.hi >= 0 || in.bidx || in.arr ||
+                            !in.aidx.empty() || !in.e || in.tmp || in.delay || !in.dly.empty() || sigW_[a] > 64 ||
+                            (in.drv >= 0 && (in.s0 == STR_HIZ || in.s1 == STR_HIZ)) || !small(in.e, 0))
+                            continue;
+                        auto [x, pr] = where[a];
+                        if (!x || pr < 0 || pr == i || x->sig != a) continue;
+                        if (in.e->op == Op::Ref && in.e->sig == a) continue;
+                        // The read becomes E, cut to a's width (an assign keeps the low bits).
+                        const bool sg = x->sgn;
+                        Expr r;
+                        r.op = Op::Resize;
+                        r.hi = sigW_[a];
+                        r.lo = 0;
+                        r.sgn = sg;
+                        r.kids = {in.e};
+                        *x = std::move(r);
+                        nInline++;
+                    }
+                }
+            }
+            if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "inlined %zu single-use wires\n", nInline);
             // Units: a process with if / case, or one straight assign.
             struct Unit { int proc; const Instr* one; std::vector<int> wr, rd; bool live; bool seq = false; };
             std::vector<Unit> us;
