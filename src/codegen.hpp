@@ -409,6 +409,12 @@ public:
              "    if (s < 0) return a.twoState ? make(0, 0, a.elemW, 0, a.sgn) : xfill(a.elemW, a.sgn);\n"
              "    Val r = S.get(s); r.sgn = a.sgn; return r;\n"
              "}\n"
+             "// The same for an array whose elements are private (PA, from the first one's slot).\n"
+             "static inline Val APRV(const ArrShape& a, std::initializer_list<Val> ix, const PSig* p0) {\n"
+             "    int s = AOFF(a, ix);\n"
+             "    if (s < 0) return a.twoState ? make(0, 0, a.elemW, 0, a.sgn) : xfill(a.elemW, a.sgn);\n"
+             "    return PR(p0[s - a.base], a.elemW, a.sgn);\n"
+             "}\n"
              "static inline Val DSL(const Val& a, const Val& i, int w, bool down) {\n"
              "    if (shiftUnknown(i)) return allx(w);\n"
              "    int64_t s = v_to_i64(i);\n"
@@ -550,6 +556,10 @@ public:
             for (size_t x = 0; x < priv_.size(); x++)
                 if (priv_[x]) {
                     const bool k = x < sigs.size() && sigs[x].init && !sigNet_[x];
+                    if (auto ci = constInit_.find((int)x); ci != constInit_.end()) {   // a constant continuous assign (privateSigs)
+                        o << (c++ ? ", " : "") << "{" << x << ", " << ci->second << "ULL, 0, 0}";
+                        continue;
+                    }
                     o << (c++ ? ", " : "") << "{" << x << ", " << (k ? std::to_string(sigs[x].v) + "ULL" : "0") << ", "
                       << (k ? std::to_string(sigs[x].x) + "ULL" : M(sigW_[x])) << ", "
                       << (k ? std::to_string(sigs[x].z) + "ULL" : sigNet_[x] ? M(sigW_[x]) : "0") << "}";
@@ -1513,6 +1523,7 @@ private:
         return true;
     }
    // regWrite stores without comparing first   // a one-bit write goes through set()
+    std::map<int, uint64_t> constInit_;   // privateSigs: private signals driven by a constant only, and the constant
     bool isPriv(int s) const { return s >= 0 && s < (int)priv_.size() && priv_[s]; }
     // Found while emitting: a private signal used where only S.sigs works (an
     // interpreted operator, an assertion). run() ends with CodegenRetry and
@@ -1520,9 +1531,20 @@ private:
 public:
     std::set<int> noPriv, privHits_;
 private:
+    // An array whose elements are private (privateSigs: read in place):
+    // anything that reads it through S.sigs trips them all into S.sigs.
+    bool arrPriv(const ArrShape* a) const {
+        if (!a) return false;
+        for (int64_t k = 0; k < a->count; k++) if (isPriv((int)(a->base + k))) return true;
+        return false;
+    }
+    void hitArr(const ArrShape* a) {
+        if (a) for (int64_t k = 0; k < a->count; k++) if (isPriv((int)(a->base + k))) privHits_.insert((int)(a->base + k));
+    }
     void hitPriv(const E& e) {
         if (!e) return;
         if (e->op == Op::Ref && isPriv(e->sig)) privHits_.insert(e->sig);
+        if (e->op == Op::ArrRead) hitArr(e->arr.get());
         for (auto& k : e->kids) hitPriv(k);
     }
     std::string vRef(int s) const { return isPriv(s) ? "P" + std::to_string(s) + ".v" : "S.sigs[" + std::to_string(s) + "].val.v"; }
@@ -1534,9 +1556,16 @@ private:
     std::vector<const Instr*> mems_;      // $readmem / $writemem instructions, rebuilt as MI<k>
     std::vector<const Instr*> asrts_;     // immediate assertions and $assertcontrol, rebuilt as AI<k>
     std::map<const Expr*, std::string> slotNames_;   // assertion action slots, rebuilt as SL<k>
+    // Every element of a is private, in signal order (PA is indexed by signal).
+    bool privArr(const ArrShape* a) const {
+        if (!a || a->count < 1) return false;
+        for (int64_t k = 0; k < a->count; k++) if (!isPriv((int)(a->base + k))) return false;
+        return true;
+    }
     bool readsPriv(const E& e) const {
         if (!e) return false;
         if (e->op == Op::Ref && isPriv(e->sig)) return true;
+        if (e->op == Op::ArrRead && arrPriv(e->arr.get())) return true;
         for (auto& k : e->kids) if (readsPriv(k)) return true;
         return false;
     }
@@ -1648,6 +1677,7 @@ private:
         if (!e) { t += 'N'; return; }
         if (auto it = slotNames_.find(e.get()); it != slotNames_.end()) { t += "S" + it->second.substr(2); return; }
         bool ar = e->op == Op::ArrRead;   // only its kids and array count
+        if (ar) hitArr(e->arr.get());   // the interpreter reads it from S.sigs
         const Val k = ar ? Val{} : e->k;
         char b[96];
         // flags: 1 signed, 2 real (the double in v), 4 string (the text follows the limbs)
@@ -1688,6 +1718,9 @@ private:
             case Op::ArrRead: {
                 std::string ix;
                 for (size_t i = 0; i < e->kids.size(); i++) ix += (i ? ", " : "") + k((int)i);
+                if (privArr(e->arr.get()))   // every element private: read in place
+                    return "APRV(" + arrName(e->arr.get()) + ", {" + ix + "}, &P" + std::to_string(e->arr->base) + ")";
+                hitArr(e->arr.get());
                 return "AREAD(" + arrName(e->arr.get()) + ", {" + ix + "})";
             }
             case Op::Not: return f1("v_not");
@@ -1993,13 +2026,15 @@ private:
                 if (!a || a->base < 0 || a->dynElem || a->dims.size() != 1 || e->kids.size() != 1 || a->elemW < 1 || a->elemW > 64 ||
                     a->count < 1 || a->twoState)
                     return false;
+                const bool pa = privArr(a);   // every element private: (&P<base>)[i], shared chunks move P<base>
                 for (int k = 0; k < a->count; k++)
-                    if (isPriv(a->base + k) || a->base + k >= (int)sigW_.size() || sigW_[a->base + k] != a->elemW) return false;
+                    if ((!pa && isPriv(a->base + k)) || a->base + k >= (int)sigW_.size() || sigW_[a->base + k] != a->elemW) return false;
                 if (!kid(0, A, fa)) return false;
                 auto [l, r] = a->dims[0];
                 std::string off = l <= r ? "((uint64_t)(" + A + ") - (uint64_t)" + std::to_string(l) + "LL)"
                                          : "((uint64_t)" + std::to_string(l) + "LL - (uint64_t)(" + A + "))";
-                std::string at = "S.sigs[" + std::to_string(a->base) + " + (" + off + " < " + std::to_string(a->count) + " ? " + off + " : 0)].val";
+                std::string at = pa ? "(&P" + std::to_string(a->base) + ")[" + off + " < " + std::to_string(a->count) + " ? " + off + " : 0]"
+                                    : "S.sigs[" + std::to_string(a->base) + " + (" + off + " < " + std::to_string(a->count) + " ? " + off + " : 0)].val";
                 out = "(" + at + ".v)";
                 fxOor_.push_back("(" + off + " >= " + std::to_string(a->count) + " || " + at + ".x)");
                 fi = {a->elemW, e->sgn};
@@ -2333,6 +2368,7 @@ private:
             return o.str();
         }
         if (isPriv(i.sig)) {   // a testbench write to a private reg: the comb logic may read it
+            if (i.drv >= 0 && i.hi < 0 && constInit_.count(i.sig) && i.e && i.e->op == Op::Const) return " ;\n";   // its PINIT value
             if (i.drv >= 0 || i.hi >= 0) { privHits_.insert(i.sig); return " ;\n"; }
             o << " " << pw(i.sig, val) << " pclean = false; S.markFast();\n";
             return o.str();
@@ -3942,6 +3978,21 @@ private:
         std::vector<char> mine(procs.size(), 0);
         for (int i : dom) mine[i] = 1;
         for (size_t i = 0; i < procs.size(); i++) if (procs[i].combRank >= 0) mine[i] = 1;
+        // The elements of arrays a comb process reads at a run-time index
+        // (read in place, below): a constant driver may make one private.
+        std::vector<char> arrElem(ns, 0);
+        if (!std::getenv("MSIM_NOPRIVARR")) {
+            std::function<void(const E&)> ae = [&](const E& e) {
+                if (!e) return;
+                if (e->op == Op::ArrRead && e->arr)
+                    for (int64_t k = 0; k < e->arr->count; k++)
+                        if (e->arr->base + k >= 0 && (size_t)(e->arr->base + k) < ns) arrElem[(size_t)(e->arr->base + k)] = 1;
+                for (auto& k : e->kids) ae(k);
+            };
+            for (auto& pr : procs)
+                if (pr.combRank >= 0 && pr.prog)
+                    for (auto& in : pr.prog->code) { ae(in.e); ae(in.bidx); ae(in.de); for (auto& a : in.aidx) ae(a); }
+        }
         int refP = -1;
         std::function<void(const E&)> refs = [&](const E& e) {
             if (!e) return;
@@ -3996,6 +4047,22 @@ private:
                 continue;
             }
             if (armShape(procs[i], sigs)) { arms.push_back((int)i); continue; }   // its wait: armChk
+            // A constant continuous assign (assign r[0] = '0): the one driver
+            // runs once at time 0. An element of an array read in place may
+            // be private, starting with the constant (PINIT). Not any other
+            // signal: an @* block reading it would be armed through armChk,
+            // which then checks a value that never changes on every pass.
+            if (!procs[i].seq && procs[i].prog && procs[i].prog->code.size() == 1) {
+                const Instr& in = procs[i].prog->code[0];
+                if (in.k == IK::Assign && in.sig >= 0 && (size_t)in.sig < ns && arrElem[(size_t)in.sig] && in.hi < 0 && !in.arr && in.aidx.empty() && !in.bidx &&
+                    in.drv >= 0 && sigs[in.sig].drivers == 1 && in.s0 != STR_HIZ && in.s1 != STR_HIZ && in.e && in.e->op == Op::Const &&
+                    in.e->k.w == sigs[in.sig].w && in.e->k.w <= 64 && in.e->k.hi.empty() && !in.e->k.real && !in.e->k.str &&
+                    !in.e->k.x && !in.e->k.z && !std::getenv("MSIM_NOPRIVARR")) {
+                    cand[in.sig] = 1;
+                    constInit_[in.sig] = in.e->k.v;
+                    continue;
+                }
+            }
             // Another process may still write one with a plain blocking
             // assign, read it in compiled code, or $display it (the value is
             // copied into S.sigs first). Anything else keeps it in S.sigs.
@@ -4039,19 +4106,38 @@ private:
                 range(e->arr.get());
                 for (auto& k : e->kids) ea(k);
             };
+            // A read a[i] in a compiled statement of a comb process
+            // reads the private elements in place ((&P<base>)[i], APRV), so
+            // such an array (Ibex's register file mirror rf_reg) may be
+            // private: the kernel never reaches it. Each element still has to
+            // qualify on its own (cand), and an element the generated code
+            // cannot read in place trips privHits_ and stays in S.sigs.
+            // MSIM_NOPRIVARR=1: every array named stays in S.sigs.
+            std::function<void(const E&)> er = [&](const E& e) {
+                if (!e) return;
+                if (!(e->op == Op::ArrRead && e->arr && e->arr->dims.size() == 1 && !e->arr->dynElem && !e->arr->twoState &&
+                      e->arr->elemW >= 1 && e->arr->elemW <= 64))
+                    range(e->arr.get());
+                for (auto& k : e->kids) er(k);
+            };
+            const bool privArr = !std::getenv("MSIM_NOPRIVARR");
             std::unordered_set<const Prog*> seen;
-            std::function<void(const Prog*)> walk = [&](const Prog* p) {
+            std::function<void(const Prog*, bool)> walk = [&](const Prog* p, bool own) {
                 if (!p || !seen.insert(p).second) return;
                 for (auto& in : p->code) {
                     range(in.arr.get());
-                    ea(in.e); ea(in.bidx); ea(in.de);
+                    const bool rd = own && privArr && (in.k == IK::Assign || in.k == IK::JmpIfNot || in.k == IK::Nba);
+                    if (rd) { er(in.e); er(in.bidx); er(in.de); for (auto& a : in.aidx) er(a); }
+                    else { ea(in.e); ea(in.bidx); ea(in.de); for (auto& a : in.aidx) ea(a); }
                     for (auto& a : in.args) ea(a);
-                    for (auto& a : in.aidx) ea(a);
-                    walk(in.callee);
-                    for (auto* b : in.branches) walk(b);
+                    walk(in.callee, false);
+                    for (auto* b : in.branches) walk(b, false);
                 }
             };
-            for (auto& pr : procs) walk(pr.prog);
+            // Comb processes only: a clocked process of the domain reads a
+            // register another one writes from its snapshot (snap_, LS_), and
+            // an element read in place would see the new value.
+            for (size_t i = 0; i < procs.size(); i++) walk(procs[i].prog, mine[i] && procs[i].combRank >= 0);
         }
         for (int s : noPriv) if (s >= 0 && (size_t)s < ns) bad[(size_t)s] = 1;
         priv_.assign(ns, 0);
@@ -4523,6 +4609,8 @@ private:
             std::function<void(const E&, const std::function<void(Expr&)>&)> each = [&](const E& e, const std::function<void(Expr&)>& f) {
                 if (!e) return;
                 if (e->op == Op::Ref && !e->at) f(*e);
+                if (e->op == Op::ArrRead && e->arr)   // a[i]: any element (read in place when private)
+                    for (int64_t k = 0; k < e->arr->count; k++) { Expr x; x.op = Op::Ref; x.sig = (int)(e->arr->base + k); f(x); }
                 for (auto& k : e->kids) each(k, f);
             };
             auto exprs = [&](const Instr& in, const std::function<void(Expr&)>& f) {
@@ -4823,6 +4911,8 @@ private:
                         if (!x) return;
                         if (x->op == Op::Ref) rd(x->sig);
                         if (x->sig >= 0 && x->op != Op::Ref && x->op != Op::Const) rd(x->sig);
+                        if (x->op == Op::ArrRead && x->arr)   // a[i]: any element
+                            for (int64_t k = 0; k < x->arr->count; k++) rd((int)(x->arr->base + k));
                         for (auto& k : x->kids) f(k);
                         if (x->at) f(x->at);
                     };

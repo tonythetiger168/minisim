@@ -131,6 +131,8 @@ set(CASES
   "examples/pubpart.sv"
   "-no-cycle examples/bitrun.sv"
   "examples/bitrun.sv"
+  "-no-cycle examples/arrread.sv"
+  "examples/arrread.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"
