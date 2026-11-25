@@ -490,6 +490,8 @@ for it.
 | `-mhz F` | hart clock |
 | `-max-cycles N` | stop after N cycles, exit code 4 |
 | `-input TEXT` | what the first UART receives |
+| `-input-at S:TEXT` | `TEXT` reaches the first UART at `S` seconds of simulated time; repeatable. The same run every time: for scripts that type into a system once it is up (an Android shell minutes into its boot) |
+| `-stdin` | what arrives on standard input goes to the first UART, read between quanta: an interactive console, or a pipe |
 | `-trace FILE` | commit log |
 | `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
 | `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |

@@ -28,6 +28,14 @@ expect "-map" 0 map.out "0x80000000..0x87ffffff  ram        dram"
 
 "$MVPLAT" "$E/irq.elf" -input abc -q > irq.out 2>&1; rc=$?
 expect "timer, software and external interrupts" 0 irq.out "timer ticks 5, software 1, received 'abc'"
+# Input later on: at a simulated time (the harts wait in WFI until then),
+# and from standard input.
+"$MVPLAT" "$E/irq.elf" -input-at "0.002:ab" -input-at "0.003:c" -q > irqat.out 2>&1; rc=$?
+expect "-input-at: text at a simulated time" 0 irqat.out "received 'abc'"
+printf abc | "$MVPLAT" "$E/irq.elf" -stdin -q > irqin.out 2>&1; rc=$?
+expect "-stdin: what standard input brings" 0 irqin.out "received 'abc'"
+"$MVPLAT" "$E/irq.elf" -input-at "soon:abc" -q > irqbad.out 2>&1; rc=$?
+expect "-input-at refuses a time that is not a number" 2 irqbad.out "SECONDS:TEXT"
 
 "$MVPLAT" "$E/pmp.elf" -q > pmp.out 2>&1; rc=$?
 expect "PMP: NAPOT, NA4, TOR, partial match, MPRV, locked entries" 0 pmp.out "pmp: all checks passed"

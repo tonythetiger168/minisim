@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mvplat -input-at S:TEXT` (text at a simulated time, deterministic) and
+  `-stdin` (standard input to the first UART: an interactive console);
+  input waits until the driver turns the receive interrupt on. A disk image
+  mapped privately reserves no swap, so images larger than host memory
+  (Android's 16 GiB disks) open.
 - `mvplat`: `virtio-rng` (VIRTIO 1.2, 5.4; the same bytes every run for a
   `seed`) and `goldfish-rtc` (Linux's `rtc-goldfish`: time since 1970 from an
   `epoch` plus simulated time, settable, with an alarm interrupt), both with

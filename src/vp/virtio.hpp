@@ -286,7 +286,8 @@ public:
         if (img_) munmap(img_, mapped_);
     }
     // Map the image: shared (writes reach the file) or private (writes stay in
-    // the run). A size that is not a whole number of sectors is cut down.
+    // the run; no swap is reserved for them, so an image larger than the
+    // host's memory maps too, as Android's 16 GiB disks do). A size that is not a whole number of sectors is cut down.
     void open(const std::string& path, bool writeBack, bool readOnly) {
         int fd = ::open(path.c_str(), writeBack && !readOnly ? O_RDWR : O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open the disk image " + path);
@@ -297,7 +298,7 @@ public:
         }
         bytes_ = (uint64_t)st.st_size & ~511ull;
         mapped_ = (size_t)st.st_size;
-        void* m = mmap(nullptr, mapped_, PROT_READ | PROT_WRITE, writeBack && !readOnly ? MAP_SHARED : MAP_PRIVATE, fd, 0);
+        void* m = mmap(nullptr, mapped_, PROT_READ | PROT_WRITE, writeBack && !readOnly ? MAP_SHARED : MAP_PRIVATE | MAP_NORESERVE, fd, 0);
         ::close(fd);
         if (m == MAP_FAILED) throw std::runtime_error("cannot map the disk image " + path);
         img_ = static_cast<uint8_t*>(m);

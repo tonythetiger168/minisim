@@ -12,8 +12,12 @@
 #pragma once
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <deque>
+#include <string>
+#include <utility>
+#include <vector>
 #include <fstream>
 #include <sstream>
 
@@ -121,8 +125,41 @@ public:
     // an operating system's driver does once it has set the port up (and
     // cleared its FIFO): what a user types after the system is up.
     std::deque<uint8_t> held;
+    // Text that arrives at a simulated time (-input-at), in time order: the
+    // same run every time, for scripts that have to wait for a system to
+    // come up before they type.
+    std::vector<std::pair<uint64_t, std::string>> timed;
+    // A host file descriptor read between quanta (-stdin): what a person
+    // types, whenever they type it. -1: none.
+    int hostFd = -1;
 
     Uart16550() { type = "uart16550"; }
+    bool live() const override { return hostFd >= 0 || !timed.empty(); }
+    uint64_t nextEventPs(uint64_t) const override { return timed.empty() ? UINT64_MAX : timed.front().first; }
+    void advance(uint64_t now) override {
+        // Before the driver turns the receive interrupt on, input waits in
+        // `held`, as -input's does.
+        std::deque<uint8_t>& q = (ier_ & 1) ? rx : held;
+        // After a restore, what was due before the checkpoint's time was
+        // typed in the run that saved it (and is in rx or held already).
+        if (restored_) {
+            while (!timed.empty() && timed.front().first < now) timed.erase(timed.begin());
+            restored_ = false;
+        }
+        bool got = false;
+        while (!timed.empty() && timed.front().first <= now) {
+            for (char c : timed.front().second) q.push_back((uint8_t)c);
+            timed.erase(timed.begin());
+            got = true;
+        }
+        if (hostFd >= 0) {
+            uint8_t b[256];
+            ssize_t k = ::read(hostFd, b, sizeof b);
+            if (k > 0) { for (ssize_t i = 0; i < k; i++) q.push_back(b[i]); got = true; }
+            else if (k == 0) hostFd = -1;  // end of input
+        }
+        if (got) update();
+    }
     Acc read(uint64_t off, unsigned, uint64_t& v, const Who& w) override {
         if (!w.serial) return Acc::Pending;
         unsigned r = (unsigned)(off >> shift);
@@ -193,6 +230,7 @@ public:
         for (uint64_t n = r.u64(); n; n--) { uint8_t c; r.read(&c, 1); rx.push_back(c); }
         held.clear();
         for (uint64_t n = r.u64(); n; n--) { uint8_t c; r.read(&c, 1); held.push_back(c); }
+        restored_ = true;
         update();
     }
     uint64_t transmitted() const { return tx_; }
@@ -203,7 +241,7 @@ private:
         if (irq) p->setIrq(irq, lvl);
     }
     uint8_t ier_ = 0, lcr_ = 0, mcr_ = 0, scr_ = 0, dll_ = 0, dlm_ = 0;
-    bool thri_ = false;
+    bool thri_ = false, restored_ = false;
     uint64_t tx_ = 0;
 };
 
