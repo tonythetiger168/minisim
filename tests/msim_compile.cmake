@@ -137,6 +137,8 @@ set(CASES
   "examples/lazymemo.sv"
   "-no-cycle examples/inlinewire.sv"
   "examples/inlinewire.sv"
+  "-no-cycle examples/reppure.sv"
+  "examples/reppure.sv"
   "tests/spec/25.9-vif-nba-clocked.sv"
   "tests/spec/24.3.1-program-reactive.sv"
   "tests/spec/38.10-vpi-primitives.sv tests/spec/data/vpi/prims.c"

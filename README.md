@@ -122,6 +122,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-noassert`, `-nosva` | Leave concurrent assertions, assumptions and covers out of the build (as `xrun -noassert`, `vsim -nosva`, or Verilator without `--assert`); immediate assertions stay |
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
+| `-pgo-gen`, `-pgo-use` | Profile-guided `-compile` build (gcc). `-pgo-gen` builds a `simv` that writes profiles into `<dir>/pgo` when it runs; a second `-compile -pgo-use` with the same `-o <dir>` rebuilds the design with them. Ibex: 105 ms -> 92 ms, Verilator 5.054 -O3 93 ms on the same machine |
 | `-xprop[=tmerge\|xmerge\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
 | `-restore <checkpoint> [+plusargs]` | Go back to a `$save` checkpoint: run the saved command line again quietly up to it, check the state, and carry on; see [`docs/CHECKPOINT.md`](docs/CHECKPOINT.md) |
 | `-xrun ...` (or msim run as `xrun` / `irun`) | The rest of the command line is an xrun / irun one: `-f`, `-incdir`, `-define`, `-l`, `-input`, `-access`, ... translated to msim options; see [`docs/XRUN.md`](docs/XRUN.md) |
