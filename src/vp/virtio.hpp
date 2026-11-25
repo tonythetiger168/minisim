@@ -15,6 +15,8 @@
 //               ping, or Unix datagram sockets to another platform.
 //   virtio-console  a console port (Linux's hvc0).
 //   virtio-rng  random bytes, the same every run for a seed (Linux's hw_random).
+//   virtio-gpu  a 2D display (5.7): one scanout the guest draws into; the
+//               last frame can be written to a picture file.
 #pragma once
 
 #include <fcntl.h>
@@ -29,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -689,6 +692,243 @@ private:
         return z ^ (z >> 31);
     }
     uint64_t state_ = 0;
+};
+
+// virtio-gpu (5.7), 2D: a control queue and a cursor queue, one scanout of
+// `width` x `height`, no 3D (no capability sets), no blobs. The guest makes
+// resources (2D images held by the device), backs them with its own pages,
+// copies pages into them (TRANSFER_TO_HOST_2D), shows one on the scanout
+// (SET_SCANOUT) and says when a rectangle changed (RESOURCE_FLUSH). The
+// device keeps the scanout's image; `screen` names a PPM file it is written
+// to when the run ends. Linux's virtio_gpu driver (DRM, dumb buffers) works
+// on it, which is what Android's minigbm allocator and hardware composer
+// need.
+class VirtioGpu : public VirtioMmio {
+public:
+    VirtioGpu() : VirtioMmio(2) { type = "virtio-gpu"; }
+    uint32_t width = 720, height = 1280;
+    std::string screen;          // PPM written by finish(), if set
+    uint64_t maxBytes = 512ull << 20;  // host memory all resources may use
+    uint64_t flushes() const { return flushes_; }
+
+    // The scanout as RGB, row by row (black while nothing is shown).
+    std::vector<uint8_t> rgb() const {
+        std::vector<uint8_t> o((size_t)width * height * 3, 0);
+        auto it = res_.find(scanoutRes_);
+        if (it == res_.end()) return o;
+        const Res& r = it->second;
+        int ri, gi, bi;
+        order(r.format, ri, gi, bi);
+        for (uint32_t y = 0; y < height; y++) {
+            uint32_t sy = sy_ + y;
+            if (sy >= r.h || y >= sh_) break;
+            for (uint32_t x = 0; x < width && x < sw_; x++) {
+                uint32_t sx = sx_ + x;
+                if (sx >= r.w) break;
+                const uint8_t* px = &r.pix[((size_t)sy * r.w + sx) * 4];
+                uint8_t* d = &o[((size_t)y * width + x) * 3];
+                d[0] = px[ri]; d[1] = px[gi]; d[2] = px[bi];
+            }
+        }
+        return o;
+    }
+    void writePpm(const std::string& path) const {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) throw std::runtime_error("cannot write " + path);
+        fprintf(f, "P6\n%u %u\n255\n", width, height);
+        std::vector<uint8_t> o = rgb();
+        fwrite(o.data(), 1, o.size(), f);
+        fclose(f);
+    }
+    void finish() override {
+        if (!screen.empty()) writePpm(screen);
+    }
+
+protected:
+    uint32_t deviceId() const override { return 16; }
+    uint64_t features() const override { return F_VERSION_1; }
+    // events_read, events_clear, num_scanouts, num_capsets (5.7.4)
+    uint8_t configByte(uint64_t o) const override {
+        uint32_t f[4] = {0, 0, 1, 0};
+        return o < 16 ? (uint8_t)(f[o / 4] >> (8 * (o % 4))) : 0;
+    }
+    uint32_t request(unsigned qi, const std::vector<Buf>& chain) override {
+        std::vector<uint8_t> in = gather(chain);
+        if (qi == 1) return 0;  // cursor: no image to draw it on, no reply
+        std::vector<uint8_t> out(24, 0);
+        uint32_t resp = command(in, out);
+        // The reply's header: its type, and the request's fence (5.7.6.7).
+        uint32_t flags = in.size() >= 24 ? u32(in, 4) & 1 : 0;
+        put32(out, 0, resp);
+        put32(out, 4, flags);
+        if (flags) for (int i = 8; i < 24; i++) out[i] = in[i];  // fence_id, ctx_id, ring_idx
+        return fill(chain, out.data(), (uint32_t)out.size());
+    }
+    void saveDevice(Writer& w) const override {
+        w.u64(flushes_); w.u32(scanoutRes_); w.u32(sx_); w.u32(sy_); w.u32(sw_); w.u32(sh_);
+        w.u64(res_.size());
+        for (auto& [id, r] : res_) {
+            w.u32(id); w.u32(r.format); w.u32(r.w); w.u32(r.h);
+            w.u64(r.backing.size());
+            for (auto& b : r.backing) { w.u64(b.first); w.u32(b.second); }
+            w.str(std::string(r.pix.begin(), r.pix.end()));
+        }
+    }
+    void loadDevice(Reader& rd) override {
+        res_.clear(); used_ = 0;
+        flushes_ = rd.u64(); scanoutRes_ = rd.u32(); sx_ = rd.u32(); sy_ = rd.u32(); sw_ = rd.u32(); sh_ = rd.u32();
+        for (uint64_t n = rd.u64(); n; n--) {
+            uint32_t id = rd.u32();
+            Res& r = res_[id];
+            r.format = rd.u32(); r.w = rd.u32(); r.h = rd.u32();
+            for (uint64_t k = rd.u64(); k; k--) { uint64_t a = rd.u64(); r.backing.push_back({a, rd.u32()}); }
+            std::string s = rd.str();
+            r.pix.assign(s.begin(), s.end());
+            used_ += r.pix.size();
+        }
+    }
+    void resetDevice() override {
+        res_.clear(); used_ = 0; scanoutRes_ = 0; sx_ = sy_ = sw_ = sh_ = 0;
+    }
+
+private:
+    struct Res {
+        uint32_t format = 0, w = 0, h = 0;
+        std::vector<std::pair<uint64_t, uint32_t>> backing;  // guest address, length
+        std::vector<uint8_t> pix;                            // w x h x 4 bytes
+    };
+    enum : uint32_t {
+        OK = 0x1100, OK_DISPLAY_INFO = 0x1101,
+        ERR_UNSPEC = 0x1200, ERR_OOM = 0x1201, ERR_SCANOUT = 0x1202, ERR_RES = 0x1203, ERR_PARAM = 0x1205,
+    };
+    static uint32_t u32(const std::vector<uint8_t>& b, size_t o) {
+        uint32_t v = 0;
+        if (o + 4 <= b.size()) memcpy(&v, &b[o], 4);
+        return v;
+    }
+    static uint64_t u64(const std::vector<uint8_t>& b, size_t o) {
+        uint64_t v = 0;
+        if (o + 8 <= b.size()) memcpy(&v, &b[o], 8);
+        return v;
+    }
+    static void put32(std::vector<uint8_t>& b, size_t o, uint32_t v) {
+        if (b.size() < o + 4) b.resize(o + 4, 0);
+        memcpy(&b[o], &v, 4);
+    }
+    // Byte positions of red, green and blue in a pixel of a format (5.7.6.8:
+    // the names give the bytes' order in memory).
+    static bool order(uint32_t f, int& r, int& g, int& b) {
+        switch (f) {
+            case 1: case 2: r = 2; g = 1; b = 0; return true;      // B8G8R8A8, B8G8R8X8
+            case 3: case 4: r = 1; g = 2; b = 3; return true;      // A8R8G8B8, X8R8G8B8
+            case 67: case 134: r = 0; g = 1; b = 2; return true;   // R8G8B8A8, R8G8B8X8
+            case 68: case 121: r = 3; g = 2; b = 1; return true;   // X8B8G8R8, A8B8G8R8
+            default: r = 0; g = 1; b = 2; return false;
+        }
+    }
+    // Copy `n` bytes at `off` of a resource's backing pages into dst.
+    bool fromBacking(const Res& r, uint64_t off, uint8_t* dst, uint64_t n) {
+        for (auto& [a, len] : r.backing) {
+            if (!n) break;
+            if (off >= len) { off -= len; continue; }
+            uint64_t k = std::min<uint64_t>(len - off, n);
+            if (!readMem(a + off, dst, k)) return false;
+            dst += k; n -= k; off = 0;
+        }
+        return n == 0;
+    }
+    uint32_t command(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
+        if (in.size() < 24) return ERR_UNSPEC;
+        const uint32_t type = u32(in, 0);
+        const size_t B = 24;  // after the header
+        auto rect = [&](size_t o, uint32_t& x, uint32_t& y, uint32_t& w, uint32_t& h) {
+            x = u32(in, o); y = u32(in, o + 4); w = u32(in, o + 8); h = u32(in, o + 12);
+        };
+        switch (type) {
+            case 0x0100: {  // GET_DISPLAY_INFO: 16 pmodes; scanout 0 enabled
+                out.assign(24 + 16 * 24, 0);
+                put32(out, 24 + 8, width);
+                put32(out, 24 + 12, height);
+                put32(out, 24 + 16, 1);
+                return OK_DISPLAY_INFO;
+            }
+            case 0x0101: {  // RESOURCE_CREATE_2D
+                uint32_t id = u32(in, B), fmt = u32(in, B + 4), w = u32(in, B + 8), h = u32(in, B + 12);
+                int a, b, c;
+                if (!id || res_.count(id)) return ERR_RES;
+                if (!order(fmt, a, b, c) || !w || !h || w > 16384 || h > 16384) return ERR_PARAM;
+                uint64_t bytes = (uint64_t)w * h * 4;
+                if (used_ + bytes > maxBytes) return ERR_OOM;
+                Res& r = res_[id];
+                r.format = fmt; r.w = w; r.h = h;
+                r.pix.assign(bytes, 0);
+                used_ += bytes;
+                return OK;
+            }
+            case 0x0102: {  // RESOURCE_UNREF
+                auto it = res_.find(u32(in, B));
+                if (it == res_.end()) return ERR_RES;
+                used_ -= it->second.pix.size();
+                if (scanoutRes_ == it->first) scanoutRes_ = 0;
+                res_.erase(it);
+                return OK;
+            }
+            case 0x0103: {  // SET_SCANOUT
+                uint32_t x, y, w, h;
+                rect(B, x, y, w, h);
+                uint32_t sid = u32(in, B + 16), id = u32(in, B + 20);
+                if (sid != 0) return ERR_SCANOUT;
+                if (id == 0) { scanoutRes_ = 0; return OK; }  // display off
+                auto it = res_.find(id);
+                if (it == res_.end()) return ERR_RES;
+                if ((uint64_t)x + w > it->second.w || (uint64_t)y + h > it->second.h) return ERR_PARAM;
+                scanoutRes_ = id; sx_ = x; sy_ = y; sw_ = w; sh_ = h;
+                return OK;
+            }
+            case 0x0104: {  // RESOURCE_FLUSH
+                if (!res_.count(u32(in, B + 16))) return ERR_RES;
+                if (u32(in, B + 16) == scanoutRes_) flushes_++;
+                return OK;
+            }
+            case 0x0105: {  // TRANSFER_TO_HOST_2D: rows of the backing into the image
+                uint32_t x, y, w, h;
+                rect(B, x, y, w, h);
+                uint64_t off = u64(in, B + 16);
+                auto it = res_.find(u32(in, B + 24));
+                if (it == res_.end()) return ERR_RES;
+                Res& r = it->second;
+                if ((uint64_t)x + w > r.w || (uint64_t)y + h > r.h) return ERR_PARAM;
+                const uint64_t stride = (uint64_t)r.w * 4;
+                for (uint32_t row = 0; row < h; row++) {
+                    uint8_t* d = &r.pix[(size_t)((y + row) * stride + (uint64_t)x * 4)];
+                    if (!fromBacking(r, off + row * stride, d, (uint64_t)w * 4)) return ERR_PARAM;
+                }
+                return OK;
+            }
+            case 0x0106: {  // RESOURCE_ATTACH_BACKING
+                auto it = res_.find(u32(in, B));
+                uint32_t n = u32(in, B + 4);
+                if (it == res_.end()) return ERR_RES;
+                if (in.size() < B + 8 + 16ull * n) return ERR_PARAM;
+                it->second.backing.clear();
+                for (uint32_t i = 0; i < n; i++)
+                    it->second.backing.push_back({u64(in, B + 8 + 16 * i), u32(in, B + 16 + 16 * i)});
+                return OK;
+            }
+            case 0x0107: {  // RESOURCE_DETACH_BACKING
+                auto it = res_.find(u32(in, B));
+                if (it == res_.end()) return ERR_RES;
+                it->second.backing.clear();
+                return OK;
+            }
+            default:
+                return ERR_UNSPEC;
+        }
+    }
+
+    std::map<uint32_t, Res> res_;
+    uint64_t used_ = 0, flushes_ = 0;
+    uint32_t scanoutRes_ = 0, sx_ = 0, sy_ = 0, sw_ = 0, sh_ = 0;
 };
 
 }  // namespace vp

@@ -237,6 +237,17 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             if (d.get("seed")) v->seed = d.get("seed")->u64();
             return std::unique_ptr<VirtioMmio>(std::move(v));
+        } else if (t == "virtio-gpu") {
+            auto v = std::make_unique<VirtioGpu>();
+            v->name = name;
+            v->base = at;
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (d.get("width")) v->width = (uint32_t)d.get("width")->u64();
+            if (d.get("height")) v->height = (uint32_t)d.get("height")->u64();
+            if (v->width < 16 || v->width > 8192 || v->height < 16 || v->height > 8192)
+                throw std::runtime_error(d.where() + "'" + name + "': width and height are 16 to 8192");
+            if (d.get("screen")) v->screen = rel(d.get("screen")->str());
+            return std::unique_ptr<VirtioMmio>(std::move(v));
         } else if (t == "virtio-net") {
             auto v = std::make_unique<VirtioNet>();
             v->name = name;
@@ -337,7 +348,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
                     std::string ct = c.get("type") ? c.get("type")->str() : "";
                     std::string cn = c.get("name") ? c.get("name")->str() : name + "." + ct;
                     auto v = makeVirtio(c, ct, cn, 0);
-                    if (!v) throw std::runtime_error(c.where() + "a PCIe device is virtio-blk, virtio-net, virtio-console or virtio-rng, not '" + ct + "'");
+                    if (!v) throw std::runtime_error(c.where() + "a PCIe device is virtio-blk, virtio-net, virtio-console, virtio-rng or virtio-gpu, not '" + ct + "'");
                     if (h->count() >= 31) throw std::runtime_error(c.where() + "at most 31 devices behind a PCIe host");
                     h->addVirtio(std::move(v));
                 }
@@ -348,7 +359,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             Ext* x = loadExt(g_argc, g_argv, ("device type '" + type + "'").c_str());
             if (x && x->device(m, d, type, name, dir)) continue;
             throw std::runtime_error(d.where() + "unknown device type '" + type +
-                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console, virtio-rng, goldfish-rtc, pcie" +
+                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console, virtio-rng, virtio-gpu, goldfish-rtc, pcie" +
                                      (x ? "" : "; mvp and rtl need the mvplat extension library") + ")");
         }
         m.bus.add(std::move(dev));

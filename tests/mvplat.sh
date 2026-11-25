@@ -164,6 +164,28 @@ expect "PCIe host and virtio over PCI" 0 pcie.out "pcie: all checks passed"
 grep -q "pci-host-ecam-generic" pcie.dtb && grep -q "interrupt-map" pcie.dtb &&
   ok "the device tree has the ECAM host and its interrupt-map" || bad "PCIe host in the device tree"
 
+# virtio-gpu: a bare-metal driver draws through the 2D commands; the
+# picture the device writes at the end ("screen") is what it drew.
+sed 's/"height": 32}/"height": 32, "screen": "gpu.ppm"}/' "$T/gpu.json" > gpu.json
+rm -f gpu.ppm
+"$MVPLAT" -platform gpu.json "$E/gpu.elf" -q > gpu.out 2>&1; rc=$?
+expect "virtio-gpu: display info, resources, transfers, scanout, flush" 0 gpu.out "gpu: all checks passed"
+if command -v python3 > /dev/null 2>&1; then
+  python3 - <<'P' && ok "virtio-gpu: the screen file holds the picture" || bad "virtio-gpu screen file"
+import sys
+b = open('gpu.ppm', 'rb').read()
+h = b'P6\n64 32\n255\n'
+assert b[:len(h)] == h and len(b) == len(h) + 64 * 32 * 3, b[:20]
+p = b[len(h):]
+for y in range(32):
+    for x in range(64):
+        want = (0x80, 8 * y, 4 * x)
+        if 10 <= x < 14 and 5 <= y < 8: want = (255, 255, 255)
+        got = tuple(p[3 * (y * 64 + x):3 * (y * 64 + x) + 3])
+        assert got == want, (x, y, got, want)
+P
+fi
+
 # virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
 # image; the file changes only with -disk-write.
 if command -v python3 > /dev/null 2>&1; then

@@ -180,7 +180,7 @@ private:
             put16(0x02, (uint16_t)(0x1040 + id));
             put16(0x06, 0x0010);           // status: a capabilities list
             cfg[0x08] = 1;                 // revision 1: modern only
-            uint32_t cls = id == 1 ? 0x020000 : id == 2 ? 0x010000 : id == 3 ? 0x078000 : 0x00ff00;
+            uint32_t cls = id == 1 ? 0x020000 : id == 2 ? 0x010000 : id == 3 ? 0x078000 : id == 16 ? 0x038000 : 0x00ff00;
             cfg[0x09] = (uint8_t)cls; cfg[0x0a] = (uint8_t)(cls >> 8); cfg[0x0b] = (uint8_t)(cls >> 16);
             put32(0x10, 0x4);              // BAR0: memory, 64-bit
             put16(0x2c, 0x1af4);
