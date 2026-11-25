@@ -1,0 +1,20 @@
+// A PCIe host with ECAM and two virtio-rng devices behind it
+// (tests/vplat/pcie.c).
+{
+  "name": "virt32+pcie",
+  "devices": [
+    {"type": "finisher", "base": "0x00100000"},
+    {"type": "clint", "base": "0x02000000"},
+    {"type": "plic", "base": "0x0c000000", "sources": 95},
+    {"type": "uart16550", "name": "uart0", "base": "0x10000000", "irq": 10},
+    {"type": "pcie", "name": "pcie", "base": "0x30000000", "buses": 2, "mmio": "0x40000000", "mmio_size": "0x40000000", "irq": 32,
+     "devices": [
+       {"type": "virtio-rng", "seed": 42},
+       {"type": "virtio-rng", "seed": 1},
+       {"type": "virtio-rng", "seed": 2},
+       {"type": "virtio-rng", "seed": 3},
+       {"type": "virtio-rng", "seed": 5}
+     ]},
+    {"type": "ram", "name": "dram", "base": "0x80000000", "size": "16M"}
+  ]
+}

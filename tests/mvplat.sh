@@ -147,6 +147,15 @@ expect "goldfish-rtc and virtio-rng" 0 adev.out "android devices: all checks pas
 "$MVPLAT" -platform "$T/androiddev.json" "$E/androiddev.elf" -q > adev2.out 2>&1
 cmp -s adev.out adev2.out && ok "virtio-rng gives the same bytes for the same seed" || bad "virtio-rng differs between runs"
 
+# A PCIe host (ECAM) with virtio devices behind it: enumeration, BAR
+# sizing, the virtio PCI capabilities, a request, and INTx shared by two
+# devices; the device tree describes the host as QEMU's virt board does.
+"$MVPLAT" -platform "$T/pcie.json" "$E/pcie.elf" -q > pcie.out 2>&1; rc=$?
+expect "PCIe host and virtio over PCI" 0 pcie.out "pcie: all checks passed"
+"$MVPLAT" -platform "$T/pcie.json" -dump-dtb pcie.dtb "$E/pcie.elf" -q > /dev/null 2>&1
+grep -q "pci-host-ecam-generic" pcie.dtb && grep -q "interrupt-map" pcie.dtb &&
+  ok "the device tree has the ECAM host and its interrupt-map" || bad "PCIe host in the device tree"
+
 # virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
 # image; the file changes only with -disk-write.
 if command -v python3 > /dev/null 2>&1; then
@@ -311,6 +320,15 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
         -input "/bin/busybox echo root on disk: \$(/bin/busybox ls /bin); /bin/busybox poweroff -f
 " > rootfs.out 2>&1; rc=$?
       expect "Linux boots with its root file system on virtio-blk" 0 rootfs.out "^root on disk: busybox sh"
+      # The same disk behind a PCIe host: Linux's pci-host-generic finds the
+      # device, assigns its BAR, and virtio-pci drives it with INTx.
+      printf '%s\n' '{"devices": [{"type":"finisher","base":"0x100000"},{"type":"clint","base":"0x2000000"},{"type":"plic","base":"0xc000000","sources":95},{"type":"uart16550","base":"0x10000000","irq":10},{"type":"ram","base":"0x80000000","size":"512M"},{"type":"pcie","base":"0x30000000","irq":32,"devices":[{"type":"virtio-blk","file":"data.img"}]}]}' > linux_pci.json
+      "$MVPLAT" -platform linux_pci.json -bios "$BIOS" -kernel "$MVPLAT_LINUX_KERNEL" -initrd bb.cpio \
+        -append "console=ttyS0 rdinit=/init quiet" -q \
+        -input "mount -t devtmpfs d /dev; cat /sys/bus/pci/devices/0000:00:01.0/vendor; mount /dev/vda /mnt; cat /mnt/hello.txt; poweroff -f
+" > pcidisk.out 2>&1; rc=$?
+      expect "Linux mounts a virtio-blk disk behind the PCIe host" 0 pcidisk.out "^hello from the disk"
+      grep -q "^0x1af4" pcidisk.out && ok "Linux enumerated the virtio device at 00:01.0" || bad "PCI enumeration under Linux"
     else
       echo "skip  ext4 disk: no mkfs.ext4 and debugfs (e2fsprogs)"
     fi

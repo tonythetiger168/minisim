@@ -15,6 +15,7 @@
 
 #include "devices.hpp"
 #include "virtio.hpp"
+#include "pci.hpp"
 
 namespace vp {
 
@@ -219,6 +220,33 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
             if (v->irq) {
                 f.propU32("interrupt-parent", {plicPh});
                 f.propU32("interrupts", {v->irq});
+            }
+            f.end();
+        } else if (d->type == "pcie") {
+            // As QEMU's virt board gives it: a generic ECAM host, one 32-bit
+            // memory window, INTx through an interrupt-map (swizzled by slot).
+            auto* h = static_cast<const PcieHost*>(d.get());
+            f.begin(hexName("pci", d->base));
+            f.propStr("compatible", {"pci-host-ecam-generic"});
+            f.propStr("device_type", {"pci"});
+            f.propU32("#address-cells", {3});
+            f.propU32("#size-cells", {2});
+            f.propU32("#interrupt-cells", {1});
+            f.propU32("bus-range", {0, h->buses - 1});
+            f.propU32("linux,pci-domain", {0});
+            f.propEmpty("dma-coherent");
+            f.reg(d->base, d->size);
+            const uint32_t sp = h->mmioBase + h->mmioSize > (1ull << 32) ? 0x03000000u : 0x02000000u;
+            f.propU32("ranges", {sp, (uint32_t)(h->mmioBase >> 32), (uint32_t)h->mmioBase,
+                                 (uint32_t)(h->mmioBase >> 32), (uint32_t)h->mmioBase,
+                                 (uint32_t)(h->mmioSize >> 32), (uint32_t)h->mmioSize});
+            if (h->irq) {
+                std::vector<uint32_t> im;
+                for (uint32_t slot = 0; slot < 4; slot++)
+                    for (uint32_t pin = 1; pin <= 4; pin++)
+                        for (uint32_t c : {slot << 11, 0u, 0u, pin, plicPh, h->irq + (slot + pin - 1) % 4}) im.push_back(c);
+                f.propU32("interrupt-map", im);
+                f.propU32("interrupt-map-mask", {0x1800, 0, 0, 7});
             }
             f.end();
         } else if (d->type == "goldfish-rtc") {

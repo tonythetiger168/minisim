@@ -252,6 +252,7 @@ it). It is the address map most RISC-V bare-metal software already targets.
 | `virtio-console` | virtio over MMIO, version 2, one port | a console (Linux's `hvc0`): output to stdout, `input` typed once the guest has printed and been quiet for 100 ms of simulated time |
 | `virtio-rng` | virtio over MMIO, version 2, one queue (5.4) | random bytes (Linux's `hw_random`, Android's entropy): the same every run for a `seed` |
 | `goldfish-rtc` | `TIME_LOW` / `TIME_HIGH` at 0x00 / 0x04, alarm at 0x08 / 0x0c, `IRQ_ENABLED` 0x10, `CLEAR_ALARM` 0x14, `ALARM_STATUS` 0x18, `CLEAR_INTERRUPT` 0x1c | the real-time clock of Android's emulator boards (Linux's `rtc-goldfish`, device tree `google,goldfish-rtc`): nanoseconds since 1970, `epoch` (seconds, default 2026-01-01) plus simulated time; `irq` for the alarm |
+| `pcie` | PCI Express host, ECAM (PCIe 6.0, 7.2.2), `buses` × 1 MiB at `base`; a memory window `mmio` / `mmio_size` (default 0x40000000, 1 GiB) | `devices`: virtio-blk, virtio-net, virtio-console or virtio-rng entries (no `base`), on bus 0 at 01.0 up, each with a 64-bit 16 KiB BAR0 holding the virtio PCI structures (VIRTIO 1.2, 4.1, modern only: common configuration, ISR, device configuration, notifications); INTx level interrupts, INTA of device *d* on PLIC source `irq` + *d* % 4, given to the kernel as an `interrupt-map`. What Android's kernels (no virtio-mmio) need |
 | `mvp` | the library's own map (`mvp_add_device`) | see below |
 | `rtl` | whatever the RTL decodes | see below |
 

@@ -12,6 +12,11 @@ Spec references are IEEE 1800-2023 clauses.
   `seed`) and `goldfish-rtc` (Linux's `rtc-goldfish`: time since 1970 from an
   `epoch` plus simulated time, settable, with an alarm interrupt), both with
   device tree nodes: the devices an Android guest needs beyond Linux's.
+- `mvplat`: a `pcie` device, a PCI Express host with ECAM configuration
+  space (Linux's `pci-host-ecam-generic`, as on QEMU's virt board) and
+  virtio-blk, -net, -console and -rng behind it on the virtio PCI transport
+  (VIRTIO 1.2, 4.1, modern), with 64-bit BARs the guest assigns and INTx
+  through an interrupt-map. Linux finds, assigns and mounts a disk on it.
 - mvplat `-mt`: each hart on a host thread of its own, at once (as QEMU's
   MTTCG): AMOs and LR/SC as host atomics, one shared translation of paged
   code, rounds of 1000000 cycles with 10000-cycle slices so IPIs arrive

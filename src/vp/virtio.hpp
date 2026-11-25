@@ -124,6 +124,8 @@ public:
         update();
     }
     uint64_t requests() const { return requests_; }
+    uint32_t deviceIdPublic() const { return deviceId(); }
+    unsigned queueCount() const { return (unsigned)queues_.size(); }
 
 protected:
     static constexpr uint32_t QMAX = 256;

@@ -28,6 +28,7 @@
 #include "vp/json.hpp"
 #include "vp/machine.hpp"
 #include "vp/virtio.hpp"
+#include "vp/pci.hpp"
 
 namespace fs = std::filesystem;
 using namespace vp;
@@ -205,6 +206,53 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
 
     const json::Value* devs = pl.get("devices");
     if (!devs || devs->kind != json::Value::Arr) throw std::runtime_error("the platform has no \"devices\" list");
+    // A virtio device from its entry: on the bus at `at`, or behind a
+    // PCIe host (at 0).
+    auto makeVirtio = [&](const json::Value& d, const std::string& t, const std::string& name,
+                          uint64_t at) -> std::unique_ptr<VirtioMmio> {
+        if (t == "virtio-blk") {
+            auto v = std::make_unique<VirtioBlk>();
+            v->name = name;
+            v->base = at;
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (!d.get("file")) throw std::runtime_error(d.where() + "'" + name + "' has no \"file\" (a raw disk image)");
+            bool w = d.get("write") && d.get("write")->b;
+            bool ro = d.get("readonly") && d.get("readonly")->b;
+            v->open(rel(d.get("file")->str()), w || o.diskWrite, ro);
+            return std::unique_ptr<VirtioMmio>(std::move(v));
+        } else if (t == "virtio-console") {
+            auto v = std::make_unique<VirtioConsole>();
+            v->name = name;
+            v->base = at;
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            for (char c : d.get("input") ? d.get("input")->str() : std::string()) v->held.push_back((uint8_t)c);
+            return std::unique_ptr<VirtioMmio>(std::move(v));
+        } else if (t == "virtio-rng") {
+            auto v = std::make_unique<VirtioRng>();
+            v->name = name;
+            v->base = at;
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (d.get("seed")) v->seed = d.get("seed")->u64();
+            return std::unique_ptr<VirtioMmio>(std::move(v));
+        } else if (t == "virtio-net") {
+            auto v = std::make_unique<VirtioNet>();
+            v->name = name;
+            v->base = at;
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (d.get("mac")) setMac(*v, d.get("mac")->str(), d.where());
+            std::string be = d.get("backend") ? d.get("backend")->str() : "user";
+            if (be == "dgram") {
+                if (!d.get("local") || !d.get("remote"))
+                    throw std::runtime_error(d.where() + "'" + name + "': the dgram back end needs \"local\" and \"remote\"");
+                v->useDgram(rel(d.get("local")->str()), rel(d.get("remote")->str()));
+            } else if (be != "user") {
+                throw std::runtime_error(d.where() + "'" + name + "': unknown back end '" + be + "' (user, dgram)");
+            }
+            if (d.get("pcap")) v->capture(rel(d.get("pcap")->str()));
+            return std::unique_ptr<VirtioMmio>(std::move(v));
+        }
+        return nullptr;
+    };
     bool firstUart = true;
     for (auto& d : devs->a) {
         if (!d.get("type")) throw std::runtime_error(d.where() + "a device has no \"type\"");
@@ -253,30 +301,9 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             f->name = name;
             f->base = base();
             dev = std::move(f);
-        } else if (type == "virtio-blk") {
-            auto v = std::make_unique<VirtioBlk>();
-            v->name = name;
-            v->base = base();
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            if (!d.get("file")) throw std::runtime_error(d.where() + "'" + name + "' has no \"file\" (a raw disk image)");
-            bool w = d.get("write") && d.get("write")->b;
-            bool ro = d.get("readonly") && d.get("readonly")->b;
-            v->open(rel(d.get("file")->str()), w || o.diskWrite, ro);
-            dev = std::move(v);
-        } else if (type == "virtio-console") {
-            auto v = std::make_unique<VirtioConsole>();
-            v->name = name;
-            v->base = base();
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            for (char c : d.get("input") ? d.get("input")->str() : std::string()) v->held.push_back((uint8_t)c);
-            dev = std::move(v);
-        } else if (type == "virtio-rng") {
-            auto v = std::make_unique<VirtioRng>();
-            v->name = name;
-            v->base = base();
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            if (d.get("seed")) v->seed = d.get("seed")->u64();
-            dev = std::move(v);
+        } else if (type.rfind("virtio-", 0) == 0 && type != "virtio-pci") {
+            dev = makeVirtio(d, type, name, base());
+            if (!dev) throw std::runtime_error(d.where() + "unknown device type '" + type + "'");
         } else if (type == "goldfish-rtc") {
             auto r = std::make_unique<GoldfishRtc>();
             r->name = name;
@@ -284,27 +311,33 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             r->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             if (d.get("epoch")) r->epochNs = d.get("epoch")->u64() * 1000000000ull;
             dev = std::move(r);
-        } else if (type == "virtio-net") {
-            auto v = std::make_unique<VirtioNet>();
-            v->name = name;
-            v->base = base();
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            if (d.get("mac")) setMac(*v, d.get("mac")->str(), d.where());
-            std::string be = d.get("backend") ? d.get("backend")->str() : "user";
-            if (be == "dgram") {
-                if (!d.get("local") || !d.get("remote"))
-                    throw std::runtime_error(d.where() + "'" + name + "': the dgram back end needs \"local\" and \"remote\"");
-                v->useDgram(rel(d.get("local")->str()), rel(d.get("remote")->str()));
-            } else if (be != "user") {
-                throw std::runtime_error(d.where() + "'" + name + "': unknown back end '" + be + "' (user, dgram)");
+        } else if (type == "pcie") {
+            auto h = std::make_unique<PcieHost>();
+            h->name = name;
+            h->base = base();
+            h->buses = d.get("buses") ? (unsigned)d.get("buses")->u64() : 1;
+            if (h->buses < 1 || h->buses > 256) throw std::runtime_error(d.where() + "PCIe buses must be 1 to 256");
+            h->size = (uint64_t)h->buses << 20;
+            if (d.get("mmio")) h->mmioBase = d.get("mmio")->u64();
+            if (d.get("mmio_size")) h->mmioSize = d.get("mmio_size")->u64();
+            h->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (const json::Value* fs = d.get("devices")) {
+                for (auto& c : fs->a) {
+                    std::string ct = c.get("type") ? c.get("type")->str() : "";
+                    std::string cn = c.get("name") ? c.get("name")->str() : name + "." + ct;
+                    auto v = makeVirtio(c, ct, cn, 0);
+                    if (!v) throw std::runtime_error(c.where() + "a PCIe device is virtio-blk, virtio-net, virtio-console or virtio-rng, not '" + ct + "'");
+                    if (h->count() >= 31) throw std::runtime_error(c.where() + "at most 31 devices behind a PCIe host");
+                    h->addVirtio(std::move(v));
+                }
             }
-            if (d.get("pcap")) v->capture(rel(d.get("pcap")->str()));
-            dev = std::move(v);
+            m.bus.add(h->window());
+            dev = std::move(h);
         } else {
             Ext* x = loadExt(g_argc, g_argv, ("device type '" + type + "'").c_str());
             if (x && x->device(m, d, type, name, dir)) continue;
             throw std::runtime_error(d.where() + "unknown device type '" + type +
-                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console, virtio-rng, goldfish-rtc" +
+                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console, virtio-rng, goldfish-rtc, pcie" +
                                      (x ? "" : "; mvp and rtl need the mvplat extension library") + ")");
         }
         m.bus.add(std::move(dev));
