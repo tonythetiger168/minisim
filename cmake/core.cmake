@@ -124,6 +124,7 @@ set(MINISIM_CORE_VP_HEADERS
     jit.hpp
     json.hpp
     machine.hpp
+    pci.hpp
     rv32.hpp
     vector.inc
     vcrypto.inc
