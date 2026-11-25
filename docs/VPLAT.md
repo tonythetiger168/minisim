@@ -124,6 +124,13 @@ The PLIC has two contexts per hart, as QEMU's `virt` does: context 2*h*
 interrupts hart *h* in machine mode (MEIP) and 2*h*+1 in supervisor mode
 (SEIP).
 
+Give a Linux platform a PLIC source count that is not a multiple of 32
+above 32 (QEMU's `virt` has 95). Linux's `sifive-plic` driver sizes each
+hart's saved enable bits as `riscv,ndev / 32` words but writes word
+`ndev / 32` when it masks source `ndev`, 4 bytes past the end; with 64
+sources that lands in the next 8-byte heap object and, on a multi-hart
+boot, shows up seconds later as a slab freelist crash in `kmalloc`.
+
 The RISC-V architecture tests all pass, 837 programs: ui, um, ua, uc, uf,
 ud, uzba, uzbb, uzbc, uzbs, uzicond, uzbkb, uzbkx, uzabha, uzacas,
 uzabha_zacas and uzfh for RV32 and RV64, both bare (`p`) and under the riscv-tests supervisor with
