@@ -1827,6 +1827,12 @@ private:
         if (a->op != b->op || a->kids.size() != b->kids.size()) return false;
         switch (a->op) {
             case Op::Ref: if (a->sig != b->sig || a->sgn != b->sgn || a->at || b->at) return false; break;
+            // Side-effect-free operators ({32{a & b[31]}} lowers to 32 copies of one And).
+            case Op::Not: case Op::And: case Op::Or: case Op::Xor: case Op::Eq: case Op::Ne:
+            case Op::LogNot: case Op::LogAnd: case Op::LogOr: case Op::RedAnd: case Op::RedOr: case Op::RedXor:
+            case Op::Mux: case Op::Resize:
+                if (a->hi != b->hi || a->lo != b->lo || a->sgn != b->sgn) return false;
+                break;
             case Op::Const: if (!(a->k == b->k) || a->k.w != b->k.w || a->k.sgn != b->k.sgn || a->k.real || a->k.str) return false; break;
             case Op::Slice: if (a->hi != b->hi || a->lo != b->lo) return false; break;
             case Op::Concat: break;

@@ -282,6 +282,11 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_partcomp
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_partcomp.cmake)
+  # Profile-guided compiled builds (-pgo-gen, then -pgo-use).
+  add_test(NAME msim_pgo
+           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_pgo
+                   -P ${CMAKE_SOURCE_DIR}/tests/msim_pgo.cmake)
   # Siemens vlib/vlog/vcom/vsim and Synopsys vlogan/vhdlan/vcs/simv flows.
   add_test(NAME msim_mstep
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR} "-DUVM_HOME=${UVM_HOME}"
