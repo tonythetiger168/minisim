@@ -221,6 +221,16 @@ inline std::vector<uint8_t> makeDeviceTree(const Bus& bus, unsigned harts, bool 
                 f.propU32("interrupts", {v->irq});
             }
             f.end();
+        } else if (d->type == "goldfish-rtc") {
+            auto* r = static_cast<const GoldfishRtc*>(d.get());
+            f.begin(hexName("rtc", d->base));
+            f.propStr("compatible", {"google,goldfish-rtc"});
+            f.reg(d->base, d->size);
+            if (r->irq) {
+                f.propU32("interrupt-parent", {plicPh});
+                f.propU32("interrupts", {r->irq});
+            }
+            f.end();
         } else if (d->type == "finisher") {
             f.begin(hexName("test", d->base));
             f.propStr("compatible", {"sifive,test1", "sifive,test0", "syscon"});

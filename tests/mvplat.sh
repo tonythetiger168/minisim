@@ -139,6 +139,14 @@ if [ -z "${MVPLAT_EXT:-}" ]; then
   expect "an rtl device without the extension library" 2 p.out "mvp and rtl need the mvplat extension library"
 fi
 
+# The devices an Android guest needs beyond Linux's: goldfish-rtc (time,
+# setting it, an alarm and its interrupt) and virtio-rng (the same bytes for
+# the same seed).
+"$MVPLAT" -platform "$T/androiddev.json" "$E/androiddev.elf" -q > adev.out 2>&1; rc=$?
+expect "goldfish-rtc and virtio-rng" 0 adev.out "android devices: all checks passed"
+"$MVPLAT" -platform "$T/androiddev.json" "$E/androiddev.elf" -q > adev2.out 2>&1
+cmp -s adev.out adev2.out && ok "virtio-rng gives the same bytes for the same seed" || bad "virtio-rng differs between runs"
+
 # virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
 # image; the file changes only with -disk-write.
 if command -v python3 > /dev/null 2>&1; then

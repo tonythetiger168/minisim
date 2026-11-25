@@ -407,4 +407,84 @@ public:
     }
 };
 
+// goldfish-rtc: the real-time clock of Android's emulator boards (Linux's
+// rtc-goldfish, device tree "google,goldfish-rtc"). Time is in nanoseconds
+// since 1970: `epoch` (seconds) at the start of the run plus the simulated
+// time, so a run is the same every time; software may set it. Registers:
+// 0x00 TIME_LOW (reading it latches TIME_HIGH), 0x04 TIME_HIGH, 0x08
+// ALARM_LOW (writing it arms the alarm at ALARM_HIGH:ALARM_LOW), 0x0c
+// ALARM_HIGH, 0x10 IRQ_ENABLED, 0x14 CLEAR_ALARM, 0x18 ALARM_STATUS,
+// 0x1c CLEAR_INTERRUPT.
+class GoldfishRtc : public Device {
+public:
+    GoldfishRtc() { type = "goldfish-rtc"; size = 0x1000; }
+    unsigned irq = 0;
+    uint64_t epochNs = 1767225600ull * 1000000000ull;  // 2026-01-01 00:00 UTC
+
+    Acc read(uint64_t off, unsigned, uint64_t& v, const Who& w) override {
+        if (!w.serial) return Acc::Pending;
+        catchUp(w);
+        switch (off) {
+            case 0x00: { uint64_t t = timeNs(); latched_ = (uint32_t)(t >> 32); v = (uint32_t)t; break; }
+            case 0x04: v = latched_; break;
+            case 0x08: v = (uint32_t)alarm_; break;
+            case 0x0c: v = (uint32_t)(alarm_ >> 32); break;
+            case 0x10: v = irqEnabled_; break;
+            case 0x18: v = armed_; break;
+            default: v = 0; break;
+        }
+        return Acc::Ok;
+    }
+    Acc write(uint64_t off, unsigned, uint64_t v, const Who& w) override {
+        if (!w.serial) return Acc::Pending;
+        catchUp(w);
+        uint32_t x = (uint32_t)v;
+        switch (off) {
+            case 0x00: setTime((timeNs() & ~0xffffffffull) | x); break;
+            case 0x04: setTime((timeNs() & 0xffffffffull) | (uint64_t)x << 32); break;
+            case 0x08: alarm_ = (alarm_ & ~0xffffffffull) | x; armed_ = 1; check(); break;
+            case 0x0c: alarm_ = (alarm_ & 0xffffffffull) | (uint64_t)x << 32; break;
+            case 0x10: irqEnabled_ = x & 1; update(); break;
+            case 0x14: armed_ = 0; break;
+            case 0x1c: pending_ = 0; update(); break;
+            default: break;
+        }
+        return Acc::Ok;
+    }
+    void advance(uint64_t now) override { nowPs_ = now; check(); }
+    uint64_t nextEventPs(uint64_t now) const override {
+        if (!armed_) return UINT64_MAX;
+        uint64_t t = timeNs();
+        if (alarm_ <= t) return now + 1;
+        uint64_t d = alarm_ - t;
+        return d > (UINT64_MAX - now) / 1000 ? UINT64_MAX : now + d * 1000;
+    }
+    bool live() const override { return armed_ != 0; }
+    void save(Writer& w) const override {
+        w.u64(nowPs_); w.u64((uint64_t)offsetNs_); w.u64(alarm_);
+        w.u32(latched_); w.u32(armed_); w.u32(irqEnabled_); w.u32(pending_);
+    }
+    void load(Reader& r) override {
+        nowPs_ = r.u64(); offsetNs_ = (int64_t)r.u64(); alarm_ = r.u64();
+        latched_ = r.u32(); armed_ = r.u32(); irqEnabled_ = r.u32(); pending_ = r.u32();
+        update();
+    }
+
+private:
+    uint64_t timeNs() const { return epochNs + nowPs_ / 1000 + (uint64_t)offsetNs_; }
+    void setTime(uint64_t t) { offsetNs_ = (int64_t)(t - epochNs - nowPs_ / 1000); }
+    void catchUp(const Who& w) {
+        uint64_t t = w.cycle * p->cyclePs();
+        if (t > nowPs_) nowPs_ = t;
+        check();
+    }
+    void check() {
+        if (armed_ && timeNs() >= alarm_) { armed_ = 0; pending_ = 1; update(); }
+    }
+    void update() { if (irq && p) p->setIrq(irq, pending_ && irqEnabled_); }
+    uint64_t nowPs_ = 0, alarm_ = 0;
+    int64_t offsetNs_ = 0;
+    uint32_t latched_ = 0, armed_ = 0, irqEnabled_ = 0, pending_ = 0;
+};
+
 }  // namespace vp

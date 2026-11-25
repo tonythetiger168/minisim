@@ -243,6 +243,8 @@ it). It is the address map most RISC-V bare-metal software already targets.
 | `virtio-blk` | virtio over MMIO, version 2 (VIRTIO 1.2, 4.2), one queue | a disk: `file` is a raw image, `irq` its PLIC source; writes stay in the run unless `"write": true`, `"readonly": true` refuses them. See "Disks" |
 | `virtio-net` | virtio over MMIO, version 2, a receive and a transmit queue | an Ethernet interface: `mac`, `irq`, `backend` (`user` or `dgram` with `local` and `remote` socket paths), `pcap`. See "Networks" |
 | `virtio-console` | virtio over MMIO, version 2, one port | a console (Linux's `hvc0`): output to stdout, `input` typed once the guest has printed and been quiet for 100 ms of simulated time |
+| `virtio-rng` | virtio over MMIO, version 2, one queue (5.4) | random bytes (Linux's `hw_random`, Android's entropy): the same every run for a `seed` |
+| `goldfish-rtc` | `TIME_LOW` / `TIME_HIGH` at 0x00 / 0x04, alarm at 0x08 / 0x0c, `IRQ_ENABLED` 0x10, `CLEAR_ALARM` 0x14, `ALARM_STATUS` 0x18, `CLEAR_INTERRUPT` 0x1c | the real-time clock of Android's emulator boards (Linux's `rtc-goldfish`, device tree `google,goldfish-rtc`): nanoseconds since 1970, `epoch` (seconds, default 2026-01-01) plus simulated time; `irq` for the alarm |
 | `mvp` | the library's own map (`mvp_add_device`) | see below |
 | `rtl` | whatever the RTL decodes | see below |
 

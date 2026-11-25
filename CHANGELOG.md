@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mvplat`: `virtio-rng` (VIRTIO 1.2, 5.4; the same bytes every run for a
+  `seed`) and `goldfish-rtc` (Linux's `rtc-goldfish`: time since 1970 from an
+  `epoch` plus simulated time, settable, with an alarm interrupt), both with
+  device tree nodes: the devices an Android guest needs beyond Linux's.
 - mvplat `-mt`: each hart on a host thread of its own, at once (as QEMU's
   MTTCG): AMOs and LR/SC as host atomics, one shared translation of paged
   code, rounds of 1000000 cycles with 10000-cycle slices so IPIs arrive

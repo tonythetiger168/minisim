@@ -270,6 +270,20 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             for (char c : d.get("input") ? d.get("input")->str() : std::string()) v->held.push_back((uint8_t)c);
             dev = std::move(v);
+        } else if (type == "virtio-rng") {
+            auto v = std::make_unique<VirtioRng>();
+            v->name = name;
+            v->base = base();
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (d.get("seed")) v->seed = d.get("seed")->u64();
+            dev = std::move(v);
+        } else if (type == "goldfish-rtc") {
+            auto r = std::make_unique<GoldfishRtc>();
+            r->name = name;
+            r->base = base();
+            r->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (d.get("epoch")) r->epochNs = d.get("epoch")->u64() * 1000000000ull;
+            dev = std::move(r);
         } else if (type == "virtio-net") {
             auto v = std::make_unique<VirtioNet>();
             v->name = name;
@@ -290,7 +304,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             Ext* x = loadExt(g_argc, g_argv, ("device type '" + type + "'").c_str());
             if (x && x->device(m, d, type, name, dir)) continue;
             throw std::runtime_error(d.where() + "unknown device type '" + type +
-                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console" +
+                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console, virtio-rng, goldfish-rtc" +
                                      (x ? "" : "; mvp and rtl need the mvplat extension library") + ")");
         }
         m.bus.add(std::move(dev));
