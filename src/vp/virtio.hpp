@@ -14,6 +14,7 @@
 //   virtio-net  an Ethernet interface: a built-in gateway that answers ARP and
 //               ping, or Unix datagram sockets to another platform.
 //   virtio-console  a console port (Linux's hvc0).
+//   virtio-rng  random bytes, the same every run for a seed (Linux's hw_random).
 #pragma once
 
 #include <fcntl.h>
@@ -123,6 +124,8 @@ public:
         update();
     }
     uint64_t requests() const { return requests_; }
+    uint32_t deviceIdPublic() const { return deviceId(); }
+    unsigned queueCount() const { return (unsigned)queues_.size(); }
 
 protected:
     static constexpr uint32_t QMAX = 256;
@@ -648,6 +651,43 @@ private:
     }
     static constexpr uint64_t IDLE_PS = 100000000000ull;  // 100 ms
     uint64_t tx_ = 0, lastTxPs_ = 0, now_ = 0;
+};
+
+// virtio-rng (5.4): one request queue, filled with random bytes. The bytes
+// come from a generator seeded by `seed`, so a run is the same every time
+// (a guest's entropy pool, a test that logs keys); a different seed gives
+// different bytes.
+class VirtioRng : public VirtioMmio {
+public:
+    VirtioRng() : VirtioMmio(1) { type = "virtio-rng"; }
+    uint64_t seed = 0x6d76706c6174726eull;
+
+protected:
+    uint32_t deviceId() const override { return 4; }
+    uint64_t features() const override { return F_VERSION_1; }
+    uint32_t request(unsigned, const std::vector<Buf>& chain) override {
+        uint32_t room = 0;
+        for (const Buf& b : chain) if (b.write) room += b.len;
+        room = std::min<uint32_t>(room, 65536);
+        std::vector<uint8_t> d(room);
+        for (uint32_t i = 0; i < room; i += 8) {
+            uint64_t x = next();
+            memcpy(d.data() + i, &x, std::min<uint32_t>(8, room - i));
+        }
+        return fill(chain, d.data(), room);
+    }
+    void saveDevice(Writer& w) const override { w.u64(state_); }
+    void loadDevice(Reader& r) override { state_ = r.u64(); }
+    void resetDevice() override {}
+
+private:
+    uint64_t next() {  // splitmix64
+        uint64_t z = (state_ += 0x9e3779b97f4a7c15ull) ^ seed;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    }
+    uint64_t state_ = 0;
 };
 
 }  // namespace vp
