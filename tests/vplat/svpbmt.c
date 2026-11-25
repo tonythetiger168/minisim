@@ -20,7 +20,7 @@ static void check(const char* what, uint64_t got, uint64_t want) {
 }
 
 // The trap handler: record mcause, step over the 4-byte instruction.
-volatile uint64_t lastCause;
+volatile uint64_t lastCause, lastTval;
 __attribute__((naked, aligned(4))) void handler(void) {
     __asm__ volatile(
         "csrrw sp, mscratch, sp\n"
@@ -28,6 +28,9 @@ __attribute__((naked, aligned(4))) void handler(void) {
         "sd t1, 8(sp)\n"
         "csrr t0, mcause\n"
         "la t1, lastCause\n"
+        "sd t0, 0(t1)\n"
+        "csrr t0, mtval\n"
+        "la t1, lastTval\n"
         "sd t0, 0(t1)\n"
         "ld t1, 8(sp)\n"
         "csrr t0, mepc\n"
@@ -44,6 +47,11 @@ static uint64_t trapStack[64] __attribute__((aligned(16)));
 // root[3] points to l1, which maps VA 0xc0000000 to it with 2 MiB pages.
 static uint64_t root[512] __attribute__((aligned(4096)));
 static uint64_t l1[512] __attribute__((aligned(4096)));
+// root[4] -> l1b -> l0: VA 0x100000000 is one 4 KiB page, the next one is
+// not mapped (an access across the two faults on its second part).
+static uint64_t l1b[512] __attribute__((aligned(4096)));
+static uint64_t l0[512] __attribute__((aligned(4096)));
+static uint8_t page[4096] __attribute__((aligned(4096)));
 static volatile uint64_t target = 0x1122334455667788ull;
 
 #define PTE_V 1
@@ -109,6 +117,31 @@ static void svpbmt(void) {
     root[1] = leaf(0x80000000, 0) | 1ull << 54;
     sload(0x40000000 + off, &c);
     check("a reserved PTE bit (54): load page fault", c, 13);
+    // An 8-byte store across a mapped page and an unmapped one: a store page
+    // fault whose mtval is the second page's address, the part that faulted.
+    root[4] = ((uint64_t)(uintptr_t)l1b >> 12) << 10 | PTE_V;
+    l1b[0] = ((uint64_t)(uintptr_t)l0 >> 12) << 10 | PTE_V;
+    l0[0] = leaf((uintptr_t)page, 0);
+    lastCause = 0;
+    __asm__ volatile("sfence.vma\n"
+                     "csrs mstatus, %1\n"
+                     "sd %2, 0(%0)\n"
+                     "csrc mstatus, %1\n"
+                     :
+                     : "r"(0x100000ffcull), "r"(1ull << 17 | 1ull << 11), "r"(0x1122334455667788ull)
+                     : "memory");
+    check("a store across into an unmapped page: store page fault", lastCause, 15);
+    check("  mtval is the unmapped page's address", lastTval, 0x100001000ull);
+    lastCause = 0;
+    __asm__ volatile("sfence.vma\n"
+                     "csrs mstatus, %1\n"
+                     "sd %2, 0(%0)\n"
+                     "csrc mstatus, %1\n"
+                     :
+                     : "r"(0xffcull | 0x0ffffff000ull), "r"(1ull << 17 | 1ull << 11), "r"(0x1122334455667788ull)
+                     : "memory");
+    check("a store from an unmapped page across: store page fault", lastCause, 15);
+    check("  mtval is the access's own address", lastTval, 0xffffffffcull);
     csr_write(satp, 0);
     __asm__ volatile("csrc 0x30a, %0" ::"r"(1ull << 62));
     check("menvcfg.PBMTE clears", csr_read(0x30a) >> 62 & 1, 0);

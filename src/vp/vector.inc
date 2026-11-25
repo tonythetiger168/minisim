@@ -222,7 +222,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                     if (r == Acc::Pending) return VPEND;
                     h.vstart = i;
                     cause = (st ? 7 : 5) + (r == Acc::PageFault ? 8 : 0);
-                    tval = a;
+                    tval = faultVa(h, a);
                     return VTRAP;
                 }
             }
@@ -284,7 +284,7 @@ int vexec(Hart& h, uint32_t insn, uint32_t& cause, uint64_t& tval, int& wrd, uin
                     }
                     h.vstart = i;
                     cause = (st ? 7 : 5) + (r == Acc::PageFault ? 8 : 0);
-                    tval = a;
+                    tval = faultVa(h, a);
                     return VTRAP;
                 }
             }

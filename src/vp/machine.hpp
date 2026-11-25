@@ -755,6 +755,7 @@ public:
         if (h.wfi && (h.mip & h.mie)) h.wfi = false;
     }
     void trap(Hart& h, uint32_t cause, uint64_t tval, bool intr) {
+        h.splitFault = false;
         bool toS = h.priv <= 1 && (((intr ? h.mideleg : h.medeleg) >> cause) & 1);
         const uint64_t ibit = intr ? (h.rv64 ? 1ull << 63 : 1ull << 31) : 0;
         tval = h.ax(tval);
@@ -889,6 +890,7 @@ public:
     template <class F>
     Acc xlatData(Hart& h, uint64_t va, unsigned n, int kind, F&& f) {
         unsigned priv = dataPriv(h);
+        h.splitFault = false;
         if (((va & 0xfff) + n) <= 4096) {
             uint64_t pa;
             Acc r = translate(h, va, kind, priv, pa);
@@ -900,10 +902,22 @@ public:
         Acc r = translate(h, va, kind, priv, pa0);
         if (r != Acc::Ok) return r;
         r = translate(h, h.ax(va + first), kind, priv, pa1);
-        if (r != Acc::Ok) return r;
+        if (r != Acc::Ok) {
+            h.splitFault = true;
+            h.splitFaultVa = h.ax(va + first);
+            return r;
+        }
         r = f(pa0, 0u, first);
         if (r != Acc::Ok) return r;
         return f(pa1, first, n - first);
+    }
+
+    // The address a memory fault reports: the access's, or the second
+    // page's when only that part of a split access faulted.
+    static uint64_t faultVa(Hart& h, uint64_t a) {
+        if (!h.splitFault) return a;
+        h.splitFault = false;
+        return h.splitFaultVa;
     }
 
     // ------------------------------------------------------------ memory
@@ -3239,7 +3253,7 @@ inline Stop Machine::exec(Hart& h, uint64_t endq) {
 #define FD(v) do { uint64_t _v = (v); h.f[rd] = _v; h.mstatus |= MSTATUS_FS; wrd = 32 + (int)rd; wval = _v; } while (0)
 #define TRAP(c, t) do { trap(h, (c), (t), false); h.cycle++; goto next_insn; } while (0)
 #define ILLEGAL() TRAP(2, len == 4 ? insn : raw)
-#define MEMFAIL(r, cause, a) do { if ((r) == Acc::Pending) return Stop::Pending; TRAP((r) == Acc::PageFault ? (cause) + 8 : (cause), a); } while (0)
+#define MEMFAIL(r, cause, a) do { if ((r) == Acc::Pending) return Stop::Pending; TRAP((r) == Acc::PageFault ? (cause) + 8 : (cause), faultVa(h, a)); } while (0)
 
         switch (op) {
             case 0x37: RD(W(insn & 0xfffff000u)); break;               // LUI
