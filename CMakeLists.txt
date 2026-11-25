@@ -99,6 +99,14 @@ include(cmake/tools/shared_par_wave.cmake)
 # against. Mimalloc's -mno-outline is a clang flag that g++ rejects, so the
 # default is off; -DSLANG_USE_MIMALLOC=ON still overrides it.
 option(MINISIM_WITH_SLANG "Build the slang front end and lowering tests" OFF)
+# Vendor command-line compatibility (other vendors' command names, options,
+# aliases and message formats; src/compat/, docs/compat/). Not part of the
+# default build: the tools then accept only minisim's own commands and open
+# standards. ON builds the layer and registers its tests (tests/compat).
+option(MINISIM_VENDOR_COMPAT "Build the vendor command-line compatibility layer (src/compat)" OFF)
+if(MINISIM_VENDOR_COMPAT)
+  add_compile_definitions(MINISIM_VENDOR_COMPAT=1)
+endif()
 if(MINISIM_WITH_SLANG)
   set(SLANG_USE_MIMALLOC OFF CACHE BOOL "g++ rejects mimalloc's -mno-outline")
   include(FetchContent)
@@ -272,26 +280,33 @@ if(MINISIM_WITH_SLANG)
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_restore
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_restore.cmake)
-  # The xrun / irun command line (msim run as xrun, or msim -xrun).
-  add_test(NAME msim_xrun
-           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
-                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xrun
-                   -P ${CMAKE_SOURCE_DIR}/tests/msim_xrun.cmake)
+  # The xrun / irun command line (msim run as xrun, or msim -xrun): vendor layer.
+  if(MINISIM_VENDOR_COMPAT)
+    add_test(NAME msim_xrun
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_xrun
+                     -P ${CMAKE_SOURCE_DIR}/tests/compat/msim_xrun.cmake)
+    set_tests_properties(msim_xrun PROPERTIES LABELS compat)
+  endif()
   # VCS partition compile spellings (-partcomp, -partcomp_dir, -Mdir).
   add_test(NAME msim_partcomp
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
-                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_partcomp
+                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_partcomp -DCOMPAT=${MINISIM_VENDOR_COMPAT}
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_partcomp.cmake)
+  set_tests_properties(msim_partcomp PROPERTIES LABELS compat)
   # Profile-guided compiled builds (-pgo-gen, then -pgo-use).
   add_test(NAME msim_pgo
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
                    -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_pgo
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_pgo.cmake)
-  # Siemens vlib/vlog/vcom/vsim and Synopsys vlogan/vhdlan/vcs/simv flows.
-  add_test(NAME msim_mstep
-           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR} "-DUVM_HOME=${UVM_HOME}"
-                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mstep
-                   -P ${CMAKE_SOURCE_DIR}/tests/msim_mstep.cmake)
+  # Multi-step vendor flows (src/compat/mstep.inc): vendor layer.
+  if(MINISIM_VENDOR_COMPAT)
+    add_test(NAME msim_mstep
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR} "-DUVM_HOME=${UVM_HOME}"
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_mstep
+                     -P ${CMAKE_SOURCE_DIR}/tests/compat/msim_mstep.cmake)
+    set_tests_properties(msim_mstep PROPERTIES LABELS compat)
+  endif()
   # Simulation profile (msim -profile): processes, instances, kinds.
   add_test(NAME msim_profile
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}

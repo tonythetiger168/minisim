@@ -8,7 +8,7 @@
 //   msim -xrun -f run.f -uvm -input run.tcl
 //
 // What is translated, what is accepted and ignored, and what is refused is
-// listed in docs/XRUN.md. Everything else passes through to msim unchanged,
+// listed in docs/compat/XRUN.md. Everything else passes through to msim unchanged,
 // so msim's own options work in this mode too.
 #pragma once
 #include "compat.hpp"

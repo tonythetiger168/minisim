@@ -41,9 +41,9 @@
 //   -parse           stop after parsing: syntax errors only (vlog / vlogan, mstep.inc)
 //   -vlog, -vcom, -vopt, -vsim, -vlib, -vmap, -vlogan, -vhdlan, -vcs
 //                    the rest is that Siemens / Synopsys step (also when msim
-//                    runs under that name): docs/COMPAT.md
+//                    runs under that name): docs/compat/COMPAT.md
 //   -xrun, -irun     take the rest of the command line as xrun / irun options
-//                    (also when msim runs as xrun, irun or xmverilog): docs/XRUN.md
+//                    (also when msim runs as xrun, irun or xmverilog): docs/compat/XRUN.md
 //   -profile [<file>] time every process and region and write a report
 //                    (default simprofile.txt): busiest processes, time per
 //                    instance, file and kind. Runs the interpreter on one thread.
@@ -203,9 +203,13 @@
 #include "vendor_tasks.hpp"
 #include "objview.inc"
 #include "statview.inc"
-#include "xrun.inc"
+#if MINISIM_VENDOR_COMPAT
+#include "compat/xrun.inc"   // vendor layer: built only with -DMINISIM_VENDOR_COMPAT=ON
+#endif
 #include "runresult.inc"
-#include "mstep.inc"
+#if MINISIM_VENDOR_COMPAT
+#include "compat/mstep.inc"
+#endif
 #include "vhdl/front.hpp"
 
 static bool startsWith(std::string_view s, std::string_view p) { return s.substr(0, p.size()) == p; }
@@ -3810,7 +3814,9 @@ static void usage() {
                  "  -vcd [<file>]  write a VCD waveform (default dump.vcd); a .fst name writes FST\n"
                  "  -saif [<file>] write switching activity as SAIF (default dump.saif), for mpower\n"
                  "  -restore <file> go back to a $save checkpoint (first option; also -r)\n"
+#if MINISIM_VENDOR_COMPAT
                  "  -xrun ...      the rest is an xrun / irun command line (also when run as xrun or irun)\n"
+#endif
                  "  -elab          stop after elaboration, before the run\n"
                  "  -profile [<file>] write where simulation time goes (default simprofile.txt)\n"
                  "  -saif_forward <file>  forward SAIF for -saif: library (SDPD) or RTL mapping\n"
@@ -3898,6 +3904,7 @@ static int msimMain(int argc, char** argv) {
             (void)!write(2, w.data(), w.size());
             _exit(139);
         });
+#if MINISIM_VENDOR_COMPAT
     // Siemens vlib / vmap / vlog / vcom / vsim and Synopsys vlogan / vhdlan /
     // vcs / simv (mstep.inc): the analysis steps run there; vsim and simv
     // become an msim command line on the libraries' sources.
@@ -3933,6 +3940,7 @@ static int msimMain(int argc, char** argv) {
         argv = xargv.data();
         xrun::teeLog(xo);
     }
+#endif
     // Pass 1: take msim's own options out; translate VCS spellings for slang.
     std::vector<std::string> fwd{argv[0]};
     std::vector<std::string> plusargs;
@@ -4051,7 +4059,7 @@ static int msimMain(int argc, char** argv) {
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a == "-pgo-gen") { pgoMode() = 1; compiled = true; continue; }
         if (a == "-pgo-use") { pgoMode() = 2; compiled = true; continue; }
-        // VCS partition compile (docs/COMPAT.md): compiled mode. msim chooses
+        // VCS partition compile (docs/compat/COMPAT.md): compiled mode. msim chooses
         // its own parts, the generated C++ files; an unchanged one is not
         // rebuilt, and the build directory keeps them between runs.
         if (a == "-partcomp" || startsWith(a, "-partcomp=") || a == "-fastpartcomp" || startsWith(a, "-fastpartcomp=")) {
