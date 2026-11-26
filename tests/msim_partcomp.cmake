@@ -1,4 +1,4 @@
-# VCS partition compile spellings on msim (src/msim.cpp, docs/COMPAT.md):
+# VCS partition compile spellings on msim (src/msim.cpp, docs/compat/COMPAT.md):
 # -partcomp / -fastpartcomp=j<n> run compiled mode, -partcomp_dir=<dir> and
 # -Mdir=<dir> name its build directory, and a second run with nothing
 # changed reuses the simv there. The output must match the interpreter's.
@@ -40,11 +40,13 @@ if(NOT out STREQUAL ref OR NOT t1 STREQUAL t2)
   message(FATAL_ERROR "second run: simv ${t1} -> ${t2}\n${out}")
 endif()
 
-# Through the xrun front end, unchanged.
-run(${MSIM} -xrun -partcomp -partcomp_dir=${OUT}/pc -O1 ${DUT} -nolog)
-file(TIMESTAMP ${OUT}/pc/simv t3 "%s")
-if(NOT out STREQUAL ref OR NOT t1 STREQUAL t3)
-  message(FATAL_ERROR "xrun -partcomp: simv ${t1} -> ${t3}\n${out}")
+# Through the xrun front end (vendor layer, -DCOMPAT=ON builds only), unchanged.
+if(COMPAT)
+  run(${MSIM} -xrun -partcomp -partcomp_dir=${OUT}/pc -O1 ${DUT} -nolog)
+  file(TIMESTAMP ${OUT}/pc/simv t3 "%s")
+  if(NOT out STREQUAL ref OR NOT t1 STREQUAL t3)
+    message(FATAL_ERROR "xrun -partcomp: simv ${t1} -> ${t3}\n${out}")
+  endif()
 endif()
 if(EXISTS ${OUT}/msim.d)
   message(FATAL_ERROR "-partcomp_dir was not used: ${OUT}/msim.d exists")

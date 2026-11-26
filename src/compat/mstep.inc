@@ -22,7 +22,7 @@
 // file again replaces its line. Library names map to directories through
 // modelsim.ini ([Library] name = dir) for the Siemens tools and
 // synopsys_sim.setup (NAME : dir, WORK > NAME) for the Synopsys ones; an
-// unmapped name is a directory of that name. docs/COMPAT.md lists the
+// unmapped name is a directory of that name. docs/compat/COMPAT.md lists the
 // options.
 #pragma once
 #include <algorithm>

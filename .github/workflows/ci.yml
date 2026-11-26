@@ -195,3 +195,12 @@ jobs:
       # job's 32 minutes. The longest single test is about 2.5 minutes.
       - name: Test with slang
         run: ctest --test-dir build --output-on-failure -j4
+
+      # The vendor compatibility layer (src/compat, -DMINISIM_VENDOR_COMPAT=ON)
+      # is not in the default build above. Rebuild with it and run the tests
+      # labelled compat (only what includes src/compat recompiles).
+      - name: Test the vendor compatibility layer
+        run: |
+          cmake -B build -DMINISIM_VENDOR_COMPAT=ON
+          cmake --build build -j4
+          ctest --test-dir build --output-on-failure -j4 -L compat

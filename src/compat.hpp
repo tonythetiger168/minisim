@@ -71,6 +71,16 @@ inline std::string basename(std::string_view path) {
     return b;
 }
 
+// The vendor tables are built only with -DMINISIM_VENDOR_COMPAT=ON (CMake
+// option, default OFF). Without it detect() never picks a vendor: a
+// --compat=VENDOR option stays in args, so the tool reports it as a bad
+// option, and argv0 aliases are not looked at.
+#if MINISIM_VENDOR_COMPAT
+inline constexpr bool kVendorCompat = true;
+#else
+inline constexpr bool kVendorCompat = false;
+#endif
+
 // Removes every --compat=X / -compat X from args (the last one wins), else
 // falls back to argv0. Throws nothing: an unknown vendor name is left in args
 // so the tool reports it as a bad option.
@@ -85,15 +95,16 @@ inline Vendor detect(std::string_view argv0, std::vector<std::string>& args,
         if (a.rfind("--compat=", 0) == 0) val = a.substr(9);
         else if (a.rfind("-compat=", 0) == 0) val = a.substr(8);
         else if ((a == "--compat" || a == "-compat") && i + 1 < args.size()) {
-            if (auto v = parseVendor(args[i + 1])) { chosen = v; ++i; continue; }
+            if (auto v = parseVendor(args[i + 1]); v && (kVendorCompat || *v == Vendor::Native)) { chosen = v; ++i; continue; }
         }
         if (val) {
-            if (auto v = parseVendor(*val)) { chosen = v; continue; }
+            if (auto v = parseVendor(*val); v && (kVendorCompat || *v == Vendor::Native)) { chosen = v; continue; }
         }
         out.push_back(a);
     }
     args.swap(out);
     if (chosen) return *chosen;
+    if (!kVendorCompat) return Vendor::Native;
     std::string b = basename(argv0);
     for (const Alias& al : aliases)
         if (b == al.argv0) return al.vendor;

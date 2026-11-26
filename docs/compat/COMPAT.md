@@ -1,5 +1,10 @@
 # Vendor command-line compatibility
 
+> Vendor compatibility layer. It is moving behind the build option
+> `-DMINISIM_VENDOR_COMPAT=ON` (default OFF), tool by tool. The msim front ends for
+> the xrun / irun and the multi-step vlog / vsim / vcs command lines are already
+> built only with that option.
+
 Every minisim tool has one engine. Users moving from Synopsys, Cadence or
 Siemens tools keep their command lines: the tool translates the other
 vendor's options into its own before parsing them. There is never a second

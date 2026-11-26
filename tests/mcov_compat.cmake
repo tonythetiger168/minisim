@@ -1,4 +1,4 @@
-# mcov with other vendors' coverage command lines (docs/COMPAT.md): URG
+# mcov with other vendors' coverage command lines (docs/compat/COMPAT.md): URG
 # (--compat=synopsys), IMC batch (--compat=cadence) and vcover
 # (--compat=siemens), or the name mcov is started as. The same engine runs:
 # each form must give what the native command gives.
