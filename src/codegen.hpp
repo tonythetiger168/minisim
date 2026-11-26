@@ -185,12 +185,22 @@ public:
                              cycle ? "" : "; off: a comb cycle, -upf or -no-cycle");
             }
             if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
+            // The domain's code holds every comb statement in a 4-state and a
+            // 2-state copy, without the per-module sharing of event mode:
+            // NVDLA (1.1M comb statements) runs out of 16 GB while emitting
+            // it, XiangShan (394k) too, where event mode builds in 13 GB.
+            // MSIM_CYCMAX=<n> moves the limit.
+            static const size_t combMax = [] { const char* e = std::getenv("MSIM_CYCMAX"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)300000; }();
+            if (!dom.empty() && comb > combMax && !getenv("MSIM_XCYC")) {
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %zu comb statements, more than %zu\n", comb, combMax);
+                dom.clear();
+            }
             // Many clock groups (an SoC's gated and divided clocks, ticking at
             // different times): each group's commit evaluates every comb
             // statement. OpenTitan Earl Grey, 779 groups, ran 4.6x slower in
             // the domain than event-driven.
-            if (domGroups_ > 64 && !getenv("MSIM_XCYC")) {
-                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %d clock groups\n", domGroups_);
+            if (domClocks_ > 64 && !getenv("MSIM_XCYC")) {
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %d clock groups on %d clock edges\n", domGroups_, domClocks_);
                 dom.clear();
             }
         }
@@ -3168,6 +3178,154 @@ private:
                 if (writers[d] != 1 || sigs[d].w != 1 || sigs[src].w != 1 || sigs[d].drivers > 1) continue;
                 root[d] = src;
             }
+            // Copies through bits of vectors: a port bound to v[i], a vector
+            // built from copies (assign v[k*32 +: 32] = {32{clk}}), the
+            // signal of an event expression (@(posedge v[i]), also written
+            // once before time 0). Each bit of a continuous assign's target
+            // that comes from one bit of a signal, and has no other writer,
+            // is followed to its source; a one-bit signal whose chain ends
+            // at a one-bit signal is a copy of it. MSIM_NOBITCOPY=1: off.
+            copyEnd_.clear();
+            if (!std::getenv("MSIM_NOBITCOPY")) {
+                std::unordered_map<int, std::vector<std::pair<int, int>>> bitSrc;   // signal -> per bit (source, bit); source -1: none, -2: another writer
+                std::vector<int> evInit(sigs.size(), 0);
+                for (size_t x = 0; x < sigs.size(); x++) evInit[x] = sigs[x].name.rfind("__event", 0) == 0;
+                std::function<bool(const E&, std::vector<std::pair<int, int>>&)> bits = [&](const E& e, std::vector<std::pair<int, int>>& out) -> bool {
+                    if (!e || e->at) return false;
+                    if (e->op == Op::Ref) {
+                        if (e->sig < 0 || (size_t)e->sig >= sigs.size() || sigs[e->sig].w > 4096) return false;
+                        for (int b = 0; b < sigs[e->sig].w; b++) out.push_back({e->sig, b});
+                        return true;
+                    }
+                    if (e->op == Op::Slice && e->kids.size() == 1 && e->kids[0] && e->kids[0]->op == Op::Ref && !e->kids[0]->at) {
+                        int sg = e->kids[0]->sig;
+                        if (sg < 0 || (size_t)sg >= sigs.size() || e->lo < 0 || e->hi < e->lo || e->hi >= sigs[sg].w) return false;
+                        for (int b = e->lo; b <= e->hi; b++) out.push_back({sg, b});
+                        return true;
+                    }
+                    if (e->op == Op::Index && e->kids.size() == 2 && e->kids[0] && e->kids[0]->op == Op::Ref && !e->kids[0]->at && e->kids[1] &&
+                        e->kids[1]->op == Op::Const && !e->kids[1]->k.x && e->kids[1]->k.hi.empty()) {
+                        int sg = e->kids[0]->sig;
+                        uint64_t i = e->kids[1]->k.v;
+                        if (sg < 0 || (size_t)sg >= sigs.size() || i >= (uint64_t)sigs[sg].w) return false;
+                        out.push_back({sg, (int)i});
+                        return true;
+                    }
+                    if (e->op == Op::Concat) {
+                        std::vector<std::pair<int, int>> all;
+                        for (size_t k = e->kids.size(); k-- > 0;) {   // the last kid is the low bits
+                            std::vector<std::pair<int, int>> part;
+                            if (!bits(e->kids[k], part)) return false;
+                            all.insert(all.end(), part.begin(), part.end());
+                        }
+                        out.insert(out.end(), all.begin(), all.end());
+                        return true;
+                    }
+                    return false;
+                };
+                std::vector<char> bad(sigs.size(), 0);
+                for (auto& pr : procs) {
+                    if (pr.combRank < 0 || !oneAssign(*pr.prog)) continue;
+                    const Instr& a = pr.prog->code[0];
+                    int d = a.sig;
+                    if (d < 0 || (size_t)d >= sigs.size() || a.arr || a.bidx || !a.aidx.empty() || !a.e || sigs[d].w > 4096) continue;
+                    std::vector<std::pair<int, int>> src;
+                    const int lo = a.hi >= 0 ? a.lo : 0, hi = a.hi >= 0 ? a.hi : sigs[d].w - 1;
+                    if (!bits(a.e, src) || (int)src.size() != hi - lo + 1) { bad[d] = 1; continue; }
+                    auto& v = bitSrc[d];
+                    if (v.empty()) v.assign((size_t)sigs[d].w, {-1, 0});
+                    for (int b = lo; b <= hi; b++) v[(size_t)b] = v[(size_t)b].first == -1 ? src[(size_t)(b - lo)] : std::pair<int, int>{-2, 0};
+                }
+                // Any other write of a target (a process, a force, a second
+                // driver of the same bits): not a copy. The one write of an
+                // event signal before time 0 is its starting value.
+                std::vector<int> other(sigs.size(), 0);
+                for (auto& pr : procs) {
+                    const bool copyProc = pr.combRank >= 0 && oneAssign(*pr.prog);
+                    std::vector<const Prog*> progs;
+                    reachAll(pr.prog, progs);
+                    for (const Prog* q : progs)
+                        for (size_t pc = 0; pc < q->code.size(); pc++) {
+                            const Instr& in = q->code[pc];
+                            if (!(in.k == IK::Assign || in.k == IK::Nba || in.k == IK::Force) || in.sig < 0 || (size_t)in.sig >= other.size()) continue;
+                            if (copyProc && q == pr.prog && pc == 0) continue;
+                            if (in.k == IK::Assign && evInit[in.sig] && !pr.seq && pr.combRank < 0) continue;
+                            other[in.sig]++;
+                        }
+                }
+                auto srcOf = [&](int sg, int b) -> std::pair<int, int> {
+                    if (bad[sg] || other[sg]) return {-1, 0};
+                    auto it = bitSrc.find(sg);
+                    if (it == bitSrc.end() || (size_t)b >= it->second.size()) return {-1, 0};
+                    return it->second[(size_t)b];
+                };
+                size_t n = 0;
+                for (auto& [d, v] : bitSrc) {
+                    if (sigs[d].w != 1 || root[d] != d) continue;
+                    std::pair<int, int> at{d, 0};
+                    for (int k = 0; k < 64; k++) {
+                        auto nx = srcOf(at.first, at.second);
+                        if (nx.first < 0) break;
+                        at = nx;
+                    }
+                    if (at.first != d) copyEnd_[d] = at.first;
+                    if (at.first != d && at.second == 0 && sigs[at.first].w == 1) { root[d] = at.first; n++; }
+                }
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu one-bit copies through vector bits\n", n);
+            }
+            // Clock gates (an ICG cell: q <= en at the falling edge, or a latch
+            // open while the clock is low, and gclk = clk & q): q holds still
+            // while clk is high, so gclk rises exactly when clk rises with q
+            // not 0. A process on posedge gclk joins clk's group and runs
+            // only then (domGate_). Gated clocks of gated clocks, and gclk
+            // used at its falling edge or beside another clock, stay apart.
+            // MSIM_NOICG=1: off.
+            gate_.clear();
+            if (!std::getenv("MSIM_NOICG")) {
+                auto rootOf = [&](int x) {
+                    for (int k = 0; k < 1000 && root[x] != x; k++) x = root[x];
+                    return x;
+                };
+                // q: every write is an NBA (or blocking write) of a process that waits only on one edge.
+                std::vector<int> qEdgeSig(sigs.size(), -1);   // the signal q's writer waits on (-2: none fit)
+                std::vector<Edge> qEdge(sigs.size(), ANY);
+                for (auto& pr : procs) {
+                    std::vector<const Prog*> progs;
+                    reachAll(pr.prog, progs);
+                    for (const Prog* q : progs)
+                        for (auto& in : q->code) {
+                            if (!(in.k == IK::Assign || in.k == IK::Nba || in.k == IK::Force) || in.sig < 0 || (size_t)in.sig >= sigs.size()) continue;
+                            int& at = qEdgeSig[in.sig];
+                            if (at == -2) continue;
+                            if (!pr.seq || pr.combRank >= 0 || pr.seqEv.size() != 1 || in.k == IK::Force) { at = -2; continue; }
+                            int es = rootOf(pr.seqEv[0].first);
+                            if (at == -1) { at = es; qEdge[in.sig] = pr.seqEv[0].second; }
+                            else if (at != es || qEdge[in.sig] != pr.seqEv[0].second) at = -2;
+                        }
+                }
+                size_t ng = 0;
+                for (auto& pr : procs) {
+                    if (pr.combRank < 0 || !oneAssign(*pr.prog)) continue;
+                    const Instr& a = pr.prog->code[0];
+                    if (a.k != IK::Assign || a.hi >= 0 || a.arr || a.bidx || !a.aidx.empty() || !a.e || a.e->op != Op::And || a.e->kids.size() != 2) continue;
+                    int d = a.sig;
+                    if (d < 0 || (size_t)d >= sigs.size() || sigs[d].w != 1 || writers[d] != 1 || sigs[d].drivers > 1 || root[d] != d) continue;
+                    const E& k0 = a.e->kids[0]; const E& k1 = a.e->kids[1];
+                    if (!k0 || !k1 || k0->op != Op::Ref || k1->op != Op::Ref || k0->at || k1->at) continue;
+                    for (int side = 0; side < 2; side++) {
+                        int c = side ? k1->sig : k0->sig, q = side ? k0->sig : k1->sig;
+                        if (c < 0 || q < 0 || (size_t)c >= sigs.size() || (size_t)q >= sigs.size() || sigs[c].w != 1 || sigs[q].w != 1) continue;
+                        int cr = rootOf(c);
+                        if (qEdgeSig[q] != cr || qEdge[q] != NEG) continue;
+                        if (gate_.count(cr) || cr == d) continue;   // a gated clock of a gated clock
+                        root[d] = c;
+                        gate_[d] = q;
+                        ng++;
+                        break;
+                    }
+                }
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu clock gates\n", ng);
+            }
         }
         auto find = [&](int x) {
             for (int n = 0; x >= 0 && (size_t)x < root.size() && root[x] != x && n < 1000; n++) x = root[x];
@@ -3183,6 +3341,64 @@ private:
             for (auto& [sg, ed] : ev) if (find(sg) != sg) return false;
             return true;
         };
+        // Clock gates (gate_): a process on posedge gclk runs when clk rises
+        // and the enable is not 0 (domGate_), or when one of its resets is
+        // at its resetting level. Any other use of gclk as a clock (its
+        // falling edge, beside a second clock): gclk stays a clock of its own.
+        auto gatedNode = [&](int x) {
+            for (int k = 0; k < 1000; k++) {
+                if (gate_.count(x)) return x;
+                if (root[x] == x) break;
+                x = root[x];
+            }
+            return -1;
+        };
+        auto readsOf = [&](const CodegenProc& pr) {
+            std::set<int> rd;
+            std::function<void(const E&)> f = [&](const E& x) {
+                if (!x) return;
+                if (x->sig >= 0) { rd.insert(x->sig); rd.insert(find(x->sig)); if (auto ce = copyEnd_.find(x->sig); ce != copyEnd_.end()) rd.insert(ce->second); }
+                for (auto& k : x->kids) f(k);
+                if (x->at) f(x->at);
+            };
+            for (auto& in : pr.prog->code) { f(in.e); f(in.bidx); for (auto& a : in.aidx) f(a); for (auto& a : in.args) f(a); }
+            return rd;
+        };
+        auto isRead = [&](const std::set<int>& rd, int sg) {
+            if (rd.count(sg) || rd.count(find(sg))) return true;
+            auto ce = copyEnd_.find(sg);
+            return ce != copyEnd_.end() && rd.count(ce->second);
+        };
+        domGate_.assign(procs.size(), -1);
+        domGateRst_.assign(procs.size(), {});
+        if (!gate_.empty()) {
+            std::set<int> bad;
+            for (auto& pr : procs) {
+                if (!pr.seq || pr.combRank >= 0) continue;
+                int gated = 0;
+                for (auto& [sg, ed] : pr.seqEv) if (sg >= 0 && (size_t)sg < root.size() && gatedNode(sg) >= 0) gated++;
+                if (!gated) continue;
+                std::set<int> rd = readsOf(pr);
+                for (auto& [sg, ed] : pr.seqEv) {
+                    int g = sg >= 0 && (size_t)sg < root.size() ? gatedNode(sg) : -1;
+                    if (g >= 0 && (ed != POS || gated > 1)) bad.insert(g);
+                    if (g < 0 && !isRead(rd, sg))
+                        for (auto& [s2, e2] : pr.seqEv) if (int g2 = s2 >= 0 && (size_t)s2 < root.size() ? gatedNode(s2) : -1; g2 >= 0) bad.insert(g2);
+                }
+            }
+            for (int g : bad) { root[g] = g; gate_.erase(g); }
+            for (size_t i = 0; i < procs.size(); i++) {
+                const CodegenProc& pr = procs[i];
+                if (!pr.seq || pr.combRank >= 0) continue;
+                for (auto& [sg, ed] : pr.seqEv)
+                    if (int g = sg >= 0 && (size_t)sg < root.size() ? gatedNode(sg) : -1; g >= 0) domGate_[i] = gate_[g];
+                if (domGate_[i] < 0) continue;
+                for (auto& [sg, ed] : pr.seqEv)
+                    if (gatedNode(sg) < 0) domGateRst_[i].push_back({sg, ed == NEG ? 0 : 1});
+            }
+            if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu clock gates kept, %zu used beside another clock or at a falling edge\n", gate_.size(), bad.size());
+        }
+        domParent_ = root;
         domRoot_.resize(sigs.size());
         for (size_t x = 0; x < sigs.size(); x++) domRoot_[x] = find((int)x);
         std::vector<std::vector<int>> groups;
@@ -3265,6 +3481,7 @@ private:
             }
         domGroup_.assign(procs.size(), -1);
         domGroups_ = 0;
+        domClocks_ = 0;
         if (best.empty()) return best;
         // No other process may make an NBA to a target of the domain.
         auto clash = [&](const std::vector<int>& d) {
@@ -3334,11 +3551,44 @@ private:
             for (size_t g = 0; g < groups.size(); g++)
                 for (int i : groups[g]) domGroup_[i] = (int)g;
             domGroups_ = (int)groups.size();
+            // The clocks of the groups: an event signal the process does not
+            // read (an asynchronous reset is read: if (!rst_n)). Groups that
+            // differ only in their reset tick together, and the groups that
+            // run in one time step share one commit (dpend), so the cost
+            // follows the clocks, not the groups.
+            std::set<std::pair<int, Edge>> clk;
+            for (auto& g : groups) {
+                const CodegenProc& pr = procs[g[0]];
+                std::set<int> rd;
+                std::function<void(const E&)> f = [&](const E& x) {
+                    if (!x) return;
+                    if (x->sig >= 0) rd.insert(find(x->sig));
+                    for (auto& k : x->kids) f(k);
+                    if (x->at) f(x->at);
+                };
+                for (auto& in : pr.prog->code) { f(in.e); f(in.bidx); for (auto& a : in.aidx) f(a); for (auto& a : in.args) f(a); }
+                bool any = false;
+                for (auto& [sg, ed] : canon(pr.seqEv)) {
+                    auto ce = copyEnd_.find(sg);   // a reset read through the vector its port comes from
+                    if (!rd.count(sg) && (ce == copyEnd_.end() || !rd.count(find(ce->second)))) { clk.insert({sg, ed}); any = true; }
+                }
+                if (!any) for (auto& e : canon(pr.seqEv)) clk.insert(e);
+                if (const char* w = std::getenv("MSIM_WHYCYCLE"); w && *w == '2') {
+                    std::string t;
+                    for (auto& [sg, ed] : canon(pr.seqEv)) t += " " + sigs[sg].name + (rd.count(sg) ? "(read)" : "") + (copyEnd_.count(sg) ? "(copy of " + sigs[copyEnd_[sg]].name + ")" : "");
+                    std::string r;
+                    for (int x : rd) r += " " + sigs[x].name;
+                    std::fprintf(stderr, "group events:%s; reads:%s\n", t.c_str(), r.c_str());
+                }
+            }
+            domClocks_ = (int)clk.size();
+            if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %d clock groups on %d clock edges\n", domGroups_, domClocks_);
             return all;
         }
         if (clash(best)) return {};
         for (int i : best) domGroup_[i] = 0;
         domGroups_ = 1;
+        domClocks_ = 1;
         return best;
     }
 
@@ -3916,9 +4166,20 @@ private:
             for (int c = 0; c < kRefCls; c++) r += (c ? ", " : "") + std::to_string(D[c]);
             return r;
         };
+        // A process on a gated clock (domGate_): it returns at once when its
+        // enable is a known 0 and no reset of it is at its resetting level.
+        auto guard = [&](int n) -> std::string {
+            if ((size_t)n >= domGate_.size() || domGate_[n] < 0) return "";
+            const int q = domGate_[n];
+            std::string c = "!((" + vRef(q) + " | " + xRef(q) + ") & 1)";
+            for (auto& [r, lvl] : domGateRst_[n])
+                c += " && !(" + xRef(r) + " & 1) && " + (lvl ? "!" : "") + "(" + vRef(r) + " & 1)";
+            return "    if (" + c + ") return;\n";
+        };
         size_t saved = 0, total = 0;
         for (int n : dom) {
             total += b4[n].size() + b2[n].size();
+            const std::string gd = guard(n);
             o4 << "// process " << n << " (" << procs[n].kind << ", cycle domain)\n";
             if (isT[n]) {
                 o4 << "static void __attribute__((noinline)) dsT" << n << "(" << dParams() << ") {" << dUnused() << "\n"
@@ -3930,15 +4191,15 @@ private:
             int t = isT[n] ? n : useT[n];
             if (t >= 0) {
                 std::string a = args(isT[n] ? std::array<long long, kRefCls>{} : useD[n]);
-                o4 << "static void ds" << n << "() { dsT" << t << "(" << a << "); }\n";
+                o4 << "static void ds" << n << "() {" << gd << " dsT" << t << "(" << a << "); }\n";
                 if (tmp[n]) o2 << "static void ds" << n << "_2() { ds" << n << "(); }\n";
-                else o2 << "static void ds" << n << "_2() { dsT" << t << "_2(" << a << "); }\n";
+                else o2 << "static void ds" << n << "_2() {" << gd << " dsT" << t << "_2(" << a << "); }\n";
                 if (!isT[n]) saved += b4[n].size() + b2[n].size();
                 continue;
             }
-            o4 << "static void ds" << n << "() {\n" << b4[n] << "}\n";
+            o4 << "static void ds" << n << "() {\n" << gd << b4[n] << "}\n";
             if (tmp[n]) o2 << "static void ds" << n << "_2() { ds" << n << "(); }\n";
-            else o2 << "static void ds" << n << "_2() {\n" << b2[n] << "}\n";
+            else o2 << "static void ds" << n << "_2() {\n" << gd << b2[n] << "}\n";
         }
         if (std::getenv("MSIM_WHYSHARE"))
             std::fprintf(stderr, "shared clocked code: %zu of %zu bytes are calls to another instance's copy\n", saved, total);
@@ -3958,7 +4219,11 @@ private:
             std::vector<std::pair<int, Edge>> ev, key;
             for (int d : dom)
                 if (domGroups_ <= 1 || domGroup_[d] == g)
-                    for (auto& e : procs[d].seqEv) {
+                    for (auto e : procs[d].seqEv) {
+                        // Below a clock gate, the copy the gate reads: the group wakes at every clk edge.
+                        if (!gate_.empty() && e.first >= 0 && (size_t)e.first < domParent_.size())
+                            for (int x = e.first, k = 0; k < 1000 && domParent_[x] != x; k++, x = domParent_[x])
+                                if (gate_.count(x)) e.first = domParent_[x];
                         int rt = e.first >= 0 && (size_t)e.first < domRoot_.size() ? domRoot_[e.first] : e.first;
                         std::pair<int, Edge> kk{rt, e.second};
                         auto it = std::find(key.begin(), key.end(), kk);
@@ -3973,6 +4238,14 @@ private:
         return false;
     }
     int domGroups_ = 0;
+    int domClocks_ = 0;
+    std::unordered_map<int, int> copyEnd_;
+    std::unordered_map<int, int> gate_;      // cycleDomain: a gated clock -> its enable (clk & q, q set at clk's falling edge)
+    // cycleDomain: per process, the enable its clock edge needs (-1: none) and
+    // the resets (signal, level that resets) that run it anyway.
+    std::vector<int> domGate_;
+    std::vector<int> domParent_;   // cycleDomain: per signal, the signal it is a copy of, one step up
+    std::vector<std::vector<std::pair<int, int>>> domGateRst_;   // cycleDomain: a one-bit signal copied from a bit of a vector -> that vector   // cycleDomain: the distinct clock edges of the groups (not their resets)
 
     // A signal is private to the cycle domain when only the domain uses it
     // in ways that need S.sigs: a full-width NBA target of a domain process or the output of a
