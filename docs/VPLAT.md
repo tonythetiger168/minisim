@@ -380,6 +380,10 @@ kernel's driver turns the receive interrupt on (a driver empties the FIFO
 when it sets the port up, so earlier characters would be lost), as if they
 were typed once the system is up.
 
+Android: an unmodified AOSP Cuttlefish riscv64 build boots on mvplat to its
+boot animation, drawn on the `virtio-gpu` screen. [ANDROID.md](ANDROID.md)
+has the recipe (`tests/vplat/android/run.sh`) and how far it gets.
+
 ## Debugging
 
 `-trace FILE` writes a commit log, one line per instruction with the
@@ -613,8 +617,8 @@ vector instructions still run on the general path.
   to integers; other RMM results round as ties-to-even (differs only for a
   value exactly half way). Bare-metal software, RTOSes (FreeRTOS, Zephyr),
   OpenSBI, Linux with an rv64gc user space and the architecture tests run.
-- Of virtio, the block, network and console devices: no entropy, 9p,
-  GPU or input devices yet, no console multiport, and no indirect descriptors, `EVENT_IDX`, checksum or segmentation
+- Of virtio, the block, network, console, entropy and GPU (2D) devices: no
+  9p, input or sound devices yet, no 3D GPU (virgl, Venus), no console multiport, and no indirect descriptors, `EVENT_IDX`, checksum or segmentation
   offload, or multiqueue. Disk images are raw (no qcow2). The `user` network
   answers ARP and ping only; there is no NAT to the host or a TAP back end.
 - No hardware triggers, no Smepmp (`mseccfg`).

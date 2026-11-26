@@ -1,0 +1,17 @@
+{
+  "name": "android-rv64",
+  "devices": [
+    {"type": "finisher", "base": "0x00100000"},
+    {"type": "clint", "base": "0x02000000"},
+    {"type": "plic", "base": "0x0c000000", "sources": 95},
+    {"type": "uart16550", "name": "uart0", "base": "0x10000000", "irq": 10},
+    {"type": "goldfish-rtc", "name": "rtc", "base": "0x10100000", "irq": 11},
+    {"type": "pcie", "name": "pcie", "base": "0x30000000", "mmio": "0x40000000", "mmio_size": "0x40000000", "irq": 32,
+     "devices": [
+       {"type": "virtio-blk", "file": "android.disk"},
+       {"type": "virtio-rng", "seed": 1},
+       {"type": "virtio-gpu", "width": 720, "height": 1280, "screen": "screen.ppm"}
+     ]},
+    {"type": "ram", "name": "dram", "base": "0x80000000", "size": "4G"}
+  ]
+}
