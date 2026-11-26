@@ -78,7 +78,7 @@ for name in sorted(os.listdir(rules_dir)):
 # Goals: each one names only known rules, and -goal runs just its set.
 rc, out, _ = run(["-list-goals"])
 goal_names = [l.split()[0] for l in out.splitlines() if l.strip()]
-if "starc" not in goal_names or "lint_rtl" not in goal_names:
+if "starc" not in goal_names or "rtl" not in goal_names:
     fail(f"-list-goals: {out}")
 for g in goal_names:
     rc, out, err = run(["-goal", g, "-list"])

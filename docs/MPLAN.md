@@ -7,12 +7,12 @@ the current failures are. It reads what the other tools already write: the
 `mcov`. It does not run tests or collect coverage itself.
 
 ```sh
-mregress tests.list -cov -plan uart.vplan     # regress, then score the plan into regress.d/plan/
-mplan check  uart.vplan                       # read the plan, report mistakes
-mplan report uart.vplan -results regress.d    # score, snapshot, plan.json, plan.html
-mplan triage -results regress.d -plan uart.vplan
+mregress tests.list -cov -plan uart.mplan     # regress, then score the plan into regress.d/plan/
+mplan check  uart.mplan                       # read the plan, report mistakes
+mplan report uart.mplan -results regress.d    # score, snapshot, plan.json, plan.html
+mplan triage -results regress.d -plan uart.mplan
 mplan trend  plan.d/history.jsonl
-mplan init   -results regress.d -o draft.vplan
+mplan init   -results regress.d -o draft.mplan
 ```
 
 ## The plan file
@@ -35,7 +35,7 @@ plan uart "UART verification plan"
     assert tb.dut.u_tx              # assertions in that scope
     feature parity "Parity"
       test uart_parity_*
-  include rx.vplan                  # the features of another plan file
+  include rx.mplan                  # the features of another plan file
 ```
 
 | Line | Meaning |
@@ -159,7 +159,7 @@ counts (the `Reqs` column of `mplan trend`), and:
 - `-trace FILE` writes the traceability matrix as CSV: id, title, parent,
   priority, status, score, features, owners, tests.
 - `-fail-on-uncovered` exits 1 on an uncovered requirement or an unknown id.
-- `mplan init -reqs FILE -o draft.vplan` drafts a plan with one feature per
+- `mplan init -reqs FILE -o draft.mplan` drafts a plan with one feature per
   requirement, nested like the requirements.
 
 ## Ranking and per-test coverage
@@ -168,7 +168,7 @@ counts (the `Reqs` column of `mplan trend`), and:
 them and says what each test adds:
 
 ```
-$ mplan rank uart.vplan -results regress.d -keep keep.list
+$ mplan rank uart.mplan -results regress.d -keep keep.list
 Rank  Test          New  Coverage  Seconds  Unique
    1  uart_random  5120     71.3%     41.0     310
    2  uart_parity   640     80.2%      6.5     122

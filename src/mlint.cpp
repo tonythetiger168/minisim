@@ -130,7 +130,7 @@ void usage() {
                  "  -enable X        turn on a rule, a group (naming, width, synth, ...) or all (repeatable)\n"
                  "  -disable X       turn off a rule or a group (repeatable)\n"
                  "  -only X[,Y]      run these rules or groups and nothing else\n"
-                 "  -goal NAME       run one methodology goal (lint_rtl, starc, ...); -list-goals\n"
+                 "  -goal NAME       run one methodology goal (rtl, starc, ...); -list-goals\n"
                  "  -severity R=L    report rule or group R as error, warning or info\n"
                  "  -set NAME=VALUE  a setting, such as name.module='^[a-z][a-z0-9_]*$'\n"
                  "  -config FILE     directives, one per line: enable, disable, only, severity, set, waive\n"

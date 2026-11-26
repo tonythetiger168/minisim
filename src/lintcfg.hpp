@@ -481,8 +481,7 @@ struct Waiver {
     mutable size_t hits = 0;
 };
 
-// Methodology goals, like SpyGlass's lint goals: a named set of rules for one
-// purpose. "goal NAME" (or -goal NAME) is "only" with that set; later enable,
+// Methodology goals: a named set of rules for one purpose. "goal NAME" (or -goal NAME) is "only" with that set; later enable,
 // disable and severity directives adjust it.
 struct Goal {
     const char* name;
@@ -491,8 +490,8 @@ struct Goal {
 };
 inline const std::vector<Goal>& goals() {
     static const std::vector<Goal> g = {
-        {"lint_rtl", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,vhdl,sdc",
-         "RTL correctness before simulation and synthesis (SpyGlass lint_rtl)"},
+        {"rtl", "latch,comb,case,assign,driver,width,unused,connect,clock,reset,fsm,synth,vhdl,sdc",
+         "RTL correctness before simulation and synthesis"},
         {"lint_synth", "latch,comb,case,driver,synth,SEQ001,SEQ002,W001,RST006,RST007",
          "what synthesis rejects or builds differently from simulation"},
         {"lint_style", "naming,style,format,suspicious", "naming, layout and coding style"},
@@ -512,6 +511,10 @@ inline const std::vector<Goal>& goals() {
     return g;
 }
 inline const Goal* findGoal(std::string_view n) {
+#if MINISIM_VENDOR_COMPAT
+    // Vendor layer: another lint tool's name for the rtl goal (docs/compat/COMPAT.md).
+    if (n == "lint_rtl") n = "rtl";
+#endif
     for (auto& g : goals())
         if (n == g.name) return &g;
     return nullptr;
@@ -615,6 +618,7 @@ struct Config {
         } else if (cmd == "goal") {
             if (w.size() != 2) return bad("goal NAME (mlint -list-goals)");
             const Goal* g = findGoal(w[1]);
+            if (!g && w[1] == "lint_rtl") return bad("unknown goal 'lint_rtl': the goal is now called 'rtl'");
             if (!g) return bad("unknown goal '" + w[1] + "' (mlint -list-goals)");
             only(g->rules);
         } else if (cmd == "severity") {

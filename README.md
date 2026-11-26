@@ -391,14 +391,14 @@ plan uart "UART verification plan"
 ```
 
 ```sh
-mregress tests.list -cov -plan uart.vplan   # regress, then score the plan into regress.d/plan/
-mplan report uart.vplan -results regress.d -label $GIT_COMMIT -rules triage.rules -gate
-mplan triage -results regress.d -plan uart.vplan   # only the failure buckets
+mregress tests.list -cov -plan uart.mplan   # regress, then score the plan into regress.d/plan/
+mplan report uart.mplan -results regress.d -label $GIT_COMMIT -rules triage.rules -gate
+mplan triage -results regress.d -plan uart.mplan   # only the failure buckets
 mplan trend  plan.d/history.jsonl                  # score, tests and coverage per snapshot
-mplan init   -results regress.d -o draft.vplan     # a starting plan from an existing regression
+mplan init   -results regress.d -o draft.mplan     # a starting plan from an existing regression
 mplan rank   -results regress.d -keep keep.list    # what each test adds; the redundant tests
 mplan serve  -root /srv/mplan -users users.txt     # dashboard for many plans; CI uploads with mplan push
-mplan report uart.vplan -results regress.d -reqs reqs.reqif -trace trace.csv   # requirement traceability
+mplan report uart.mplan -results regress.d -reqs reqs.reqif -trace trace.csv   # requirement traceability
 ```
 
 `mplan report` scores every feature (weighted, with a goal per metric),

@@ -8,6 +8,13 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Changed
+- mcov's URG, IMC and vcover command lines move to `tools/compat/mcov_compat.py`,
+  installed beside mcov only with `-DMINISIM_VENDOR_COMPAT=ON`.
+- mlint: the goal `lint_rtl` is now `rtl` (the old name only in a
+  `-DMINISIM_VENDOR_COMPAT=ON` build).
+- mplan: plan files are written `.mplan` in the docs and examples, and the
+  docs say "verification plan". The extension was never checked, so
+  existing `.vplan` files still read.
 - Vendor command-line compatibility is now a build option,
   `-DMINISIM_VENDOR_COMPAT=ON` (default OFF). The default build accepts only
   minisim's own options and open standards. First step: msim's xrun / irun

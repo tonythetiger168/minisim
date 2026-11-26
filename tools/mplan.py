@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """mplan: verification planning and tracking on top of mregress and mcov.
 
-    mplan check  uart.vplan
-    mplan report uart.vplan -results regress.d [-cov cov.json] [-o plan.d]
-    mplan triage -results regress.d [-plan uart.vplan] [-rules triage.rules]
+    mplan check  uart.mplan
+    mplan report uart.mplan -results regress.d [-cov cov.json] [-o plan.d]
+    mplan triage -results regress.d [-plan uart.mplan] [-rules triage.rules]
     mplan trend  plan.d/history.jsonl
-    mplan init   -results regress.d [-cov cov.json] -o draft.vplan
-    mplan init   -reqs reqs.csv -o draft.vplan
-    mplan rank   -results regress.d [uart.vplan] [-by rate] [-keep keep.list]
+    mplan init   -results regress.d [-cov cov.json] -o draft.mplan
+    mplan init   -reqs reqs.csv -o draft.mplan
+    mplan rank   -results regress.d [uart.mplan] [-by rate] [-keep keep.list]
     mplan serve  -root /srv/mplan [-port 8080] [-users users.txt]
     mplan push   http://host:8080 plan.d [-project uart]
 
-A verification plan (vPlan) lists the features of a design and, per feature,
+A verification plan (plan) lists the features of a design and, per feature,
 what proves it: tests (mregress results), code coverage, covergroups and
 assertions (the msim -cov database that mcov merges). ``mplan report`` scores
 every feature, records the result in a history file so progress shows over
@@ -37,7 +37,7 @@ The plan file. Indentation nests features; ``#`` starts a comment:
           req UART-12 UART-13           # the requirements this feature verifies
           test uart_parity_*
       reqs uart_reqs.csv                # the requirement list (CSV or ReqIF)
-      include rx.vplan                  # the features of another plan file
+      include rx.mplan                  # the features of another plan file
 
 A metric line is ``<kind> <pattern> [goal=PCT] [weight=N]``. In a pattern
 ``*`` matches any text and ``?`` one character. A hierarchical name also
