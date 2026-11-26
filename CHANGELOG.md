@@ -440,6 +440,15 @@ Spec references are IEEE 1800-2023 clauses.
 - mlint: the formal-assisted checks are about 6x faster (Ibex: 0.43 s to 0.07 s, the whole run 0.55 s to 0.2 s) with the same findings: a case's items are checked in one pass, independent path conditions are not multiplied in, and case-item matches are remembered per block. `-set formal.fast=0` gives the plain search, which the tests compare against.
 
 ### Fixed
+- `mvplat -mt`: Linux on several harts lost its timer ticks on all but one
+  hart for about 17 minutes of simulated time (soft and hard lockup
+  reports; long Android boots hung or panicked). Within a round the harts'
+  clocks drift apart, so a task moving to a hart behind read the time going
+  back; the time CSR now never reads less than any earlier read on any
+  hart. Also: a hart updating the interrupt lines no longer overwrites
+  another hart's software interrupt bits written at the same moment (a lost
+  IPI), and a timer set during a round fires on its compare, not at the
+  round's end, for a running or a waiting hart.
 - `mvplat`: a load or store that crosses a page boundary and faults only on
   its second page reports that page's address in `stval`/`mtval`
   (privileged spec 3.1.16), not the access's own address. Linux mapped the
