@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mvplat`: Android. `tests/vplat/android/run.sh` boots an unmodified AOSP
+  riscv64 Cuttlefish build: `mkdisk.py` makes the GPT disk from the build's
+  images, `mkinitrd.py` the ramdisks plus the bootconfig a bootloader would
+  pass. It reaches the boot animation on the `virtio-gpu` screen
+  (`docs/ANDROID.md`).
 - `mvplat`: `virtio-gpu` (VIRTIO 1.2, 5.7, 2D): one scanout of `width` x
   `height`, resources backed by guest pages, transfers, flushes, fences;
   `screen` names a PPM file the last picture is written to when the run
