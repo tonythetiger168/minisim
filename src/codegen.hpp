@@ -136,6 +136,12 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
+        // Writers of each signal other than force / assign: a held signal
+        // is compiled only when nothing else writes it (emitProc IK::Force).
+        plainW_.assign(sigs.size(), 0);
+        for (auto& p : procs)
+            for (auto& in : p.prog->code)
+                if ((in.k == IK::Assign || in.k == IK::Nba) && in.sig >= 0 && (size_t)in.sig < sigs.size()) plainW_[in.sig]++;
         for (auto& g : sigs) { quiet_.push_back(g.quiet); sigW_.push_back(g.w); sigNet_.push_back(g.net); soleNba_.push_back(g.soleNba); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
         {
             // Array shapes numbered by base signal: the instances of a module
@@ -1572,6 +1578,13 @@ private:
     std::vector<const ArrShape*> arrs_;   // unpacked arrays, emitted as AS<k>
     std::vector<E> evals_;                // operators without C++ yet: interpreted (ET<k>)
     std::vector<const Instr*> mems_;      // $readmem / $writemem instructions, rebuilt as MI<k>
+    static bool noReads(const E& e) {   // an expression of constants only
+        if (!e) return true;
+        if (e->sig >= 0 || e->arr || e->at || e->op == Op::Ref) return false;
+        for (auto& k : e->kids) if (!noReads(k)) return false;
+        return e->op == Op::Const || e->op == Op::Resize || e->op == Op::Concat;
+    }
+    std::vector<int> plainW_;             // per signal: its writers other than force / assign (run)
     std::vector<const Instr*> asrts_;     // immediate assertions and $assertcontrol, rebuilt as AI<k>
     std::map<const Expr*, std::string> slotNames_;   // assertion action slots, rebuilt as SL<k>
     // Every element of a is private, in signal order (PA is indexed by signal).
@@ -7549,6 +7562,32 @@ private:
                     case IK::RandMode:   // 18.8, 18.9
                         o << " { const Instr& i = " << msimIns(i) << "; Val h = eval(i.e, rd); if (h.x || !h.v) nullAccess();"
                              " randModeAll((int)h.v, i.hi != 0, truth(eval(i.de, rd)) == 1); }\n";
+                        break;
+                    // force / assign and release / deassign (10.6) through the
+                    // kernel, as exec.inc runs them: the held expression is
+                    // msim's (ET<k>) and the kernel re-evaluates it. Its
+                    // signals and the target stay in S.sigs (not private).
+                    case IK::Force: {
+                        if (i.callee) throw CodegenUnsupported("force of an expression with a function call");
+                        if (!i.e || i.sig < 0) throw CodegenUnsupported("force");
+                        // Compiled code writes and reads signals past the
+                        // kernel's hold checks: only a constant held on a
+                        // signal nothing else writes (a PLL model's lock
+                        // output, a testbench strap) is compiled.
+                        if ((size_t)i.sig >= plainW_.size() || plainW_[i.sig] || !noReads(i.e))
+                            throw CodegenUnsupported("force of a signal another process writes, or of a non-constant");
+                        hitPriv(i.e);
+                        if (isPriv(i.sig)) privHits_.insert(i.sig);
+                        evals_.push_back(i.e);
+                        o << " S.holdOn(" << i.sig << ", ET" << evals_.size() - 1 << ", " << (i.hi != 0 ? "true" : "false") << ", "
+                          << (i.pw ? std::to_string(i.dkey + i.pw - 1) : std::string("-1")) << ", " << i.dkey << ");\n";
+                        break;
+                    }
+                    case IK::Release:
+                        if (i.sig < 0 || (size_t)i.sig >= plainW_.size() || plainW_[i.sig]) throw CodegenUnsupported("release of a signal another process writes");
+                        if (isPriv(i.sig)) privHits_.insert(i.sig);
+                        o << " S.holdOff(" << i.sig << ", " << (i.hi != 0 ? "true" : "false") << ", "
+                          << (i.pw ? std::to_string(i.dkey + i.pw - 1) : std::string("-1")) << ", " << i.dkey << ");\n";
                         break;
                     default: throw CodegenUnsupported("instruction " + std::to_string((int)i.k));
                 }

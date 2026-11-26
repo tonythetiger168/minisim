@@ -88,6 +88,8 @@ set(CASES
   "examples/manygroups.sv"
   "examples/vecclk.sv"
   "examples/icgclk.sv"
+  "examples/forceinit.sv"
+  "examples/forcemix.sv"
   "-x-assign 0 -x-initial 0 examples/vecclk.sv"
   "-x-assign 0 -x-initial 0 examples/icgclk.sv"
   "examples/islands.sv"
@@ -195,6 +197,10 @@ foreach(c IN LISTS CASES)
   endif()
   if(err MATCHES "using the interpreter")
     message(FATAL_ERROR "${c}: -compile fell back to the interpreter\n${err}")
+  endif()
+  # A constant forced on a signal nothing else writes stays compiled.
+  if(c STREQUAL "examples/forceinit.sv" AND err MATCHES "interpreted")
+    message(FATAL_ERROR "${c}: the force ran in mixed mode\n${err}")
   endif()
   if(NOT want STREQUAL got)
     message(FATAL_ERROR "${c}: -compile output differs\n--- interpreter\n${want}--- compiled\n${got}")

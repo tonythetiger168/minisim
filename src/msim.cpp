@@ -2439,6 +2439,7 @@ static bool runJobs(const std::vector<std::string>& jobs, const std::vector<doub
 // msim -compile-plan <file>: the end of a large msim -compile in a fresh
 // process (runCompiled wrote the plan, then ran this): compile, link,
 // record the build, run simv.
+static std::string kernelObject(const std::string& cc, const std::string& cflags, const std::string& inc, const std::string& dir);
 static int runPlan(const char* path) {
     std::ifstream f(path);
     std::map<std::string, std::string> kv;
@@ -2455,8 +2456,13 @@ static int runPlan(const char* path) {
         } else kv[k] = v;
     }
     if (!f.eof() || kv["EXE"].empty()) { std::cerr << "msim: cannot read " << path << "\n"; return 1; }
-    const std::string dir = kv["DIR"], exe = kv["EXE"], kobj = kv["KOBJ"];
+    const std::string dir = kv["DIR"], exe = kv["EXE"];
+    std::string kobj = kv["KOBJ"];
     std::error_code ec;
+    if (kv.count("KFLAGS")) {   // the kernel object, left to this process (runCompiled)
+        kobj = kernelObject(kv["KCC"], kv["KFLAGS"], kv["KINC"], dir);
+        if (kobj.empty()) return 1;
+    }
     if (!kv["G"].empty() && std::system(kv["G"].c_str()) != 0) std::filesystem::remove(kv["GCH"], ec);
     if (!runJobs(jobs, jobMB)) return 1;
     phaseMark("C++ compile");
@@ -2917,10 +2923,22 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
     // The kernel object: built (once, cached) while the design's files compile.
     std::string kobj;
     std::thread kthread;
-    if (useKernelObject() && !mix.on)
-        kthread = std::thread([&] { kobj = kernelObject(cc, " -std=c++20 " + opt + (getenv("MSIM_KCFLAGS") ? std::string(" ") + getenv("MSIM_KCFLAGS") : std::string()) + " -I" + shq(inc) + fstC, inc, dir); });
+    const std::string kflags = " -std=c++20 " + opt + (getenv("MSIM_KCFLAGS") ? std::string(" ") + getenv("MSIM_KCFLAGS") : std::string()) + " -I" + shq(inc) + fstC;
+    // A large design hands the build to a fresh msim (runPlan, below): the
+    // kernel object, when it is not cached, is built there too. Built here
+    // beside codegen's memory (OpenPiton 4x4: 9 GB, the kernel's compiler
+    // 5 GB) it ran out of 16 GB.
+    const bool execLikely = !mix.on && !g_cov && !upf && !g_workAfterRun && !std::getenv("MSIM_NOEXEC") &&
+                            rssGB() >= (std::getenv("MSIM_EXECGB") ? std::atof(std::getenv("MSIM_EXECGB")) : kExecGB);
+    bool kDeferred = false;
+    if (useKernelObject() && !mix.on) {
+        if (execLikely) kDeferred = true;
+        else kthread = std::thread([&] { kobj = kernelObject(cc, kflags, inc, dir); });
+    }
     auto kernelReady = [&]() -> bool {
         if (kthread.joinable()) kthread.join();
+        if (kDeferred && kobj.empty()) kobj = kernelObject(cc, kflags, inc, dir);
+        kDeferred = false;
         return !useKernelObject() || mix.on || !kobj.empty();
     };
     struct KJoin { std::thread& t; ~KJoin() { if (t.joinable()) t.join(); } } kjoin{kthread};
@@ -3046,12 +3064,13 @@ static int runCompiled(const LowerResult& lowered, const std::string& dir, const
         // to a plan and becomes a fresh msim that runs it (runPlan).
         if (!mix.on && !g_cov && !upf && !g_workAfterRun && !jobs.empty() && !std::getenv("MSIM_NOEXEC") &&
             rssGB() >= (std::getenv("MSIM_EXECGB") ? std::atof(std::getenv("MSIM_EXECGB")) : kExecGB)) {   // tests: MSIM_EXECGB=0
-            if (!kernelReady()) return 1;
+            if (!kDeferred && !kernelReady()) return 1;
             std::string plan = dir + "/build.plan";
             {
                 std::ofstream f(plan);
                 f << "DIR\t" << dir << "\nEXE\t" << exe << "\nKOBJ\t" << kobj << "\nLINK\t" << linkCmd << "\nFSTL\t" << fstL
                   << "\nLOCK\t" << lockFd << "\nRUN\t" << runCmd() << "\n";
+                if (kDeferred) f << "KCC\t" << cc << "\nKFLAGS\t" << kflags << "\nKINC\t" << inc << "\n";
                 if (!gchCmd.empty()) f << "GCH\t" << dir + "/design.hpp.gch" << "\nG\t" << gchCmd << "\n";
                 for (size_t j = 0; j < jobs.size(); j++) f << "J\t" << jobMB[j] << "\t" << jobs[j] << "\n";
                 std::ofstream(dir + "/simv.stamp.next") << stamp;
