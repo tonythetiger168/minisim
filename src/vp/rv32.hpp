@@ -163,6 +163,7 @@ struct Hart {
     uint32_t medeleg = 0, mideleg = 0;
     bool pbmte = false;  // menvcfg.PBMTE (Svpbmt, RV64)
     uint32_t mipSw = 0;  // SSIP, STIP, SEIP as software wrote them
+    uint32_t mipExt = 0; // MSIP, MTIP, MEIP, SEIP from the CLINT and the PLIC
     // Is paging on (Sv32 on RV32; Sv39, Sv48 or Sv57 on RV64)?
     bool paging() const { return rv64 ? (satp >> 60) != 0 : (satp >> 31) != 0; }
     // Values as the hart's XLEN sees them: sign-extended from bit 31 on RV32.

@@ -296,28 +296,48 @@ public:
     double seconds() const { return std::chrono::duration<double>(wall1_ - wall0_).count(); }
     uint64_t consoleBytes() const { return consoleBytes_; }
 
-    // mip from the CLINT and the PLIC, for every hart.
+    // mip from the CLINT and the PLIC, for every hart. With -mt another
+    // hart's thread may be writing that hart's software bits (setMipSw) at
+    // the same moment, so each side stores its own half and then changes
+    // only its own bits of mip, atomically: neither undoes the other's
+    // (a lost MSIP or SSIP is a lost IPI, and the hart sleeps through it).
+    static constexpr uint32_t MIP_EXT = MIP_MSIP | MIP_MTIP | MIP_MEIP | MIP_SEIP;
+    static constexpr uint32_t MIP_SW = MIP_SSIP | MIP_STIP | MIP_SEIP;
     void updateIrqs() {
         irqDirty_ = false;
         for (auto& hp : harts) {
             Hart& h = *hp;
-            uint32_t mip = h.mipSw;
+            uint32_t ext = 0;
             if (clint) {
-                if (clint->msip[h.id]) mip |= MIP_MSIP;
-                if (clint->mtimeAtCycle(h.cycle) >= clint->mtimecmp[h.id]) mip |= MIP_MTIP;
+                if (clint->msip[h.id]) ext |= MIP_MSIP;
+                if (clint->mtimeAtCycle(h.cycle) >= clint->mtimecmp[h.id]) ext |= MIP_MTIP;
             }
-            if (plic && plic->eip(2 * h.id)) mip |= MIP_MEIP;
-            if (plic && plic->eip(2 * h.id + 1)) mip |= MIP_SEIP;
-            h.mip = mip;
-            if (h.wfi && (h.mip & h.mie)) h.wfi = false;
+            if (plic && plic->eip(2 * h.id)) ext |= MIP_MEIP;
+            if (plic && plic->eip(2 * h.id + 1)) ext |= MIP_SEIP;
+            __atomic_store_n(&h.mipExt, ext, __ATOMIC_SEQ_CST);
+            uint32_t old = __atomic_load_n(&h.mip, __ATOMIC_RELAXED), nv;
+            do {
+                nv = (old & ~MIP_EXT) | ext | (__atomic_load_n(&h.mipSw, __ATOMIC_SEQ_CST) & MIP_SW);
+            } while (!__atomic_compare_exchange_n(&h.mip, &old, nv, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+            if (h.wfi && (nv & h.mie)) h.wfi = false;
         }
         if (mt) mtNotify();
     }
 
     // ------------------------------------------------------------ CSRs
     uint64_t mtime(const Hart& h) const {
-        return clint ? clint->mtimeAtCycle(h.cycle) : h.cycle * cycle_ps / tick_ps;
+        const uint64_t v = clint ? clint->mtimeAtCycle(h.cycle) : h.cycle * cycle_ps / tick_ps;
+        if (!inMt_) return v;
+        // -mt: within a round the harts' clocks drift apart (each runs to the
+        // round's end at its own pace), so a thread that moves from a hart
+        // ahead to one behind would see time go back; Linux's timekeeping
+        // takes that as a huge step forward (no ticks for ~17 minutes). The
+        // time read is never less than any read before it, on any hart.
+        uint64_t f = mtimeFloor_.load(std::memory_order_relaxed);
+        while (v > f && !mtimeFloor_.compare_exchange_weak(f, v, std::memory_order_relaxed)) {}
+        return v > f ? v : f;
     }
+    mutable std::atomic<uint64_t> mtimeFloor_{0};
     // The extensions misa reports: A C D F I M S U.
     // Zba, Zbb, Zbc, Zbs and Zicond (unprivileged ISA, chapters 28 and 12):
     // the OP, OP-IMM, OP-32 and OP-IMM-32 encodings the base ISA leaves
@@ -749,10 +769,13 @@ public:
 
     // ------------------------------------------------------------ traps
     void setMipSw(Hart& h, uint32_t v) {
-        h.mipSw = v;
-        h.mip = (h.mip & ~(MIP_SSIP | MIP_STIP | MIP_SEIP)) | v |
-                ((plic && plic->eip(2 * h.id + 1)) ? MIP_SEIP : 0u);
-        if (h.wfi && (h.mip & h.mie)) h.wfi = false;
+        __atomic_store_n(&h.mipSw, v, __ATOMIC_SEQ_CST);
+        uint32_t old = __atomic_load_n(&h.mip, __ATOMIC_RELAXED), nv;
+        do {
+            nv = (old & ~MIP_SW) | v | (__atomic_load_n(&h.mipExt, __ATOMIC_SEQ_CST) & (MIP_EXT & ~MIP_SEIP)) |
+                 ((plic && plic->eip(2 * h.id + 1)) ? MIP_SEIP : 0u);
+        } while (!__atomic_compare_exchange_n(&h.mip, &old, nv, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
+        if (h.wfi && (nv & h.mie)) h.wfi = false;
     }
     void trap(Hart& h, uint32_t cause, uint64_t tval, bool intr) {
         h.splitFault = false;
@@ -2990,9 +3013,16 @@ private:
         for (auto& hp : harts) jitForPg(*hp);  // made here, not by the workers
         std::atomic<unsigned> running{0};
         std::atomic<uint64_t> front{gcycle_};
+        // The earliest timer compare (a cycle) of a hart waiting in WFI: the
+        // others' time reaching it wakes that hart, which then takes its
+        // timer interrupt on that cycle. Without this a hart that set its
+        // timer after the round's end was chosen would sleep to the round's
+        // end, up to a quantum (10 ms by default) late.
+        std::atomic<uint64_t> wakeAt{UINT64_MAX};
         auto pub = [&](uint64_t c) {
             uint64_t f = front.load(std::memory_order_relaxed);
             while (f < c && !front.compare_exchange_weak(f, c, std::memory_order_relaxed)) {}
+            if (c >= wakeAt.load(std::memory_order_relaxed)) mtNotify();
         };
         // A hart only waits in WFI when every hart has a thread of its own;
         // with fewer threads it would hold up the harts queued behind it.
@@ -3025,9 +3055,15 @@ private:
                     // waiting: not running translated code, so mtExclusive
                     // does not wait for it
                     active_--;
+                    const uint64_t due = mtTimerDue(h);
+                    if (due < end) {
+                        uint64_t wa = wakeAt.load();
+                        while (due < wa && !wakeAt.compare_exchange_weak(wa, due)) {}
+                    }
                     for (unsigned spins = 0;;) {
                         const uint32_t w = mtWake_.load();
                         if (!__atomic_load_n(&h.wfi, __ATOMIC_ACQUIRE) || exit_) break;
+                        if (due < end && front.load(std::memory_order_relaxed) >= due) break;
                         if (__atomic_load_n(&h.mip, __ATOMIC_RELAXED) & __atomic_load_n(&h.mie, __ATOMIC_RELAXED)) break;
                         if (!running.load()) break;
                         if (++spins < 256) mtRelax();
@@ -3036,6 +3072,14 @@ private:
                     active_++;
                     mtPark();
                     if (exit_) { h.stop = Stop::Exit; break; }
+                    // Its timer, if the others got there or nobody else is
+                    // left to run: the hart's time becomes the compare's.
+                    if (due < end && __atomic_load_n(&h.wfi, __ATOMIC_ACQUIRE) &&
+                        (front.load(std::memory_order_relaxed) >= due || !running.load())) {
+                        std::lock_guard<std::mutex> l(devMu_);
+                        h.cycle = std::max(h.cycle, due);
+                        updateIrqs();
+                    }
                     if (__atomic_load_n(&h.wfi, __ATOMIC_ACQUIRE) &&
                         !(__atomic_load_n(&h.mip, __ATOMIC_RELAXED) & __atomic_load_n(&h.mie, __ATOMIC_RELAXED))) {
                         h.cycle = std::max(h.cycle, end);  // nobody is left to wake it
@@ -3048,6 +3092,12 @@ private:
                 if (h.cycle >= end) break;
                 Stop s = exec(h, std::min(end, h.cycle + mtSlice));
                 pub(h.cycle);
+                // Its own timer, set after the round's end was chosen, falls
+                // due on its own clock: raised within a slice.
+                if (mtTimerDue(h, false) <= h.cycle) {
+                    std::lock_guard<std::mutex> l(devMu_);
+                    updateIrqs();
+                }
                 if (s != Stop::Budget) { h.stop = s; break; }
             }
             if (run && --running == 0) mtNotify();
@@ -3060,6 +3110,15 @@ private:
         if (irqDirty_) updateIrqs();
         for (auto& hp : harts)
             if (hp->stop == Stop::Break) { breakHart(*hp); hp->stop = Stop::Budget; }
+    }
+    // -mt: the cycle at which hart h's machine timer interrupt would wake
+    // it (its compare, on the run's clock), or UINT64_MAX: none set, already
+    // pending, or (wake) not enabled in mie.
+    uint64_t mtTimerDue(const Hart& h, bool wake = true) const {
+        if (!clint || (__atomic_load_n(&h.mip, __ATOMIC_RELAXED) & MIP_MTIP)) return UINT64_MAX;
+        if (wake && !(__atomic_load_n(&h.mie, __ATOMIC_RELAXED) & MIP_MTIP)) return UINT64_MAX;
+        const uint64_t cmp = __atomic_load_n(&clint->mtimecmp[h.id], __ATOMIC_RELAXED);
+        return cmp == UINT64_MAX ? UINT64_MAX : clint->cycleOfCalc(cmp);
     }
     static void mtRelax() {
 #if defined(__x86_64__) || defined(__i386__)
