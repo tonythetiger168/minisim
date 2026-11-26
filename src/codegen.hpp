@@ -189,8 +189,8 @@ public:
             // different times): each group's commit evaluates every comb
             // statement. OpenTitan Earl Grey, 779 groups, ran 4.6x slower in
             // the domain than event-driven.
-            if (domGroups_ > 64 && !getenv("MSIM_XCYC")) {
-                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %d clock groups\n", domGroups_);
+            if (domClocks_ > 64 && !getenv("MSIM_XCYC")) {
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %d clock groups on %d clock edges\n", domGroups_, domClocks_);
                 dom.clear();
             }
         }
@@ -3162,6 +3162,101 @@ private:
                 if (writers[d] != 1 || sigs[d].w != 1 || sigs[src].w != 1 || sigs[d].drivers > 1) continue;
                 root[d] = src;
             }
+            // Copies through bits of vectors: a port bound to v[i], a vector
+            // built from copies (assign v[k*32 +: 32] = {32{clk}}), the
+            // signal of an event expression (@(posedge v[i]), also written
+            // once before time 0). Each bit of a continuous assign's target
+            // that comes from one bit of a signal, and has no other writer,
+            // is followed to its source; a one-bit signal whose chain ends
+            // at a one-bit signal is a copy of it. MSIM_NOBITCOPY=1: off.
+            copyEnd_.clear();
+            if (!std::getenv("MSIM_NOBITCOPY")) {
+                std::unordered_map<int, std::vector<std::pair<int, int>>> bitSrc;   // signal -> per bit (source, bit); source -1: none, -2: another writer
+                std::vector<int> evInit(sigs.size(), 0);
+                for (size_t x = 0; x < sigs.size(); x++) evInit[x] = sigs[x].name.rfind("__event", 0) == 0;
+                std::function<bool(const E&, std::vector<std::pair<int, int>>&)> bits = [&](const E& e, std::vector<std::pair<int, int>>& out) -> bool {
+                    if (!e || e->at) return false;
+                    if (e->op == Op::Ref) {
+                        if (e->sig < 0 || (size_t)e->sig >= sigs.size() || sigs[e->sig].w > 4096) return false;
+                        for (int b = 0; b < sigs[e->sig].w; b++) out.push_back({e->sig, b});
+                        return true;
+                    }
+                    if (e->op == Op::Slice && e->kids.size() == 1 && e->kids[0] && e->kids[0]->op == Op::Ref && !e->kids[0]->at) {
+                        int sg = e->kids[0]->sig;
+                        if (sg < 0 || (size_t)sg >= sigs.size() || e->lo < 0 || e->hi < e->lo || e->hi >= sigs[sg].w) return false;
+                        for (int b = e->lo; b <= e->hi; b++) out.push_back({sg, b});
+                        return true;
+                    }
+                    if (e->op == Op::Index && e->kids.size() == 2 && e->kids[0] && e->kids[0]->op == Op::Ref && !e->kids[0]->at && e->kids[1] &&
+                        e->kids[1]->op == Op::Const && !e->kids[1]->k.x && e->kids[1]->k.hi.empty()) {
+                        int sg = e->kids[0]->sig;
+                        uint64_t i = e->kids[1]->k.v;
+                        if (sg < 0 || (size_t)sg >= sigs.size() || i >= (uint64_t)sigs[sg].w) return false;
+                        out.push_back({sg, (int)i});
+                        return true;
+                    }
+                    if (e->op == Op::Concat) {
+                        std::vector<std::pair<int, int>> all;
+                        for (size_t k = e->kids.size(); k-- > 0;) {   // the last kid is the low bits
+                            std::vector<std::pair<int, int>> part;
+                            if (!bits(e->kids[k], part)) return false;
+                            all.insert(all.end(), part.begin(), part.end());
+                        }
+                        out.insert(out.end(), all.begin(), all.end());
+                        return true;
+                    }
+                    return false;
+                };
+                std::vector<char> bad(sigs.size(), 0);
+                for (auto& pr : procs) {
+                    if (pr.combRank < 0 || !oneAssign(*pr.prog)) continue;
+                    const Instr& a = pr.prog->code[0];
+                    int d = a.sig;
+                    if (d < 0 || (size_t)d >= sigs.size() || a.arr || a.bidx || !a.aidx.empty() || !a.e || sigs[d].w > 4096) continue;
+                    std::vector<std::pair<int, int>> src;
+                    const int lo = a.hi >= 0 ? a.lo : 0, hi = a.hi >= 0 ? a.hi : sigs[d].w - 1;
+                    if (!bits(a.e, src) || (int)src.size() != hi - lo + 1) { bad[d] = 1; continue; }
+                    auto& v = bitSrc[d];
+                    if (v.empty()) v.assign((size_t)sigs[d].w, {-1, 0});
+                    for (int b = lo; b <= hi; b++) v[(size_t)b] = v[(size_t)b].first == -1 ? src[(size_t)(b - lo)] : std::pair<int, int>{-2, 0};
+                }
+                // Any other write of a target (a process, a force, a second
+                // driver of the same bits): not a copy. The one write of an
+                // event signal before time 0 is its starting value.
+                std::vector<int> other(sigs.size(), 0);
+                for (auto& pr : procs) {
+                    const bool copyProc = pr.combRank >= 0 && oneAssign(*pr.prog);
+                    std::vector<const Prog*> progs;
+                    reachAll(pr.prog, progs);
+                    for (const Prog* q : progs)
+                        for (size_t pc = 0; pc < q->code.size(); pc++) {
+                            const Instr& in = q->code[pc];
+                            if (!(in.k == IK::Assign || in.k == IK::Nba || in.k == IK::Force) || in.sig < 0 || (size_t)in.sig >= other.size()) continue;
+                            if (copyProc && q == pr.prog && pc == 0) continue;
+                            if (in.k == IK::Assign && evInit[in.sig] && !pr.seq && pr.combRank < 0) continue;
+                            other[in.sig]++;
+                        }
+                }
+                auto srcOf = [&](int sg, int b) -> std::pair<int, int> {
+                    if (bad[sg] || other[sg]) return {-1, 0};
+                    auto it = bitSrc.find(sg);
+                    if (it == bitSrc.end() || (size_t)b >= it->second.size()) return {-1, 0};
+                    return it->second[(size_t)b];
+                };
+                size_t n = 0;
+                for (auto& [d, v] : bitSrc) {
+                    if (sigs[d].w != 1 || root[d] != d) continue;
+                    std::pair<int, int> at{d, 0};
+                    for (int k = 0; k < 64; k++) {
+                        auto nx = srcOf(at.first, at.second);
+                        if (nx.first < 0) break;
+                        at = nx;
+                    }
+                    if (at.first != d) copyEnd_[d] = at.first;
+                    if (at.first != d && at.second == 0 && sigs[at.first].w == 1) { root[d] = at.first; n++; }
+                }
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %zu one-bit copies through vector bits\n", n);
+            }
         }
         auto find = [&](int x) {
             for (int n = 0; x >= 0 && (size_t)x < root.size() && root[x] != x && n < 1000; n++) x = root[x];
@@ -3259,6 +3354,7 @@ private:
             }
         domGroup_.assign(procs.size(), -1);
         domGroups_ = 0;
+        domClocks_ = 0;
         if (best.empty()) return best;
         // No other process may make an NBA to a target of the domain.
         auto clash = [&](const std::vector<int>& d) {
@@ -3328,11 +3424,44 @@ private:
             for (size_t g = 0; g < groups.size(); g++)
                 for (int i : groups[g]) domGroup_[i] = (int)g;
             domGroups_ = (int)groups.size();
+            // The clocks of the groups: an event signal the process does not
+            // read (an asynchronous reset is read: if (!rst_n)). Groups that
+            // differ only in their reset tick together, and the groups that
+            // run in one time step share one commit (dpend), so the cost
+            // follows the clocks, not the groups.
+            std::set<std::pair<int, Edge>> clk;
+            for (auto& g : groups) {
+                const CodegenProc& pr = procs[g[0]];
+                std::set<int> rd;
+                std::function<void(const E&)> f = [&](const E& x) {
+                    if (!x) return;
+                    if (x->sig >= 0) rd.insert(find(x->sig));
+                    for (auto& k : x->kids) f(k);
+                    if (x->at) f(x->at);
+                };
+                for (auto& in : pr.prog->code) { f(in.e); f(in.bidx); for (auto& a : in.aidx) f(a); for (auto& a : in.args) f(a); }
+                bool any = false;
+                for (auto& [sg, ed] : canon(pr.seqEv)) {
+                    auto ce = copyEnd_.find(sg);   // a reset read through the vector its port comes from
+                    if (!rd.count(sg) && (ce == copyEnd_.end() || !rd.count(find(ce->second)))) { clk.insert({sg, ed}); any = true; }
+                }
+                if (!any) for (auto& e : canon(pr.seqEv)) clk.insert(e);
+                if (const char* w = std::getenv("MSIM_WHYCYCLE"); w && *w == '2') {
+                    std::string t;
+                    for (auto& [sg, ed] : canon(pr.seqEv)) t += " " + sigs[sg].name + (rd.count(sg) ? "(read)" : "") + (copyEnd_.count(sg) ? "(copy of " + sigs[copyEnd_[sg]].name + ")" : "");
+                    std::string r;
+                    for (int x : rd) r += " " + sigs[x].name;
+                    std::fprintf(stderr, "group events:%s; reads:%s\n", t.c_str(), r.c_str());
+                }
+            }
+            domClocks_ = (int)clk.size();
+            if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain: %d clock groups on %d clock edges\n", domGroups_, domClocks_);
             return all;
         }
         if (clash(best)) return {};
         for (int i : best) domGroup_[i] = 0;
         domGroups_ = 1;
+        domClocks_ = 1;
         return best;
     }
 
@@ -3967,6 +4096,8 @@ private:
         return false;
     }
     int domGroups_ = 0;
+    int domClocks_ = 0;
+    std::unordered_map<int, int> copyEnd_;   // cycleDomain: a one-bit signal copied from a bit of a vector -> that vector   // cycleDomain: the distinct clock edges of the groups (not their resets)
 
     // A signal is private to the cycle domain when only the domain uses it
     // in ways that need S.sigs: a full-width NBA target of a domain process or the output of a

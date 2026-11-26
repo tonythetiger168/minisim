@@ -86,6 +86,8 @@ set(CASES
   "-x-assign 0 -x-initial 0 examples/procorder.sv"
   "-x-assign 0 -x-initial 0 examples/parpub.sv"
   "examples/manygroups.sv"
+  "examples/vecclk.sv"
+  "-x-assign 0 -x-initial 0 examples/vecclk.sv"
   "examples/islands.sv"
   "examples/combbranch.sv"
   "examples/combcycle.sv"
