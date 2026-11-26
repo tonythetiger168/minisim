@@ -4930,6 +4930,16 @@ static int msimMain(int argc, char** argv) {
             if (plC.rank[i] < 0 && !plC.seq[i] && lowered.procs[i].program < 0 && !lowered.procs[i].reactive && !upfPinned(lowered.procs[i].prog) &&
                 seqShape(lowered.procs[i].prog, plC.ev[i], true))
                 plC.seq[i] = 1;
+    // A large design: the elaborated slang AST (XiangShan: 3.6 GB) is not
+    // read again by codegen or the compiled run, only by VPI, -vcd-class and
+    // msim -i. Freed before codegen, whose text needs the memory.
+    if (compiled && comp && !vpi::st().active && !vcdClass && !interactiveMode && !std::getenv("MSIM_KEEPAST") &&
+        (rssGB() > 4 || std::getenv("MSIM_FREEAST"))) {
+        comp.reset();
+        driver.syntaxTrees.clear();
+        malloc_trim(0);
+        phaseMark("slang AST freed");
+    }
     if (compiled) {
         runres::R().phase = 1;   // the compiled program writes its own output: no UVM counts, no -maxtime check
         runres::R().compiledMode = true;

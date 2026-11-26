@@ -181,8 +181,12 @@ foreach(c IN LISTS CASES)
     set(ENV{MSIM_SPLITPIECE} 1500)
     set(ENV{MSIM_EXECGB} 0)   # the C++ build in a fresh msim (msim.cpp runPlan)
   endif()
+  # The slang AST freed before codegen (msim.cpp; on its own only past
+  # 4 GB, e.g. XiangShan): nothing after it may read the AST.
+  set(ENV{MSIM_FREEAST} 1)
   execute_process(COMMAND ${MSIM} -compile -O1 -o ${OUT}/c${n} ${files}
                   OUTPUT_VARIABLE got RESULT_VARIABLE r2 ERROR_VARIABLE err)
+  unset(ENV{MSIM_FREEAST})
   unset(ENV{MSIM_OUTLINEMIN})
   unset(ENV{MSIM_SPLITPIECE})
   unset(ENV{MSIM_EXECGB})
