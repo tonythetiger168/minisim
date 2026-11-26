@@ -1110,26 +1110,37 @@ public:
             o << intTable("DT", v);
         }
         if (dom.empty() && !byRank.empty()) {   // the ranks: functions, wait lists in CINS
+            // One row per rank as numbers (encoded like CINS): its functions
+            // by index into CFN, which holds each distinct set once (shared
+            // per module), level, wait-list length and context. A table of
+            // a million function-pointer rows (OpenPiton 4x4: 88 MB of C++)
+            // took gcc minutes and gigabytes.
             std::string tab;
-            std::vector<int> ins;
-            size_t off = 0;
+            std::vector<int> ins, rFn, rLv, rN, rX;
+            std::map<std::string, int> fnIdx;
             for (int i : byRank) {
                 ins.insert(ins.end(), procs[i].combIns.begin(), procs[i].combIns.end());
                 bool one = oneAssign(*procs[i].prog);
                 const std::string nm = evName_.size() > (size_t)i && !evName_[i].empty() ? evName_[i] : std::to_string(i);
-                tab += "        {comb" + nm + ", " + (one ? "combv" + nm : "nullptr") + ", " +
-                       (one ? "combc" + nm : "nullptr") + ", " + std::to_string(procs[i].combLevel) + ", " +
-                       std::to_string(off) + ", " + std::to_string(procs[i].combIns.size()) + ", " + evCtx(i) + "},\n";
-                off += procs[i].combIns.size();
+                std::string row = "{comb" + nm + ", " + (one ? "combv" + nm : "nullptr") + ", " + (one ? "combc" + nm : "nullptr") + "}";
+                auto [it, fresh] = fnIdx.emplace(row, (int)fnIdx.size());
+                if (fresh) tab += "        " + row + ",\n";
+                rFn.push_back(it->second);
+                rLv.push_back(procs[i].combLevel);
+                rN.push_back((int)procs[i].combIns.size());
+                rX.push_back(i >= 0 && (size_t)i < evAt_.size() ? evAt_[(size_t)i] : -1);
             }
             std::string cyc;   // ranks on a cycle: only their final writes wake readers
             for (size_t k = 0; k < byRank.size(); k++) if (procs[byRank[k]].combOnCycle) cyc += std::to_string(k) + ",";
             ins.push_back(0);
-            o << intTable("CINS", ins) <<
-                 "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); int lv, at, n; const void* x; } COMBS[] = {\n"
+            o << intTable("CINS", ins) << intTable("CRF", rFn) << intTable("CRL", rLv) << intTable("CRN", rN) << intTable("CRX", rX) <<
+                 "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); } CFN[] = {\n"
               << tab << "    };\n"
                  "    const size_t combBase = S.combs.size();\n"
-                 "    for (auto& c : COMBS) S.addComb(c.f, c.x, std::vector<int>(CINS + c.at, CINS + c.at + c.n), c.lv, c.v, c.c);\n";
+                 "    for (size_t k = 0, at = 0; k < " << rFn.size() << "; at += (size_t)CRN[k], k++) {\n"
+                 "        const auto& c = CFN[CRF[k]];\n"
+                 "        S.addComb(c.f, " << (evDT_.empty() ? "nullptr" : "CRX[k] < 0 ? nullptr : (const void*)(DT + CRX[k])") << ", std::vector<int>(CINS + at, CINS + at + CRN[k]), CRL[k], c.v, c.c);\n"
+                 "    }\n";
             if (!cyc.empty())
                 o << "    static const int CYC[] = {" << cyc << "};\n"
                      "    for (int k : CYC) S.combs[combBase + (size_t)k].onCycle = true;\n";
