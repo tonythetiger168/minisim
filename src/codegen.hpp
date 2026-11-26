@@ -185,6 +185,16 @@ public:
                              cycle ? "" : "; off: a comb cycle, -upf or -no-cycle");
             }
             if (comb > 64 && comb > 64 * nba && !getenv("MSIM_XCYC")) dom.clear();
+            // The domain's code holds every comb statement in a 4-state and a
+            // 2-state copy, without the per-module sharing of event mode:
+            // NVDLA (1.1M comb statements) runs out of 16 GB while emitting
+            // it, XiangShan (394k) too, where event mode builds in 13 GB.
+            // MSIM_CYCMAX=<n> moves the limit.
+            static const size_t combMax = [] { const char* e = std::getenv("MSIM_CYCMAX"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)300000; }();
+            if (!dom.empty() && comb > combMax && !getenv("MSIM_XCYC")) {
+                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %zu comb statements, more than %zu\n", comb, combMax);
+                dom.clear();
+            }
             // Many clock groups (an SoC's gated and divided clocks, ticking at
             // different times): each group's commit evaluates every comb
             // statement. OpenTitan Earl Grey, 779 groups, ran 4.6x slower in
