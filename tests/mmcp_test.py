@@ -261,10 +261,10 @@ class Engines(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertEqual((r["passed"], r["failed"]), (1, 1))
         self.assertEqual(r["failure_groups"][0]["runs"][0]["test"], "bad")
-        (self.root / "p.vplan").write_text("plan p \"P\"\n  feature f \"F\"\n    test good\n  feature g \"G\"\n    test bad\n")
-        c, err = self.c.call("mplan_report", mode="check", plan="p.vplan")
+        (self.root / "p.mplan").write_text("plan p \"P\"\n  feature f \"F\"\n    test good\n  feature g \"G\"\n    test bad\n")
+        c, err = self.c.call("mplan_report", mode="check", plan="p.mplan")
         self.assertEqual(c["exit_status"], 0, c)
-        p, err = self.c.call("mplan_report", plan="p.vplan", results="reg")
+        p, err = self.c.call("mplan_report", plan="p.mplan", results="reg")
         self.assertFalse(err, p)
         feats = {f["id"]: f for f in p["plan"]["features"]}
         self.assertEqual(feats["f"]["status"], "met")

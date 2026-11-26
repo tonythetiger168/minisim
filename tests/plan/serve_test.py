@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mplan serve / push end to end (tests/mplan.cmake): serve_test.py MPLAN.PY PLAN.VPLAN RESULTS_DIR OUT_DIR"""
+"""mplan serve / push end to end (tests/mplan.cmake): serve_test.py MPLAN.PY PLAN.MPLAN RESULTS_DIR OUT_DIR"""
 import json
 import os
 import re
@@ -9,7 +9,7 @@ import threading
 import urllib.error
 import urllib.request
 
-mplan, vplan, results, out = sys.argv[1:5]
+mplan, planfile, results, out = sys.argv[1:5]
 os.makedirs(out, exist_ok=True)
 users = os.path.join(out, "users.txt")
 with open(users, "w") as f:
@@ -40,7 +40,7 @@ def run(*args, env=None):
 
 
 plan_d = os.path.join(out, "plan")
-run("report", vplan, "-results", results, "-o", plan_d, "-label", "s1", "-time", "2026-11-01T00:00:00Z")
+run("report", planfile, "-results", results, "-o", plan_d, "-label", "s1", "-time", "2026-11-01T00:00:00Z")
 srv = subprocess.Popen([sys.executable, mplan, "serve", "-root", os.path.join(out, "root"), "-port", "0", "-users", users, "-q"],
                        stdout=subprocess.PIPE, text=True)
 try:
@@ -56,7 +56,7 @@ try:
     expect("push with a read token is refused", rc == 1 and "HTTP 403" in text, text)
     rc, text = run("push", base, plan_d, "-token", "alice-token-1")
     expect("push", rc == 0 and "pushed counter" in text and "(1 snapshot(s))" in text, text)
-    run("report", vplan, "-results", results, "-o", plan_d, "-label", "s2", "-time", "2026-11-02T00:00:00Z")
+    run("report", planfile, "-results", results, "-o", plan_d, "-label", "s2", "-time", "2026-11-02T00:00:00Z")
     rc, text = run("push", base, plan_d, "-token", "alice-token-1")
     expect("second push", rc == 0 and "(2 snapshot(s))" in text, text)
     rc, text = run("push", base, plan_d, "-token", "alice-token-1")
@@ -95,7 +95,7 @@ try:
     expect("audit log", [a["action"] for a in audit] == ["push", "push", "push", "annotate"] and audit[-1]["user"] == "alice", str(audit))
 
     # The next report takes the dashboard's annotations as its triage rules.
-    rc, text = run("report", vplan, "-results", results, "-o", plan_d, "-label", "s3", "-rules", base + "/api/p/counter/rules", "-fail-on-new")
+    rc, text = run("report", planfile, "-results", results, "-o", plan_d, "-label", "s3", "-rules", base + "/api/p/counter/rules", "-fail-on-new")
     expect("report with the server's rules", "known" in text and "owner: carol; bug: CNT-77" in text and "new failure bucket" not in text, text)
 
     # Several clients at once: three writers push 4 runs each into one project
@@ -106,7 +106,7 @@ try:
     for w, _ in writers:
         for i in range(4):
             d = os.path.join(out, f"multi_{w}_{i}")
-            run("report", vplan, "-results", results, "-o", d, "-label", f"{w}-{i}", "-time", f"2026-11-0{i + 1}T00:00:00Z")
+            run("report", planfile, "-results", results, "-o", d, "-label", f"{w}-{i}", "-time", f"2026-11-0{i + 1}T00:00:00Z")
             dirs.append((w, d))
     run("push", base, dirs[0][1], "-token", "alice-token-1", "-project", "busy")  # the project exists before the storm
     errs = []

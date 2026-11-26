@@ -3,7 +3,9 @@
 > Vendor compatibility layer. It is moving behind the build option
 > `-DMINISIM_VENDOR_COMPAT=ON` (default OFF), tool by tool. The msim front ends for
 > the xrun / irun and the multi-step vlog / vsim / vcs command lines are already
-> built only with that option.
+> built only with that option, and so are mcov's URG / IMC / vcover command
+> lines (`tools/compat/mcov_compat.py`, installed beside mcov only then) and
+> mlint's `lint_rtl` goal name (the native name is `rtl`).
 
 Every minisim tool has one engine. Users moving from Synopsys, Cadence or
 Siemens tools keep their command lines: the tool translates the other
@@ -160,6 +162,14 @@ vcs -sverilog +incdir+inc pkg.sv ctr.vhd tb.sv -R +more   # one step
 - **Not here:** `vlog -mfcu` (one unit over several files: macros defined
   in one file reaching the next), `.db` snapshot files, other vendors'
   precompiled libraries.
+
+## mcov and mlint
+
+- mcov: `--compat=synopsys|cadence|siemens`, or a symlink named `urg`, `imc`
+  or `vcover`, takes those tools' coverage commands (examples in the
+  docstring of `tools/compat/mcov_compat.py`). The module is loaded only
+  when it sits beside `mcov`; a build without the option does not install it.
+- mlint: `-goal lint_rtl` is read as `-goal rtl`.
 
 ## Limits / Not yet
 

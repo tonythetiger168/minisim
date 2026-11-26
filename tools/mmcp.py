@@ -520,7 +520,7 @@ def t_mplan(srv, a):
     argv = [mplan, mode]
     if mode in ("report", "check"):
         if not a.get("plan"):
-            raise ToolError("plan: the .vplan file")
+            raise ToolError("plan: the .mplan file")
         argv.append(srv.path(a["plan"]))
     elif a.get("plan"):
         argv += ["-plan", srv.path(a["plan"])]
@@ -646,7 +646,7 @@ def _register_builtin(srv):
                  "timeout": {"type": "number", "description": "seconds for the whole regression (default 3600)"}, "out": S}},
              t_mregress, needs=["mregress"])
     srv.tool("mplan_report",
-             "Verification plan tracking with mplan: mode report scores a .vplan against mregress results and coverage "
+             "Verification plan tracking with mplan: mode report scores a .mplan against mregress results and coverage "
              "(features below goal and their unmet metrics), mode check validates a plan, mode triage sorts failures into buckets.",
              {"type": "object", "properties": {
                  "mode": {"type": "string", "enum": ["report", "check", "triage"]},

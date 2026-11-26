@@ -2,10 +2,10 @@
 # (--compat=synopsys), IMC batch (--compat=cadence) and vcover
 # (--compat=siemens), or the name mcov is started as. The same engine runs:
 # each form must give what the native command gives.
-#   cmake -DPY=<python3> -DMSIM=<msim> -DSRC=<source dir> -DOUT=<dir> -P mcov_compat.cmake
+#   cmake -DPY=<python3> -DMSIM=<msim> -DSRC=<source dir> -DMCOVDIR=<dir with mcov.py and mcov_compat.py> -DOUT=<dir> -P mcov_compat.cmake
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT}/runs)
-set(MCOV ${PY} ${SRC}/tools/mcov.py)
+set(MCOV ${PY} ${MCOVDIR}/mcov.py)
 foreach(t fsm counter inst)
   execute_process(COMMAND ${MSIM} ${SRC}/tests/cov/${t}.sv -cov runs/${t}.json WORKING_DIRECTORY ${OUT}
                   RESULT_VARIABLE rc OUTPUT_QUIET ERROR_VARIABLE err)
@@ -55,7 +55,7 @@ if(NOT EXISTS ${OUT}/vc_html/index.html)
   message(FATAL_ERROR "vcover report -html wrote no vc_html/index.html")
 endif()
 # Started as vcover (a symlink the user makes).
-file(CREATE_LINK ${SRC}/tools/mcov.py ${OUT}/vcover SYMBOLIC)
+file(CREATE_LINK ${MCOVDIR}/mcov.py ${OUT}/vcover SYMBOLIC)
 run(0 ${PY} ${OUT}/vcover merge -out link.json ${RUNS})
 same(native.json link.json "mcov started as vcover")
 

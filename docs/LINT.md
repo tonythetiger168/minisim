@@ -25,22 +25,22 @@ with `mbug lint`.
 
 ## Goals
 
-A goal is a named set of rules for one purpose, like SpyGlass's lint goals.
+A goal is a named set of rules for one purpose.
 `-goal NAME` (or `goal NAME` in a config file) runs that set and nothing
 else; `-enable`, `-disable` and `-severity` after it adjust it.
 `mlint -list-goals` prints them.
 
 | Goal | Rules | For |
 |---|---|---|
-| `lint_rtl` | latch, comb, case, assign, driver, width, unused, connect, clock, reset, fsm, synth | RTL correctness before simulation and synthesis |
+| `rtl` | latch, comb, case, assign, driver, width, unused, connect, clock, reset, fsm, synth | RTL correctness before simulation and synthesis |
 | `lint_synth` | latch, comb, case, driver, synth, SEQ001, SEQ002, W001, RST006, RST007 | what synthesis rejects or builds differently from simulation |
 | `lint_style` | naming, style, format, suspicious | naming, layout and coding style |
-| `starc` | `lint_rtl` + naming, style | the STARC RTL design style guide (table below) |
-| `openmore` | `lint_rtl` without fsm + naming, style, format | the OpenMORE / Reuse Methodology Manual checklist |
+| `starc` | `rtl` + naming, style | the STARC RTL design style guide (table below) |
+| `openmore` | `rtl` without fsm + naming, style, format | the OpenMORE / Reuse Methodology Manual checklist |
 | `verible` | the rules after Verible's (FMT, STY004..STY015, SUS, NAME014..NAME019, W009, TIDY009) | a Verible-like style check |
 | `cdc` | cdc, rdc | clock- and reset-domain crossings |
 | `formal` | formal | dead branches, out-of-range indexes, stuck registers |
-| `signoff` | `lint_rtl` + formal, cdc, rdc, soc | everything that can break hardware, before handing a block off |
+| `signoff` | `rtl` + formal, cdc, rdc, soc | everything that can break hardware, before handing a block off |
 
 A goal turns on the rules of its groups that are off by default, too.
 
@@ -537,7 +537,7 @@ What is left out, because it would describe the translation and not the VHDL:
   tri-state are `L005`).
 
 What the translation erases is checked on the VHDL text itself
-(`src/lintvhdl.hpp`, group `vhdl`, in the `lint_rtl`, `starc` and
+(`src/lintvhdl.hpp`, group `vhdl`, in the `rtl`, `starc` and
 `openmore` goals):
 
 | Rule | Severity | Default | What |
