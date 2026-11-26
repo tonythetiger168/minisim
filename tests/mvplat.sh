@@ -28,6 +28,14 @@ expect "-map" 0 map.out "0x80000000..0x87ffffff  ram        dram"
 
 "$MVPLAT" "$E/irq.elf" -input abc -q > irq.out 2>&1; rc=$?
 expect "timer, software and external interrupts" 0 irq.out "timer ticks 5, software 1, received 'abc'"
+# Input later on: at a simulated time (the harts wait in WFI until then),
+# and from standard input.
+"$MVPLAT" "$E/irq.elf" -input-at "0.002:ab" -input-at "0.003:c" -q > irqat.out 2>&1; rc=$?
+expect "-input-at: text at a simulated time" 0 irqat.out "received 'abc'"
+printf abc | "$MVPLAT" "$E/irq.elf" -stdin -q > irqin.out 2>&1; rc=$?
+expect "-stdin: what standard input brings" 0 irqin.out "received 'abc'"
+"$MVPLAT" "$E/irq.elf" -input-at "soon:abc" -q > irqbad.out 2>&1; rc=$?
+expect "-input-at refuses a time that is not a number" 2 irqbad.out "SECONDS:TEXT"
 
 "$MVPLAT" "$E/pmp.elf" -q > pmp.out 2>&1; rc=$?
 expect "PMP: NAPOT, NA4, TOR, partial match, MPRV, locked entries" 0 pmp.out "pmp: all checks passed"
@@ -155,6 +163,92 @@ expect "PCIe host and virtio over PCI" 0 pcie.out "pcie: all checks passed"
 "$MVPLAT" -platform "$T/pcie.json" -dump-dtb pcie.dtb "$E/pcie.elf" -q > /dev/null 2>&1
 grep -q "pci-host-ecam-generic" pcie.dtb && grep -q "interrupt-map" pcie.dtb &&
   ok "the device tree has the ECAM host and its interrupt-map" || bad "PCIe host in the device tree"
+
+# virtio-gpu: a bare-metal driver draws through the 2D commands; the
+# picture the device writes at the end ("screen") is what it drew.
+sed 's/"height": 32}/"height": 32, "screen": "gpu.ppm"}/' "$T/gpu.json" > gpu.json
+rm -f gpu.ppm
+"$MVPLAT" -platform gpu.json "$E/gpu.elf" -q > gpu.out 2>&1; rc=$?
+expect "virtio-gpu: display info, resources, transfers, scanout, flush" 0 gpu.out "gpu: all checks passed"
+if command -v python3 > /dev/null 2>&1; then
+  python3 - <<'P' && ok "virtio-gpu: the screen file holds the picture" || bad "virtio-gpu screen file"
+import sys
+b = open('gpu.ppm', 'rb').read()
+h = b'P6\n64 32\n255\n'
+assert b[:len(h)] == h and len(b) == len(h) + 64 * 32 * 3, b[:20]
+p = b[len(h):]
+for y in range(32):
+    for x in range(64):
+        want = (0x80, 8 * y, 4 * x)
+        if 10 <= x < 14 and 5 <= y < 8: want = (255, 255, 255)
+        got = tuple(p[3 * (y * 64 + x):3 * (y * 64 + x) + 3])
+        assert got == want, (x, y, got, want)
+P
+fi
+
+# The Android recipe's image tools (tests/vplat/android), on small made-up
+# images: the initrd is vendor ramdisk + ramdisk + a bootconfig trailer, and
+# the disk is a GPT with the images at their partitions.
+if command -v python3 > /dev/null; then
+  mkdir -p aimg
+  python3 - <<'P' || bad "android: made-up boot images"
+import struct
+def page(b): return b + b'\0' * (-len(b) % 4096)
+# init_boot: a v4 boot image with no kernel and a 5-byte ramdisk.
+h = b'ANDROID!' + struct.pack('<4I', 0, 5, 0, 4096) + b'\0' * 20 + struct.pack('<I', 4)
+open('aimg/init_boot.img', 'wb').write(page(h) + page(b'RAMDK'))
+# vendor_boot v4: a 3-byte vendor ramdisk, no dtb, no table, a bootconfig.
+bc = b'androidboot.hardware=cutf_cvm\nandroidboot.slot_suffix=_b\n'
+h = b'VNDRBOOT' + struct.pack('<5I', 4, 4096, 0, 0, 3) + b'\0' * 2048 + b'\0' * 20
+h += struct.pack('<II', 2128, 0) + struct.pack('<Q', 0) + struct.pack('<4I', 0, 0, 0, len(bc))
+open('aimg/vendor_boot.img', 'wb').write(page(h) + page(b'VRD') + page(bc))
+for n in ['boot', 'vbmeta', 'vbmeta_system', 'vbmeta_system_dlkm', 'vbmeta_vendor_dlkm', 'userdata']:
+    open('aimg/%s.img' % n, 'wb').write(n.encode())
+# super as an Android sparse image: 1 raw block, 1 fill block.
+blk = 4096
+sp = struct.pack('<IHHHHIIII', 0xed26ff3a, 1, 0, 28, 12, blk, 2, 2, 0)
+sp += struct.pack('<HHII', 0xcac1, 0, 1, 12 + blk) + b'S' * blk
+sp += struct.pack('<HHII', 0xcac2, 0, 1, 16) + b'\x01\x02\x03\x04'
+open('aimg/super.img', 'wb').write(sp)
+P
+  python3 -I "$T/android/mkinitrd.py" a.initrd aimg/init_boot.img aimg/vendor_boot.img androidboot.lcd_density=240 > /dev/null &&
+  python3 -I "$T/android/mkinitrd.py" a.initrd - - androidboot.serialconsole=0 > /dev/null &&
+  python3 -I "$T/android/mkdisk.py" a.disk aimg > /dev/null &&
+  python3 - <<'P' && ok "android: initrd and GPT disk from boot images" || bad "android image tools"
+import struct, zlib
+d = open('a.initrd', 'rb').read()
+assert d.endswith(b'#BOOTCONFIG\n')
+size, csum = struct.unpack('<II', d[-20:-12])
+body = d[-20 - size:-20]
+assert sum(body) & 0xffffffff == csum
+assert d[:-20 - size] == b'VRD\0RAMDK\0\0\0', d[:16]
+kv = dict(l.split('=', 1) for l in body.rstrip(b'\0').decode().split('\n') if l)
+assert kv['androidboot.hardware'] == 'cutf_cvm'
+assert kv['androidboot.slot_suffix'] == '_a'          # the recipe's entry wins
+assert kv['androidboot.lcd_density'] == '240'         # then the arguments
+assert kv['androidboot.serialconsole'] == '0'         # a rewrite keeps the rest
+assert kv['androidboot.hw_timeout_multiplier'] == '20'
+g = open('a.disk', 'rb').read()
+assert g[510:512] == b'\x55\xaa' and g[512:520] == b'EFI PART'
+hdr = g[512:512 + 92]
+assert zlib.crc32(hdr[:16] + b'\0' * 4 + hdr[20:]) & 0xffffffff == struct.unpack('<I', hdr[16:20])[0]
+ents = g[1024:1024 + 128 * 128]
+assert zlib.crc32(ents) & 0xffffffff == struct.unpack('<I', hdr[88:92])[0]
+parts = {}
+for i in range(128):
+    e = ents[128 * i:128 * i + 128]
+    if e[:16] == b'\0' * 16: continue
+    first, last = struct.unpack('<QQ', e[32:48])
+    parts[e[56:].decode('utf-16-le').rstrip('\0')] = (first, last)
+assert list(parts)[:3] == ['misc', 'frp', 'boot_a'] and 'super' in parts and 'userdata' in parts, parts
+s = parts['super'][0] * 512
+assert g[s:s + 4096] == b'S' * 4096 and g[s + 4096:s + 8192] == b'\x01\x02\x03\x04' * 1024
+b = parts['boot_a'][0] * 512
+assert g[b:b + 4] == b'boot'
+alt = struct.unpack('<Q', hdr[32:40])[0]
+assert g[alt * 512:alt * 512 + 8] == b'EFI PART'
+P
+fi
 
 # virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
 # image; the file changes only with -disk-write.

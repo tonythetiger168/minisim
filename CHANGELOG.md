@@ -8,6 +8,21 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Added
+- `mvplat`: Android. `tests/vplat/android/run.sh` boots an unmodified AOSP
+  riscv64 Cuttlefish build: `mkdisk.py` makes the GPT disk from the build's
+  images, `mkinitrd.py` the ramdisks plus the bootconfig a bootloader would
+  pass. It reaches the boot animation on the `virtio-gpu` screen
+  (`docs/ANDROID.md`).
+- `mvplat`: `virtio-gpu` (VIRTIO 1.2, 5.7, 2D): one scanout of `width` x
+  `height`, resources backed by guest pages, transfers, flushes, fences;
+  `screen` names a PPM file the last picture is written to when the run
+  ends. Over MMIO or behind the PCIe host (display class). Linux's
+  `virtio_gpu` DRM driver uses it, which Android's graphics allocator needs.
+- `mvplat -input-at S:TEXT` (text at a simulated time, deterministic) and
+  `-stdin` (standard input to the first UART: an interactive console);
+  input waits until the driver turns the receive interrupt on. A disk image
+  mapped privately reserves no swap, so images larger than host memory
+  (Android's 16 GiB disks) open.
 - `mvplat`: `virtio-rng` (VIRTIO 1.2, 5.4; the same bytes every run for a
   `seed`) and `goldfish-rtc` (Linux's `rtc-goldfish`: time since 1970 from an
   `epoch` plus simulated time, settable, with an alarm interrupt), both with
@@ -410,6 +425,10 @@ Spec references are IEEE 1800-2023 clauses.
 - mlint: the formal-assisted checks are about 6x faster (Ibex: 0.43 s to 0.07 s, the whole run 0.55 s to 0.2 s) with the same findings: a case's items are checked in one pass, independent path conditions are not multiplied in, and case-item matches are remembered per block. `-set formal.fast=0` gives the plain search, which the tests compare against.
 
 ### Fixed
+- `mvplat`: a load or store that crosses a page boundary and faults only on
+  its second page reports that page's address in `stval`/`mtval`
+  (privileged spec 3.1.16), not the access's own address. Linux mapped the
+  first page again and again and never the second (Android's odrefresh hung).
 - SAIF from a long waveform (`msim -saif`, power tools' `-write_saif`) no
   longer needs every value change in memory: a large FST or VCD is summed a
   group of signals at a time (a 207 MB gate-level FST of 118,746 cycles went

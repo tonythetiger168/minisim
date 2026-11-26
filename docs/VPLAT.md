@@ -252,7 +252,8 @@ it). It is the address map most RISC-V bare-metal software already targets.
 | `virtio-console` | virtio over MMIO, version 2, one port | a console (Linux's `hvc0`): output to stdout, `input` typed once the guest has printed and been quiet for 100 ms of simulated time |
 | `virtio-rng` | virtio over MMIO, version 2, one queue (5.4) | random bytes (Linux's `hw_random`, Android's entropy): the same every run for a `seed` |
 | `goldfish-rtc` | `TIME_LOW` / `TIME_HIGH` at 0x00 / 0x04, alarm at 0x08 / 0x0c, `IRQ_ENABLED` 0x10, `CLEAR_ALARM` 0x14, `ALARM_STATUS` 0x18, `CLEAR_INTERRUPT` 0x1c | the real-time clock of Android's emulator boards (Linux's `rtc-goldfish`, device tree `google,goldfish-rtc`): nanoseconds since 1970, `epoch` (seconds, default 2026-01-01) plus simulated time; `irq` for the alarm |
-| `pcie` | PCI Express host, ECAM (PCIe 6.0, 7.2.2), `buses` × 1 MiB at `base`; a memory window `mmio` / `mmio_size` (default 0x40000000, 1 GiB) | `devices`: virtio-blk, virtio-net, virtio-console or virtio-rng entries (no `base`), on bus 0 at 01.0 up, each with a 64-bit 16 KiB BAR0 holding the virtio PCI structures (VIRTIO 1.2, 4.1, modern only: common configuration, ISR, device configuration, notifications); INTx level interrupts, INTA of device *d* on PLIC source `irq` + *d* % 4, given to the kernel as an `interrupt-map`. What Android's kernels (no virtio-mmio) need |
+| `virtio-gpu` | virtio over MMIO, version 2, a control and a cursor queue (5.7, 2D only: no 3D capability sets, no blobs, no EDID) | a display of `width` x `height` (default 720 x 1280), one scanout: GET_DISPLAY_INFO, RESOURCE_CREATE_2D / UNREF, ATTACH / DETACH_BACKING, TRANSFER_TO_HOST_2D, SET_SCANOUT, RESOURCE_FLUSH, fences; cursor commands are taken and not drawn. `screen`: a PPM file the scanout is written to when the run ends. Linux's `virtio_gpu` (DRM, dumb buffers), so Android's minigbm allocator and composer |
+| `pcie` | PCI Express host, ECAM (PCIe 6.0, 7.2.2), `buses` × 1 MiB at `base`; a memory window `mmio` / `mmio_size` (default 0x40000000, 1 GiB) | `devices`: virtio-blk, virtio-net, virtio-console, virtio-rng or virtio-gpu entries (no `base`), on bus 0 at 01.0 up, each with a 64-bit 16 KiB BAR0 holding the virtio PCI structures (VIRTIO 1.2, 4.1, modern only: common configuration, ISR, device configuration, notifications); INTx level interrupts, INTA of device *d* on PLIC source `irq` + *d* % 4, given to the kernel as an `interrupt-map`. What Android's kernels (no virtio-mmio) need |
 | `mvp` | the library's own map (`mvp_add_device`) | see below |
 | `rtl` | whatever the RTL decodes | see below |
 
@@ -379,6 +380,10 @@ kernel's driver turns the receive interrupt on (a driver empties the FIFO
 when it sets the port up, so earlier characters would be lost), as if they
 were typed once the system is up.
 
+Android: an unmodified AOSP Cuttlefish riscv64 build boots on mvplat to its
+boot animation, drawn on the `virtio-gpu` screen. [ANDROID.md](ANDROID.md)
+has the recipe (`tests/vplat/android/run.sh`) and how far it gets.
+
 ## Debugging
 
 `-trace FILE` writes a commit log, one line per instruction with the
@@ -490,6 +495,8 @@ for it.
 | `-mhz F` | hart clock |
 | `-max-cycles N` | stop after N cycles, exit code 4 |
 | `-input TEXT` | what the first UART receives |
+| `-input-at S:TEXT` | `TEXT` reaches the first UART at `S` seconds of simulated time; repeatable. The same run every time: for scripts that type into a system once it is up (an Android shell minutes into its boot) |
+| `-stdin` | what arrives on standard input goes to the first UART, read between quanta: an interactive console, or a pipe |
 | `-trace FILE` | commit log |
 | `-bios FILE`, `-kernel FILE`, `-initrd FILE`, `-append TEXT` | boot firmware and a kernel (see "Booting an operating system") |
 | `-dtb FILE`, `-dump-dtb FILE` | pass another device tree; write the platform's and exit |
@@ -610,8 +617,8 @@ vector instructions still run on the general path.
   to integers; other RMM results round as ties-to-even (differs only for a
   value exactly half way). Bare-metal software, RTOSes (FreeRTOS, Zephyr),
   OpenSBI, Linux with an rv64gc user space and the architecture tests run.
-- Of virtio, the block, network and console devices: no entropy, 9p,
-  GPU or input devices yet, no console multiport, and no indirect descriptors, `EVENT_IDX`, checksum or segmentation
+- Of virtio, the block, network, console, entropy and GPU (2D) devices: no
+  9p, input or sound devices yet, no 3D GPU (virgl, Venus), no console multiport, and no indirect descriptors, `EVENT_IDX`, checksum or segmentation
   offload, or multiqueue. Disk images are raw (no qcow2). The `user` network
   answers ARP and ping only; there is no NAT to the host or a TAP back end.
 - No hardware triggers, no Smepmp (`mseccfg`).
