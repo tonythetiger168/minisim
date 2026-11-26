@@ -389,10 +389,19 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_ucis
                      -P ${CMAKE_SOURCE_DIR}/tests/mcov_ucis.cmake)
-    add_test(NAME mcov_compat
-             COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
-                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_compat
-                     -P ${CMAKE_SOURCE_DIR}/tests/mcov_compat.cmake)
+    if(MINISIM_VENDOR_COMPAT)
+      # mcov loads its vendor layer only from beside itself, so the test runs
+      # a copy of the two scripts, as they are installed.
+      set(_mcovdir ${CMAKE_CURRENT_BINARY_DIR}/compat_tools)
+      configure_file(tools/mcov.py ${_mcovdir}/mcov.py COPYONLY)
+      configure_file(tools/compat/mcov_compat.py ${_mcovdir}/mcov_compat.py COPYONLY)
+      add_test(NAME mcov_compat
+               COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
+                       -DSRC=${CMAKE_SOURCE_DIR} -DMCOVDIR=${_mcovdir}
+                       -DOUT=${CMAKE_CURRENT_BINARY_DIR}/mcov_compat
+                       -P ${CMAKE_SOURCE_DIR}/tests/compat/mcov_compat.cmake)
+      set_tests_properties(mcov_compat PROPERTIES LABELS compat)
+    endif()
     add_test(NAME msim_cov_select
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_select
@@ -631,6 +640,9 @@ if(MINISIM_WITH_SLANG)
 endif()
 install(PROGRAMS tools/mregress.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mregress)
 install(PROGRAMS tools/mcov.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mcov)
+if(MINISIM_VENDOR_COMPAT)
+  install(FILES tools/compat/mcov_compat.py DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(PROGRAMS tools/mbug.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mbug)
 install(PROGRAMS tools/mplan.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan)
 install(PROGRAMS tools/mplan_serve.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME mplan_serve)

@@ -5,7 +5,7 @@ file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT})
 set(MPLAN ${PY} ${SRC}/tools/mplan.py)
 set(MREGRESS ${PY} ${SRC}/tools/mregress.py)
-set(PLAN ${SRC}/tests/plan/counter.vplan)
+set(PLAN ${SRC}/tests/plan/counter.mplan)
 set(LIST ${SRC}/tests/plan/plan.list)
 
 function(expect what rc want out)
@@ -98,9 +98,9 @@ execute_process(COMMAND ${MPLAN} triage -results ${OUT}/r1 -plan ${PLAN} -histor
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("triage" ${rc} 1 "${out}" "\\[new\\]  Error: scoreboard mismatch" "features: scoreboard; owner: bob")
 
-execute_process(COMMAND ${MPLAN} init -results ${OUT}/r1 -name counter -o ${OUT}/draft.vplan
+execute_process(COMMAND ${MPLAN} init -results ${OUT}/r1 -name counter -o ${OUT}/draft.mplan
                 RESULT_VARIABLE rc OUTPUT_QUIET)
-execute_process(COMMAND ${MPLAN} report ${OUT}/draft.vplan -results ${OUT}/r1 -o ${OUT}/draft -no-history
+execute_process(COMMAND ${MPLAN} report ${OUT}/draft.mplan -results ${OUT}/r1 -o ${OUT}/draft -no-history
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("init" ${rc} 0 "${out}" "test count\\* +100\\.0% +met +3/3" "cover tb\\.cg +100\\.0%" "assert tb\\.dut +100\\.0% +met +3/3")
 if(EXISTS ${OUT}/draft/history.jsonl)
@@ -117,16 +117,16 @@ endforeach()
 
 # FSM and condition metrics (tests/cov/fsm.sv): one run, then both.
 file(WRITE ${OUT}/fsm.list "a: ${SRC}/tests/cov/fsm.sv -top tb\nb: ${SRC}/tests/cov/fsm.sv -top tb +define+MORE\n")
-file(WRITE ${OUT}/fsm.vplan "plan fsm\n  feature ctrl\n    fsm tb.u.state goal=80\n    cond fsm.sv goal=60\n  feature all\n    fsm tb\n")
+file(WRITE ${OUT}/fsm.mplan "plan fsm\n  feature ctrl\n    fsm tb.u.state goal=80\n    cond fsm.sv goal=60\n  feature all\n    fsm tb\n")
 execute_process(COMMAND ${MREGRESS} ${OUT}/fsm.list -exe ${MSIM} -cov -seed 1 -q -o ${OUT}/f0 -filter "^a$"
                 RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
-execute_process(COMMAND ${MPLAN} report ${OUT}/fsm.vplan -results ${OUT}/f0 -o ${OUT}/fplan -label f0
+execute_process(COMMAND ${MPLAN} report ${OUT}/fsm.mplan -results ${OUT}/f0 -o ${OUT}/fplan -label f0
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("fsm report 0" ${rc} 0 "${out}" "fsm tb\\.u\\.state +60\\.0% +below goal +6/10  goal 80%"
        "cond fsm\\.sv +50\\.0% +below goal +9/18  goal 60%" "fsm tb +70\\.8% +below goal +17/24" "cond 50\\.0%, fsm 70\\.8%")
 execute_process(COMMAND ${MREGRESS} ${OUT}/fsm.list -exe ${MSIM} -cov -seed 1 -q -o ${OUT}/f1
                 RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
-execute_process(COMMAND ${MPLAN} report ${OUT}/fsm.vplan -results ${OUT}/f1 -o ${OUT}/fplan -label f1
+execute_process(COMMAND ${MPLAN} report ${OUT}/fsm.mplan -results ${OUT}/f1 -o ${OUT}/fplan -label f1
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("fsm report 1" ${rc} 0 "${out}" "fsm tb\\.u\\.state +90\\.0% +met +9/10  goal 80%" "fsm tb +87\\.5% +below goal +21/24"
        "\\+17\\.2 since f0")
@@ -134,17 +134,17 @@ execute_process(COMMAND ${MPLAN} init -results ${OUT}/f1 RESULT_VARIABLE rc OUTP
 expect("fsm init" ${rc} 0 "${out}" "fsm tb\\.u\\.state" "cond fsm\\.sv")
 
 # Bad plans are refused with the file and line.
-file(WRITE ${OUT}/bad1.vplan "plan p\n  feature a\n    tset x\n")
-file(WRITE ${OUT}/bad2.vplan "plan p\n  feature a\n  feature a\n")
-file(WRITE ${OUT}/bad3.vplan "plan p\n  feature a\n    test x goal=120\n")
-file(WRITE ${OUT}/bad4.vplan "plan p\n  include bad4.vplan\n")
+file(WRITE ${OUT}/bad1.mplan "plan p\n  feature a\n    tset x\n")
+file(WRITE ${OUT}/bad2.mplan "plan p\n  feature a\n  feature a\n")
+file(WRITE ${OUT}/bad3.mplan "plan p\n  feature a\n    test x goal=120\n")
+file(WRITE ${OUT}/bad4.mplan "plan p\n  include bad4.mplan\n")
 foreach(n 1 2 3 4)
-  execute_process(COMMAND ${MPLAN} check ${OUT}/bad${n}.vplan RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
-  expect("bad plan ${n}" ${rc} 2 "${out}" "bad${n}\\.vplan(:[0-9]+)?: ")
+  execute_process(COMMAND ${MPLAN} check ${OUT}/bad${n}.mplan RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+  expect("bad plan ${n}" ${rc} 2 "${out}" "bad${n}\\.mplan(:[0-9]+)?: ")
 endforeach()
 
 # Requirements: a CSV list named by the plan, the matrix, the gate, the trend column.
-set(TRACED ${SRC}/tests/plan/traced.vplan)
+set(TRACED ${SRC}/tests/plan/traced.mplan)
 execute_process(COMMAND ${MPLAN} check ${TRACED} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("reqs check" ${rc} 0 "${out}" "6 requirement\\(s\\), 5 named by a feature" "no feature verifies: CNT-5  Parity output"
        "warning: feature reset names requirement 'CNT-9'")
@@ -170,8 +170,8 @@ execute_process(COMMAND ${MPLAN} trend ${OUT}/tplan/history.jsonl RESULT_VARIABL
 expect("reqs trend" ${rc} 0 "${out}" "Buckets +Reqs" " 3/6 ")
 
 # The same requirements from ReqIF (-reqs), with the hierarchy and the XHTML text; a draft plan from them.
-file(WRITE ${OUT}/rq.vplan "plan rq\n  feature count\n    req CNT-1.1 CNT-1.2\n    test count_*\n  feature sb\n    req CNT-2\n    test sb_*\n")
-execute_process(COMMAND ${MPLAN} report ${OUT}/rq.vplan -reqs ${SRC}/tests/plan/reqs.reqif -results ${OUT}/r1 -o ${OUT}/rqplan -no-history
+file(WRITE ${OUT}/rq.mplan "plan rq\n  feature count\n    req CNT-1.1 CNT-1.2\n    test count_*\n  feature sb\n    req CNT-2\n    test sb_*\n")
+execute_process(COMMAND ${MPLAN} report ${OUT}/rq.mplan -reqs ${SRC}/tests/plan/reqs.reqif -results ${OUT}/r1 -o ${OUT}/rqplan -no-history
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("reqif report" ${rc} 0 "${out}" "requirements: 2/3 verified, 1 failing" "failing +CNT-2  Reset  \\(sb 0\\.0%\\)")
 file(READ ${OUT}/rqplan/plan.json js)
@@ -181,7 +181,7 @@ endif()
 execute_process(COMMAND ${MPLAN} init -reqs ${SRC}/tests/plan/reqs.reqif -name cnt RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("reqif init" ${rc} 0 "${out}" "feature CNT-1 \"Counting\"\n    feature CNT-1_1 \"Count up and down\"\n      req CNT-1\\.1" "feature CNT-2 \"Reset\"\n    req CNT-2")
 file(WRITE ${OUT}/bad.csv "name,text\nx,y\n")
-execute_process(COMMAND ${MPLAN} check ${OUT}/rq.vplan -reqs ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+execute_process(COMMAND ${MPLAN} check ${OUT}/rq.mplan -reqs ${OUT}/bad.csv RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
 expect("bad reqs" ${rc} 2 "${out}" "bad\\.csv: no 'id' column")
 
 # Ranking: what each passing test adds (per-run coverage databases), the redundant ones, the tests behind a feature.
