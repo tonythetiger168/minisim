@@ -772,8 +772,15 @@ public:
                 std::sort(mine[f].begin(), mine[f].end());   // process order within a file
                 std::string body;
                 std::set<std::string> syms;
-                for (size_t i : mine[f]) { body += chunks[i]; syms.insert(csyms[i].begin(), csyms[i].end()); }
-                outFiles.push_back("#include \"design.hpp\"\n\n" + relocDecls(syms) + partDecls(body, hitems, howner) + "\n" + body);
+                for (size_t i : mine[f]) {
+                    body += chunks[i];
+                    std::string().swap(chunks[i]);   // held once (XiangShan's cycle domain: gigabytes)
+                    syms.insert(csyms[i].begin(), csyms[i].end());
+                }
+                std::string part = "#include \"design.hpp\"\n\n" + relocDecls(syms) + partDecls(body, hitems, howner) + "\n";
+                part += body;
+                std::string().swap(body);
+                outFiles.push_back(std::move(part));
             }
             o.str("");
             o << (kernelObj || mix ? "#include \"design.hpp\"\n\n" : "#include \"design.hpp\"\n\nSim S;\n\n");
@@ -1239,10 +1246,9 @@ public:
         }
         // Each piece is freed as it is appended (a large design's C++ is
         // gigabytes).
-        size_t total = dcpp.size() + 64 * (outFiles.size() + 1);
-        for (auto& f : outFiles) total += f.size();
+        // No reserve: grown in place (mremap) while the pieces are freed, the
+        // text is held about once instead of twice.
         std::string all;
-        all.reserve(total);
         all += std::string(kFileMark) + "design.hpp\n";
         all += outFiles[0];
         std::string().swap(outFiles[0]);
