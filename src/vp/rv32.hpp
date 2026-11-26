@@ -281,6 +281,11 @@ struct Hart {
     bool wfi = false;
     bool resv = false;
     uint64_t resvAddr = 0;
+    // An access split across two pages faulted on its second page: the
+    // trap's tval is that page's address, the part that faulted (privileged
+    // spec, 3.1.16), not the access's own. Taken by the trap.
+    bool splitFault = false;
+    uint64_t splitFaultVa = 0;
     uint64_t resvVal = 0;  // -mt: the value LR read; SC stores only if it is still there
 
     // Run state.

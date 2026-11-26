@@ -1,0 +1,13 @@
+// A virtio-gpu display, 64 x 32, over MMIO (tests/vplat/gpu.c). The test
+// adds "screen" to a copy of this file to get the picture.
+{
+  "name": "virt32+gpu",
+  "devices": [
+    {"type": "finisher", "base": "0x00100000"},
+    {"type": "clint", "base": "0x02000000"},
+    {"type": "plic", "base": "0x0c000000", "sources": 31},
+    {"type": "uart16550", "name": "uart0", "base": "0x10000000", "irq": 10},
+    {"type": "virtio-gpu", "name": "gpu", "base": "0x10001000", "irq": 1, "width": 64, "height": 32},
+    {"type": "ram", "name": "dram", "base": "0x80000000", "size": "16M"}
+  ]
+}

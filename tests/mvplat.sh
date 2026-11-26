@@ -28,6 +28,14 @@ expect "-map" 0 map.out "0x80000000..0x87ffffff  ram        dram"
 
 "$MVPLAT" "$E/irq.elf" -input abc -q > irq.out 2>&1; rc=$?
 expect "timer, software and external interrupts" 0 irq.out "timer ticks 5, software 1, received 'abc'"
+# Input later on: at a simulated time (the harts wait in WFI until then),
+# and from standard input.
+"$MVPLAT" "$E/irq.elf" -input-at "0.002:ab" -input-at "0.003:c" -q > irqat.out 2>&1; rc=$?
+expect "-input-at: text at a simulated time" 0 irqat.out "received 'abc'"
+printf abc | "$MVPLAT" "$E/irq.elf" -stdin -q > irqin.out 2>&1; rc=$?
+expect "-stdin: what standard input brings" 0 irqin.out "received 'abc'"
+"$MVPLAT" "$E/irq.elf" -input-at "soon:abc" -q > irqbad.out 2>&1; rc=$?
+expect "-input-at refuses a time that is not a number" 2 irqbad.out "SECONDS:TEXT"
 
 "$MVPLAT" "$E/pmp.elf" -q > pmp.out 2>&1; rc=$?
 expect "PMP: NAPOT, NA4, TOR, partial match, MPRV, locked entries" 0 pmp.out "pmp: all checks passed"
@@ -155,6 +163,28 @@ expect "PCIe host and virtio over PCI" 0 pcie.out "pcie: all checks passed"
 "$MVPLAT" -platform "$T/pcie.json" -dump-dtb pcie.dtb "$E/pcie.elf" -q > /dev/null 2>&1
 grep -q "pci-host-ecam-generic" pcie.dtb && grep -q "interrupt-map" pcie.dtb &&
   ok "the device tree has the ECAM host and its interrupt-map" || bad "PCIe host in the device tree"
+
+# virtio-gpu: a bare-metal driver draws through the 2D commands; the
+# picture the device writes at the end ("screen") is what it drew.
+sed 's/"height": 32}/"height": 32, "screen": "gpu.ppm"}/' "$T/gpu.json" > gpu.json
+rm -f gpu.ppm
+"$MVPLAT" -platform gpu.json "$E/gpu.elf" -q > gpu.out 2>&1; rc=$?
+expect "virtio-gpu: display info, resources, transfers, scanout, flush" 0 gpu.out "gpu: all checks passed"
+if command -v python3 > /dev/null 2>&1; then
+  python3 - <<'P' && ok "virtio-gpu: the screen file holds the picture" || bad "virtio-gpu screen file"
+import sys
+b = open('gpu.ppm', 'rb').read()
+h = b'P6\n64 32\n255\n'
+assert b[:len(h)] == h and len(b) == len(h) + 64 * 32 * 3, b[:20]
+p = b[len(h):]
+for y in range(32):
+    for x in range(64):
+        want = (0x80, 8 * y, 4 * x)
+        if 10 <= x < 14 and 5 <= y < 8: want = (255, 255, 255)
+        got = tuple(p[3 * (y * 64 + x):3 * (y * 64 + x) + 3])
+        assert got == want, (x, y, got, want)
+P
+fi
 
 # virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
 # image; the file changes only with -disk-write.

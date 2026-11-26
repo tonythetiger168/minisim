@@ -78,6 +78,8 @@ void usage() {
         "  -mhz F             hart clock in MHz (default 100)\n"
         "  -max-cycles N      stop after N cycles (exit code 4)\n"
         "  -input TEXT        characters the first UART receives\n"
+        "  -input-at S:TEXT   TEXT reaches the first UART at S seconds of simulated time (repeatable)\n"
+        "  -stdin             what is typed on standard input goes to the first UART, between quanta\n"
         "  -trace FILE        commit log, one line per instruction (spike's format)\n"
         "  -nojit             interpret only (no translation to host code)\n"
         "  -serial            harts take turns on one thread, a quantum each, with no\n"
@@ -130,7 +132,8 @@ struct Options {
     long long quantum = -1, maxCycles = 0;
     double mhz = 0;
     bool map = false, quiet = false, nojit = false, serial = false, parallel = false, threadsGiven = false, mt = false;
-    bool haveInput = false;
+    bool haveInput = false, stdinInput = false;
+    std::vector<std::pair<double, std::string>> inputAt;
 };
 
 std::string exeDir() {
@@ -234,6 +237,17 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             if (d.get("seed")) v->seed = d.get("seed")->u64();
             return std::unique_ptr<VirtioMmio>(std::move(v));
+        } else if (t == "virtio-gpu") {
+            auto v = std::make_unique<VirtioGpu>();
+            v->name = name;
+            v->base = at;
+            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+            if (d.get("width")) v->width = (uint32_t)d.get("width")->u64();
+            if (d.get("height")) v->height = (uint32_t)d.get("height")->u64();
+            if (v->width < 16 || v->width > 8192 || v->height < 16 || v->height > 8192)
+                throw std::runtime_error(d.where() + "'" + name + "': width and height are 16 to 8192");
+            if (d.get("screen")) v->screen = rel(d.get("screen")->str());
+            return std::unique_ptr<VirtioMmio>(std::move(v));
         } else if (t == "virtio-net") {
             auto v = std::make_unique<VirtioNet>();
             v->name = name;
@@ -279,6 +293,14 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             u->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             std::string in = d.get("input") ? d.get("input")->str() : "";
             if (firstUart && o.haveInput && !o.vcon) in = o.input;
+            if (firstUart && !o.vcon) {
+                for (auto& [t, text] : o.inputAt) u->timed.push_back({(uint64_t)(t * 1e12), text});
+                std::stable_sort(u->timed.begin(), u->timed.end(), [](auto& a, auto& b) { return a.first < b.first; });
+                if (o.stdinInput) {
+                    u->hostFd = 0;
+                    fcntl(0, F_SETFL, fcntl(0, F_GETFL) | O_NONBLOCK);
+                }
+            }
             for (char c : in) u->rx.push_back((uint8_t)c);
             firstUart = false;
             dev = std::move(u);
@@ -326,7 +348,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
                     std::string ct = c.get("type") ? c.get("type")->str() : "";
                     std::string cn = c.get("name") ? c.get("name")->str() : name + "." + ct;
                     auto v = makeVirtio(c, ct, cn, 0);
-                    if (!v) throw std::runtime_error(c.where() + "a PCIe device is virtio-blk, virtio-net, virtio-console or virtio-rng, not '" + ct + "'");
+                    if (!v) throw std::runtime_error(c.where() + "a PCIe device is virtio-blk, virtio-net, virtio-console, virtio-rng or virtio-gpu, not '" + ct + "'");
                     if (h->count() >= 31) throw std::runtime_error(c.where() + "at most 31 devices behind a PCIe host");
                     h->addVirtio(std::move(v));
                 }
@@ -337,7 +359,7 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             Ext* x = loadExt(g_argc, g_argv, ("device type '" + type + "'").c_str());
             if (x && x->device(m, d, type, name, dir)) continue;
             throw std::runtime_error(d.where() + "unknown device type '" + type +
-                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console, virtio-rng, goldfish-rtc, pcie" +
+                                     "' (ram, rom, uart16550, clint, plic, finisher, virtio-blk, virtio-net, virtio-console, virtio-rng, virtio-gpu, goldfish-rtc, pcie" +
                                      (x ? "" : "; mvp and rtl need the mvplat extension library") + ")");
         }
         m.bus.add(std::move(dev));
@@ -569,6 +591,18 @@ int main(int argc, char** argv) {
         else if (s == "-mhz") { std::string v = next("a frequency"); o.mhz = atof(v.c_str()); }
         else if (s == "-max-cycles") o.maxCycles = integer("a number of cycles");
         else if (s == "-input") { o.input = next("text"); o.haveInput = true; }
+        else if (s == "-input-at") {
+            std::string a = next("SECONDS:TEXT");
+            size_t c = a.find(':');
+            char* e = nullptr;
+            double t = c == std::string::npos ? -1 : strtod(a.substr(0, c).c_str(), &e);
+            if (c == std::string::npos || !e || *e || t < 0) {
+                std::cerr << "mvplat: -input-at wants SECONDS:TEXT (simulated seconds), not '" << a << "'\n";
+                std::exit(2);
+            }
+            o.inputAt.push_back({t, a.substr(c + 1)});
+        }
+        else if (s == "-stdin") o.stdinInput = true;
         else if (s == "-trace") o.trace = next("a file");
         else if (s == "-bios") o.bios = next("a firmware file");
         else if (s == "-kernel") o.kernel = next("a kernel file");
