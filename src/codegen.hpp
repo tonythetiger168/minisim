@@ -227,7 +227,18 @@ public:
         evPlain_.assign(procs.size(), 0);
         evAt_.assign(procs.size(), -1);
         evDT_.clear();
+        // The arming processes of always @* blocks (tens of thousands in an
+        // SoC, each a coroutine of its own) run as one shared coroutine,
+        // armOnce, given their wait list and flag (MSIM_NOARMSHARE=1: off).
+        armOne_.assign(procs.size(), 0);
+        if (dom.empty() && !upf && !std::getenv("MSIM_NOARMSHARE"))
+            for (size_t i = 0; i < procs.size(); i++) {
+                if (!armShape(procs[i], sigs) || procs[i].kind == "init" || sigs[procs[i].prog->code[1].sig].w != 1) continue;
+                const E& v = procs[i].prog->code[1].e;
+                if (v && v->op == Op::Const && v->k.v == 1 && !v->k.x && !v->k.z && !v->k.real && !v->k.str) armOne_[i] = 1;
+            }
         for (size_t i = 0; i < procs.size(); i++) {
+            if (armOne_[i]) continue;
             const bool inDom = inDomV[i] != 0;
             if (upf && procs[i].prog->pd >= 0 && (procs[i].combRank >= 0 || procs[i].seq || inDom))
                 throw CodegenUnsupported("a statically scheduled process of a power domain");
@@ -407,6 +418,10 @@ public:
              "static E XT(const char* p) { return XP(p); }\n"
              "// A process that never waits, as a plain function (Codegen::evPlain).\n"
              "[[maybe_unused]] static Task evOnce(void (*f)(const void*), const void* x) { f(x); co_return; }\n"
+             "// An always @* arming process (msim.cpp rotateAtStar), one for all of them:\n"
+             "// wait once on the block's inputs, then set its flag.\n"
+             "[[maybe_unused]] static Task armOnce(const std::vector<std::pair<int, Edge>>* ev, int flag) {\n"
+             "    co_await WaitAny{ev};\n    S.setOneBit(flag, Val{1, 0, 1, 0, false});\n    co_return;\n}\n"
              "static E XA(E e, const ArrShape& a) { e->arr = std::shared_ptr<const ArrShape>(std::shared_ptr<void>{}, &a); return e; }\n"
              "// Unpacked arrays (eval() Op::ArrRead, target() in exec.inc): the element signal, or -1.\n"
              "static inline int AOFF(const ArrShape& a, std::initializer_list<Val> ix) {\n"
@@ -1166,14 +1181,16 @@ public:
             o << "    S.fastCommit = fcommit;\n";
         }
         {   // clocked functions and coroutine processes, in process order
-            std::string evs, tab;
+            std::string tab;
+            std::vector<int> evS, evE;   // the wait lists, as numbers (intTable)
             size_t off = 0, n = 0;
+            int nArm = 0;
             for (size_t i = 0; i < procs.size(); i++) {
                 if (procs[i].combRank >= 0) continue;
                 if (std::find(dom.begin(), dom.end(), (int)i) != dom.end() || isInit(i)) continue;
                 n++;
                 if (procs[i].seq && !(i < mixSeq_.size() && mixSeq_[i])) {
-                    for (auto& [sg, ed] : procs[i].seqEv) evs += "{" + std::to_string(sg) + ", " + edge(ed) + "},";
+                    for (auto& [sg, ed] : procs[i].seqEv) { evS.push_back(sg); evE.push_back((int)ed); }
                     const std::string nm = evName_.size() > i && !evName_[i].empty() ? evName_[i] : std::to_string(i);
                     tab += "        {seq" + nm + ", nullptr, " + std::to_string(off) + ", " +
                            std::to_string(procs[i].seqEv.size()) + ", 0, " + evCtx((int)i) + ", nullptr},\n";
@@ -1184,7 +1201,14 @@ public:
                     // first initial block start just before it (or last if there
                     // is none); each Task is still made in declaration order.
                     const int late = procs[i].kind == "assign" && !procs[i].loops ? 1 : procs[i].kind == "Initial" ? 2 : 0;
-                    if (i < evPlain_.size() && evPlain_[i]) {
+                    if (armOne_[i]) {
+                        const auto& w = procs[i].prog->code[0];
+                        for (auto& [sg, ed] : w.events) { evS.push_back(sg); evE.push_back((int)ed); }
+                        tab += "        {nullptr, nullptr, " + std::to_string(off) + ", " + std::to_string(w.events.size()) + ", " +
+                               std::to_string(late) + ", nullptr, nullptr, 0, 0, " + std::to_string(nArm++) + ", " +
+                               std::to_string(procs[i].prog->code[1].sig) + "},\n";
+                        off += w.events.size();
+                    } else if (i < evPlain_.size() && evPlain_[i]) {
                         const std::string nm = !evName_[i].empty() ? evName_[i] : std::to_string(i);
                         tab += "        {nullptr, nullptr, 0, 0, " + std::to_string(late) + ", " + evCtx((int)i) + ", proc" + nm + "},\n";
                     } else {
@@ -1197,11 +1221,18 @@ public:
                 }
             }
             if (n) {
-                o << "    static const std::pair<int, Edge> SEV[] = {" << evs << "{0, ANY}};\n"
-                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; const void* x; void (*f)(const void*); int ck; unsigned long long half; } PROCS[] = {\n"
+                o << intTable("SEVS", evS) << intTable("SEVE", evE) <<
+                     "    static std::vector<std::pair<int, Edge>> SEVV(" << evS.size() + 1 << ");\n"
+                     "    for (size_t k = 0; k < " << evS.size() << "; k++) SEVV[k] = {SEVS[k], (Edge)SEVE[k]};\n"
+                     "    const std::pair<int, Edge>* const SEV = SEVV.data();\n"
+                     "    static std::vector<std::pair<int, Edge>> ARMEV[" << std::max(nArm, 1) << "];\n"
+                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; const void* x; void (*f)(const void*); int ck; unsigned long long half; int arm = -1, flag = -1; } PROCS[] = {\n"
                   << tab << "    };\n"
                      "    std::vector<Task> held;\n    bool init1 = false;\n"
-                     "    auto mk = [](const auto& p) { return p.p ? p.p() : evOnce(p.f, p.x); };\n"
+                     "    auto mk = [&](const auto& p) {\n"
+                     "        if (p.arm < 0) return p.p ? p.p() : evOnce(p.f, p.x);\n"
+                     "        ARMEV[p.arm].assign(SEV + p.at, SEV + p.at + p.n);\n"
+                     "        return armOnce(&ARMEV[p.arm], p.flag);\n    };\n"
                      "    for (auto& p : PROCS)\n"
                      "        if (p.s) S.addSeq(p.s, p.x, std::vector<std::pair<int, Edge>>(SEV + p.at, SEV + p.at + p.n));\n"
                      "        else if (p.late == 1 && !init1) held.push_back(mk(p));\n"
@@ -1323,6 +1354,7 @@ public:
         msimIns_.push_back(&i);
         return "MSIMI(" + std::to_string(msimIns_.size() - 1) + ")";
     }
+    std::vector<char> armOne_;   // an always @* arming process run by armOnce (run)
     std::vector<char> mixSeq_;   // a clocked process left to the interpreter, or run as a coroutine
     // A clocked process as a clocked function, or else (a $display in it, say)
     // as an ordinary coroutine process, as with msim -no-static-seq.
