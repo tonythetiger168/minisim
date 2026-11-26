@@ -1,7 +1,7 @@
 # msim -xprop (docs/XPROP.md): each tests/xprop/*.sv prints its "//> " lines
 # in every execution mode: event-driven on one thread, the default
 # interpreter, four threads, and msim -compile. "//! args:" gives the test's
-# options (-xprop, -xprop=xmerge). Also checks -xprop-report.
+# options (-xprop, -xprop=pessimistic). Also checks -xprop-report.
 # Called with -DMSIM=<msim> -DSRC=<source dir> -DOUT=<scratch dir>.
 file(GLOB tests ${SRC}/tests/xprop/*.sv)
 list(SORT tests)
@@ -45,7 +45,7 @@ endforeach()
 execute_process(COMMAND ${MSIM} checks-fallback.sv -xprop -xprop-report ${OUT}/report.txt
                 OUTPUT_QUIET RESULT_VARIABLE rc WORKING_DIRECTORY ${SRC}/tests/xprop)
 file(READ ${OUT}/report.txt rep)
-if(NOT rc EQUAL 0 OR NOT rep MATCHES "xprop tmerge: 19 of 21" OR NOT rep MATCHES "case: merged"
+if(NOT rc EQUAL 0 OR NOT rep MATCHES "xprop merge: 19 of 21" OR NOT rep MATCHES "case: merged"
    OR NOT rep MATCHES "rest after break / continue / disable: merged"
    OR NOT rep MATCHES "loop body: merged"
    OR NOT rep MATCHES "if: not merged, it holds a task or function call statement"

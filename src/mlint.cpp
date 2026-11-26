@@ -16,6 +16,7 @@
 //   L004  one variable or net is assigned by more than one process.
 //   CDC001..CDC005, RDC001..RDC004  clock- and reset-domain crossings (cdc.hpp).
 //   UPF001..UPF012  with -upf: power intent checks (upf.hpp check()).
+#include "compat.hpp"   // compat::kVendorCompat: other vendors' option spellings
 #include "upf_hdl.hpp"
 #include <unistd.h>
 
@@ -149,7 +150,7 @@ void usage() {
               << cdc::usage() <<
                  "  -top M           the top module    -f <file>  an argument file\n"
                  "  -upf <file>      check IEEE 1801 (UPF) power intent against the design (UPF rules)\n"
-                 "  -power_top <i>   the instance the UPF describes (default: set_design_top, else the top)\n"
+                 "  -upf_top <i>     the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  +define+N[=V]  +incdir+<dir>  -I <dir>  -D N[=V]\n"
               << protfront::Options::help() <<
                  "  -version         print the version\n"
@@ -603,11 +604,11 @@ int main(int argc, char** argv) {
         if (a == "-Werror") { werror = true; continue; }
         if (cdcOpt.take(a, next)) continue;
         if (a == "-upf") { upfPath = next("a UPF file"); continue; }
-        if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
+        if (a == "-upf_top" || (compat::kVendorCompat && a == "-power_top")) { powerTop = next("an instance path"); powerTopSet = true; continue; }
         if (a == "-quiet" || a == "-q") { quiet = true; continue; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
-        if (a == "-sv" || a == "-sverilog") continue;
+        if (a == "-sv" || (compat::kVendorCompat && a == "-sverilog")) continue;
         if (fe.prot.take(argc, argv, i)) continue;
         if (a == "-v93" || a == "-v2008" || a == "-vhdl2008" || a == "-v200x" || a == "-vhdl93" || a == "-vhdl87") continue;
         if (a.size() && a[0] != '-' && vhdl::isVhdlFile(a)) { vhdlFiles.push_back(a); continue; }

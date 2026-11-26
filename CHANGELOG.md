@@ -8,6 +8,14 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Changed
+- msim's options take minisim's own names: `-cov_metrics=`, `-cov_scope`,
+  `-cov_cond`, `-upf_top`, `-dpi_header`, `-vpi`, `-uvm_home`,
+  `-xprop=merge|pessimistic|off`, and `-compile` / `-o` for partition
+  compile. The other simulators' spellings (`-cm`, `-cm_hier`, `-cm_cond`,
+  `-power_top`, `-dpiheader`, `-load`, `-uvmhome`, `-sverilog`, `-ucli`,
+  `+ntb_random_seed=`, `-partcomp*`, `-Mdir=`) are accepted only in a
+  `-DMINISIM_VENDOR_COMPAT=ON` build (docs/compat/COMPAT.md). mdebug and
+  mlint take `-upf_top` too. mregress passes `-seed` to msim.
 - mcov's URG, IMC and vcover command lines move to `tools/compat/mcov_compat.py`,
   installed beside mcov only with `-DMINISIM_VENDOR_COMPAT=ON`.
 - mlint: the goal `lint_rtl` is now `rtl` (the old name only in a
