@@ -7043,6 +7043,8 @@ private:
         }
         return r;
     }
+    static constexpr long long kEvArr = 1LL << 40;   // shareEv: array shape numbers, apart from signals
+    const bool noShareArr_ = std::getenv("MSIM_NOSHAREARR") != nullptr;
     void shareEv(std::vector<EvUnit>& us, std::vector<std::string>& chunks) {
         // Each distinct signal of a template is a slot a member moves by its
         // own distance (the same signal twice: the same distance). Slots
@@ -7059,11 +7061,13 @@ private:
             std::vector<long long> num;
             bool ok = true;
             size_t last = 0;
+            // Signal numbers, and array shapes AS<k> (a module's memories:
+            // OpenSPARC's TLBs), which the template reaches as AST[k + D].
             refScan(norm[u], [&](size_t, size_t at, size_t e, long long n, int kind) {
-                if (kind != 0) ok = false;
+                if (kind != 0 && (kind != 2 || noShareArr_)) ok = false;
                 shape += refPiece(norm[u].substr(last, at - last));
-                shape += '\x01';
-                num.push_back(n);
+                shape += kind == 2 ? '\x02' : '\x01';
+                num.push_back(kind == 2 ? kEvArr + n : n);
                 last = e;
             });
             shape += refPiece(norm[u].substr(last));
@@ -7134,9 +7138,15 @@ private:
             std::string r;
             r.reserve(nt.size() + nt.size() / 4);
             size_t last = 0, k = 0;
-            refScan(nt, [&](size_t, size_t, size_t e, long long, int) {
-                r.append(nt, last, e - last);
-                if (int m = merged[(size_t)t.slot[k]]; m >= 0) r += " + D" + std::to_string(m);
+            refScan(nt, [&](size_t start, size_t, size_t e, long long n, int kind) {
+                const int m = merged[(size_t)t.slot[k]];
+                if (kind == 2 && m >= 0) {
+                    r.append(nt, last, start - last);
+                    r += "(*AST[" + std::to_string(n) + " + D" + std::to_string(m) + "])";
+                } else {
+                    r.append(nt, last, e - last);
+                    if (m >= 0) r += " + D" + std::to_string(m);
+                }
                 k++;
                 last = e;
             });
