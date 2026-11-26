@@ -13,7 +13,7 @@ endmodule
 module vecclk;
   localparam int N = 72;
   logic clk = 0;
-  logic [N-1:0] rst_n = '0;
+  logic [N-1:0] rst_n = '1;   // falls at 1: every block sees a reset edge
   logic [N-1:0] kids;
   logic [7:0] q [N];
   logic [7:0] sum = 0, ev = 0;
@@ -27,6 +27,7 @@ module vecclk;
   always @(posedge bus[N + 5]) ev <= ev + 1;
   always #5 clk = ~clk;
   initial begin
+    #1 rst_n = '0;
     for (int i = 0; i < N; i++) begin
       #3 rst_n[i] = 1;
     end
