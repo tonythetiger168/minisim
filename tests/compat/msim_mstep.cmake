@@ -1,11 +1,11 @@
-# The multi-step front ends (src/mstep.inc, docs/COMPAT.md): Siemens vlib,
+# The multi-step front ends (src/compat/mstep.inc, docs/compat/COMPAT.md): Siemens vlib,
 # vmap, vlog, vcom, vsim and Synopsys vlogan, vhdlan, vcs, simv, run as
 # links to msim. Each flow analyses a package into a library of its own, a
 # VHDL entity and an SV testbench into work, then simulates the testbench.
 # A file with a syntax error is not added; analysing a file again replaces
 # its line.
 #   cmake -DMSIM=<msim> -DSRC=<source dir> -DOUT=<dir> -P msim_mstep.cmake
-set(D ${SRC}/tests/mstep)
+set(D ${SRC}/tests/compat/mstep)
 set(VHD ${SRC}/tests/vhdl/counter.vhd)
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT}/bin ${OUT}/q ${OUT}/s ${OUT}/one)

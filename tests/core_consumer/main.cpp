@@ -40,5 +40,10 @@ int main() {
     std::vector<std::string> args{"--compat=cadence", "-64bit"};
     compat::Vendor v = compat::detect("tool", args, {});
     compat::Result r = compat::translate(v, args, {});
-    return (sum == 10 && prog.code.size() == 1 && v == compat::Vendor::Cadence && r.args.empty()) ? 0 : 1;
+    // Without MINISIM_VENDOR_COMPAT the vendor option is not recognized and
+    // stays in the arguments; with it, it selects the Cadence rules.
+    bool compatOk = compat::kVendorCompat
+                        ? (v == compat::Vendor::Cadence && r.args.empty())
+                        : (v == compat::Vendor::Native && r.args.size() == 2);
+    return (sum == 10 && prog.code.size() == 1 && compatOk) ? 0 : 1;
 }

@@ -1,9 +1,9 @@
-# The xrun / irun front end (src/xrun.inc, docs/XRUN.md): msim run as xrun
+# The xrun / irun front end (src/compat/xrun.inc, docs/compat/XRUN.md): msim run as xrun
 # (a link), as irun, and as msim -xrun, with -f / -F files, -incdir, -define,
 # -top, -timescale, ignored options, the log file, -input Tcl, -elaborate,
 # and VHDL files passed to msim's VHDL front end.
 #   cmake -DMSIM=<msim> -DSRC=<source dir> -DOUT=<dir> -P msim_xrun.cmake
-set(D ${SRC}/tests/xrun)
+set(D ${SRC}/tests/compat/xrun)
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT})
 file(CREATE_LINK ${MSIM} ${OUT}/xrun SYMBOLIC)

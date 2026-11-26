@@ -4,4 +4,6 @@ include_guard(GLOBAL)
 add_executable(test_compat ${CMAKE_SOURCE_DIR}/tests/test_compat.cpp)
 target_include_directories(test_compat PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(test_compat PRIVATE -UNDEBUG)   # asserts stay on in Release too
+# The mechanism is tested with the vendor tables on, whatever the build option.
+target_compile_definitions(test_compat PRIVATE MINISIM_VENDOR_COMPAT=1)
 add_test(NAME test_compat COMMAND test_compat)

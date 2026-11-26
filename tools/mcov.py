@@ -94,7 +94,7 @@ with its statements, branches, conditions, toggles, FSMs, assertions and
 covergroups; a reader adds the instances up. Proprietary binary databases
 are not read.
 
-Other vendors' command lines (docs/COMPAT.md): with --compat=synopsys,
+Other vendors' command lines (docs/compat/COMPAT.md): with --compat=synopsys,
 cadence or siemens (or -compat X), or started through a symlink named urg,
 imc or vcover, mcov takes those tools' commands and runs its own engine:
 
@@ -1870,7 +1870,7 @@ def rank_main(a):
 
 
 # ---------------------------------------------------------------------------
-# Other vendors' coverage command lines (docs/COMPAT.md): one engine, these
+# Other vendors' coverage command lines (docs/compat/COMPAT.md): one engine, these
 # only translate. --compat=synopsys|cadence|siemens (or -compat X) anywhere,
 # or the name mcov was started as (a symlink the user makes) picks the
 # vendor. Their binary databases are not read: give mcov databases (JSON or

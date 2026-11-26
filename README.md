@@ -125,7 +125,7 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-pgo-gen`, `-pgo-use` | Profile-guided `-compile` build (gcc). `-pgo-gen` builds a `simv` that writes profiles into `<dir>/pgo` when it runs; a second `-compile -pgo-use` with the same `-o <dir>` rebuilds the design with them. Ibex: 105 ms -> 92 ms, Verilator 5.054 -O3 93 ms on the same machine |
 | `-xprop[=tmerge\|xmerge\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
 | `-restore <checkpoint> [+plusargs]` | Go back to a `$save` checkpoint: run the saved command line again quietly up to it, check the state, and carry on; see [`docs/CHECKPOINT.md`](docs/CHECKPOINT.md) |
-| `-xrun ...` (or msim run as `xrun` / `irun`) | The rest of the command line is an xrun / irun one: `-f`, `-incdir`, `-define`, `-l`, `-input`, `-access`, ... translated to msim options; see [`docs/XRUN.md`](docs/XRUN.md) |
+| `-xrun ...` (or msim run as `xrun` / `irun`) | The rest of the command line is an xrun / irun one: `-f`, `-incdir`, `-define`, `-l`, `-input`, `-access`, ... translated to msim options; see [`docs/compat/XRUN.md`](docs/compat/XRUN.md). Vendor layer: only in builds with `-DMINISIM_VENDOR_COMPAT=ON` |
 | `-elab` | Stop after elaboration, before the run |
 | `-strict-drivers` | Illegal variable drivers (several continuous assignments, an always_ff variable written elsewhere; IEEE 1800 6.5, 9.2.2) are errors |
 | `-profile [<file>]` | Simulation profile: time and activations per process, instance, source file and kind, plus scheduler regions (default `simprofile.txt`); see [`docs/PROFILE.md`](docs/PROFILE.md) |

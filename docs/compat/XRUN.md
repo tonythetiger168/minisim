@@ -1,5 +1,8 @@
 # xrun / irun command line
 
+> Vendor compatibility layer. It is built only with `-DMINISIM_VENDOR_COMPAT=ON`
+> and is not part of the default minisim build.
+
 msim takes the Cadence `xrun` / `irun` command line through a small
 translation layer (`src/xrun.inc`). It is the same msim binary and the same
 engine: the options are rewritten to msim's own and the run is msim's.
@@ -64,7 +67,7 @@ are always on in msim; coverage files and snapshot names have no counterpart.
 
 | xrun / irun | why |
 |---|---|
-| `.vhd`, `.vhdl`, `-v93`, `-v200x` | VHDL files go to msim's VHDL front end ([VHDL.md](VHDL.md)); the version options are accepted |
+| `.vhd`, `.vhdl`, `-v93`, `-v200x` | VHDL files go to msim's VHDL front end ([VHDL.md](../VHDL.md)); the version options are accepted |
 | `-R`, `-r snapshot` | msim keeps no snapshot between runs; give the sources again |
 | `-gui` | no GUI; the run goes on, open the waveform with mdebug (docs/DEBUG.md) |
 | Tcl `database`, `simvision`, `dumptcf`, `assertion` in `-input` | ignored with a note; `probe` writes a VCD (`dump`), not an SHM database |

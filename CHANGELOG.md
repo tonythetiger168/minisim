@@ -7,6 +7,14 @@ Spec references are IEEE 1800-2023 clauses.
 
 ## [Unreleased]
 
+### Changed
+- Vendor command-line compatibility is now a build option,
+  `-DMINISIM_VENDOR_COMPAT=ON` (default OFF). The default build accepts only
+  minisim's own options and open standards. First step: msim's xrun / irun
+  front end and the multi-step vlog / vcom / vsim / vlogan / vcs / simv front
+  end move to `src/compat/` and are compiled only with the option; their tests
+  move to `tests/compat/` and their manuals to `docs/compat/`.
+
 ### Added
 - `mvplat`: Android. `tests/vplat/android/run.sh` boots an unmodified AOSP
   riscv64 Cuttlefish build: `mkdisk.py` makes the GPT disk from the build's
