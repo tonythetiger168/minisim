@@ -307,6 +307,29 @@ fi
 " > vcon.out 2>&1; rc=$?
 expect "virtio-console: output, and -input once the console is quiet" 0 vcon.out "^vcon: got typed line"
 grep -q "^vcon: hello over virtio-console" vcon.out && ok "virtio-console output reaches the console" || bad "virtio-console output"
+# virtio-console "socket": the console is a Unix stream socket a host
+# program listens on; "output": its output goes to a file instead.
+vcon_json() {
+  cat > vs.json <<EOF
+{"name": "virt32+console", "devices": [
+  {"type": "finisher", "base": "0x00100000"}, {"type": "clint", "base": "0x02000000"},
+  {"type": "plic", "base": "0x0c000000", "sources": 31},
+  {"type": "uart16550", "name": "uart0", "base": "0x10000000", "irq": 10},
+  {"type": "virtio-console", "name": "vcon", "base": "0x10001000", "irq": 1, $1},
+  {"type": "ram", "name": "dram", "base": "0x80000000", "size": "16M"}]}
+EOF
+}
+vcon_json '"socket": "vcon.sock"'
+rm -f vcon.sock
+python3 "$T/vcon_peer.py" "$PWD/vcon.sock" > vpeer.out 2>&1 &
+for i in $(seq 50); do [ -S vcon.sock ] && break; sleep 0.1; done
+"$MVPLAT" -platform vs.json "$E/vcon.elf" -q > vsock.out 2>&1; rc=$?
+wait
+[ "$rc" = 0 ] && ok "virtio-console socket: the guest runs to the end" || bad "virtio-console socket: exit $rc"
+grep -q "^vcon: got line from the host" vpeer.out && ok "virtio-console socket: the host reads the output and types the input" || bad "virtio-console socket: $(head -c 300 vpeer.out)"
+vcon_json '"output": "vcon.txt", "input": "typed\n"'
+"$MVPLAT" -platform vs.json "$E/vcon.elf" -q > vfile.out 2>&1; rc=$?
+grep -q "^vcon: got typed" vcon.txt && ! grep -q "^vcon:" vfile.out && ok "virtio-console output to a file" || bad "virtio-console output to a file (rc $rc)"
 "$MVPLAT" "$E/vnet.elf" -net tap0 -q > p.out 2>&1; rc=$?
 expect "-net with an unknown back end" 2 p.out "unknown back end 'tap0'"
 

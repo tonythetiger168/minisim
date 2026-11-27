@@ -229,6 +229,8 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
             v->base = at;
             v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             for (char c : d.get("input") ? d.get("input")->str() : std::string()) v->held.push_back((uint8_t)c);
+            if (d.get("output")) v->outputTo(d.get("output")->str() == "none" ? "none" : rel(d.get("output")->str()));
+            if (d.get("socket")) v->connectTo(rel(d.get("socket")->str()));
             return std::unique_ptr<VirtioMmio>(std::move(v));
         } else if (t == "virtio-rng") {
             auto v = std::make_unique<VirtioRng>();
