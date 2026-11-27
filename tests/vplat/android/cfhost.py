@@ -14,11 +14,18 @@
 #   second, then the payload), carrying the goldfish sensor protocol as text.
 #   "list-sensors" is answered with the host's sensor mask: none, so the
 #   guest's SensorService starts with no sensors instead of waiting.
+#
+#   hvc10: the OEM lock HAL, the same messages: the command is the field
+#   (0 allowed by carrier, 1 allowed by device, 2 allowed, 3 locked), a set
+#   carries a one-byte value and every answer is the field's value. Kept in
+#   memory: carrier allows unlocking, the device is not locked.
 import os, selectors, socket, struct, sys
 
 d = sys.argv[1]
 n = int(sys.argv[2]) if len(sys.argv) > 2 else 20
 SENSORS_CONTROL = 18
+OEMLOCK = 10
+oemlock = {0: 1, 1: 0, 2: 0, 3: 0}
 
 sel = selectors.DefaultSelector()
 logs, bufs = {}, {}
@@ -38,7 +45,7 @@ def message(payload, response=True):
     return struct.pack('<II', (1 << 31 if response else 0), len(payload)) + payload
 
 
-def sensors(conn, i):
+def messages(i):
     b = bufs[i]
     while len(b) >= 8:
         w0, size = struct.unpack('<II', b[:8])
@@ -47,9 +54,23 @@ def sensors(conn, i):
         payload = bytes(b[8:8 + size])
         del b[:8 + size]
         logs[i].write(b'<- %d %r\n' % (w0 & 0x7fffffff, payload))
+        yield w0 & 0x7fffffff, payload
+
+
+def sensors(conn, i):
+    for _, payload in messages(i):
         if payload.rstrip(b'\0') == b'list-sensors':
             conn.sendall(message(b'0'))
             logs[i].write(b'-> 0\n')
+
+
+def oemlock_hal(conn, i):
+    for cmd, payload in messages(i):
+        if payload:
+            oemlock[cmd] = payload[0] & 1
+        v = bytes([oemlock.get(cmd, 0)])
+        conn.sendall(struct.pack('<II', cmd | 1 << 31, 1) + v)
+        logs[i].write(b'-> %d %r\n' % (cmd, v))
 
 
 while True:
@@ -68,8 +89,8 @@ while True:
             sel.unregister(key.fileobj)
             key.fileobj.close()
             continue
-        if i == SENSORS_CONTROL:
+        if i in (SENSORS_CONTROL, OEMLOCK):
             bufs[i] += data
-            sensors(key.fileobj, i)
+            (sensors if i == SENSORS_CONTROL else oemlock_hal)(key.fileobj, i)
         else:
             logs[i].write(data)

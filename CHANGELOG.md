@@ -31,6 +31,10 @@ Spec references are IEEE 1800-2023 clauses.
   move to `tests/compat/` and their manuals to `docs/compat/`.
 
 ### Added
+- mvplat: the Android riscv64 Cuttlefish image boots to `sys.boot_completed`
+  (lock screen and launcher, about 1570 simulated seconds on 4 harts):
+  `run.sh` starts `cfhost.py` on 20 console ports, `cfhost.py` also answers
+  the OEM lock HAL, and the bootconfig sets `openthread_node_id`.
 - mvplat: a `virtio-console` in a platform file takes `output` (a file, or
   `none`) and `socket` (a Unix stream socket a host program listens on), and
   `tests/vplat/android/cfhost.py` is the host end of an Android guest's

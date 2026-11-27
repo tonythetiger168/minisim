@@ -10,7 +10,27 @@
      "devices": [
        {"type": "virtio-blk", "file": "android.disk"},
        {"type": "virtio-rng", "seed": 1},
-       {"type": "virtio-gpu", "width": 720, "height": 1280, "screen": "screen.ppm"}
+       {"type": "virtio-gpu", "width": 720, "height": 1280, "screen": "screen.ppm"},
+       {"type": "virtio-console", "socket": "cf/hvc0.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc1.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc2.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc3.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc4.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc5.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc6.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc7.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc8.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc9.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc10.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc11.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc12.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc13.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc14.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc15.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc16.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc17.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc18.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc19.sock"}
      ]},
     {"type": "ram", "name": "dram", "base": "0x80000000", "size": "4G"}
   ]

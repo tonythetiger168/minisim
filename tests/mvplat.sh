@@ -249,6 +249,29 @@ alt = struct.unpack('<Q', hdr[32:40])[0]
 assert g[alt * 512:alt * 512 + 8] == b'EFI PART'
 P
 fi
+# cfhost.py, the host end of an Android guest's console ports: the sensors
+# HAL's list-sensors and the OEM lock HAL's reads and writes.
+mkdir -p cf
+python3 -I "$T/android/cfhost.py" "$PWD/cf" > cfhost.out 2>&1 &
+cfpid=$!
+for i in $(seq 50); do [ -S cf/hvc19.sock ] && break; sleep 0.1; done
+python3 - "$PWD/cf" <<'P' && ok "android: cfhost.py answers the sensors and OEM lock HALs" || bad "android: cfhost.py"
+import socket, struct, sys
+def talk(port, cmd, payload):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect('%s/hvc%d.sock' % (sys.argv[1], port))
+    s.settimeout(10)
+    s.sendall(struct.pack('<II', cmd, len(payload)) + payload)
+    w0, n = struct.unpack('<II', s.recv(8))
+    r = s.recv(n) if n else b''
+    s.close()
+    return w0, r
+assert talk(18, 0, b'list-sensors') == (1 << 31, b'0')
+assert talk(10, 1, b'\x01') == (1 << 31 | 1, b'\x01')
+assert talk(10, 1, b'') == (1 << 31 | 1, b'\x01')
+assert talk(10, 3, b'') == (1 << 31 | 3, b'\x00')
+P
+kill $cfpid 2> /dev/null; wait $cfpid 2> /dev/null
 
 # virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
 # image; the file changes only with -disk-write.
