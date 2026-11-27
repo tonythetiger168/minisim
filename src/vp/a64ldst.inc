@@ -57,6 +57,25 @@ inline void Machine::loadStore(Cpu& c, uint32_t i, uint64_t pc) {
             if (!xlate(c, a, 1, false, pa, h)) return;  // a write, compared equal or not
             const uint64_t m = ones(8 * en);
             const bool x64 = en == 8;
+            if (mt && h) {  // the host's compare-and-swap
+                uint8_t* p = h + (pa & 0xfff);
+                if (!pairCas) {
+                    uint64_t old = X(c, rs) & m;
+                    hostCas(p, en, old, X(c, rt) & m);
+                    setX(c, rs, old, x64);
+                } else if (en == 4) {
+                    uint64_t old = (X(c, rs) & m) | X(c, rs + 1) << 32;
+                    hostCas(p, 8, old, (X(c, rt) & m) | X(c, rt + 1) << 32);
+                    setX(c, rs, old & m, false);
+                    setX(c, rs + 1, old >> 32, false);
+                } else {
+                    uint64_t lo = X(c, rs), hi = X(c, rs + 1);
+                    hostCas16(p, lo, hi, X(c, rt), X(c, rt + 1));
+                    setX(c, rs, lo, true);
+                    setX(c, rs + 1, hi, true);
+                }
+                return;
+            }
             if (!pairCas) {
                 uint64_t old;
                 if (!rd(c, a, en, old)) return;
@@ -92,6 +111,8 @@ inline void Machine::loadStore(Cpu& c, uint32_t i, uint64_t pc) {
             uint8_t* h;
             xlate(c, a, 0, false, pa, h);
             setMonitor(c, pa, total);
+            c.exVal[0] = v1;
+            c.exVal[1] = v2;
             setX(c, rt, v1, true);
             if (pair) setX(c, rt2, v2, true);
             return;
@@ -101,6 +122,22 @@ inline void Machine::loadStore(Cpu& c, uint32_t i, uint64_t pc) {
         uint8_t* h;
         if (!xlate(c, a, 1, false, pa, h)) return;
         bool ok = c.exAddr == pa && c.exSize == total;
+        if (ok && mt && h) {  // the store happens if memory still holds what the load read
+            uint8_t* p = h + (pa & 0xfff);
+            if (pair && n == 8) {
+                uint64_t lo = c.exVal[0], hi = c.exVal[1];
+                ok = hostCas16(p, lo, hi, X(c, rt), X(c, rt2));
+            } else if (pair) {
+                uint64_t e = (c.exVal[0] & 0xffffffffull) | c.exVal[1] << 32;
+                ok = hostCas(p, 8, e, (X(c, rt) & 0xffffffffull) | X(c, rt2) << 32);
+            } else {
+                uint64_t e = c.exVal[0];
+                ok = hostCas(p, n, e, X(c, rt) & ones(8 * n));
+            }
+            clearMonitor(c);
+            setX(c, rs, ok ? 0 : 1, false);
+            return;
+        }
         if (ok) {
             if (pair) {
                 if (n == 8) { if (!wr(c, a, 8, X(c, rt)) || !wr(c, a + 8, 8, X(c, rt2))) return; }
@@ -268,10 +305,31 @@ inline void Machine::atomic(Cpu& c, uint32_t i, uint64_t pc) {
     uint64_t pa;
     uint8_t* h;
     if (!xlate(c, a, 1, false, pa, h)) return;
-    uint64_t old;
-    if (!rd(c, a, n, old)) return;
     const uint64_t m = ones(8 * n), s = X(c, rs) & m;
     auto sgn = [&](uint64_t v) { return (int64_t)(v << (64 - 8 * n)) >> (64 - 8 * n); };
+    auto op = [&](uint64_t old) -> uint64_t {
+        if (o3) return s;  // SWP
+        switch (opc) {
+            case 0: return old + s;
+            case 1: return old & ~s;
+            case 2: return old ^ s;
+            case 3: return old | s;
+            case 4: return sgn(old) > sgn(s) ? old : s;
+            case 5: return sgn(old) < sgn(s) ? old : s;
+            case 6: return old > s ? old : s;
+            default: return old < s ? old : s;
+        }
+    };
+    if (mt && h) {  // a compare-and-swap loop on host memory
+        uint8_t* p = h + (pa & 0xfff);
+        uint64_t old = 0;
+        memcpy(&old, p, n);
+        while (!hostCas(p, n, old, op(old) & m)) {}
+        setX(c, rt, old, size == 3);
+        return;
+    }
+    uint64_t old;
+    if (!rd(c, a, n, old)) return;
     uint64_t r;
     if (o3) r = s;  // SWP
     else switch (opc) {

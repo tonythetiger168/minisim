@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "a64gic.hpp"
 #include "bus.hpp"
 #include "wtrack.hpp"
+#include "parallel.hpp"
 
 namespace vp {
 namespace a64 {
@@ -32,7 +34,15 @@ public:
     uint64_t timerHz = 62500000;        // CNTFRQ_EL0
     uint64_t quantum = 10000;
     uint64_t maxCycles = UINT64_MAX;
-    bool exit_ = false;
+    std::atomic<bool> exit_{false};
+    // -mt: the processors run at once, each on a thread, a quantum per
+    // round, storing to memory directly; exclusives and atomics are the
+    // host's. Devices, the GIC and the firmware are used under devMu_.
+    bool mt = false;
+    unsigned threads = 0;
+    std::recursive_mutex devMu_;
+    std::unique_ptr<par::Pool> pool_;
+    std::atomic<uint64_t> cntFloor_{0};  // -mt: the counter never reads below what any processor read
     int exitCode = 0;
     bool quiet = false;
     unsigned undefReports = 0;          // undefined instructions reported so far
@@ -82,6 +92,45 @@ public:
         gic->reset();
     }
 
+    // With -mt: holds devMu_ (devices, the GIC, the firmware) for a scope.
+    struct DevLock {
+        std::recursive_mutex* m;
+        explicit DevLock(Machine& M) : m(M.mt ? &M.devMu_ : nullptr) { if (m) m->lock(); }
+        ~DevLock() { if (m) m->unlock(); }
+    };
+    // CNTPCT_EL0 as software reads it: with -mt never below what another
+    // processor has read (their cycle counts drift apart within a round).
+    uint64_t counterRead(const Cpu& c) {
+        uint64_t v = counter(c);
+        if (!mt) return v;
+        uint64_t f = cntFloor_.load(std::memory_order_relaxed);
+        while (v > f && !cntFloor_.compare_exchange_weak(f, v, std::memory_order_relaxed)) {}
+        return std::max(v, f);
+    }
+
+    // -mt: another processor's TLBI asked this one to empty its TLB.
+    void serviceFlush(Cpu& c) {
+        if (c.flushReq.load(std::memory_order_acquire)) {
+            c.flushTlb();
+            c.flushReq.store(0, std::memory_order_release);
+        }
+    }
+    // -mt, DSB after a broadcast TLBI: until every processor still running
+    // has emptied its TLB (a processor not running empties it before it
+    // runs again).
+    void waitFlushes(Cpu& c) {
+        c.tlbiPending = false;
+        for (auto& o : cpus) {
+            if (o.get() == &c) continue;
+            while (o->flushReq.load(std::memory_order_seq_cst) && o->running.load(std::memory_order_seq_cst)) {
+                serviceFlush(c);  // two processors may wait for each other
+#if defined(__x86_64__)
+                __builtin_ia32_pause();
+#endif
+            }
+        }
+    }
+
     // Time
     uint64_t now() const {  // the slowest running processor's cycle
         uint64_t t = UINT64_MAX;
@@ -104,6 +153,7 @@ public:
     }
     void updateTimers(Cpu& c) {
         if (!gic) return;
+        DevLock l(*this);
         gic->setPpi(c.id, 30, timerFires(c, false) && !(c.cntpCtl & 2));
         gic->setPpi(c.id, 27, timerFires(c, true) && !(c.cntvCtl & 2));
     }
@@ -118,6 +168,9 @@ public:
     // Runs until a processor's cycle count reaches maxCycles or the
     // software asks to stop. The return value is the exit code.
     int run() {
+        if (mt && cpus.size() > 1 && !pool_)
+            pool_ = std::make_unique<par::Pool>(std::min<unsigned>(threads ? threads : par::defaultThreads(), (unsigned)cpus.size()));
+        std::vector<Cpu*> act;
         for (auto& d : bus.devices()) d->start();
         for (auto& c : cpus) updateTimers(*c);
         while (!exit_) {
@@ -130,13 +183,31 @@ public:
                 uint64_t e = d->nextEventPs(nowPs);
                 if (e != UINT64_MAX) end = std::min(end, std::max(t0 + 1, e / cyclePs_ + 1));
             }
-            for (auto& c : cpus) if (!c->off) end = std::min(end, std::max(t0 + 1, nextTimer(*c)));
+            // (a timer that has fired already is pending at the GIC: no cut,
+            // or a processor with interrupts masked would get 1-cycle rounds)
+            for (auto& c : cpus)
+                if (!c->off) {
+                    const uint64_t nt = nextTimer(*c);
+                    if (nt > t0) end = std::min(end, nt);
+                }
             bool ran = false;
-            for (auto& c : cpus) {
-                if (c->off) continue;
-                if (runCpu(*c, end)) ran = true;
-                if (exit_) break;
-            }
+            if (pool_) {  // -mt: all at once
+                act.clear();
+                for (auto& c : cpus) if (!c->off) act.push_back(c.get());
+                std::atomic<bool> any{false};
+                pool_->run(act.size(), [&](size_t k) {
+                    Cpu& c = *act[k];
+                    c.running.store(true, std::memory_order_seq_cst);
+                    if (runCpu(c, end)) any.store(true, std::memory_order_relaxed);
+                    c.running.store(false, std::memory_order_seq_cst);
+                });
+                ran = any.load();
+            } else
+                for (auto& c : cpus) {
+                    if (c->off) continue;
+                    if (runCpu(*c, end)) ran = true;
+                    if (exit_) break;
+                }
             const uint64_t t1 = now();
             for (auto& d : bus.devices()) d->advance(t1 * cyclePs_);
             for (auto& c : cpus) updateTimers(*c);
@@ -181,21 +252,22 @@ public:
     // Runs one processor up to cycle `end`. False when it only waited.
     bool runCpu(Cpu& c, uint64_t end) {
         bool ran = false;
-        dead_.clear();
+        c.deadCode.clear();
         while (c.cycle < end && !exit_ && !c.off) {
             if (c.wfi) {
                 if (!c.irqLine && !wakeTimer(c)) { c.cycle = end; break; }
                 c.wfi = false;
             }
             ran = true;
+            if (mt) serviceFlush(c);
             if (c.irqLine && !(c.daif & 0x80)) { exception(c, 0, 0, c.pc, 1); }
             {  // decoded already
-                if (WriteWatch::writes() != codeWrites_) codeSync();
+                if (WriteWatch::writes() != c.codeWrites) codeSync(c);
                 const uint64_t pc0 = c.pc;
                 const Cpu::Fast& f = c.fastX[(pc0 >> 12) & (Cpu::FAST_N - 1)];
                 if (f.key == ((pc0 >> 12) << 1 | (c.el == 0)) && f.code && !(pc0 & 3)) {
                     const Op& op = f.code->op[(pc0 & 0xfff) >> 2];
-                    curPc_ = pc0;
+                    c.curPc = pc0;
                     c.pc = pc0 + 4;
                     op.fn(*this, c, op, pc0);
                     c.cycle++;
@@ -232,6 +304,7 @@ public:
         c.wfi = false;
     }
     void undefined(Cpu& c, uint32_t insn, uint64_t pc) {
+        DevLock l(*this);
         if (undefReports < 20 && !quiet && c.el) {  // EL0: the kernel handles it (SIGILL, emulated MRS)
             char b[96];
             snprintf(b, sizeof b, "mvplat: cpu %u: undefined instruction 0x%08x at 0x%llx (EL%u)\n", c.id, insn,
@@ -366,12 +439,11 @@ public:
         if (!raise) return false;
         c.far = va;
         if (acc == 2) exception(c, c.el == 0 ? EC_IABT_LOW : EC_IABT_CUR, fsc, c.pc);
-        else exception(c, c.el == 0 ? EC_DABT_LOW : EC_DABT_CUR, fsc | (acc == 1 ? 1u << 6 : 0), curPc_);
+        else exception(c, c.el == 0 ? EC_DABT_LOW : EC_DABT_CUR, fsc | (acc == 1 ? 1u << 6 : 0), c.curPc);
         return false;
     }
 
     // ---------------------------------------------------------- memory
-    uint64_t curPc_ = 0;  // the instruction being executed (data aborts return to it)
     bool fetch(Cpu& c, uint32_t& insn) {
         if (c.pc & 3) { c.far = c.pc; exception(c, EC_PC_ALIGN, 0, c.pc); return false; }
         const uint64_t key = (c.pc >> 12) << 1 | (c.el == 0);
@@ -380,9 +452,10 @@ public:
         uint64_t pa;
         uint8_t* h;
         if (!xlate(c, c.pc, 2, false, pa, h)) return false;
-        if (h) { f = {key, h, pa & ~0xfffull, codePage(pa, h)}; memcpy(&insn, h + (pa & 0xfff), 4); return true; }
+        if (h) { f = {key, h, pa & ~0xfffull, codePage(c, pa, h)}; memcpy(&insn, h + (pa & 0xfff), 4); return true; }
         uint64_t v;
         Device* d = bus.find(pa);
+        DevLock l(*this);
         if (!d || d->read(pa - d->base, 4, v, Who{c.id, c.cycle, true}) != Acc::Ok) {
             c.far = c.pc;
             exception(c, c.el == 0 ? EC_IABT_LOW : EC_IABT_CUR, F_EXT, c.pc);
@@ -395,13 +468,14 @@ public:
         Device* d = bus.find(pa);
         Acc r = Acc::Fault;
         if (d && pa + n <= d->base + d->size) {
+            DevLock l(*this);
             const Who w{c.id, c.cycle, true};
             r = write ? d->write(pa - d->base, n, v, w) : d->read(pa - d->base, n, v, w);
             if (write) d->nwrite++; else d->nread++;
         }
         if (r != Acc::Ok) {
             c.far = va;
-            exception(c, c.el == 0 ? EC_DABT_LOW : EC_DABT_CUR, F_EXT | (write ? 1u << 6 : 0), curPc_);
+            exception(c, c.el == 0 ? EC_DABT_LOW : EC_DABT_CUR, F_EXT | (write ? 1u << 6 : 0), c.curPc);
             return false;
         }
         return true;
@@ -473,14 +547,42 @@ public:
             }
         }
     }
+    // (-mt keeps no count: no store looks at the others' monitors; the
+    // exclusive store compares values instead, as a host compare-and-swap)
     void setMonitor(Cpu& c, uint64_t pa, unsigned n) {
-        if (c.exAddr == ~0ull) monitors_++;
+        if (c.exAddr == ~0ull && !mt) monitors_++;
         c.exAddr = pa;
         c.exSize = n;
     }
     void clearMonitor(Cpu& c) {
-        if (c.exAddr != ~0ull) monitors_--;
+        if (c.exAddr != ~0ull && !mt) monitors_--;
         c.exAddr = ~0ull;
+    }
+    // -mt: compare-and-swap of 1, 2, 4, 8 or 16 bytes of host memory (p
+    // aligned); expect gets what was there.
+    static bool hostCas(uint8_t* p, unsigned n, uint64_t& expect, uint64_t v) {
+        switch (n) {
+            case 1: { uint8_t e = (uint8_t)expect; bool ok = __atomic_compare_exchange_n(p, &e, (uint8_t)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); expect = e; return ok; }
+            case 2: { uint16_t e = (uint16_t)expect; bool ok = __atomic_compare_exchange_n((uint16_t*)p, &e, (uint16_t)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); expect = e; return ok; }
+            case 4: { uint32_t e = (uint32_t)expect; bool ok = __atomic_compare_exchange_n((uint32_t*)p, &e, (uint32_t)v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); expect = e; return ok; }
+            default: return __atomic_compare_exchange_n((uint64_t*)p, &expect, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        }
+    }
+    static bool hostCas16(uint8_t* p, uint64_t& lo, uint64_t& hi, uint64_t nlo, uint64_t nhi) {
+#if defined(__x86_64__)
+        bool ok;
+        __asm__ volatile("lock cmpxchg16b %1" : "=@ccz"(ok), "+m"(*(u128*)p), "+a"(lo), "+d"(hi) : "b"(nlo), "c"(nhi) : "memory");
+        return ok;
+#else
+        static std::mutex mu;  // atomic against other pairs only
+        std::lock_guard<std::mutex> l(mu);
+        uint64_t a, b;
+        memcpy(&a, p, 8); memcpy(&b, p + 8, 8);
+        const bool ok = a == lo && b == hi;
+        if (ok) { memcpy(p, &nlo, 8); memcpy(p + 8, &nhi, 8); }
+        lo = a; hi = b;
+        return ok;
+#endif
     }
 
     // ------------------------------------------------------ registers
@@ -590,14 +692,13 @@ public:
     }
 
     // ------------------------------------------------------ the decoder
-    // Pages of decoded instructions (a64dec.inc), by physical page.
-    std::unordered_map<uint64_t, std::unique_ptr<CodePage>> code_;
-    std::vector<std::unique_ptr<CodePage>> dead_;  // dropped, freed before the next instruction
+    // Decoded instruction pages (a64dec.inc; each processor has its own).
     std::unordered_map<Device*, int> watchIds_;    // RAM as WriteWatch regions
-    uint64_t codeWrites_ = 0;
+    std::mutex watchMu_;
     bool decodeAhead_ = !getenv("MVPLAT_NO_DECODE");
-    CodePage* codePage(uint64_t pa, uint8_t* host);
-    void codeSync();
+    static constexpr size_t CODE_PAGES = 4096;     // per processor, at most
+    CodePage* codePage(Cpu& c, uint64_t pa, uint8_t* host);
+    void codeSync(Cpu& c);
     void exec(Cpu& c, uint32_t i, uint64_t pc);
     void dpImm(Cpu& c, uint32_t i, uint64_t pc);
     void branchSys(Cpu& c, uint32_t i, uint64_t pc);
@@ -622,7 +723,7 @@ public:
 };
 
 inline void Machine::exec(Cpu& c, uint32_t i, uint64_t pc) {
-    curPc_ = pc;
+    c.curPc = pc;
     switch ((i >> 25) & 0xf) {
         case 0x8: case 0x9: dpImm(c, i, pc); break;
         case 0xa: case 0xb: branchSys(c, i, pc); break;

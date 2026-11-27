@@ -44,7 +44,9 @@ void buildA64(A64Board& b, const json::Value& pl, const fs::path& dir, const Opt
     if (mhz <= 0 || mhz > 1e6) throw std::runtime_error("mhz must be above 0");
     m.cyclePs_ = std::max<uint64_t>(1, (uint64_t)(1e6 / mhz + 0.5));
     if (pl.get("timer_hz")) m.timerHz = pl.get("timer_hz")->u64();
-    m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : 10000;
+    m.mt = o.mt && n > 1;
+    m.threads = o.threads;
+    m.quantum = pl.get("quantum") ? pl.get("quantum")->u64() : m.mt ? 20000 : 10000;
     if (o.quantum > 0) m.quantum = (uint64_t)o.quantum;
     m.addCpus(n);
     const json::Value* devs = pl.get("devices");

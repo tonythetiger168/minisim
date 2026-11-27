@@ -702,8 +702,20 @@ as a separate program; `tests/mvplat.sh` runs 1500 blocks when
 `qemu-aarch64` is installed. `tests/vplat/get-linux-arm64.sh` fetches the
 kernel and BusyBox for the Linux test.
 
-Not yet on AArch64: `-mt` and a translator to host code (the processors
-take turns on one thread), the commit log, and the extension's features.
+Several processors take turns on one thread by default (the same run
+every time). With `-mt` each runs on a host thread of its own, at once, a
+quantum (20000 cycles by default) per round, storing to memory directly:
+exclusive loads and stores, CAS and the LSE atomics use the host's
+compare-and-swap (an exclusive store succeeds if memory still holds what
+the load read), devices, the GIC and the firmware are used under one lock,
+a broadcast TLBI reaches the other processors before their next
+instruction and DSB waits for it, and the counter never reads below what
+another processor read. A run with `-mt` is not the same twice. Busy work
+on three processors ran 1.7 times as fast on a host with two physical
+cores.
+
+Not yet on AArch64: a translator to host code, the commit log, and the
+extension's features.
 
 ## Limits / Not yet
 
