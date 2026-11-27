@@ -1,7 +1,7 @@
 # msim -i / -do as VCS UCLI and the xrun Tcl shell: tests/debug/ucli.do runs
 # tests/debug/ucli.sv through a stop at a line, next (over a task call) and
 # step, describe, scope / show, get -radix, condition and time stops, Tcl
-# (set, foreach, proc, puts), alias, senv, search, a stop with -continue and
+# (set, foreach, proc, puts), alias, env, search, a stop with -continue and
 # -command, listing, -once, dump -add, run -posedge and run -slot. Then:
 # commands that end while stopped at a line run the rest of the simulation,
 # and quit at a line stops it.
@@ -104,4 +104,18 @@ file(WRITE ${OUT}/after.do "print tb.acc\nrun 10\nprint tb.acc\n")
 execute_process(COMMAND ${MSIM} -restore ${OUT}/ck2 INPUT_FILE ${OUT}/after.do OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT out MATCHES "restored the checkpoint at time 12\ntb.acc = 8'h11\ntime 22: ran to time 22 \\(next event at 25\\)\ntb.acc = 8'h12\n")
   message(FATAL_ERROR "msim -restore of a save checkpoint:\n${out}${err}")
+endif()
+
+# The other simulators' names (value, deposit, senv, checkpoint) exist only in
+# a vendor-layer build (docs/compat/UCLI.md); otherwise they are unknown.
+file(WRITE ${OUT}/names.do "run 12\nvalue tb.sum\ndeposit tb.sum 7\nprint tb.sum\nsenv time\nenv time\nquit\n")
+execute_process(COMMAND ${MSIM} ${SV} -do ${OUT}/names.do WORKING_DIRECTORY ${OUT}
+                RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
+if(COMPAT)
+  set(want "tb.sum = 32'h[0-9a-f]+\n.*tb.sum = 32'h7\n12\n12\n")
+else()
+  set(want "unknown command 'value'.*unknown command 'deposit'.*unknown command 'senv'.*\n12\n")
+endif()
+if(NOT out MATCHES "${want}")
+  message(FATAL_ERROR "vendor command names (COMPAT=${COMPAT}):\n${out}${err}")
 endif()

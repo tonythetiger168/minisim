@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Changed
+- `msim -i` and `-do` use minisim's own command names: `print`, `change`,
+  `dump -add`, `save` and the new `env` (for `senv`). `value`, `deposit`,
+  `probe`, `senv`, `checkpoint`, Verdi's `fsdbDump*` and the ignored xrun
+  commands (`database`, `simvision`, `dumptcf`, `assertion`) work only in a
+  `-DMINISIM_VENDOR_COMPAT=ON` build (docs/compat/UCLI.md).
+- The Verdi, VCS and Xcelium waveform tasks (`$fsdbDump*`, `$vcdplus*`,
+  `$shm_*`, `$record*`) and Verdi's `$fsdbTrans_*` transaction tasks are
+  known only in a `-DMINISIM_VENDOR_COMPAT=ON` build (docs/compat/WAVES.md).
+  Use `$dumpfile` / `$dumpvars`, `-vcd-sva`, `-vcd-power` and
+  `$begin_transaction` and the rest of the recording API.
 - msim's options take minisim's own names: `-cov_metrics=`, `-cov_scope`,
   `-cov_cond`, `-upf_top`, `-dpi_header`, `-vpi`, `-uvm_home`,
   `-xprop=merge|pessimistic|off`, and `-compile` / `-o` for partition
@@ -31,6 +41,23 @@ Spec references are IEEE 1800-2023 clauses.
   move to `tests/compat/` and their manuals to `docs/compat/`.
 
 ### Added
+- mvplat runs AArch64 (Armv8.0-A, EL0 and EL1) on a built-in arm board: the
+  A64 base set with floating point and NEON, stage 1 translation with the
+  4 KiB granule, a GICv3, the generic timer, a PL011 UART, PSCI 1.1 firmware
+  for several processors, and Linux `Image` loading with a generated device
+  tree. Floating point follows the architecture's NaN, flush-to-zero,
+  rounding and FPSR flag rules. Ubuntu's arm64 kernel boots to a BusyBox
+  shell on up to four processors. Written from Arm's public architecture
+  reference; tests in `tests/vplat/a64`, including random instruction
+  blocks compared with qemu-aarch64 run as a separate program
+  (docs/VPLAT.md, "Arm (AArch64)").
+- mvplat's AArch64 processors keep the instructions of each code page
+  decoded and cache recent translations for loads, stores and fetches:
+  Linux arm64 boots at about 115 MIPS instead of 61, with the same
+  instruction count; pages written are decoded again.
+- mvplat's AArch64 platforms take the virtio devices on virtio-mmio and
+  behind a PCIe host, and `-disk`, `-net` and `-vcon`; Linux arm64 reads a
+  disk, pings over virtio-net and runs a shell on hvc0.
 - mvplat: the Android riscv64 Cuttlefish image boots to `sys.boot_completed`
   (lock screen and launcher, about 1570 simulated seconds on 4 harts):
   `run.sh` starts `cfhost.py` on 20 console ports, `cfhost.py` also answers

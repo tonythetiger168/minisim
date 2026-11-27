@@ -1,4 +1,4 @@
-// Assertions in the waveform (msim -vcd-sva, $fsdbDumpSVA): a_gnt fails at
+// Assertions in the waveform (msim -vcd-sva): a_gnt fails at
 // 45 and 85 (gnt is held low after a request), c_req covers each request.
 module arb(input logic clk, input logic req, input logic hold, output logic gnt);
   always_ff @(posedge clk) gnt <= req && !hold;
@@ -10,9 +10,8 @@ module tb;
   arb u(.clk, .req, .hold, .gnt);
   always #5 clk = ~clk;
   initial begin
-    $fsdbDumpfile("sva.fsdb");
-    $fsdbDumpvars(0, tb);
-    $fsdbDumpSVA;
+    $dumpfile("sva.fst");
+    $dumpvars(0, tb);
     @(negedge clk) req = 1;
     @(negedge clk) req = 0;
     @(negedge clk) req = 1; hold = 1;

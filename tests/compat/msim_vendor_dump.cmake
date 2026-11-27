@@ -6,7 +6,7 @@
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT})
 function(sim name sv fst)
-  execute_process(COMMAND ${MSIM} ${SRC}/tests/debug/${sv} WORKING_DIRECTORY ${OUT}
+  execute_process(COMMAND ${MSIM} ${SRC}/tests/compat/debug/${sv} WORKING_DIRECTORY ${OUT}
                   RESULT_VARIABLE rc OUTPUT_QUIET ERROR_VARIABLE err)
   if(NOT rc EQUAL 0)
     message(FATAL_ERROR "${name}: msim exited ${rc}\n${err}")
@@ -56,7 +56,7 @@ sim(shm vendor_shm.sv waves.fst)
 has(shm "${wave}" "\n0 tb.c 0000\n" "\n25 tb.c 0011\n")
 
 # mdebug compiles the same source and reads the FST.
-execute_process(COMMAND ${MDEBUG} ${SRC}/tests/debug/vendor_fsdb.sv -vcd ${OUT}/wave.fst -active tb.c -at 45
+execute_process(COMMAND ${MDEBUG} ${SRC}/tests/compat/debug/vendor_fsdb.sv -vcd ${OUT}/wave.fst -active tb.c -at 45
                 RESULT_VARIABLE rc OUTPUT_VARIABLE o ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "mdebug exited ${rc}\n${err}\n${o}")
@@ -65,7 +65,7 @@ has(mdebug "${o}" "tb.c = 4'h5 @45\n  <- [^\n]*vendor_fsdb.sv:10: c <= c \\+ 1")
 
 # The same from msim -i / -do: Verdi's UCLI commands fsdbDumpfile, fsdbDumpvars, fsdbDumpoff.
 file(WRITE ${OUT}/ucli.do "fsdbDumpfile ui.fsdb\nfsdbDumpvars 1 tb\nrun 12\nfsdbDumpoff\nrun\n")
-execute_process(COMMAND ${MSIM} ${SRC}/tests/debug/vendor_shm.sv -do ${OUT}/ucli.do WORKING_DIRECTORY ${OUT}
+execute_process(COMMAND ${MSIM} ${SRC}/tests/compat/debug/vendor_shm.sv -do ${OUT}/ucli.do WORKING_DIRECTORY ${OUT}
                 RESULT_VARIABLE rc OUTPUT_VARIABLE o ERROR_VARIABLE err)
 if(NOT rc EQUAL 0 OR NOT o MATCHES "dumping to ui.fst from the next time slot")
   message(FATAL_ERROR "ucli: msim exited ${rc}\n${err}\n${o}")

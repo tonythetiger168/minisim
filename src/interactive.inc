@@ -7,14 +7,16 @@
 //   run [T [unit]] [-absolute] | run -posedge/-negedge/-change SIG | run -slot [N] | run -all
 //   step, next                 one statement (any process / this process)
 //   stop ...                   on a signal, a value, a line, a time or a condition (UCLI and xrun forms)
-//   get, print/value, force, release, change/deposit, scope, show, search, signals, describe,
-//   where/stack, listing, dump/probe, drivers/loads, call, save/restore/restart, senv, alias,
+//   get, print, force, release, change, scope, show, search, signals, describe,
+//   where/stack, listing, dump, drivers/loads, call, save/restore/restart, env, alias,
 //   time, help, quit/exit/finish
 // The kernel is driven one time slot at a time through Sim::run(end), so a
 // normal run pays nothing for this mode. A stop at a line or a step pauses
 // inside the statement hook (prog.hpp g_stmtHook) and reads commands there;
 // the run goes on when one of them is run, step or next. Maintained by the
 // debug tool thread.
+
+#include "compat.hpp"   // kVendorCompat: the other simulators' command names
 
 namespace interactive {
 
@@ -1067,7 +1069,7 @@ struct Session {
             {"stopped", nest ? "1" : "0"}};
         if (a.size() > 1) {
             auto it = e.find(a[1]);
-            if (it == e.end()) throw tcl::Error("senv: time, scope, top, timescale, file, line or stopped");
+            if (it == e.end()) throw tcl::Error(a[0] + ": time, scope, top, timescale, file, line or stopped");
             return it->second;
         }
         std::string s;
@@ -1347,13 +1349,12 @@ struct Session {
             "stop SIG [posedge|negedge|== VALUE] | stop -line N [-file F] | stop -absolute/-relative T |\n"
             "  stop -condition {EXPR} | ... [-condition E] [-command {CMDS}] [-continue] [-once] |\n"
             "  stop [-show] | stop -delete/-disable/-enable N|all | delete N\n"
-            "get SIG [-radix hex|dec|sdec|bin|oct] | print/value NAME ... | describe NAME |\n"
-            "force SIG VALUE | release SIG | deposit/change SIG VALUE\n"
+            "get SIG [-radix hex|dec|sdec|bin|oct] | print NAME ... | describe NAME |\n"
+            "force SIG VALUE | release SIG | change SIG VALUE\n"
             "scope [PATH|-up] | show [-scopes|-signals|-ports] [-value] [SCOPE] | search PATTERN | signals [TEXT]\n"
-            "where/stack | listing [N] | dump -file F | dump -add NAMES [-depth N] | probe NAMES | dump -off/-on/-flush/-close\n"
-            "fsdbDumpfile F | fsdbDumpvars [DEPTH] [SCOPES] [+all] | fsdbDumpon/off/flush/Finish (written as FST)\n"
+            "where/stack | listing [N] | dump -file F | dump -add NAMES [-depth N] | dump -off/-on/-flush/-close\n"
             "drivers SIG | loads SIG | call TASK(ARGS) | save FILE | restore FILE | restart\n"
-            "senv [NAME] | alias NAME COMMAND | time | help | quit/exit/finish\n"
+            "env [NAME] | alias NAME COMMAND | time | help | quit/exit/finish\n"
             "Tcl: set, if, foreach, while, proc, expr, source, [command] ...\n";
     }
 
@@ -1390,12 +1391,13 @@ struct Session {
             return std::string();
         });
         tcl.addCommand("get", [this](const W& a) { return cmdGet(a); });
-        for (const char* d : {"database", "simvision", "dumptcf", "assertion"})   // xrun -input commands with no counterpart here
-            tcl.addCommand(d, [](const W& a) {
-                std::cerr << "msim: the command '" << a[0] << "' is not supported; ignored\n";
-                return std::string();
-            });
-        for (const char* pr : {"print", "value"}) tcl.addCommand(pr, [this](const W& a) {
+        if (compat::kVendorCompat)
+            for (const char* d : {"database", "simvision", "dumptcf", "assertion"})   // xrun -input commands with no counterpart here
+                tcl.addCommand(d, [](const W& a) {
+                    std::cerr << "msim: the command '" << a[0] << "' is not supported; ignored\n";
+                    return std::string();
+                });
+        auto print = [this](const W& a) {
             if (a.size() < 2) std::cout << "print needs a name\n";
             for (size_t i = 1; i < a.size(); i++) {
                 if (printPath(a[i])) continue;
@@ -1404,8 +1406,22 @@ struct Session {
                 else std::cout << shown(s) << " = " << fmt(S.get(s)) << "\n";
             }
             return std::string();
-        });
-        for (const char* f : {"force", "deposit", "change"}) tcl.addCommand(f, [this](const W& a) { return cmdWrite(a); });
+        };
+        tcl.addCommand("print", print);
+        for (const char* f : {"force", "change"}) tcl.addCommand(f, [this](const W& a) { return cmdWrite(a); });
+        tcl.addCommand("env", [this](const W& a) { return cmdSenv(a); });
+        // The other simulators' names for the same commands (vendor layer,
+        // docs/compat/UCLI.md): xrun's value / deposit / probe, VCS UCLI's
+        // senv / checkpoint, Verdi's fsdbDump*.
+        if (compat::kVendorCompat) {
+            tcl.addCommand("value", print);
+            tcl.addCommand("deposit", [this](const W& a) { return cmdWrite(a); });
+            tcl.addCommand("probe", [this](const W& a) { return cmdDump(a); });
+            tcl.addCommand("senv", [this](const W& a) { return cmdSenv(a); });
+            tcl.addCommand("checkpoint", [this](const W& a) { return cmdSave(a); });
+            for (const char* d : {"fsdbDumpfile", "fsdbDumpvars", "fsdbDumpon", "fsdbDumpoff", "fsdbDumpflush", "fsdbDumpFinish", "fsdbDumpMDA"})
+                tcl.addCommand(d, [this](const W& a) { return cmdFsdb(a); });
+        }
         tcl.addCommand("release", [this](const W& a) {
             int s = sigArg(a, a.size() > 2 && a[1][0] == '-' ? 2 : 1);
             S.holdOff(s, true);
@@ -1419,13 +1435,10 @@ struct Session {
         for (const char* w : {"where", "stack"}) tcl.addCommand(w, [this](const W& a) { return cmdWhere(a); });
         tcl.addCommand("listing", [this](const W& a) { return cmdListing(a); });
         for (const char* s : {"search", "signals"}) tcl.addCommand(s, [this](const W& a) { return cmdSearch(a); });
-        for (const char* d : {"dump", "probe"}) tcl.addCommand(d, [this](const W& a) { return cmdDump(a); });
-        for (const char* d : {"fsdbDumpfile", "fsdbDumpvars", "fsdbDumpon", "fsdbDumpoff", "fsdbDumpflush", "fsdbDumpFinish", "fsdbDumpMDA"})
-            tcl.addCommand(d, [this](const W& a) { return cmdFsdb(a); });
-        tcl.addCommand("senv", [this](const W& a) { return cmdSenv(a); });
+        tcl.addCommand("dump", [this](const W& a) { return cmdDump(a); });
         for (const char* d : {"drivers", "loads"}) tcl.addCommand(d, [this](const W& a) { return cmdDrivers(a); });
         tcl.addCommand("call", [this](const W& a) { return cmdCall(a); });
-        for (const char* sv : {"save", "checkpoint"}) tcl.addCommand(sv, [this](const W& a) { return cmdSave(a); });
+        tcl.addCommand("save", [this](const W& a) { return cmdSave(a); });
         for (const char* r : {"restore", "restart"}) tcl.addCommand(r, [this](const W& a) { return cmdRestore(a); });
         tcl.addCommand("alias", [this](const W& a) {
             if (a.size() < 3) throw tcl::Error("alias NAME COMMAND ...");
