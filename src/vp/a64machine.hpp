@@ -605,6 +605,7 @@ public:
     void dpReg(Cpu& c, uint32_t i, uint64_t pc);
     void simdFp(Cpu& c, uint32_t i, uint64_t pc);
     void simdLdSt(Cpu& c, uint32_t i, uint64_t pc);
+    void atomic(Cpu& c, uint32_t i, uint64_t pc);
     void system(Cpu& c, uint32_t i, uint64_t pc);
     bool sysReg(Cpu& c, uint32_t reg, bool write, uint64_t& v, uint32_t i, uint64_t pc);
     void sysOp(Cpu& c, uint32_t i, uint64_t pc);
@@ -902,6 +903,21 @@ inline void Machine::dpReg(Cpu& c, uint32_t i, uint64_t pc) {
                 case 8: case 9: case 10: case 11:  // LSLV, LSRV, ASRV, RORV
                     r = shiftReg(a, opc - 8, (unsigned)(b & (w - 1)), sf);
                     break;
+                case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17: {
+                    // CRC32B/H/W/X, CRC32CB/H/W/X: the reflected CRC update, no inversion
+                    const unsigned sz = opc & 3;
+                    if ((sz == 3) != sf) { undefined(c, i, pc); return; }
+                    const uint32_t poly = (opc & 4) ? 0x82f63b78u : 0xedb88320u;
+                    uint32_t acc = (uint32_t)a;
+                    const uint64_t val = b;
+                    for (unsigned k = 0; k < (1u << sz); k++) {
+                        acc ^= (uint8_t)(val >> (8 * k));
+                        for (int j = 0; j < 8; j++) acc = (acc >> 1) ^ (poly & (0u - (acc & 1)));
+                    }
+                    r = acc;
+                    setX(c, rd, r, false);
+                    return;
+                }
                 default: undefined(c, i, pc); return;
             }
             setX(c, rd, r, sf);

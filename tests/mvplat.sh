@@ -405,6 +405,8 @@ expect "aarch64: GICv3, timers, SGI, priority mask" 0 a64irq.out "irq: all passe
 expect "aarch64: PSCI CPU_ON, exclusives and a spin lock on 4 processors" 0 a64smp.out "smp: all passed"
 "$MVPLAT" "$A/smc.elf" -q > a64smc.out 2>&1; rc=$?
 expect "aarch64: code rewritten while it runs; the decoded load and store forms" 0 a64smc.out "smc: all passed"
+"$MVPLAT" "$A/lse.elf" -q > a64lse.out 2>&1; rc=$?
+expect "aarch64: Armv8.1 atomics (LDADD .. SWP, CAS, CASP) and CRC32" 0 a64lse.out "lse: all passed"
 MVPLAT_NO_DECODE=1 "$MVPLAT" "$A/smc.elf" -q > a64smc2.out 2>&1; rc=$?
 expect "aarch64: the same with nothing decoded ahead (MVPLAT_NO_DECODE)" 0 a64smc2.out "smc: all passed"
 "$MVPLAT" "$A/hello.elf" -bios "$A/hello.elf" -q > a64bios.out 2>&1; rc=$?
