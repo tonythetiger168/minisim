@@ -42,8 +42,37 @@ inline void Machine::loadStore(Cpu& c, uint32_t i, uint64_t pc) {
     if ((i & 0x3f000000) == 0x08000000) {
         const unsigned size = i >> 30, o2 = i >> 23 & 1, l = i >> 22 & 1, o1 = i >> 21 & 1, rs = (i >> 16) & 31, rt2 = (i >> 10) & 31;
         const unsigned n = 1u << size;
-        if (vec || (o2 && o1)) { undefined(c, i, pc); return; }  // CAS, CASP: no LSE
+        if (vec) { undefined(c, i, pc); return; }
         const uint64_t a = XS(c, rn);
+        if ((o2 && o1) || (!o2 && o1 && size < 2)) {  // CAS, CASP (Armv8.1 LSE)
+            if (rt2 != 31) { undefined(c, i, pc); return; }
+            const bool pairCas = !o2;
+            const unsigned en = pairCas ? 4u << (size & 1) : n;  // bytes per element
+            if (pairCas && ((rs & 1) || (rt & 1))) { undefined(c, i, pc); return; }
+            if (!spCheck(a)) return;
+            const unsigned total = pairCas ? 2 * en : en;
+            if (a & (total - 1)) { c.far = a; exception(c, c.el ? EC_DABT_CUR : EC_DABT_LOW, F_ALIGN | 1u << 6, pc); return; }
+            uint64_t pa;
+            uint8_t* h;
+            if (!xlate(c, a, 1, false, pa, h)) return;  // a write, compared equal or not
+            const uint64_t m = ones(8 * en);
+            const bool x64 = en == 8;
+            if (!pairCas) {
+                uint64_t old;
+                if (!rd(c, a, en, old)) return;
+                if (old == (X(c, rs) & m) && !wr(c, a, en, X(c, rt) & m)) return;
+                setX(c, rs, old, x64);
+                return;
+            }
+            uint64_t o1v, o2v;
+            if (!rd(c, a, en, o1v) || !rd(c, a + en, en, o2v)) return;
+            if (o1v == (X(c, rs) & m) && o2v == (X(c, rs + 1) & m)) {
+                if (!wr(c, a, en, X(c, rt) & m) || !wr(c, a + en, en, X(c, rt + 1) & m)) return;
+            }
+            setX(c, rs, o1v, x64);
+            setX(c, rs + 1, o2v, x64);
+            return;
+        }
         if (!spCheck(a)) return;
         if (o2) {  // LDAR, STLR (o0 = 1), LDLAR, STLLR (o0 = 0)
             if (a & (n - 1)) { c.far = a; exception(c, c.el ? EC_DABT_CUR : EC_DABT_LOW, F_ALIGN | (l ? 0 : 1u << 6), pc); return; }
@@ -148,6 +177,7 @@ inline void Machine::loadStore(Cpu& c, uint32_t i, uint64_t pc) {
     }
     // Load/store register: immediate, register offset, unsigned immediate
     if ((i & 0x38000000) == 0x38000000) {
+        if (!vec && !(i >> 24 & 1) && (i >> 21 & 1) && !((i >> 10) & 3)) { atomic(c, i, pc); return; }
         const unsigned size = i >> 30, opc = (i >> 22) & 3;
         unsigned n, scale;
         bool load, sgn = false, to32 = false;
@@ -179,7 +209,7 @@ inline void Machine::loadStore(Cpu& c, uint32_t i, uint64_t pc) {
         if (i >> 24 & 1) {  // unsigned immediate
             a = base + ((uint64_t)((i >> 10) & 0xfff) << scale);
         } else if (i >> 21 & 1) {
-            if (((i >> 10) & 3) != 2) { undefined(c, i, pc); return; }  // atomics, PAC loads: not there
+            if (((i >> 10) & 3) != 2) { undefined(c, i, pc); return; }  // PAC loads: not there
             const unsigned opt = (i >> 13) & 7;
             if (!(opt & 2)) { undefined(c, i, pc); return; }
             a = base + extendReg(X(c, (i >> 16) & 31), opt, (i >> 12 & 1) ? scale : 0);
@@ -223,6 +253,39 @@ inline void Machine::loadStore(Cpu& c, uint32_t i, uint64_t pc) {
         return;
     }
     undefined(c, i, pc);
+}
+
+// Atomic memory operations (Armv8.1 LSE): LDADD, LDCLR, LDEOR, LDSET,
+// LDSMAX, LDSMIN, LDUMAX, LDUMIN and SWP, with their acquire / release
+// forms (the processors take turns, so ordering needs nothing more).
+inline void Machine::atomic(Cpu& c, uint32_t i, uint64_t pc) {
+    const unsigned size = i >> 30, rs = (i >> 16) & 31, rn = (i >> 5) & 31, rt = i & 31;
+    const unsigned o3 = i >> 15 & 1, opc = (i >> 12) & 7, n = 1u << size;
+    if (o3 && opc) { undefined(c, i, pc); return; }  // LDAPR (Armv8.3): not there
+    const uint64_t a = XS(c, rn);
+    if (rn == 31 && (a & 15) && (c.sctlr >> (c.el ? 3 : 4) & 1)) { exception(c, EC_SP_ALIGN, 0, pc); return; }
+    if (a & (n - 1)) { c.far = a; exception(c, c.el ? EC_DABT_CUR : EC_DABT_LOW, F_ALIGN | 1u << 6, pc); return; }
+    uint64_t pa;
+    uint8_t* h;
+    if (!xlate(c, a, 1, false, pa, h)) return;
+    uint64_t old;
+    if (!rd(c, a, n, old)) return;
+    const uint64_t m = ones(8 * n), s = X(c, rs) & m;
+    auto sgn = [&](uint64_t v) { return (int64_t)(v << (64 - 8 * n)) >> (64 - 8 * n); };
+    uint64_t r;
+    if (o3) r = s;  // SWP
+    else switch (opc) {
+        case 0: r = old + s; break;
+        case 1: r = old & ~s; break;
+        case 2: r = old ^ s; break;
+        case 3: r = old | s; break;
+        case 4: r = sgn(old) > sgn(s) ? old : s; break;
+        case 5: r = sgn(old) < sgn(s) ? old : s; break;
+        case 6: r = old > s ? old : s; break;
+        default: r = old < s ? old : s; break;
+    }
+    if (!wr(c, a, n, r & m)) return;
+    setX(c, rt, old, size == 3);
 }
 
 }  // namespace a64

@@ -102,7 +102,8 @@ inline bool Machine::sysReg(Cpu& c, uint32_t reg, bool write, uint64_t& v, uint3
         case SR(3, 0, 0, 0, 0): ok = ro(0x000f0510); break;            // MIDR_EL1: implementer 0, architecture 0xf
         case SR(3, 0, 0, 0, 5): ok = ro(c.mpidr); break;               // MPIDR_EL1
         case SR(3, 0, 0, 0, 6): ok = ro(0); break;                     // REVIDR_EL1
-        case SR(3, 0, 0, 4, 0): ok = ro(0x1000011); break;             // ID_AA64PFR0_EL1: EL0, EL1 AArch64; FP, AdvSIMD; GIC sysregs
+        case SR(3, 0, 0, 4, 0): ok = ro(1ull << 60 | 1ull << 56 | 0x1000011); break;  // ID_AA64PFR0_EL1: CSV3, CSV2 (no speculation); EL0, EL1 AArch64; FP, AdvSIMD; GIC sysregs
+        case SR(3, 0, 0, 6, 0): ok = ro(2u << 20 | 1u << 16); break;  // ID_AA64ISAR0_EL1: LSE atomics, CRC32
         case SR(3, 0, 0, 5, 0): ok = ro(0x6); break;                   // ID_AA64DFR0_EL1: Armv8.0 debug, no PMU
         case SR(3, 0, 0, 7, 0): ok = ro(0xf0 << 20 | 0x2 << 4 | 0x2); break;  // ID_AA64MMFR0_EL1: 40-bit PA, 16-bit ASID, 4K only
         case SR(3, 3, 0, 0, 1): ok = ro(1ull << 31 | 1ull << 29 | 1ull << 28 | 4u << 24 | 4u << 20 | 4u << 16 | 3u << 14 | 4u); break;  // CTR_EL0: DIC, IDC, 64-byte lines
