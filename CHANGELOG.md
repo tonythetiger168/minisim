@@ -41,6 +41,11 @@ Spec references are IEEE 1800-2023 clauses.
   move to `tests/compat/` and their manuals to `docs/compat/`.
 
 ### Added
+- mvplat boots the AArch64 Android Cuttlefish image
+  (`aosp_cf_arm64_only_phone-userdebug`, GKI 6.12) to `sys.boot_completed`
+  in 600 simulated seconds with `-mt`: `tests/vplat/android/run.sh` picks
+  the arm board (`android-arm64.json`) from the kernel in `boot.img`
+  (docs/ANDROID.md, "AArch64").
 - mvplat runs AArch64 (Armv8.0-A, EL0 and EL1) on a built-in arm board: the
   A64 base set with floating point and NEON, stage 1 translation with the
   4 KiB granule, a GICv3, the generic timer, a PL011 UART, PSCI 1.1 firmware

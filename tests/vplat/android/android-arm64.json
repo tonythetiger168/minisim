@@ -1,0 +1,37 @@
+{
+  "arch": "aarch64",
+  "name": "android-arm64",
+  "devices": [
+    {"type": "finisher", "base": "0x00100000"},
+    {"type": "gicv3", "name": "gic", "base": "0x08000000", "redist": "0x080a0000", "spis": 96},
+    {"type": "pl011", "name": "uart0", "base": "0x09000000", "irq": 1},
+    {"type": "goldfish-rtc", "name": "rtc", "base": "0x09010000", "irq": 2},
+    {"type": "pcie", "name": "pcie", "base": "0x3f000000", "buses": 16, "irq": 3, "mmio": "0x10000000", "mmio_size": "0x2eff0000",
+     "devices": [
+       {"type": "virtio-blk", "file": "android.disk"},
+       {"type": "virtio-rng", "seed": 1},
+       {"type": "virtio-gpu", "width": 720, "height": 1280, "screen": "screen.ppm"},
+       {"type": "virtio-console", "socket": "cf/hvc0.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc1.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc2.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc3.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc4.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc5.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc6.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc7.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc8.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc9.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc10.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc11.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc12.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc13.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc14.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc15.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc16.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc17.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc18.sock"},
+       {"type": "virtio-console", "socket": "cf/hvc19.sock"}
+     ]},
+    {"type": "ram", "name": "dram", "base": "0x40000000", "size": "4G"}
+  ]
+}
