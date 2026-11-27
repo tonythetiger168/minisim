@@ -136,6 +136,12 @@ class Codegen {
 public:
     std::string run(const std::vector<CodegenSig>& sigs, const std::vector<CodegenProc>& procs,
                     const CodegenParts& parts = {}) {
+        // Writers of each signal other than force / assign: a held signal
+        // is compiled only when nothing else writes it (emitProc IK::Force).
+        plainW_.assign(sigs.size(), 0);
+        for (auto& p : procs)
+            for (auto& in : p.prog->code)
+                if ((in.k == IK::Assign || in.k == IK::Nba) && in.sig >= 0 && (size_t)in.sig < sigs.size()) plainW_[in.sig]++;
         for (auto& g : sigs) { quiet_.push_back(g.quiet); sigW_.push_back(g.w); sigNet_.push_back(g.net); soleNba_.push_back(g.soleNba); scratch_.push_back(g.name.rfind("_tf", 0) == 0); sigName_.push_back(g.name); }
         {
             // Array shapes numbered by base signal: the instances of a module
@@ -221,7 +227,18 @@ public:
         evPlain_.assign(procs.size(), 0);
         evAt_.assign(procs.size(), -1);
         evDT_.clear();
+        // The arming processes of always @* blocks (tens of thousands in an
+        // SoC, each a coroutine of its own) run as one shared coroutine,
+        // armOnce, given their wait list and flag (MSIM_NOARMSHARE=1: off).
+        armOne_.assign(procs.size(), 0);
+        if (dom.empty() && !upf && !std::getenv("MSIM_NOARMSHARE"))
+            for (size_t i = 0; i < procs.size(); i++) {
+                if (!armShape(procs[i], sigs) || procs[i].kind == "init" || sigs[procs[i].prog->code[1].sig].w != 1) continue;
+                const E& v = procs[i].prog->code[1].e;
+                if (v && v->op == Op::Const && v->k.v == 1 && !v->k.x && !v->k.z && !v->k.real && !v->k.str) armOne_[i] = 1;
+            }
         for (size_t i = 0; i < procs.size(); i++) {
+            if (armOne_[i]) continue;
             const bool inDom = inDomV[i] != 0;
             if (upf && procs[i].prog->pd >= 0 && (procs[i].combRank >= 0 || procs[i].seq || inDom))
                 throw CodegenUnsupported("a statically scheduled process of a power domain");
@@ -401,6 +418,10 @@ public:
              "static E XT(const char* p) { return XP(p); }\n"
              "// A process that never waits, as a plain function (Codegen::evPlain).\n"
              "[[maybe_unused]] static Task evOnce(void (*f)(const void*), const void* x) { f(x); co_return; }\n"
+             "// An always @* arming process (msim.cpp rotateAtStar), one for all of them:\n"
+             "// wait once on the block's inputs, then set its flag.\n"
+             "[[maybe_unused]] static Task armOnce(const std::vector<std::pair<int, Edge>>* ev, int flag) {\n"
+             "    co_await WaitAny{ev};\n    S.setOneBit(flag, Val{1, 0, 1, 0, false});\n    co_return;\n}\n"
              "static E XA(E e, const ArrShape& a) { e->arr = std::shared_ptr<const ArrShape>(std::shared_ptr<void>{}, &a); return e; }\n"
              "// Unpacked arrays (eval() Op::ArrRead, target() in exec.inc): the element signal, or -1.\n"
              "static inline int AOFF(const ArrShape& a, std::initializer_list<Val> ix) {\n"
@@ -1104,26 +1125,37 @@ public:
             o << intTable("DT", v);
         }
         if (dom.empty() && !byRank.empty()) {   // the ranks: functions, wait lists in CINS
+            // One row per rank as numbers (encoded like CINS): its functions
+            // by index into CFN, which holds each distinct set once (shared
+            // per module), level, wait-list length and context. A table of
+            // a million function-pointer rows (OpenPiton 4x4: 88 MB of C++)
+            // took gcc minutes and gigabytes.
             std::string tab;
-            std::vector<int> ins;
-            size_t off = 0;
+            std::vector<int> ins, rFn, rLv, rN, rX;
+            std::map<std::string, int> fnIdx;
             for (int i : byRank) {
                 ins.insert(ins.end(), procs[i].combIns.begin(), procs[i].combIns.end());
                 bool one = oneAssign(*procs[i].prog);
                 const std::string nm = evName_.size() > (size_t)i && !evName_[i].empty() ? evName_[i] : std::to_string(i);
-                tab += "        {comb" + nm + ", " + (one ? "combv" + nm : "nullptr") + ", " +
-                       (one ? "combc" + nm : "nullptr") + ", " + std::to_string(procs[i].combLevel) + ", " +
-                       std::to_string(off) + ", " + std::to_string(procs[i].combIns.size()) + ", " + evCtx(i) + "},\n";
-                off += procs[i].combIns.size();
+                std::string row = "{comb" + nm + ", " + (one ? "combv" + nm : "nullptr") + ", " + (one ? "combc" + nm : "nullptr") + "}";
+                auto [it, fresh] = fnIdx.emplace(row, (int)fnIdx.size());
+                if (fresh) tab += "        " + row + ",\n";
+                rFn.push_back(it->second);
+                rLv.push_back(procs[i].combLevel);
+                rN.push_back((int)procs[i].combIns.size());
+                rX.push_back(i >= 0 && (size_t)i < evAt_.size() ? evAt_[(size_t)i] : -1);
             }
             std::string cyc;   // ranks on a cycle: only their final writes wake readers
             for (size_t k = 0; k < byRank.size(); k++) if (procs[byRank[k]].combOnCycle) cyc += std::to_string(k) + ",";
             ins.push_back(0);
-            o << intTable("CINS", ins) <<
-                 "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); int lv, at, n; const void* x; } COMBS[] = {\n"
+            o << intTable("CINS", ins) << intTable("CRF", rFn) << intTable("CRL", rLv) << intTable("CRN", rN) << intTable("CRX", rX) <<
+                 "    static const struct { void (*f)(const void*); Val (*v)(const void*); void (*c)(const void*, Val); } CFN[] = {\n"
               << tab << "    };\n"
                  "    const size_t combBase = S.combs.size();\n"
-                 "    for (auto& c : COMBS) S.addComb(c.f, c.x, std::vector<int>(CINS + c.at, CINS + c.at + c.n), c.lv, c.v, c.c);\n";
+                 "    for (size_t k = 0, at = 0; k < " << rFn.size() << "; at += (size_t)CRN[k], k++) {\n"
+                 "        const auto& c = CFN[CRF[k]];\n"
+                 "        S.addComb(c.f, " << (evDT_.empty() ? "nullptr" : "CRX[k] < 0 ? nullptr : (const void*)(DT + CRX[k])") << ", std::vector<int>(CINS + at, CINS + at + CRN[k]), CRL[k], c.v, c.c);\n"
+                 "    }\n";
             if (!cyc.empty())
                 o << "    static const int CYC[] = {" << cyc << "};\n"
                      "    for (int k : CYC) S.combs[combBase + (size_t)k].onCycle = true;\n";
@@ -1149,14 +1181,16 @@ public:
             o << "    S.fastCommit = fcommit;\n";
         }
         {   // clocked functions and coroutine processes, in process order
-            std::string evs, tab;
+            std::string tab;
+            std::vector<int> evS, evE;   // the wait lists, as numbers (intTable)
             size_t off = 0, n = 0;
+            int nArm = 0;
             for (size_t i = 0; i < procs.size(); i++) {
                 if (procs[i].combRank >= 0) continue;
                 if (std::find(dom.begin(), dom.end(), (int)i) != dom.end() || isInit(i)) continue;
                 n++;
                 if (procs[i].seq && !(i < mixSeq_.size() && mixSeq_[i])) {
-                    for (auto& [sg, ed] : procs[i].seqEv) evs += "{" + std::to_string(sg) + ", " + edge(ed) + "},";
+                    for (auto& [sg, ed] : procs[i].seqEv) { evS.push_back(sg); evE.push_back((int)ed); }
                     const std::string nm = evName_.size() > i && !evName_[i].empty() ? evName_[i] : std::to_string(i);
                     tab += "        {seq" + nm + ", nullptr, " + std::to_string(off) + ", " +
                            std::to_string(procs[i].seqEv.size()) + ", 0, " + evCtx((int)i) + ", nullptr},\n";
@@ -1167,7 +1201,14 @@ public:
                     // first initial block start just before it (or last if there
                     // is none); each Task is still made in declaration order.
                     const int late = procs[i].kind == "assign" && !procs[i].loops ? 1 : procs[i].kind == "Initial" ? 2 : 0;
-                    if (i < evPlain_.size() && evPlain_[i]) {
+                    if (armOne_[i]) {
+                        const auto& w = procs[i].prog->code[0];
+                        for (auto& [sg, ed] : w.events) { evS.push_back(sg); evE.push_back((int)ed); }
+                        tab += "        {nullptr, nullptr, " + std::to_string(off) + ", " + std::to_string(w.events.size()) + ", " +
+                               std::to_string(late) + ", nullptr, nullptr, 0, 0, " + std::to_string(nArm++) + ", " +
+                               std::to_string(procs[i].prog->code[1].sig) + "},\n";
+                        off += w.events.size();
+                    } else if (i < evPlain_.size() && evPlain_[i]) {
                         const std::string nm = !evName_[i].empty() ? evName_[i] : std::to_string(i);
                         tab += "        {nullptr, nullptr, 0, 0, " + std::to_string(late) + ", " + evCtx((int)i) + ", proc" + nm + "},\n";
                     } else {
@@ -1180,11 +1221,18 @@ public:
                 }
             }
             if (n) {
-                o << "    static const std::pair<int, Edge> SEV[] = {" << evs << "{0, ANY}};\n"
-                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; const void* x; void (*f)(const void*); int ck; unsigned long long half; } PROCS[] = {\n"
+                o << intTable("SEVS", evS) << intTable("SEVE", evE) <<
+                     "    static std::vector<std::pair<int, Edge>> SEVV(" << evS.size() + 1 << ");\n"
+                     "    for (size_t k = 0; k < " << evS.size() << "; k++) SEVV[k] = {SEVS[k], (Edge)SEVE[k]};\n"
+                     "    const std::pair<int, Edge>* const SEV = SEVV.data();\n"
+                     "    static std::vector<std::pair<int, Edge>> ARMEV[" << std::max(nArm, 1) << "];\n"
+                     "    static const struct { void (*s)(const void*, std::vector<Sim::NbaItem>&); Task (*p)(); int at, n, late; const void* x; void (*f)(const void*); int ck; unsigned long long half; int arm = -1, flag = -1; } PROCS[] = {\n"
                   << tab << "    };\n"
                      "    std::vector<Task> held;\n    bool init1 = false;\n"
-                     "    auto mk = [](const auto& p) { return p.p ? p.p() : evOnce(p.f, p.x); };\n"
+                     "    auto mk = [&](const auto& p) {\n"
+                     "        if (p.arm < 0) return p.p ? p.p() : evOnce(p.f, p.x);\n"
+                     "        ARMEV[p.arm].assign(SEV + p.at, SEV + p.at + p.n);\n"
+                     "        return armOnce(&ARMEV[p.arm], p.flag);\n    };\n"
                      "    for (auto& p : PROCS)\n"
                      "        if (p.s) S.addSeq(p.s, p.x, std::vector<std::pair<int, Edge>>(SEV + p.at, SEV + p.at + p.n));\n"
                      "        else if (p.late == 1 && !init1) held.push_back(mk(p));\n"
@@ -1306,6 +1354,7 @@ public:
         msimIns_.push_back(&i);
         return "MSIMI(" + std::to_string(msimIns_.size() - 1) + ")";
     }
+    std::vector<char> armOne_;   // an always @* arming process run by armOnce (run)
     std::vector<char> mixSeq_;   // a clocked process left to the interpreter, or run as a coroutine
     // A clocked process as a clocked function, or else (a $display in it, say)
     // as an ordinary coroutine process, as with msim -no-static-seq.
@@ -1572,6 +1621,13 @@ private:
     std::vector<const ArrShape*> arrs_;   // unpacked arrays, emitted as AS<k>
     std::vector<E> evals_;                // operators without C++ yet: interpreted (ET<k>)
     std::vector<const Instr*> mems_;      // $readmem / $writemem instructions, rebuilt as MI<k>
+    static bool noReads(const E& e) {   // an expression of constants only
+        if (!e) return true;
+        if (e->sig >= 0 || e->arr || e->at || e->op == Op::Ref) return false;
+        for (auto& k : e->kids) if (!noReads(k)) return false;
+        return e->op == Op::Const || e->op == Op::Resize || e->op == Op::Concat;
+    }
+    std::vector<int> plainW_;             // per signal: its writers other than force / assign (run)
     std::vector<const Instr*> asrts_;     // immediate assertions and $assertcontrol, rebuilt as AI<k>
     std::map<const Expr*, std::string> slotNames_;   // assertion action slots, rebuilt as SL<k>
     // Every element of a is private, in signal order (PA is indexed by signal).
@@ -6987,6 +7043,8 @@ private:
         }
         return r;
     }
+    static constexpr long long kEvArr = 1LL << 40;   // shareEv: array shape numbers, apart from signals
+    const bool noShareArr_ = std::getenv("MSIM_NOSHAREARR") != nullptr;
     void shareEv(std::vector<EvUnit>& us, std::vector<std::string>& chunks) {
         // Each distinct signal of a template is a slot a member moves by its
         // own distance (the same signal twice: the same distance). Slots
@@ -7003,11 +7061,13 @@ private:
             std::vector<long long> num;
             bool ok = true;
             size_t last = 0;
+            // Signal numbers, and array shapes AS<k> (a module's memories:
+            // OpenSPARC's TLBs), which the template reaches as AST[k + D].
             refScan(norm[u], [&](size_t, size_t at, size_t e, long long n, int kind) {
-                if (kind != 0) ok = false;
+                if (kind != 0 && (kind != 2 || noShareArr_)) ok = false;
                 shape += refPiece(norm[u].substr(last, at - last));
-                shape += '\x01';
-                num.push_back(n);
+                shape += kind == 2 ? '\x02' : '\x01';
+                num.push_back(kind == 2 ? kEvArr + n : n);
                 last = e;
             });
             shape += refPiece(norm[u].substr(last));
@@ -7078,9 +7138,15 @@ private:
             std::string r;
             r.reserve(nt.size() + nt.size() / 4);
             size_t last = 0, k = 0;
-            refScan(nt, [&](size_t, size_t, size_t e, long long, int) {
-                r.append(nt, last, e - last);
-                if (int m = merged[(size_t)t.slot[k]]; m >= 0) r += " + D" + std::to_string(m);
+            refScan(nt, [&](size_t start, size_t, size_t e, long long n, int kind) {
+                const int m = merged[(size_t)t.slot[k]];
+                if (kind == 2 && m >= 0) {
+                    r.append(nt, last, start - last);
+                    r += "(*AST[" + std::to_string(n) + " + D" + std::to_string(m) + "])";
+                } else {
+                    r.append(nt, last, e - last);
+                    if (m >= 0) r += " + D" + std::to_string(m);
+                }
                 k++;
                 last = e;
             });
@@ -7549,6 +7615,32 @@ private:
                     case IK::RandMode:   // 18.8, 18.9
                         o << " { const Instr& i = " << msimIns(i) << "; Val h = eval(i.e, rd); if (h.x || !h.v) nullAccess();"
                              " randModeAll((int)h.v, i.hi != 0, truth(eval(i.de, rd)) == 1); }\n";
+                        break;
+                    // force / assign and release / deassign (10.6) through the
+                    // kernel, as exec.inc runs them: the held expression is
+                    // msim's (ET<k>) and the kernel re-evaluates it. Its
+                    // signals and the target stay in S.sigs (not private).
+                    case IK::Force: {
+                        if (i.callee) throw CodegenUnsupported("force of an expression with a function call");
+                        if (!i.e || i.sig < 0) throw CodegenUnsupported("force");
+                        // Compiled code writes and reads signals past the
+                        // kernel's hold checks: only a constant held on a
+                        // signal nothing else writes (a PLL model's lock
+                        // output, a testbench strap) is compiled.
+                        if ((size_t)i.sig >= plainW_.size() || plainW_[i.sig] || !noReads(i.e))
+                            throw CodegenUnsupported("force of a signal another process writes, or of a non-constant");
+                        hitPriv(i.e);
+                        if (isPriv(i.sig)) privHits_.insert(i.sig);
+                        evals_.push_back(i.e);
+                        o << " S.holdOn(" << i.sig << ", ET" << evals_.size() - 1 << ", " << (i.hi != 0 ? "true" : "false") << ", "
+                          << (i.pw ? std::to_string(i.dkey + i.pw - 1) : std::string("-1")) << ", " << i.dkey << ");\n";
+                        break;
+                    }
+                    case IK::Release:
+                        if (i.sig < 0 || (size_t)i.sig >= plainW_.size() || plainW_[i.sig]) throw CodegenUnsupported("release of a signal another process writes");
+                        if (isPriv(i.sig)) privHits_.insert(i.sig);
+                        o << " S.holdOff(" << i.sig << ", " << (i.hi != 0 ? "true" : "false") << ", "
+                          << (i.pw ? std::to_string(i.dkey + i.pw - 1) : std::string("-1")) << ", " << i.dkey << ");\n";
                         break;
                     default: throw CodegenUnsupported("instruction " + std::to_string((int)i.k));
                 }
