@@ -14,7 +14,10 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -27,6 +30,8 @@
 #include "vp/fdt.hpp"
 #include "vp/json.hpp"
 #include "vp/machine.hpp"
+#include "vp/a64machine.hpp"
+#include "vp/pl011.hpp"
 #include "vp/virtio.hpp"
 #include "vp/pci.hpp"
 
@@ -556,6 +561,8 @@ bool bootOs(Machine& m, const Options& o) {
     return false;
 }
 
+#include "mvplat_a64.inc"
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -649,6 +656,39 @@ int main(int argc, char** argv) {
     }
     if (o.elf.empty() && !booting && o.dumpDtb.empty() && !(g_ext && g_ext->needsNoProgram())) { usage(); return 2; }
 
+    // AArch64: a platform file that says so, or an AArch64 program
+    {
+        std::string text;
+        fs::path dir = fs::current_path();
+        bool a64 = false;
+        if (!o.platform.empty()) {
+            std::ifstream in(o.platform);
+            if (in) {
+                std::stringstream ss;
+                ss << in.rdbuf();
+                text = ss.str();
+                dir = fs::absolute(o.platform).parent_path();
+                try {
+                    json::Value pl = json::parse(text);
+                    a64 = pl.get("arch") && pl.get("arch")->str() == "aarch64";
+                } catch (...) {}
+            }
+        } else {
+            const std::string prog = !o.elf.empty() ? o.elf : o.kernel;
+            a64 = !prog.empty() && a64File(prog);
+            text = kBuiltinA64;
+        }
+        if (a64) {
+            try {
+                if (!o.bios.empty()) throw std::runtime_error("-bios: an AArch64 platform boots the kernel itself (its firmware calls are built in)");
+                return runA64(o, text, dir);
+            } catch (std::exception& e) {
+                fflush(stdout);
+                std::cerr << "mvplat: " << e.what() << "\n";
+                return 2;
+            }
+        }
+    }
     Machine m;
     FILE* trace = nullptr;
     try {

@@ -1,4 +1,4 @@
-// elf.hpp - reading a 32-bit or 64-bit little-endian RISC-V ELF executable: its loadable
+// elf.hpp - reading a 32-bit or 64-bit little-endian RISC-V (or AArch64) ELF executable: its loadable
 // segments, its entry point and its symbols (for tohost, -profile and gdb).
 #pragma once
 
@@ -19,6 +19,7 @@ struct Elf {
     };
     uint64_t entry = 0;
     bool is64 = false;  // ELFCLASS64: the program is RV64
+    unsigned machine = 243;  // e_machine: 243 RISC-V, 183 AArch64
     std::vector<Seg> segs;
     std::map<std::string, uint64_t> syms;          // name -> address
     std::map<uint64_t, std::pair<std::string, uint64_t>> funcs;  // address -> name, size
@@ -56,8 +57,10 @@ inline Elf readElf(const std::string& path) {
     };
     auto u64 = [&](uint64_t o) { return (uint64_t)u32(o) | (uint64_t)u32(o + 4) << 32; };
     auto addr = [&](uint64_t o) { return w ? u64(o) : (uint64_t)u32(o); };  // an Elf_Addr / Elf_Off
-    if (u16(18) != 243) throw std::runtime_error(path + ": not a RISC-V ELF file");
+    const unsigned machine = u16(18);
+    if (machine != 243 && machine != 183) throw std::runtime_error(path + ": not a RISC-V or AArch64 ELF file");
     Elf e;
+    e.machine = machine;
     e.is64 = w;
     e.entry = addr(24);
     uint64_t phoff = addr(w ? 32 : 28), shoff = addr(w ? 40 : 32);
