@@ -249,6 +249,29 @@ alt = struct.unpack('<Q', hdr[32:40])[0]
 assert g[alt * 512:alt * 512 + 8] == b'EFI PART'
 P
 fi
+# cfhost.py, the host end of an Android guest's console ports: the sensors
+# HAL's list-sensors and the OEM lock HAL's reads and writes.
+mkdir -p cf
+python3 -I "$T/android/cfhost.py" "$PWD/cf" > cfhost.out 2>&1 &
+cfpid=$!
+for i in $(seq 50); do [ -S cf/hvc19.sock ] && break; sleep 0.1; done
+python3 - "$PWD/cf" <<'P' && ok "android: cfhost.py answers the sensors and OEM lock HALs" || bad "android: cfhost.py"
+import socket, struct, sys
+def talk(port, cmd, payload):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect('%s/hvc%d.sock' % (sys.argv[1], port))
+    s.settimeout(10)
+    s.sendall(struct.pack('<II', cmd, len(payload)) + payload)
+    w0, n = struct.unpack('<II', s.recv(8))
+    r = s.recv(n) if n else b''
+    s.close()
+    return w0, r
+assert talk(18, 0, b'list-sensors') == (1 << 31, b'0')
+assert talk(10, 1, b'\x01') == (1 << 31 | 1, b'\x01')
+assert talk(10, 1, b'') == (1 << 31 | 1, b'\x01')
+assert talk(10, 3, b'') == (1 << 31 | 3, b'\x00')
+P
+kill $cfpid 2> /dev/null; wait $cfpid 2> /dev/null
 
 # virtio-blk (-disk): a bare-metal driver reads, writes and flushes a raw
 # image; the file changes only with -disk-write.
@@ -361,6 +384,37 @@ J
 "$MVPLAT" "$E/hello.elf" -harts 2 -disk "$E/hello.elf" -net user -vcon -dump-dtb board.dtb > dtb.out 2>&1; rc=$?
 if [ $rc = 0 ] && [ "$(od -An -tx1 -N4 board.dtb | tr -d ' ')" = d00dfeed ]; then ok "-dump-dtb writes a device tree blob"
 else bad "-dump-dtb (exit $rc)"; fi
+
+# AArch64 (tests/vplat/a64, built by its build.sh): the built-in arm board
+# is chosen from the ELF's machine.
+A=$T/a64/elf
+"$MVPLAT" "$A/hello.elf" -input xyz -q > a64hello.out 2>&1; rc=$?
+expect "aarch64: hello and PL011 input" 0 a64hello.out "received 'xyz'"
+"$MVPLAT" "$A/hello.elf" -map -q > a64map.out 2>&1; rc=$?
+expect "aarch64: -map shows the arm board" 0 a64map.out "0x080a0000..0x080bffff  gicv3-redist"
+"$MVPLAT" "$A/calc.elf" -q > a64calc.out 2>&1; rc=$?
+if [ $rc = 0 ] && diff -q a64calc.out "$T/a64/calc.expected" > /dev/null; then ok "aarch64: integer, floating-point and NEON results match the host's"
+else bad "aarch64: calc (exit $rc)"; diff a64calc.out "$T/a64/calc.expected" | sed 's/^/      /'; fi
+"$MVPLAT" "$A/trap.elf" -q > a64trap.out 2>&1; rc=$?
+expect "aarch64: SVC, undefined, aborts, EL0, PSCI" 0 a64trap.out "trap: all passed"
+"$MVPLAT" "$A/mmu.elf" -q > a64mmu.out 2>&1; rc=$?
+expect "aarch64: stage 1 translation, faults, AT, TLBI" 0 a64mmu.out "mmu: all passed"
+"$MVPLAT" "$A/irq.elf" -q > a64irq.out 2>&1; rc=$?
+expect "aarch64: GICv3, timers, SGI, priority mask" 0 a64irq.out "irq: all passed"
+"$MVPLAT" "$A/smp.elf" -harts 4 -q > a64smp.out 2>&1; rc=$?
+expect "aarch64: PSCI CPU_ON, exclusives and a spin lock on 4 processors" 0 a64smp.out "smp: all passed"
+"$MVPLAT" "$A/hello.elf" -bios "$A/hello.elf" -q > a64bios.out 2>&1; rc=$?
+expect "aarch64: -bios is refused" 2 a64bios.out "bios"
+# Random instruction blocks against QEMU's user-mode emulator, run as a
+# separate program (when qemu-aarch64, clang and ld.lld are installed).
+QEMU_A64=$(command -v qemu-aarch64 || command -v qemu-aarch64-static || true)
+if [ -n "$QEMU_A64" ] && command -v clang > /dev/null 2>&1 && command -v ld.lld > /dev/null 2>&1; then
+  if bash "$T/a64/difftest/difftest.sh" "$MVPLAT" "$QEMU_A64" difftest 1 1500 4 > difftest.out 2>&1; then
+    ok "aarch64: 1500 random integer, NEON and floating-point blocks agree with qemu-aarch64"
+  else bad "aarch64: random blocks differ from qemu-aarch64"; tail -30 difftest.out | sed 's/^/      /'; fi
+else
+  echo "skip  aarch64 random blocks: needs qemu-aarch64, clang and ld.lld"
+fi
 if command -v dtc > /dev/null 2>&1; then
   dtc -I dtb -O dts board.dtb > board.dts 2> dtc.err; rc=$?
   if [ $rc = 0 ] && ! [ -s dtc.err ] && grep -q 'cpu@1' board.dts && grep -q 'riscv,sv32' board.dts &&
@@ -479,6 +533,20 @@ if [ -n "${MVPLAT_LINUX_KERNEL:-}" ] && [ -n "$BIOS" ]; then
   fi
 else
   echo "skip  Linux boot: set MVPLAT_LINUX_KERNEL (tests/vplat/get-linux.sh fetches a kernel)"
+fi
+
+# Linux on AArch64: Ubuntu's arm64 kernel and BusyBox on 2 processors, on
+# the built-in arm board (tests/vplat/get-linux-arm64.sh fetches them).
+if [ -n "${MVPLAT_ARM64_KERNEL:-}" ] && [ -n "${MVPLAT_ARM64_BUSYBOX:-}" ] && command -v python3 > /dev/null 2>&1; then
+  python3 "$T/mkcpio.py" bb64.cpio d:dev c:dev/console:5:1 c:dev/null:1:3 d:bin d:mnt "f:bin/busybox:$MVPLAT_ARM64_BUSYBOX" \
+    "f:init:$T/busybox_init.sh"
+  "$MVPLAT" -kernel "$MVPLAT_ARM64_KERNEL" -initrd bb64.cpio -append "console=ttyAMA0 rdinit=/init quiet" -harts 2 -q \
+    -input "echo arm \$((6*7)); uname -m; poweroff -f
+" > linux-arm64.out 2>&1; rc=$?
+  expect "Linux arm64 and a BusyBox shell on 2 AArch64 processors" 0 linux-arm64.out "shell on aarch64, 2 harts"
+  grep -q "^arm 42" linux-arm64.out && ok "the arm64 shell runs what is typed" || { bad "the arm64 shell"; sed 's/^/      /' linux-arm64.out | tail -20; }
+else
+  echo "skip  Linux arm64: set MVPLAT_ARM64_KERNEL and MVPLAT_ARM64_BUSYBOX (tests/vplat/get-linux-arm64.sh fetches them)"
 fi
 
 exit $fail

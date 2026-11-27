@@ -1,7 +1,7 @@
 # mvplat: virtual platforms
 
 `mvplat` runs the software of a system before its hardware exists. A
-platform is a set of RISC-V harts and a memory map of peripheral models; the
+platform is a set of RISC-V harts (or Arm AArch64 processors) and a memory map of peripheral models; the
 software is the same ELF file the real board will boot. It is the
 counterpart of Synopsys Virtualizer, Cadence Helium and Siemens Vista.
 
@@ -608,8 +608,85 @@ to 0.28 s). Linux (one hart) boots to the BusyBox shell and powers off in about
 1.0 s, best of 5 (QEMU 1.29 s on the same host; 4.4 s with `-nojit`). Floating point and
 vector instructions still run on the general path.
 
+## Arm (AArch64)
+
+mvplat also runs AArch64 software. An AArch64 ELF file (machine 183) or a
+Linux arm64 `Image` picks the built-in arm board by itself; a platform file
+picks it with `"arch": "aarch64"`.
+
+```sh
+mvplat prog.elf                         # bare metal, on the arm board
+mvplat prog.elf -harts 4                # four processors; PSCI starts 1 to 3
+mvplat -kernel Image -initrd root.cpio -append "console=ttyAMA0"
+```
+
+The processor model is written from Arm's public architecture reference
+(DDI 0487), not from another simulator, and it is not a model of any Arm
+core: `MIDR_EL1` has implementer 0. It implements Armv8.0-A at EL0 and EL1:
+
+- **Instructions.** The A64 base set, floating point and Advanced SIMD
+  (NEON). Floating point follows the architecture's pseudocode: NaN
+  propagation and FPCR.DN, flush to zero (FPCR.FZ) with tininess detected
+  before rounding, every FPCR rounding mode, the cumulative flags in FPSR,
+  the alternative half-precision format (FPCR.AHP), round-to-odd for FCVTXN,
+  and the reciprocal and reciprocal-square-root estimates bit for bit; the
+  saturating integer operations set FPSR.QC. Half precision is there for
+  conversions only (no FP16 arithmetic). Not yet: the large-system
+  extensions (LSE atomics, CAS), the crypto extensions, SVE and SME, pointer
+  authentication, MTE, and AArch32.
+- **Exceptions.** Synchronous exceptions with ESR_EL1, FAR_EL1 and ELR_EL1,
+  IRQs, SP_EL0/SP_EL1 selection, EL0 traps of system registers. HVC and SMC
+  from EL1 go to a built-in firmware with PSCI 1.1 (`CPU_ON`, `CPU_OFF`,
+  `AFFINITY_INFO`, `SYSTEM_OFF`, `SYSTEM_RESET`, `PSCI_FEATURES`) and SMCCC
+  1.1; there is no EL2 or EL3.
+- **Memory.** VMSAv8-64 stage 1 with the 4 KiB granule through TTBR0 and
+  TTBR1, block and page descriptors, the access permissions, PXN and UXN,
+  the access flag, ASIDs (8 or 16 bits), top-byte ignore, `AT` into PAR_EL1
+  and `TLBI`. Exclusive loads and stores with a monitor per processor.
+- **Devices.** A GICv3 (distributor and one redistributor per processor,
+  affinity routing, single security state, the system-register CPU
+  interface; no ITS or LPIs), the generic timer (physical and virtual, PPIs
+  30 and 27), a PL011 UART, the test finisher and the goldfish RTC.
+
+The built-in arm board:
+
+| Address | Device | Interrupt |
+|---|---|---|
+| `0x00100000` | test finisher | |
+| `0x08000000` | GICv3 distributor | |
+| `0x080a0000` | GICv3 redistributors, 128 KiB each | |
+| `0x09000000` | PL011 UART | SPI 1 |
+| `0x09010000` | goldfish RTC | SPI 2 |
+| `0x40000000` | 1 GiB RAM | |
+
+A Linux `Image` is loaded at the start of RAM plus its `text_offset`, the
+device tree at the top of the first GiB with the initrd below it, and the
+kernel starts at EL1 with `x0` pointing at the device tree. An ELF file
+starts at its entry point. Received characters on the PL011 (`-input`,
+`-input-at`, `-stdin`) are held until software sets `IMSC.RX` and arrive
+1 ms later (Linux's driver empties the receive FIFO right after enabling
+it).
+
+Ubuntu 24.04's stock arm64 kernel (6.8, the generic `Image`) boots to a
+BusyBox shell on the arm board, on one to four processors, in about 20
+seconds of host time; `poweroff` ends the run with exit code 0.
+
+The tests are in `tests/vplat/a64` (`build.sh` builds them with clang);
+`calc` compares integer, floating-point and NEON results with the same
+program built for the host. `tests/vplat/a64/difftest/difftest.sh`
+generates blocks of random register-only instructions (integer, NEON and
+floating point, under random FPCR modes) and compares every register,
+NZCV and FPSR after each block with QEMU's user-mode emulator, which runs
+as a separate program; `tests/mvplat.sh` runs 1500 blocks when
+`qemu-aarch64` is installed. `tests/vplat/get-linux-arm64.sh` fetches the
+kernel and BusyBox for the Linux test.
+
+Not yet on AArch64: `-mt` and the translator (the processors take turns on
+one thread), PCIe and virtio, the commit log, and the extension's features.
+
 ## Limits / Not yet
 
+- AArch64: see [Arm (AArch64)](#arm-aarch64) for what is not there yet.
 - No Zbkc,
   no Svadu (hardware A/D update), and every hart of a platform
   has the program's width. F and D
