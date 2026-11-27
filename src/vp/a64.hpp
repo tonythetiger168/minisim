@@ -20,6 +20,7 @@
 // physical) and 27 (virtual).
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "bus.hpp"
@@ -98,11 +100,20 @@ struct Cpu {
     // the exclusives monitor
     uint64_t exAddr = ~0ull;
     unsigned exSize = 0;
-    // run state
+    uint64_t exVal[2] = {};         // -mt: what the exclusive load read (the store compares it)
+    // run state (other processors' threads write the atomic ones with -mt)
     uint64_t cycle = 0, insns = 0;
-    bool wfi = false, off = false;  // off: PSCI CPU_OFF, or not started yet
-    bool irqLine = false;           // the GIC asks for an IRQ
-    bool eventReg = false;          // WFE's event register
+    uint64_t curPc = 0;             // the instruction being executed (data aborts return to it)
+    std::atomic<bool> wfi{false}, off{false};  // off: PSCI CPU_OFF, or not started yet
+    std::atomic<bool> irqLine{false};          // the GIC asks for an IRQ
+    std::atomic<bool> eventReg{false};         // WFE's event register
+    std::atomic<bool> running{false};          // -mt: on its thread in this round
+    std::atomic<uint32_t> flushReq{0};         // -mt: another processor's TLBI: empty the TLB
+    bool tlbiPending = false;                  // -mt: this one asked others to (DSB waits)
+    // decoded instruction pages (a64dec.inc), by physical page
+    std::unordered_map<uint64_t, std::unique_ptr<CodePage>> code;
+    std::vector<std::unique_ptr<CodePage>> deadCode;  // dropped, freed before the next instruction
+    uint64_t codeWrites = 0;
 
     // The TLB: virtual page -> physical page, permissions, the host page.
     struct Tlb {

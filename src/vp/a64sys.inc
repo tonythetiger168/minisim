@@ -29,6 +29,7 @@ inline void Machine::system(Cpu& c, uint32_t i, uint64_t pc) {
         if (crn == 3) {  // barriers, CLREX
             if (rt != 31) { undefined(c, i, pc); return; }
             if (op2 == 2) { clearMonitor(c); return; }
+            if (op2 == 4 && c.tlbiPending) waitFlushes(c);  // DSB: TLBIs on other processors done
             if (op2 == 4 || op2 == 5 || op2 == 6) return;  // DSB, DMB, ISB
             undefined(c, i, pc);
             return;
@@ -93,9 +94,10 @@ inline bool Machine::sysReg(Cpu& c, uint32_t reg, bool write, uint64_t& v, uint3
         }
     }
     if (op0 == 3 && op1 == 0 && crn == 12 && (crm >= 8 && crm <= 12)) {  // the GIC CPU interface
+        DevLock l(*this);
         if (gic && gic->icc(c, reg, write, v)) return true;
     }
-    if (reg == SR(3, 0, 4, 6, 0)) { if (gic && gic->icc(c, reg, write, v)) return true; }  // ICC_PMR_EL1
+    if (reg == SR(3, 0, 4, 6, 0)) { DevLock l(*this); if (gic && gic->icc(c, reg, write, v)) return true; }  // ICC_PMR_EL1
     bool ok = true;
     switch (reg) {
         // identification
@@ -152,10 +154,10 @@ inline bool Machine::sysReg(Cpu& c, uint32_t reg, bool write, uint64_t& v, uint3
         case SR(3, 0, 14, 1, 0): ok = rw(c.cntkctl, 0x3ff); break;
         // the generic timer
         case SR(3, 3, 14, 0, 0): ok = ro(timerHz); break;              // CNTFRQ_EL0
-        case SR(3, 3, 14, 0, 1): ok = ro(counter(c)); break;           // CNTPCT_EL0
-        case SR(3, 3, 14, 0, 2): ok = ro(counter(c) - c.cntvoff); break;  // CNTVCT_EL0
-        case SR(3, 3, 14, 0, 5): ok = ro(counter(c)); break;           // CNTPCTSS_EL0
-        case SR(3, 3, 14, 0, 6): ok = ro(counter(c) - c.cntvoff); break;  // CNTVCTSS_EL0
+        case SR(3, 3, 14, 0, 1): ok = ro(counterRead(c)); break;       // CNTPCT_EL0
+        case SR(3, 3, 14, 0, 2): ok = ro(counterRead(c) - c.cntvoff); break;  // CNTVCT_EL0
+        case SR(3, 3, 14, 0, 5): ok = ro(counterRead(c)); break;       // CNTPCTSS_EL0
+        case SR(3, 3, 14, 0, 6): ok = ro(counterRead(c) - c.cntvoff); break;  // CNTVCTSS_EL0
         case SR(3, 3, 14, 2, 1): case SR(3, 3, 14, 3, 1): {           // CNTP_CTL_EL0, CNTV_CTL_EL0
             const bool virt = crm == 3;
             uint32_t& ctl = virt ? c.cntvCtl : c.cntpCtl;
@@ -245,6 +247,13 @@ inline void Machine::sysOp(Cpu& c, uint32_t i, uint64_t pc) {
         const bool asidOnly = op2 == 2;
         for (auto& o : cpus) {
             if (!(crm == 3 || o.get() == &c)) continue;  // CRm 3: inner shareable
+            if (mt && o.get() != &c) {
+                // -mt: it is running; it empties its whole TLB before its
+                // next instruction, and DSB waits for that
+                o->flushReq.store(1, std::memory_order_seq_cst);
+                c.tlbiPending = true;
+                continue;
+            }
             o->flushFast();
             if (va) {
                 const uint64_t page = (v & 0xfffffffffffull);
@@ -266,6 +275,7 @@ inline void Machine::sysOp(Cpu& c, uint32_t i, uint64_t pc) {
 // HVC or SMC from EL1: the firmware's functions (PSCI 1.1, SMCCC 1.1).
 // False: not a call it knows (the instruction is then undefined).
 inline bool Machine::firmware(Cpu& c) {
+    DevLock l(*this);
     const uint32_t fn = (uint32_t)c.x[0];
     const int64_t NOT_SUPPORTED = -1, INVALID = -2, ALREADY_ON = -4, SUCCESS = 0;
     int64_t r = NOT_SUPPORTED;

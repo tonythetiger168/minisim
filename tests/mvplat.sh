@@ -405,6 +405,12 @@ expect "aarch64: GICv3, timers, SGI, priority mask" 0 a64irq.out "irq: all passe
 expect "aarch64: PSCI CPU_ON, exclusives and a spin lock on 4 processors" 0 a64smp.out "smp: all passed"
 "$MVPLAT" "$A/smc.elf" -q > a64smc.out 2>&1; rc=$?
 expect "aarch64: code rewritten while it runs; the decoded load and store forms" 0 a64smc.out "smc: all passed"
+"$MVPLAT" "$A/smpmt.elf" -harts 4 -q > a64smpmt.out 2>&1; rc=$?
+expect "aarch64: shared counters by LDXR/STXR, LDADD, CAS, CASP and a lock on 4 processors" 0 a64smpmt.out "smpmt: all passed"
+"$MVPLAT" "$A/smpmt.elf" -harts 4 -mt -q > a64smpmt2.out 2>&1; rc=$?
+expect "aarch64: the same with -mt (4 host threads, the host's atomics)" 0 a64smpmt2.out "smpmt: all passed"
+"$MVPLAT" "$A/smp.elf" -harts 4 -mt -q > a64smp2.out 2>&1; rc=$?
+expect "aarch64: PSCI, exclusives and WFE/SEV with -mt" 0 a64smp2.out "smp: all passed"
 "$MVPLAT" "$A/lse.elf" -q > a64lse.out 2>&1; rc=$?
 expect "aarch64: Armv8.1 atomics (LDADD .. SWP, CAS, CASP) and CRC32" 0 a64lse.out "lse: all passed"
 MVPLAT_NO_DECODE=1 "$MVPLAT" "$A/smc.elf" -q > a64smc2.out 2>&1; rc=$?
@@ -551,6 +557,10 @@ if [ -n "${MVPLAT_ARM64_KERNEL:-}" ] && [ -n "${MVPLAT_ARM64_BUSYBOX:-}" ] && co
 " > linux-arm64.out 2>&1; rc=$?
   expect "Linux arm64 and a BusyBox shell on 2 AArch64 processors" 0 linux-arm64.out "shell on aarch64, 2 harts"
   grep -q "^arm 42" linux-arm64.out && ok "the arm64 shell runs what is typed" || { bad "the arm64 shell"; sed 's/^/      /' linux-arm64.out | tail -20; }
+  "$MVPLAT" -kernel "$MVPLAT_ARM64_KERNEL" -initrd bb64.cpio -append "console=ttyAMA0 rdinit=/init quiet" -harts 4 -mt -q \
+    -input "echo mt \$((6*7)); poweroff -f
+" > linux-arm64-mt.out 2>&1; rc=$?
+  expect "Linux arm64 on 4 processors with -mt" 0 linux-arm64-mt.out "^mt 42"
   # virtio-mmio from -disk, -net and -vcon; virtio over PCIe from a platform file
   head -c 65536 /dev/zero > a64disk.img; printf MVPLATDISK | dd of=a64disk.img conv=notrunc 2> /dev/null
   "$MVPLAT" -kernel "$MVPLAT_ARM64_KERNEL" -initrd bb64.cpio -append "console=ttyAMA0 rdinit=/init quiet" -q \
