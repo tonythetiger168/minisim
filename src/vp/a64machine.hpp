@@ -11,12 +11,14 @@
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
 #include "a64.hpp"
 #include "a64gic.hpp"
 #include "bus.hpp"
+#include "wtrack.hpp"
 
 namespace vp {
 namespace a64 {
@@ -179,6 +181,7 @@ public:
     // Runs one processor up to cycle `end`. False when it only waited.
     bool runCpu(Cpu& c, uint64_t end) {
         bool ran = false;
+        dead_.clear();
         while (c.cycle < end && !exit_ && !c.off) {
             if (c.wfi) {
                 if (!c.irqLine && !wakeTimer(c)) { c.cycle = end; break; }
@@ -186,6 +189,20 @@ public:
             }
             ran = true;
             if (c.irqLine && !(c.daif & 0x80)) { exception(c, 0, 0, c.pc, 1); }
+            {  // decoded already
+                if (WriteWatch::writes() != codeWrites_) codeSync();
+                const uint64_t pc0 = c.pc;
+                const Cpu::Fast& f = c.fastX[(pc0 >> 12) & (Cpu::FAST_N - 1)];
+                if (f.key == ((pc0 >> 12) << 1 | (c.el == 0)) && f.code && !(pc0 & 3)) {
+                    const Op& op = f.code->op[(pc0 & 0xfff) >> 2];
+                    curPc_ = pc0;
+                    c.pc = pc0 + 4;
+                    op.fn(*this, c, op, pc0);
+                    c.cycle++;
+                    c.insns++;
+                    continue;
+                }
+            }
             uint32_t insn;
             if (!fetch(c, insn)) { c.cycle++; continue; }
             const uint64_t pc0 = c.pc;
@@ -363,7 +380,7 @@ public:
         uint64_t pa;
         uint8_t* h;
         if (!xlate(c, c.pc, 2, false, pa, h)) return false;
-        if (h) { f = {key, h, pa & ~0xfffull}; memcpy(&insn, h + (pa & 0xfff), 4); return true; }
+        if (h) { f = {key, h, pa & ~0xfffull, codePage(pa, h)}; memcpy(&insn, h + (pa & 0xfff), 4); return true; }
         uint64_t v;
         Device* d = bus.find(pa);
         if (!d || d->read(pa - d->base, 4, v, Who{c.id, c.cycle, true}) != Acc::Ok) {
@@ -573,6 +590,14 @@ public:
     }
 
     // ------------------------------------------------------ the decoder
+    // Pages of decoded instructions (a64dec.inc), by physical page.
+    std::unordered_map<uint64_t, std::unique_ptr<CodePage>> code_;
+    std::vector<std::unique_ptr<CodePage>> dead_;  // dropped, freed before the next instruction
+    std::unordered_map<Device*, int> watchIds_;    // RAM as WriteWatch regions
+    uint64_t codeWrites_ = 0;
+    bool decodeAhead_ = !getenv("MVPLAT_NO_DECODE");
+    CodePage* codePage(uint64_t pa, uint8_t* host);
+    void codeSync();
     void exec(Cpu& c, uint32_t i, uint64_t pc);
     void dpImm(Cpu& c, uint32_t i, uint64_t pc);
     void branchSys(Cpu& c, uint32_t i, uint64_t pc);
@@ -913,3 +938,4 @@ inline void Machine::dpReg(Cpu& c, uint32_t i, uint64_t pc) {
 #include "a64ldst.inc"
 #include "a64sys.inc"
 #include "a64simd.inc"
+#include "a64dec.inc"

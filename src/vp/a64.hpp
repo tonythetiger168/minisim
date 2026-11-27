@@ -50,6 +50,26 @@ constexpr uint32_t SR(unsigned op0, unsigned op1, unsigned crn, unsigned crm, un
     return op0 << 14 | op1 << 11 | crn << 7 | crm << 3 | op2;
 }
 
+class Machine;
+struct Cpu;
+
+// A decoded instruction (a64dec.inc): what runs it, and its fields.
+struct Op {
+    using Fn = void (*)(Machine&, Cpu&, const Op&, uint64_t pc);
+    Fn fn;
+    uint32_t insn;
+    uint8_t rd, rn, rm, ra;
+    uint64_t imm, imm2;
+};
+// The instructions of a 4 KiB page of RAM, decoded when first run.
+struct CodePage {
+    uint8_t* host;  // the page in host memory
+    uint64_t pa;
+    int wr;         // its WriteWatch region (-2: read-only memory)
+    uint32_t seen;  // the page's write count when it was decoded
+    Op op[1024];
+};
+
 struct Cpu {
     unsigned id = 0;
     uint64_t x[32] = {};      // x[31] reads as zero (XZR); the stack pointers are sp[]
@@ -103,6 +123,7 @@ struct Cpu {
         uint64_t key = ~0ull;      // (VA >> 12) << 1 | EL0
         uint8_t* host = nullptr;   // the page in host memory
         uint64_t pa = 0;           // the physical page
+        CodePage* code = nullptr;  // fastX: the page decoded (null: not kept)
     };
     static constexpr unsigned FAST_N = 256;
     Fast fastR[FAST_N], fastW[FAST_N], fastX[FAST_N];
