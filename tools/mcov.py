@@ -14,11 +14,11 @@ taken true and false), toggle masks (each signal bit seen rising 0->1 and
 falling 1->0), condition vectors and FSMs. Merging adds hit counts and ORs
 the toggle masks, matched by file path and line, and by signal name.
 
-With msim -cm_cond full a condition of up to 8 terms has a vector for every
-combination of its term values (2^n, ops "&&f" / "||f"); with -cm_cond
+With msim -cov_cond full a condition of up to 8 terms has a vector for every
+combination of its term values (2^n, ops "&&f" / "||f"); with -cov_cond
 allops a & b and a | b of one-bit operands are conditions too (ops "&" / "|").
 
-Condition coverage (as VCS -cm cond): a condition a && b && c, a || b || c,
+Condition coverage: a condition a && b && c, a || b || c,
 or the condition of ?: with n terms has n + 1 vectors: the one where no term
 decides alone (all 1 for &&, all 0 for ||), and for each term the one where
 only that term has the deciding value (0 for &&, 1 for ||). A condition with
@@ -32,7 +32,7 @@ per instance (its own code, signals and FSMs; not the instances below it),
 and with -detail each condition's vectors per instance, so that a vector
 only one of two instances of a module reaches shows.
 
-FSM coverage (as VCS -cm fsm): for each state register msim extracted, the
+FSM coverage: for each state register msim extracted, the
 states entered and the transitions made, out of those its next-state logic
 can make. Transitions into a state the register's reset branch assigns are
 marked; -fsm-reset-filter leaves them out of the score.
@@ -973,7 +973,7 @@ def cond_rows(op, terms, hits):
     n = len(terms)
     if op == "?:":
         return [(("1",), hits[0]), (("0",), hits[1])]
-    if op.endswith("f"):   # -cm_cond full: every combination, term 1 the high bit
+    if op.endswith("f"):   # -cov_cond full: every combination, term 1 the high bit
         return [(tuple("1" if k >> (n - 1 - i) & 1 else "0" for i in range(n)), h) for k, h in enumerate(hits)]
     base, dec = ("0", "1") if op.startswith("|") else ("1", "0")
     rows = [((base,) * n, hits[0])]

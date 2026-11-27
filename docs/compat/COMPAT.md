@@ -163,6 +163,30 @@ vcs -sverilog +incdir+inc pkg.sv ctr.vhd tb.sv -R +more   # one step
   in one file reaching the next), `.db` snapshot files, other vendors'
   precompiled libraries.
 
+## msim option spellings
+
+`src/compat/msim_flags.inc` rewrites these to msim's own options before msim
+reads its command line:
+
+| Other simulators | msim |
+|---|---|
+| `-sverilog` | `-sv` |
+| `-ucli` | `-i` |
+| `-xprop=tmerge`, `-xprop=xmerge`, `-xprop=vmerge` | `-xprop=merge`, `-xprop=pessimistic`, `-xprop=off` |
+| `-power_top` | `-upf_top` (also in mdebug and mlint) |
+| `-partcomp[=...]`, `-fastpartcomp[=j<n>]` | `-compile` (`-cfiles <n>`) |
+| `-partcomp_dir=<d>`, `-Mdir=<d>` | `-o <d>` |
+| `-partcomp_sharedlib`, `-pcmakeprof` | dropped |
+| `+ntb_random_seed=<n>` | `-seed <n>` |
+| `-cm <metrics>` (`line+cond+...`, `b:e:t:f`, `bcesftx`, `all`) | `-cov_metrics=line,cond,...` |
+| `-cm_hier <f>` | `-cov_scope <f>` |
+| `-cm_cond full+allops` | `-cov_cond full,allops` |
+| `-dpiheader` | `-dpi_header` |
+| `-load`, `-loadvpi` | `-vpi` |
+| `-uvmhome` | `-uvm_home` |
+
+mdebug, mlint and mdft also take `-sverilog`.
+
 ## mcov and mlint
 
 - mcov: `--compat=synopsys|cadence|siemens`, or a symlink named `urg`, `imc`

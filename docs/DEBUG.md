@@ -262,7 +262,7 @@ gaps. Reports and merging stay in `mcov`.
     mdebug tb.sv dut.sv -top tb -upf dut.upf -log run.log -vcd run.vcd -active tb.u_dut.u_core.cnt -at 60
 
 `-upf` reads the power intent with msim's own reader, so both see the same
-domains (`-power_top INST` as for msim; without it the UPF's
+domains (`-upf_top INST` as for msim; without it the UPF's
 `set_design_top`). `-power [DOMAIN]` lists each power domain: the instances
 in it, its primary supply set, and its isolation, level-shifter and
 retention strategies with their lines in the UPF file. With `-log`, the
@@ -454,7 +454,7 @@ written instead, and msim says so once:
 `-fst` on the command line wins over all of them, as over `$dumpvars`.
 mdebug, mlint and the other tools compile the same sources.
 
-A Verdi PLI library loaded with `-load` / `-loadvpi` that registers these
+A Verdi PLI library loaded with `-vpi` that registers these
 names itself keeps them. A second `$fsdbDumpvars` with more scopes after the
 dump has started adds none (an FST's signals are fixed when it starts);
 msim says so once.
@@ -481,7 +481,7 @@ uvm_config_db#(uvm_bitstream_t)::set(null, "*", "recording_detail", UVM_FULL);
 ```
 
 ```
-msim -uvmhome $UVM_HOME tb.sv -vcd tb.vcd
+msim -uvm_home $UVM_HOME tb.sv -vcd tb.vcd
 mdebug tb.sv -vcd tb.vcd -tr tr_db.log -trans
 uvm_test_top.e.ag.sqr.s  6 transactions  (0 to 100000)
 uvm_test_top.e.ag.d.drive  5 transactions  (10000 to 100000)
@@ -541,7 +541,7 @@ time is not used: each record has the simulation time of the call.
 
 ## Interactive simulation (msim -i)
 
-`msim -i` (also `-ucli`, and `xrun -tcl`) stops before time 0 and reads
+`msim -i` (in a vendor-layer build also `-ucli` and `xrun -tcl`) stops before time 0 and reads
 commands, like VCS UCLI or the xrun Tcl shell. `msim -do FILE` (and `xrun
 -input FILE`) reads them from a file instead; when the commands run out, the
 simulation goes on to its end, so a `-do` file can set stops and checks and

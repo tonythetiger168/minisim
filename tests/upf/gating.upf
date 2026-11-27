@@ -1,4 +1,4 @@
-# Power intent for gating.sv (run with -power_top u_dut or set_design_top).
+# Power intent for gating.sv (run with -upf_top u_dut or set_design_top).
 upf_version 4.0
 set_design_top dut
 set iso_sig iso_en

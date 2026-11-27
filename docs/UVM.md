@@ -13,7 +13,7 @@ msim -uvm my_tb.sv -top top +UVM_TESTNAME=my_test
 ```
 
 `-uvm` adds `+incdir+$UVM_HOME/src` and `uvm_pkg.sv` ahead of your files and
-builds UVM's C code into a DPI library (`-uvmhome <dir>` names the checkout
+builds UVM's C code into a DPI library (`-uvm_home <dir>` names the checkout
 instead of `$UVM_HOME`). That C code is uvm-core's own `src/dpi` sources,
 compiled with minisim's `uvm/uvm_dpi_minisim.cc`, which supplies the HDL
 backdoor through plain VPI in place of uvm-core's per-vendor files. With it:
@@ -44,7 +44,7 @@ msim +incdir+$UVM_HOME/src $UVM_HOME/src/uvm_pkg.sv my_tb.sv -top top +define+UV
 ## UVM 1.2
 
 The Accellera UVM 1.2 release (before IEEE 1800.2) works the same way:
-point `-uvmhome` (or `$UVM_HOME`) at it. Its C code has no HDL polling
+point `-uvm_home` (or `$UVM_HOME`) at it. Its C code has no HDL polling
 interface, which minisim's DPI build leaves out when the file is missing.
 `hello`, `hello_nodpi`, `agent`, `dpi` and `reg_sequences` run against it
 as the `uvm12/*` tests when CMake is configured with
@@ -55,7 +55,7 @@ as the `uvm12/*` tests when CMake is configured with
 
 `tests/uvm` holds the UVM regression, run in CI against uvm-core 2020.3.1
 (configure with `-DUVM_HOME=<uvm-core checkout>` to run it locally). Each
-test runs with `msim -uvmhome`, so with UVM's C code, unless it says
+test runs with `msim -uvm_home`, so with UVM's C code, unless it says
 `//! nodpi`:
 
 | Test | What it exercises |

@@ -1,5 +1,5 @@
-// msim -xprop=xmerge: every variable assigned under an unknown control becomes x.
-//! args: -xprop=xmerge
+// msim -xprop=pessimistic: every variable assigned under an unknown control becomes x.
+//! args: -xprop=pessimistic
 module top;
   logic c, a, b; logic [3:0] y, z, p, q; logic [1:0] sel; logic [3:0] w;
   logic clk, en, rst_n; logic [3:0] d, r, r2, r3;

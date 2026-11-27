@@ -57,9 +57,9 @@
 //   -uvm-error-status exit status 3 when the run reports a UVM_ERROR or UVM_FATAL
 //   -result <file>   write the run's verdict as JSON (status, exit status, compile error,
 //                    $fatal, -maxtime, UVM counts); see README.md "Exit status and run verdict"
-//   -sv, -sverilog   accepted and ignored (input is always SystemVerilog)
+//   -sv              accepted and ignored (input is always SystemVerilog)
 //   +<plusarg>       any other +arg is a runtime plusarg ($test$plusargs, $value$plusargs)
-//   -seed <n>        seed for $urandom / $urandom_range (also +ntb_random_seed=<n>)
+//   -seed <n>        seed for $urandom / $urandom_range
 //   -compile         compiled mode: generate C++ for the design (codegen.hpp),
 //                    build it with a C++ compiler into <dir>/simv, and run it.
 //                    A design codegen cannot translate runs on the interpreter.
@@ -67,8 +67,6 @@
 //                    unchanged design reuses the simv already in <dir>; seeds
 //                    and plusargs are passed to it at run time.
 //   -o <dir>         build directory for -compile (default msim.d)
-//   -partcomp[=...], -fastpartcomp[=j<n>], -partcomp_dir=<dir>, -Mdir=<dir>
-//                    VCS partition compile spellings: -compile, -cfiles n, -o dir
 //   -no-static-comb  run continuous assigns and always_comb as ordinary
 //                    event-driven processes instead of one levelized schedule
 //   -no-static-seq   run NBA-only always @(edge) blocks as ordinary processes
@@ -102,7 +100,7 @@
 //   -upf <file>      power-aware simulation with this IEEE 1801 (UPF) power
 //                    intent (upf.hpp, upf_rt.inc). Adds package UPF for the
 //                    testbench (supply_on, supply_off, ...).
-//   -power_top <inst> the instance the UPF file describes, as a path from
+//   -upf_top <inst>  the instance the UPF file describes, as a path from
 //                    the simulation top (u_dut, or tb/u_dut); default: the
 //                    UPF's set_design_top, else the simulation top
 //   -upf_verbose     print supply, power state and simstate changes
@@ -116,7 +114,7 @@
 //   -sv_lib <name>   load <name>.so (annex J.3), relative to -sv_root
 //   -sv_root <dir>   directory for relative -sv_lib names
 //   -sv_liblist <f>  a bootstrap file of library names (J.4)
-//   -dpiheader <f>   write the C prototypes of every import and export to f
+//   -dpi_header <f>  write the C prototypes of every import and export to f
 //   -mvp             add the virtual prototype layer: mvp.sv (mvp_axil_slave,
 //                    mvp_irq_slave, mvp_clock) and the runtime its models use.
 //                    Give your model C files on the command line as well; the
@@ -125,15 +123,14 @@
 //                    +incdir+$UVM_HOME/src, uvm_pkg.sv, and UVM's C code
 //                    (regular expressions, command line, HDL backdoor over
 //                    VPI) built from uvm/uvm_dpi_minisim.cc
-//   -uvmhome <dir>   the same with the library in <dir>
+//   -uvm_home <dir>  the same with the library in <dir>
 //   -uvmnodpi        the same without the C code (+define+UVM_NO_DPI)
 //   -CFLAGS <s>      extra flags for compiling the C files
 //   -LDFLAGS <s>     extra flags for linking them (e.g. -lm)
 //
 // VPI (IEEE 1800-2023 clauses 36-38):
-//   -load <lib>[:<boot>]     load a VPI library before elaboration and run
-//                    its vlog_startup_routines, and <boot> if given (VCS form)
-//   -loadvpi <lib>:<boot>    the same (Xcelium form)
+//   -vpi <lib>[:<boot>]      load a VPI library before elaboration and run
+//                    its vlog_startup_routines, and <boot> if given
 //   The C files and .so libraries above are VPI libraries too: a library
 //   with vlog_startup_routines has them run. A design that uses VPI runs on
 //   one thread in the interpreter.
@@ -209,6 +206,7 @@
 #include "runresult.inc"
 #if MINISIM_VENDOR_COMPAT
 #include "compat/mstep.inc"
+#include "compat/msim_flags.inc"
 #endif
 #include "vhdl/front.hpp"
 
@@ -3461,7 +3459,7 @@ Val hook(int op, const std::vector<Val>& a) {
 }
 }  // namespace covapi
 
-// -cm / -cm_hier: the code coverage written (src/cov_select.hpp).
+// -cov_metrics / -cov_scope: the code coverage written (src/cov_select.hpp).
 static covsel::Selection g_covSel;
 
 static bool writeCoverage(const std::string& path, const LowerResult& lw, const std::string& top) {
@@ -3481,7 +3479,7 @@ static bool writeCoverage(const std::string& path, const LowerResult& lw, const 
         std::map<size_t, std::vector<uint64_t>> conds;       // index in "conditions" -> hits
     };
     std::vector<InstCov> insts(g_covInsts.size());
-    // Selection (-cm, -cm_hier): the instance path and module of a coverage
+    // Selection (-cov_metrics, -cov_scope): the instance path and module of a coverage
     // instance, and whether a metric of its code in a file is written.
     auto instPath = [&](uint32_t k) {
         if (!k || k >= g_covInsts.size()) return std::string();
@@ -3860,13 +3858,11 @@ static void usage() {
                  "                 supply net's state and voltage, as upf.PD.simstate, upf.VDD.mV\n"
                  "  -cov [<file>]  write line / branch / toggle / condition / FSM coverage (default cov.json);\n"
                  "                 see mcov\n"
-                 "  -cm <metrics>  the same, with only these code coverage metrics: line+branch+cond+tgl+fsm\n"
-                 "                 (as VCS), b:e:t:f or all (as Xcelium -coverage), bcesftx (as Questa\n"
-                 "                 +cover); covergroups and assertions are always written\n"
-                 "  -cm_hier <f>   the part of the design whose code coverage is written: +tree/-tree\n"
-                 "                 <inst> [depth], +module/-module, +file/-file (as VCS -cm_hier), or\n"
-                 "                 select_coverage / deselect_coverage commands (as an Xcelium covfile)\n"
-                 "  -cm_cond <m>   condition coverage modes, joined by +: full (every combination of the\n"
+                 "  -cov_metrics=<m>  the same, with only these code coverage metrics, joined by commas:\n"
+                 "                 line, branch, cond, toggle, fsm, or all; covergroups and assertions\n"
+                 "                 are always written\n"
+                 "  -cov_scope <f> the part of the design whose code coverage is written (docs/COVERAGE.md)\n"
+                 "  -cov_cond <m>  condition coverage modes, joined by commas: full (every combination of the\n"
                  "                 term values, up to 8 terms), allops (also & and | of one-bit operands)\n"
                  "  -maxtime <n>   stop after simulation time n (ticks, or with a unit: 3ms)\n"
                  "  -maxtime-status  exit status 4 when -maxtime ends a run with events pending\n"
@@ -3886,20 +3882,20 @@ static void usage() {
                  "  -x-assign 0     every X bit of a literal is 0 (not in ===, case patterns, ==?), as Verilator\n"
                  "  -x-initial 0    variables start at 0, not X, as Verilator; with -x-assign 0 a design\n"
                  "                  runs as a 2-state model and -compile stays on its 2-state path\n"
-                 "  -xprop[=tmerge|xmerge]  X-propagation: an unknown if / case condition or clock edge\n"
+                 "  -xprop[=merge|pessimistic|off]  X-propagation: an unknown if / case condition or clock edge\n"
                  "                 merges the branches instead of picking one (docs/XPROP.md)\n"
                  "  -xprop=<file>, -xprop-config <file>  X-propagation set per instance or module\n"
                  "                 (tree / instance / module {names} {xpropOn|xpropOff}; merge = ...)\n"
                  "  -xprop-report <file>  list every if / case / edge and whether it is merged\n"
                  "  -upf <file>    power-aware simulation with IEEE 1801 (UPF) power intent\n"
-                 "  -power_top <i> the instance the UPF describes (default: set_design_top, else the top)\n"
+                 "  -upf_top <i>   the instance the UPF describes (default: set_design_top, else the top)\n"
                  "  -upf_verbose   print supply, power state and simstate changes\n"
                  "  -upf_cov <file>  low-power coverage report: power states, transitions, isolation, retention\n"
-                 "  <file>.c       C or C++ for DPI-C imports; also -sv_lib / -sv_root / -dpiheader\n"
+                 "  <file>.c       C or C++ for DPI-C imports; also -sv_lib / -sv_root / -dpi_header\n"
                  "  -mvp           add the virtual prototype layer (mvp_axil_slave and its runtime)\n"
                  "  -uvm           compile the Accellera UVM library from $UVM_HOME, with its C code\n"
-                 "                 (-uvmhome <dir>: from <dir>; -uvmnodpi: without C, +define+UVM_NO_DPI)\n"
-                 "  -load <lib>    load a VPI library before elaboration\n"
+                 "                 (-uvm_home <dir>: from <dir>; -uvmnodpi: without C, +define+UVM_NO_DPI)\n"
+                 "  -vpi <lib>     load a VPI library before elaboration\n"
                  "  +define+N[=V]  +incdir+<dir>  -f <file>  -I <dir>  -D N[=V]\n"
                  "  -version       print the msim version\n"
                  "  -v <file>      read a library file (33.3.1; -v alone prints the version)\n"
@@ -3994,12 +3990,20 @@ static int msimMain(int argc, char** argv) {
     std::vector<std::string> vhdlFiles;
     std::string vhdlSv;
     bool vhdl4 = false;   // -vhdl4: VHDL std_logic with four values (faster; see vhdl::Translator::nine)
-    std::vector<std::pair<std::string, std::string>> vpiLibs;   // -load lib:boot
+    std::vector<std::pair<std::string, std::string>> vpiLibs;   // -vpi lib:boot
     std::string svRoot, dpiHeader, cflags, ldflags;
-    std::string uvmHome;    // -uvm / -uvmhome: a uvm-core checkout
+    std::string uvmHome;    // -uvm / -uvm_home: a uvm-core checkout
     bool uvmWanted = false, uvmNoDpi = false;
     bool buildDirGiven = false;
-    bool partcompNoted = false;
+#if MINISIM_VENDOR_COMPAT
+    // Other simulators' spellings of msim's options (src/compat/msim_flags.inc).
+    std::vector<std::string> nativeArgs = vendorflags::toNative(argc, argv);
+    std::vector<char*> nativeArgv;
+    for (auto& s : nativeArgs) nativeArgv.push_back(s.data());
+    nativeArgv.push_back(nullptr);
+    argc = (int)nativeArgs.size();
+    argv = nativeArgv.data();
+#endif
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](const char* what) -> std::string {
@@ -4013,12 +4017,12 @@ static int msimMain(int argc, char** argv) {
         if (a == "-version" || a == "--version" || a == "-v") { version(); return 0; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
-        if (a == "-sv" || a == "-sverilog") continue;
+        if (a == "-sv") continue;
         if (a == "-compile") { compiled = true; continue; }
         if (a == "-elab") { elabOnly = true; continue; }
         if (a == "-strict-drivers") { strictDrivers = true; continue; }
         if (a == "-parse") { parseOnly = true; continue; }
-        if (a == "-i" || a == "-ucli") { interactiveMode = true; continue; }
+        if (a == "-i") { interactiveMode = true; continue; }
         if (a == "-do") { doPath = next("a command file"); interactiveMode = true; continue; }
         if (a == "-no-static-comb") { staticComb = false; continue; }
         if (a == "-no-static-seq") { staticSeq = false; continue; }
@@ -4033,12 +4037,12 @@ static int msimMain(int argc, char** argv) {
         }
         if (a == "-no-cycle") { cycle = false; continue; }
         if (a == "-noassert" || a == "-nosva") { Lowerer::noConcAssert() = true; continue; }
-        if (a == "-xprop" || a == "-xprop=tmerge") { Lowerer::xpropMode() = 1; continue; }
-        if (a == "-xprop=xmerge") { Lowerer::xpropMode() = 2; continue; }
-        if (a == "-xprop=off" || a == "-xprop=vmerge") { Lowerer::xpropMode() = 0; continue; }
+        if (a == "-xprop" || a == "-xprop=merge") { Lowerer::xpropMode() = 1; continue; }
+        if (a == "-xprop=pessimistic") { Lowerer::xpropMode() = 2; continue; }
+        if (a == "-xprop=off") { Lowerer::xpropMode() = 0; continue; }
         if (a.rfind("-xprop=", 0) == 0 || a == "-xprop-config") {   // a configuration file (docs/XPROP.md)
             std::string cfg = a == "-xprop-config" ? next("a file name") : a.substr(7);
-            if (a != "-xprop-config" && !std::ifstream(cfg)) { std::cerr << "msim: bad " << a << " (tmerge, xmerge, off or a configuration file)\n"; return 2; }
+            if (a != "-xprop-config" && !std::ifstream(cfg)) { std::cerr << "msim: bad " << a << " (merge, pessimistic, off or a configuration file)\n"; return 2; }
             std::string err = Lowerer::xpReadConfig(cfg);
             if (!err.empty()) { std::cerr << "msim: -xprop configuration " << cfg << ": " << err << "\n"; return 2; }
             continue;
@@ -4072,31 +4076,12 @@ static int msimMain(int argc, char** argv) {
         }
         if (a == "-o") { buildDir = next("a directory"); buildDirGiven = true; continue; }
         if (a == "-upf") { upfPath = next("a UPF file"); continue; }
-        if (a == "-power_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
+        if (a == "-upf_top") { powerTop = next("an instance path"); powerTopSet = true; continue; }
         if (a == "-upf_verbose" || a == "+upf_verbose") { upfVerbose = true; continue; }
         if (a == "-upf_cov") { upfCov = next("a coverage report file"); continue; }
         if (a == "-cc") { cc = next("a compiler"); continue; }
         if (a == "-pgo-gen") { pgoMode() = 1; compiled = true; continue; }
         if (a == "-pgo-use") { pgoMode() = 2; compiled = true; continue; }
-        // VCS partition compile (docs/compat/COMPAT.md): compiled mode. msim chooses
-        // its own parts, the generated C++ files; an unchanged one is not
-        // rebuilt, and the build directory keeps them between runs.
-        if (a == "-partcomp" || startsWith(a, "-partcomp=") || a == "-fastpartcomp" || startsWith(a, "-fastpartcomp=")) {
-            compiled = true;
-            if (startsWith(a, "-fastpartcomp=j") && std::isdigit((unsigned char)a[15]))
-                g_cfiles = std::max(1, std::atoi(a.c_str() + 15));
-            if (!partcompNoted) {
-                std::cerr << "msim: " << a << ": compiled mode; msim chooses its own parts, and an unchanged part is not rebuilt\n";
-                partcompNoted = true;
-            }
-            continue;
-        }
-        if (startsWith(a, "-partcomp_dir=") || startsWith(a, "-Mdir=")) {
-            buildDir = a.substr(a.find('=') + 1);
-            buildDirGiven = true;
-            continue;
-        }
-        if (a == "-partcomp_sharedlib" || a == "-pcmakeprof") continue;   // msim's parts are always linked into one simv
         if (a == "-cfiles") { g_cfiles = std::max(1, std::atoi(next("a file count").c_str())); continue; }
         if (a.size() == 3 && a[0] == '-' && a[1] == 'O' && std::isdigit((unsigned char)a[2])) { opt = a; continue; }
         if (prot.take(argc, argv, i)) continue;
@@ -4162,25 +4147,38 @@ static int msimMain(int argc, char** argv) {
             if (i + 1 < argc && std::string_view(argv[i + 1]).ends_with(".json")) covPath = argv[++i];
             continue;
         }
-        // -cm <metrics>: the code coverage metrics written; VCS line+cond+fsm+tgl+branch,
-        // Xcelium b:e:t:f:u:a or all, Questa bcesftx (src/cov_select.hpp). Covergroups
-        // and assertions are always written.
-        if ((a == "-cm" && i + 1 < argc) || a.starts_with("-cm=")) {
+        // -cov_metrics=line,branch,cond,toggle,fsm (or all): the code coverage
+        // metrics written (src/cov_select.hpp). Covergroups and assertions are
+        // always written.
+        if (a.starts_with("-cov_metrics=")) {
             g_cov = true;
-            std::string err;
-            std::string_view v = a == "-cm" ? std::string_view(argv[++i]) : a.substr(4);
-            if (!covsel::parseMetrics(v, g_covSel.metrics, err)) {
-                std::cerr << "msim: -cm: " << err << "\n";
-                return 2;
+            uint32_t m = 0;
+            std::string_view v = std::string_view(a).substr(13);
+            for (size_t p = 0; p <= v.size();) {
+                size_t q = std::min(v.find(',', p), v.size());
+                std::string_view w = v.substr(p, q - p);
+                if (w == "line") m |= covsel::LINE;
+                else if (w == "branch") m |= covsel::BRANCH;
+                else if (w == "cond") m |= covsel::COND;
+                else if (w == "toggle") m |= covsel::TGL;
+                else if (w == "fsm") m |= covsel::FSM;
+                else if (w == "all") m |= covsel::ALL;
+                else if (w == "none") {}
+                else {
+                    std::cerr << "msim: -cov_metrics: unknown metric '" << w << "' (line, branch, cond, toggle, fsm, all, none)\n";
+                    return 2;
+                }
+                p = q + 1;
             }
+            g_covSel.metrics = m;
             continue;
         }
-        // -cm_hier <file>: the part of the design whose code coverage is written: VCS
-        // +tree/-tree/+module/-module/+file/-file lines or Xcelium covfile commands.
-        if (a == "-cm_hier" && i + 1 < argc) {
+        // -cov_scope <file>: the part of the design whose code coverage is written
+        // (docs/COVERAGE.md).
+        if (a == "-cov_scope" && i + 1 < argc) {
             std::string err;
             if (!g_covSel.read(argv[++i], err)) {
-                std::cerr << "msim: -cm_hier: " << err << "\n";
+                std::cerr << "msim: -cov_scope: " << err << "\n";
                 return 2;
             }
             for (auto& n : g_covSel.notes) std::cerr << "msim: " << n << "\n";
@@ -4188,15 +4186,15 @@ static int msimMain(int argc, char** argv) {
             if (g_covSel.allops) g_condAllops = true;
             continue;
         }
-        if (a == "-cm_cond" && i + 1 < argc) {   // VCS: -cm_cond full+allops (std / basic: the default)
+        if (a == "-cov_cond" && i + 1 < argc) {   // -cov_cond full,allops (std: the default)
             std::string_view v = argv[++i];
             while (!v.empty()) {
-                size_t p = v.find('+');
+                size_t p = v.find(',');
                 std::string_view w = v.substr(0, p);
                 if (w == "full") g_condFull = true;
                 else if (w == "allops") g_condAllops = true;
                 else if (w != "std" && w != "basic") {
-                    std::cerr << "msim: -cm_cond: unknown mode '" << w << "' (full, allops, std)\n";
+                    std::cerr << "msim: -cov_cond: unknown mode '" << w << "' (full, allops, std)\n";
                     return 2;
                 }
                 v = p == std::string_view::npos ? std::string_view() : v.substr(p + 1);
@@ -4257,11 +4255,6 @@ static int msimMain(int argc, char** argv) {
             catch (...) { std::cerr << "msim: bad -seed " << n << "\n"; return 2; }
             continue;
         }
-        if (startsWith(a, "+ntb_random_seed=")) {
-            try { seed = std::stoull(a.substr(17)); }
-            catch (...) { std::cerr << "msim: bad " << a << "\n"; return 2; }
-            continue;
-        }
         if (a.size() > 1 && a[0] == '+' && !slangPlus(a)) { plusargs.push_back(a.substr(1)); continue; }
         if (a == "-sv_lib") { svLibs.push_back(next("a library name")); continue; }
         if (a == "-sv_root") { svRoot = next("a directory"); continue; }
@@ -4277,8 +4270,8 @@ static int msimMain(int argc, char** argv) {
             }
             continue;
         }
-        if (a == "-dpiheader") { dpiHeader = next("a file name"); continue; }
-        if (a == "-load" || a == "-loadvpi") {   // VPI (36.9.1)
+        if (a == "-dpi_header") { dpiHeader = next("a file name"); continue; }
+        if (a == "-vpi") {   // a VPI library[:bootstrap] (36.9.1)
             std::string l = next("a VPI library");
             size_t c = l.rfind(':');
             std::string lib = c == std::string::npos ? l : l.substr(0, c), boot = c == std::string::npos ? "" : l.substr(c + 1);
@@ -4299,7 +4292,7 @@ static int msimMain(int argc, char** argv) {
             continue;
         }
         if (a == "-uvm") { uvmHome = uvmHome.empty() && std::getenv("UVM_HOME") ? std::getenv("UVM_HOME") : uvmHome; uvmWanted = true; continue; }
-        if (a == "-uvmhome") { uvmHome = next("a uvm-core directory"); uvmWanted = true; continue; }
+        if (a == "-uvm_home") { uvmHome = next("a uvm-core directory"); uvmWanted = true; continue; }
         if (a == "-uvmnodpi") { uvmNoDpi = uvmWanted = true; continue; }
         if (a == "-CFLAGS") { cflags += " " + next("flags"); continue; }
         if (a == "-LDFLAGS") { ldflags += " " + next("flags"); continue; }
@@ -4314,7 +4307,7 @@ static int msimMain(int argc, char** argv) {
     }
     if (uvmWanted) {   // -uvm: the package first, then its C code (regex, command line, HDL backdoor)
         if (uvmHome.empty() && std::getenv("UVM_HOME")) uvmHome = std::getenv("UVM_HOME");
-        if (uvmHome.empty()) { std::cerr << "msim: -uvm needs $UVM_HOME or -uvmhome <dir>\n"; return 2; }
+        if (uvmHome.empty()) { std::cerr << "msim: -uvm needs $UVM_HOME or -uvm_home <dir>\n"; return 2; }
         std::string uvmSrc = uvmHome + "/src";
         std::error_code ec0;
         if (!std::filesystem::exists(uvmSrc + "/uvm_pkg.sv", ec0)) {
@@ -4527,7 +4520,7 @@ static int msimMain(int argc, char** argv) {
 
     // VPI (36.9.1): libraries load before elaboration, so the system tasks
     // and functions they register are known to it. The C files are built now
-    // for that, unless -dpiheader asks for prototypes they may include.
+    // for that, unless -dpi_header asks for prototypes they may include.
     std::string userSo, earlyDir;
     bool earlyTmp = false, keepEarly = false;   // keepEarly: simv (-compile) loads the library from there
     if (!cFiles.empty() && dpiHeader.empty()) {
@@ -4713,7 +4706,7 @@ static int msimMain(int argc, char** argv) {
         if (!f) { std::cerr << "msim: cannot write " << xpropReport << "\n"; return 1; }
         size_t ok = 0;
         for (auto& r : Lowerer::xpReport()) ok += r.ok;
-        f << "xprop " << (Lowerer::xpropMode() == 2 ? "xmerge" : Lowerer::xpropMode() == 1 ? "tmerge" : "off") << ": "
+        f << "xprop " << (Lowerer::xpropMode() == 2 ? "pessimistic" : Lowerer::xpropMode() == 1 ? "merge" : "off") << ": "
           << ok << " of " << Lowerer::xpReport().size() << " if / case / edge constructs merged\n";
         for (auto& r : Lowerer::xpReport())
             f << r.where << r.what << (r.ok ? ": merged" : ": not merged, it holds " + r.why) << "\n";

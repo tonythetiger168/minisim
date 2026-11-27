@@ -3,7 +3,7 @@
 #   cmake -DMSIM=<msim> -DMDEBUG=<mdebug> -DUVM_HOME=<uvm-core> -DSRC=<source dir> -DOUT=<dir> -P mdebug_uvm_tr.cmake
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT})
-execute_process(COMMAND ${MSIM} -uvmhome ${UVM_HOME} ${SRC}/tests/debug/uvm_record.sv -top top -vcd rec.vcd
+execute_process(COMMAND ${MSIM} -uvm_home ${UVM_HOME} ${SRC}/tests/debug/uvm_record.sv -top top -vcd rec.vcd
                 WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 600)
 if(NOT rc EQUAL 0 OR NOT out MATCHES "pass=5 fail=0" OR NOT EXISTS ${OUT}/tr_db.log)
   message(FATAL_ERROR "msim on uvm_record.sv: ${rc}\n${out}${err}")
