@@ -1,4 +1,4 @@
-# Assertions and power in the waveform (statview.inc): $fsdbDumpSVA gives
+# Assertions and power in the waveform (statview.inc): -vcd-sva gives
 # each assertion and cover .passes / .fails counters that step when an
 # attempt ends; -vcd-power gives each power domain's simstate and each
 # supply net's state and voltage, with the times msim -upf_verbose reports.
@@ -20,7 +20,7 @@ function(has name text)
   endforeach()
 endfunction()
 
-execute_process(COMMAND ${MSIM} ${SRC}/tests/debug/sva_wave.sv WORKING_DIRECTORY ${OUT}
+execute_process(COMMAND ${MSIM} ${SRC}/tests/debug/sva_wave.sv -vcd-sva WORKING_DIRECTORY ${OUT}
                 RESULT_VARIABLE rc OUTPUT_VARIABLE o ERROR_VARIABLE err)
 if(NOT rc EQUAL 0 OR NOT o MATCHES "45 a_gnt failed\n85 a_gnt failed")
   message(FATAL_ERROR "sva: msim exited ${rc}\n${err}\n${o}")

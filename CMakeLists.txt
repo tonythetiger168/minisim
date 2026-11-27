@@ -424,23 +424,34 @@ if(MINISIM_WITH_SLANG)
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DCHK=$<TARGET_FILE:test_fst>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_fst
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_fst.cmake)
-    # $fsdbDumpvars, $vcdpluson, $shm_probe, ... write FST (vendor_tasks.hpp).
-    add_test(NAME msim_vendor_dump
-             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug>
-                     -DCHK=$<TARGET_FILE:test_fst> -DSRC=${CMAKE_SOURCE_DIR}
-                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vendor_dump
-                     -P ${CMAKE_SOURCE_DIR}/tests/msim_vendor_dump.cmake)
-    # -vcd-sva, $fsdbDumpSVA and -vcd-power (statview.inc).
+    # $fsdbDumpvars, $vcdpluson, $shm_probe, ... write FST (vendor_tasks.hpp; vendor layer).
+    if(MINISIM_VENDOR_COMPAT)
+      add_test(NAME msim_vendor_dump
+               COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug>
+                       -DCHK=$<TARGET_FILE:test_fst> -DSRC=${CMAKE_SOURCE_DIR}
+                       -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_vendor_dump
+                       -P ${CMAKE_SOURCE_DIR}/tests/compat/msim_vendor_dump.cmake)
+      set_tests_properties(msim_vendor_dump PROPERTIES LABELS compat)
+    endif()
+    # -vcd-sva and -vcd-power (statview.inc).
     add_test(NAME msim_wave_state
              COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DCHK=$<TARGET_FILE:test_fst>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_wave_state
                      -P ${CMAKE_SOURCE_DIR}/tests/msim_wave_state.cmake)
   endif()
-  # Transaction recording without UVM ($begin_transaction, $fsdbTrans_begin), read by mdebug -tr.
+  # Transaction recording without UVM ($begin_transaction), read by mdebug -tr.
   add_test(NAME msim_tr
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug>
                    -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_tr
                    -P ${CMAKE_SOURCE_DIR}/tests/msim_tr.cmake)
+  if(MINISIM_VENDOR_COMPAT)   # Verdi's $fsdbTrans_* (vendor layer)
+    add_test(NAME msim_tr_fsdb
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DMDEBUG=$<TARGET_FILE:mdebug>
+                     -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_tr_fsdb
+                     -DSV=${CMAKE_SOURCE_DIR}/tests/compat/debug/tr_record_fsdb.sv
+                     -P ${CMAKE_SOURCE_DIR}/tests/msim_tr.cmake)
+    set_tests_properties(msim_tr_fsdb PROPERTIES LABELS compat)
+  endif()
   # DPI-C: -sv_lib, -sv_liblist, -dpiheader, -o, and a missing C function.
   add_test(NAME msim_dpi
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}

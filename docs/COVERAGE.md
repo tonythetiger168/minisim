@@ -5,7 +5,7 @@ Clause numbers were checked against the 2023 text; most are unchanged from 1800-
 A ✅ row has a test in `tests/spec/` named after its clause. Each of those tests
 is also checked against Icarus Verilog 13 when `iverilog` is installed.
 🟡 works with the limits listed, ❌ is an error at lowering time ("lower: unsupported ..."),
-including any system task msim does not know (only `$dumpports` and vendor waveform tasks such as `$fsdbDumpvars` are skipped),
+including any system task msim does not know (only `$dumpports` is skipped; in a `-DMINISIM_VENDOR_COMPAT=ON` build the vendor waveform tasks such as `$fsdbDumpvars` are taken too, docs/compat/WAVES.md),
 never a silent wrong answer. If you find a construct that runs but gives the
 wrong result, that is a bug: please add a spec test for it.
 

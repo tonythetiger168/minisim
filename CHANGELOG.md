@@ -8,6 +8,11 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Changed
+- The Verdi, VCS and Xcelium waveform tasks (`$fsdbDump*`, `$vcdplus*`,
+  `$shm_*`, `$record*`) and Verdi's `$fsdbTrans_*` transaction tasks are
+  known only in a `-DMINISIM_VENDOR_COMPAT=ON` build (docs/compat/WAVES.md).
+  Use `$dumpfile` / `$dumpvars`, `-vcd-sva`, `-vcd-power` and
+  `$begin_transaction` and the rest of the recording API.
 - msim's options take minisim's own names: `-cov_metrics=`, `-cov_scope`,
   `-cov_cond`, `-upf_top`, `-dpi_header`, `-vpi`, `-uvm_home`,
   `-xprop=merge|pessimistic|off`, and `-compile` / `-o` for partition
