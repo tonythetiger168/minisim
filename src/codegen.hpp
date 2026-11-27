@@ -53,6 +53,8 @@ inline void phaseMark(const char* what) {
     std::fprintf(stderr, "msim: phase %-22s %8.1f s  rss %6.2f GB  peak %6.2f GB\n", what, t, rss / 1048576.0, hwm / 1048576.0);
 }
 #include <vector>
+#include <thread>
+#include <atomic>
 
 #include "prog.hpp"
 #include "sva.hpp"
@@ -301,7 +303,16 @@ public:
             const size_t outMin = om ? std::strtoull(om, nullptr, 10) : kOutlineMin;
             for (auto& c : chunks) {
                 if (c.size() > outMin) for (auto& h : splitSeq(c)) out.push_back(std::move(h));
-                if (c.size() > outMin) for (auto& h : outlineRuns(c, [this](const std::string& st) { return stmtKey(st); })) out.push_back(std::move(h));
+                // The time-0 process (variable initializers, the first
+                // evaluation): its helpers run once, so gcc need not optimize
+                // them. OpenC910's are 1.5 MB, and every variable added by an
+                // edit lands in one: its part took 91 s, 64 s with this.
+                const bool once = c.compare(0, 11, "// process ") == 0 && c.find(" (init)") < c.find('\n');
+                if (c.size() > outMin)
+                    for (auto& h : outlineRuns(c, [this](const std::string& st) { return stmtKey(st); })) {
+                        if (once && h.compare(0, 12, "static void ") == 0) h.insert(12, "__attribute__((optimize(\"O0\"))) ");
+                        out.push_back(std::move(h));
+                    }
                 if (!c.empty()) out.push_back(std::move(c));
             }
             chunks = std::move(out);
@@ -324,10 +335,16 @@ public:
         // files < 0: exactly that many (msim -cfiles), else only for a large design.
         // A large design gets more files than cores: the compiler takes about
         // 0.25 GB per MB of generated code, so 1024 PicoRV32 cores in four
-        // 35 MB files ran a 16 GB machine out of memory. At most 2 MB a file:
+        // 35 MB files ran a 16 GB machine out of memory. At most 1 MB a file:
         // OpenTitan's 4 MB parts took 2.6 GB each at -O2, two at a time on
         // 16 GB beside msim; the header comes precompiled (design.hpp.gch).
-        size_t want = std::max<size_t>(files, (chunkBytes + (2u << 20) - 1) / (2u << 20));
+        // Counted before relocText, which makes the parts about three times
+        // larger: OpenC910's 2 MB became 6 MB parts of 60 to 100 s each, and
+        // a one-module edit waited for four of them. 1 MB (MSIM_PARTKB, in KB):
+        // C910 full build 569 -> 514 s, one-module edit 179 -> 147 s; 512 KB
+        // made the full build slower (654 s).
+        static const size_t partB = [] { const char* e = std::getenv("MSIM_PARTKB"); return (e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)1024) << 10; }();
+        size_t want = std::max<size_t>(files, (chunkBytes + partB - 1) / partB);
         int nf = files < 0 ? (int)std::min<size_t>(-files, nChunks)
                : files > 1 ? (int)std::min({want, chunkBytes / 65536, nChunks}) : 1;
         nf = std::max(nf, 1);
@@ -685,7 +702,7 @@ public:
                             size_t j = i;
                             while (j < ln.size() && (std::isalnum((unsigned char)ln[j]) || ln[j] == '_')) j++;
                             std::string id = ln.substr(i, j - i);
-                            if (j < ln.size() && ln[j] == '(' && id != "__attribute__" && id != "noinline" && id != "cold" && id != "used") { name = id; break; }
+                            if (j < ln.size() && ln[j] == '(' && id != "__attribute__" && id != "optimize" && id != "noinline" && id != "cold" && id != "used") { name = id; break; }
                             i = j;
                         } else i++;
                     }
@@ -716,8 +733,20 @@ public:
                 // part is rebuilt and design.cpp (which calls it) is not.
                 // Only the parts' code goes by symbols; design.cpp keeps the
                 // numbers (it is rebuilt on any edit, and has no extern decls).
-                for (size_t i = 0; i < chunks.size(); i++)
-                    if (!global[i]) chunks[i] = localNames(relocText(chunks[i], csyms[i]));
+                {   // per chunk, on every core (OpenC910: 5 s on one)
+                    const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+                    std::vector<std::vector<std::pair<std::string, std::string>>> defs(nt);
+                    std::atomic<size_t> next{0};
+                    auto work = [&](unsigned w) {
+                        for (size_t i; (i = next.fetch_add(1)) < chunks.size();)
+                            if (!global[i]) chunks[i] = localNames(relocText(chunks[i], csyms[i], &defs[w]));
+                    };
+                    std::vector<std::thread> th;
+                    for (unsigned w = 1; w < nt; w++) th.emplace_back(work, w);
+                    work(0);
+                    for (auto& t : th) t.join();
+                    for (auto& d : defs) for (auto& [sym, def] : d) relocSyms_.emplace(std::move(sym), std::move(def));
+                }
                 auto mapIds = mapIdents;
                 std::unordered_map<std::string, int> taken;
                 for (size_t i = 0; i < chunks.size(); i++) {
@@ -2571,21 +2600,36 @@ private:
                     walk(in.e);
                     if (!k.empty()) evKey.emplace(in.sig, "__event:" + k);
                 }
-        for (size_t s = 0; s < sigName_.size(); s++) {
-            auto ek = evKey.find((int)s);
-            const std::string& n = ek != evKey.end() ? ek->second : sigName_[s];
-            if (n.empty()) continue;
-            uint64_t h = 1469598103934665603ULL;
-            for (char c : n) h = (h ^ (unsigned char)c) * 1099511628211ULL;
-            std::string m;
-            for (size_t i = n.size() > 48 ? n.size() - 48 : 0; i < n.size(); i++)
-                m += std::isalnum((unsigned char)n[i]) ? n[i] : '_';
-            char hx[24];
-            std::snprintf(hx, sizeof hx, "%012llx", (unsigned long long)(h & 0xffffffffffffULL));
-            std::string stem = std::string(hx) + "_" + m;
-            int& k = used[stem];
-            if (k++) stem += "_" + std::to_string(k - 1);   // the same name twice: in table order
-            symOf_[s] = stem;
+        {   // the stems on every core (OpenC910: 3 million signals), then
+            // the same name twice numbered in table order
+            const size_t ns = sigName_.size();
+            const unsigned nt = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+            std::vector<std::thread> th;
+            auto work = [&](unsigned w) {
+                for (size_t s = ns * w / nt; s < ns * (w + 1) / nt; s++) {
+                    auto ek = evKey.find((int)s);
+                    const std::string& n = ek != evKey.end() ? ek->second : sigName_[s];
+                    if (n.empty()) continue;
+                    uint64_t h = 1469598103934665603ULL;
+                    for (char c : n) h = (h ^ (unsigned char)c) * 1099511628211ULL;
+                    static const char hd[] = "0123456789abcdef";
+                    std::string& stem = symOf_[s];
+                    stem.reserve(13 + std::min<size_t>(n.size(), 48));
+                    for (int b = 44; b >= 0; b -= 4) stem += hd[(h >> b) & 15];
+                    stem += '_';
+                    for (size_t i = n.size() > 48 ? n.size() - 48 : 0; i < n.size(); i++)
+                        stem += std::isalnum((unsigned char)n[i]) ? n[i] : '_';
+                }
+            };
+            for (unsigned w = 1; w < nt; w++) th.emplace_back(work, w);
+            work(0);
+            for (auto& t : th) t.join();
+            used.reserve(ns);
+            for (size_t s = 0; s < ns; s++) {
+                if (symOf_[s].empty()) continue;
+                int& k = used[symOf_[s]];
+                if (k++) symOf_[s] += "_" + std::to_string(k - 1);
+            }
         }
         // An NBA slot: its target's name, bits and how many slots before it
         // have that same target.
@@ -2599,7 +2643,9 @@ private:
                           (i ? "_" + std::to_string(i) : std::string());
         }
     }
-    std::string relocText(const std::string& t, std::set<std::string>& syms) {
+    // defs: where the symbols' definitions go (one list per thread, merged
+    // into relocSyms_ by the caller), else relocSyms_ itself.
+    std::string relocText(const std::string& t, std::set<std::string>& syms, std::vector<std::pair<std::string, std::string>>* defs = nullptr) {
         std::string r;
         r.reserve(t.size() + t.size() / 4);
         size_t last = 0, skipTo = 0;
@@ -2607,7 +2653,9 @@ private:
             if (n < 0 || (size_t)n >= symOf_.size() || symOf_[(size_t)n].empty()) return nullptr;
             return &symOf_[(size_t)n];
         };
-        auto use = [&](const std::string& sym, const std::string& def) { syms.insert(sym); relocSyms_.emplace(sym, def); };
+        auto use = [&](const std::string& sym, const std::string& def) {
+            if (syms.insert(sym).second) { if (defs) defs->emplace_back(sym, def); else relocSyms_.emplace(sym, def); }
+        };
         refScan(t, [&](size_t start, size_t at, size_t e, long long n, int kind) {
             if (start < skipTo) return;
             if (kind == 1) {   // P<N>: the private copy
