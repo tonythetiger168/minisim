@@ -1998,7 +1998,8 @@ static void substituteWires(LowerResult& lowered) {
     {
         const char* why = !concAsserts().empty() ? "concurrent assertions" : !clockings().empty() ? "clocking blocks"
                         : !cgDefs().empty() || !cgInsts().empty() ? "covergroups" : !timingChecks().empty() ? "timing checks"
-                        : !pathRecs().empty() ? "specify paths" : !gateRecs().empty() ? "gate delays"
+                        : !pathRecs().empty() ? "specify paths"
+                        : !gateRecs().empty() && (vpi::st().active || !sdfRequests().empty() || sdfAtRunTime()) ? "gate delays changed at run time"
                         : !sampleClocks().empty() || !shadowPairs().empty() ? "sampled values"
                         : nullptr;
         if (why) { if (dbg) std::cerr << "wire substitution: off (" << why << ")\n"; return; }
@@ -2034,6 +2035,15 @@ static void substituteWires(LowerResult& lowered) {
     }
     for (auto& [s, d] : lowered.netDelays) mark(s);
     for (auto& d : lowered.trireg) mark(d.sig);
+    // A delayed gate or continuous assign keeps the signals it drives (its
+    // delay applies to them), and so does a copy of one: its net starts at z
+    // and the copy's write at time 0 is an event its readers see, which the
+    // gate's own output (x from the start) does not make. Copies elsewhere
+    // in the design still go: C910's gate delays had turned substitution
+    // off for all of its clock copies.
+    std::vector<char> gateOut(ns, 0);
+    for (auto& g : gateRecs())
+        for (int s : g.outs) { mark(s); if (s >= 0 && (size_t)s < ns) gateOut[(size_t)s] = 1; }
     std::function<void(const E&)> ex = [&](const E& e) {
         if (!e) return;
         why = 4; if (e->op != Op::Ref || e->at) mark(e->sig);
@@ -2085,7 +2095,7 @@ static void substituteWires(LowerResult& lowered) {
     for (auto& sp : lowered.subs) if (sp && seen.insert(sp.get()).second) scan(*sp, nullptr);
     std::vector<int> alias(ns, -1);
     for (size_t a = 0; a < ns; a++)
-        if (cand[a] >= 0 && !bad[a]) alias[a] = own[(size_t)cand[a]]->e->sig;
+        if (cand[a] >= 0 && !bad[a] && !gateOut[(size_t)own[(size_t)cand[a]]->e->sig]) alias[a] = own[(size_t)cand[a]]->e->sig;
     auto root = [&](int a) {
         int r = a;
         for (size_t n = 0; alias[(size_t)r] >= 0; n++) { r = alias[(size_t)r]; if (n > ns) return -1; }   // a loop of copies
