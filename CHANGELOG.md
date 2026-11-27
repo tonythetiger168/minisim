@@ -31,6 +31,16 @@ Spec references are IEEE 1800-2023 clauses.
   move to `tests/compat/` and their manuals to `docs/compat/`.
 
 ### Added
+- mvplat runs AArch64 (Armv8.0-A, EL0 and EL1) on a built-in arm board: the
+  A64 base set with floating point and NEON, stage 1 translation with the
+  4 KiB granule, a GICv3, the generic timer, a PL011 UART, PSCI 1.1 firmware
+  for several processors, and Linux `Image` loading with a generated device
+  tree. Floating point follows the architecture's NaN, flush-to-zero,
+  rounding and FPSR flag rules. Ubuntu's arm64 kernel boots to a BusyBox
+  shell on up to four processors. Written from Arm's public architecture
+  reference; tests in `tests/vplat/a64`, including random instruction
+  blocks compared with qemu-aarch64 run as a separate program
+  (docs/VPLAT.md, "Arm (AArch64)").
 - mvplat: the Android riscv64 Cuttlefish image boots to `sys.boot_completed`
   (lock screen and launcher, about 1570 simulated seconds on 4 harts):
   `run.sh` starts `cfhost.py` on 20 console ports, `cfhost.py` also answers

@@ -1,0 +1,111 @@
+// a64.hpp - an AArch64 processor element (Armv8-A, EL0 and EL1) and the
+// platform it runs on, for mvplat. Written from the Arm Architecture Reference
+// Manual for A-profile (DDI 0487): the A64 instruction set (chapter C4 has
+// the encoding index this decoder follows), the AArch64 exception model (D1),
+// the VMSAv8-64 translation (D8: stage 1, 4 KiB granule) and the generic
+// timer (D11). No Arm code is used and no Arm core is claimed: MIDR_EL1 has
+// implementer 0 (software use).
+//
+// What is there: the integer instructions, loads and stores (exclusives,
+// load-acquire / store-release, pairs, all addressing modes), branches, the
+// system instructions Linux uses (MRS / MSR, DC ZVA, IC, TLBI, AT, the
+// barriers, WFI / WFE), SVC / HVC / BRK / ERET, the SIMD and floating-point
+// registers with their loads and stores and the AdvSIMD and scalar
+// floating-point instructions in a64simd.inc. EL2 and EL3 are not there:
+// HVC and SMC from EL1 reach the platform's firmware (PSCI, SMCCC), as on a
+// board whose firmware sits above the operating system.
+//
+// The interrupt controller is a GICv3 with its CPU interface in system
+// registers (a64gic.hpp); the timer's interrupts are its PPIs 30 (EL1
+// physical) and 27 (virtual).
+#pragma once
+
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "bus.hpp"
+
+namespace vp {
+namespace a64 {
+
+using u128 = unsigned __int128;
+
+// Exception classes (ESR_ELx.EC, D23.2.41).
+enum : uint32_t {
+    EC_UNKNOWN = 0x00, EC_WFX = 0x01, EC_FP = 0x07, EC_ILLEGAL = 0x0e, EC_SVC = 0x15, EC_HVC = 0x16,
+    EC_SMC = 0x17, EC_SYS = 0x18, EC_IABT_LOW = 0x20, EC_IABT_CUR = 0x21, EC_PC_ALIGN = 0x22,
+    EC_DABT_LOW = 0x24, EC_DABT_CUR = 0x25, EC_SP_ALIGN = 0x26, EC_FP_EXC = 0x2c, EC_BRK = 0x3c,
+};
+
+// A system register by its encoding (op0, op1, CRn, CRm, op2), as MRS / MSR
+// carry it in bits 20:5.
+constexpr uint32_t SR(unsigned op0, unsigned op1, unsigned crn, unsigned crm, unsigned op2) {
+    return op0 << 14 | op1 << 11 | crn << 7 | crm << 3 | op2;
+}
+
+struct Cpu {
+    unsigned id = 0;
+    uint64_t x[32] = {};      // x[31] reads as zero (XZR); the stack pointers are sp[]
+    uint64_t sp[2] = {};      // SP_EL0, SP_EL1
+    uint64_t pc = 0;
+    // PSTATE
+    uint32_t nzcv = 0;        // bits 31:28
+    uint32_t daif = 0x3c0;    // bits 9:6 (D A I F), as in SPSR
+    unsigned el = 1;
+    bool spsel = true;        // SP_ELx at EL1
+    // SIMD and floating point
+    u128 v[32] = {};
+    uint32_t fpcr = 0, fpsr = 0;
+    // EL1 system registers
+    uint64_t sctlr = 0x30d00800, actlr = 0, cpacr = 0, ttbr0 = 0, ttbr1 = 0, tcr = 0, mair = 0, amair = 0,
+             vbar = 0, elr = 0, spsr = 0, esr = 0, far = 0, par = 0, tpidr1 = 0, tpidr0 = 0, tpidrro0 = 0,
+             contextidr = 0, afsr0 = 0, afsr1 = 0, mdscr = 0, cntkctl = 0, csselr = 0, oslsr = 0, mdccint = 0;
+    uint64_t mpidr = 0;
+    // generic timer, EL1 physical and virtual
+    uint64_t cntpCval = 0, cntvCval = 0, cntvoff = 0;
+    uint32_t cntpCtl = 0, cntvCtl = 0;
+    // GIC CPU interface (ICC_*_EL1)
+    uint32_t pmr = 0, bpr1 = 2, igrpen1 = 0, icc_ctlr = 0x400;  // CTLR: IDbits 16, PRIbits 5
+    uint32_t sre = 7;
+    std::vector<uint32_t> activeStack;  // (priority << 16 | intid) of acknowledged interrupts, oldest first
+    // the exclusives monitor
+    uint64_t exAddr = ~0ull;
+    unsigned exSize = 0;
+    // run state
+    uint64_t cycle = 0, insns = 0;
+    bool wfi = false, off = false;  // off: PSCI CPU_OFF, or not started yet
+    bool irqLine = false;           // the GIC asks for an IRQ
+    bool eventReg = false;          // WFE's event register
+
+    // The TLB: virtual page -> physical page, permissions, the host page.
+    struct Tlb {
+        uint64_t tag = ~0ull;      // VA bits 63:12 (top byte as used), with the regime half
+        uint64_t pa = 0;           // physical page
+        uint8_t* host = nullptr;   // RAM: where the page is
+        uint16_t asid = 0;
+        bool global = false;
+        uint8_t perm = 0;          // 1 EL1 r, 2 EL1 w, 4 EL1 x, 8 EL0 r, 16 EL0 w, 32 EL0 x
+    };
+    static constexpr unsigned TLB_N = 1024;
+    Tlb tlb[TLB_N];
+    void flushTlb() { for (auto& e : tlb) e.tag = ~0ull; }
+
+    uint64_t& spRef() { return (el && spsel) ? sp[1] : sp[0]; }
+    uint64_t pstate() const {  // as SPSR keeps it
+        return nzcv | daif | (uint64_t)el << 2 | (spsel ? 1 : 0);
+    }
+    uint16_t asid() const {
+        const uint64_t t = (tcr >> 22 & 1) ? ttbr1 : ttbr0;
+        return (uint16_t)(t >> 48);
+    }
+};
+
+}  // namespace a64
+}  // namespace vp
