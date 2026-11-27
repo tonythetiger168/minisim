@@ -545,6 +545,24 @@ if [ -n "${MVPLAT_ARM64_KERNEL:-}" ] && [ -n "${MVPLAT_ARM64_BUSYBOX:-}" ] && co
 " > linux-arm64.out 2>&1; rc=$?
   expect "Linux arm64 and a BusyBox shell on 2 AArch64 processors" 0 linux-arm64.out "shell on aarch64, 2 harts"
   grep -q "^arm 42" linux-arm64.out && ok "the arm64 shell runs what is typed" || { bad "the arm64 shell"; sed 's/^/      /' linux-arm64.out | tail -20; }
+  # virtio-mmio from -disk, -net and -vcon; virtio over PCIe from a platform file
+  head -c 65536 /dev/zero > a64disk.img; printf MVPLATDISK | dd of=a64disk.img conv=notrunc 2> /dev/null
+  "$MVPLAT" -kernel "$MVPLAT_ARM64_KERNEL" -initrd bb64.cpio -append "console=ttyAMA0 rdinit=/init quiet" -q \
+    -disk a64disk.img -net user -input "mount -t devtmpfs d /dev; head -c 10 /dev/vda; echo; ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ping -c 2 10.0.2.2; poweroff -f
+" > linux-arm64-virtio.out 2>&1; rc=$?
+  expect "arm64: Linux reads virtio-blk (-disk)" 0 linux-arm64-virtio.out "^MVPLATDISK"
+  grep -q "2 packets transmitted, 2 packets received" linux-arm64-virtio.out && ok "arm64: Linux pings the gateway over virtio-net (-net user)" ||
+    { bad "arm64: virtio-net"; tail -20 linux-arm64-virtio.out | sed 's/^/      /'; }
+  "$MVPLAT" -kernel "$MVPLAT_ARM64_KERNEL" -initrd bb64.cpio -append "console=hvc0 rdinit=/init quiet" -q -vcon \
+    -input "echo on hvc \$((6*7)); poweroff -f
+" > linux-arm64-hvc.out 2>&1; rc=$?
+  expect "arm64: a shell on hvc0 (-vcon)" 0 linux-arm64-hvc.out "^on hvc 42"
+  cp "$T/a64/pcie.json" a64pcie.json; cp a64disk.img disk.img
+  "$MVPLAT" -platform a64pcie.json -kernel "$MVPLAT_ARM64_KERNEL" -initrd bb64.cpio -append "console=ttyAMA0 rdinit=/init quiet" -q \
+    -input "mount -t devtmpfs d /dev; head -c 10 /dev/vda; echo; ls /sys/bus/pci/devices; poweroff -f
+" > linux-arm64-pcie.out 2>&1; rc=$?
+  expect "arm64: virtio-blk behind the PCIe host (2 processors)" 0 linux-arm64-pcie.out "^MVPLATDISK"
+  grep -q "0000:00:01.0  0000:00:02.0" linux-arm64-pcie.out && ok "arm64: both PCIe devices enumerated" || bad "arm64: PCIe enumeration"
 else
   echo "skip  Linux arm64: set MVPLAT_ARM64_KERNEL and MVPLAT_ARM64_BUSYBOX (tests/vplat/get-linux-arm64.sh fetches them)"
 fi

@@ -141,6 +141,69 @@ struct Options {
     std::vector<std::pair<double, std::string>> inputAt;
 };
 
+// A virtio device from its entry: on the bus at `at`, or behind a
+// PCIe host (at 0).
+std::unique_ptr<VirtioMmio> makeVirtioDev(const json::Value& d, const std::string& t, const std::string& name,
+                                          uint64_t at, const Options& o, const fs::path& dir) {
+    auto rel = [&](const std::string& p) { return fs::path(p).is_absolute() ? p : (dir / p).string(); };
+    if (t == "virtio-blk") {
+        auto v = std::make_unique<VirtioBlk>();
+        v->name = name;
+        v->base = at;
+        v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+        if (!d.get("file")) throw std::runtime_error(d.where() + "'" + name + "' has no \"file\" (a raw disk image)");
+        bool w = d.get("write") && d.get("write")->b;
+        bool ro = d.get("readonly") && d.get("readonly")->b;
+        v->open(rel(d.get("file")->str()), w || o.diskWrite, ro);
+        return std::unique_ptr<VirtioMmio>(std::move(v));
+    } else if (t == "virtio-console") {
+        auto v = std::make_unique<VirtioConsole>();
+        v->name = name;
+        v->base = at;
+        v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+        for (char c : d.get("input") ? d.get("input")->str() : std::string()) v->held.push_back((uint8_t)c);
+        if (d.get("output")) v->outputTo(d.get("output")->str() == "none" ? "none" : rel(d.get("output")->str()));
+        if (d.get("socket")) v->connectTo(rel(d.get("socket")->str()));
+        return std::unique_ptr<VirtioMmio>(std::move(v));
+    } else if (t == "virtio-rng") {
+        auto v = std::make_unique<VirtioRng>();
+        v->name = name;
+        v->base = at;
+        v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+        if (d.get("seed")) v->seed = d.get("seed")->u64();
+        return std::unique_ptr<VirtioMmio>(std::move(v));
+    } else if (t == "virtio-gpu") {
+        auto v = std::make_unique<VirtioGpu>();
+        v->name = name;
+        v->base = at;
+        v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+        if (d.get("width")) v->width = (uint32_t)d.get("width")->u64();
+        if (d.get("height")) v->height = (uint32_t)d.get("height")->u64();
+        if (v->width < 16 || v->width > 8192 || v->height < 16 || v->height > 8192)
+            throw std::runtime_error(d.where() + "'" + name + "': width and height are 16 to 8192");
+        if (d.get("screen")) v->screen = rel(d.get("screen")->str());
+        return std::unique_ptr<VirtioMmio>(std::move(v));
+    } else if (t == "virtio-net") {
+        auto v = std::make_unique<VirtioNet>();
+        v->name = name;
+        v->base = at;
+        v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
+        if (d.get("mac")) setMac(*v, d.get("mac")->str(), d.where());
+        std::string be = d.get("backend") ? d.get("backend")->str() : "user";
+        if (be == "dgram") {
+            if (!d.get("local") || !d.get("remote"))
+                throw std::runtime_error(d.where() + "'" + name + "': the dgram back end needs \"local\" and \"remote\"");
+            v->useDgram(rel(d.get("local")->str()), rel(d.get("remote")->str()));
+        } else if (be != "user") {
+            throw std::runtime_error(d.where() + "'" + name + "': unknown back end '" + be + "' (user, dgram)");
+        }
+        if (d.get("pcap")) v->capture(rel(d.get("pcap")->str()));
+        return std::unique_ptr<VirtioMmio>(std::move(v));
+    }
+    return nullptr;
+}
+
+
 std::string exeDir() {
     std::error_code ec;
     auto p = fs::read_symlink("/proc/self/exe", ec);
@@ -214,65 +277,8 @@ void build(Machine& m, const json::Value& pl, const fs::path& dir, const Options
 
     const json::Value* devs = pl.get("devices");
     if (!devs || devs->kind != json::Value::Arr) throw std::runtime_error("the platform has no \"devices\" list");
-    // A virtio device from its entry: on the bus at `at`, or behind a
-    // PCIe host (at 0).
-    auto makeVirtio = [&](const json::Value& d, const std::string& t, const std::string& name,
-                          uint64_t at) -> std::unique_ptr<VirtioMmio> {
-        if (t == "virtio-blk") {
-            auto v = std::make_unique<VirtioBlk>();
-            v->name = name;
-            v->base = at;
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            if (!d.get("file")) throw std::runtime_error(d.where() + "'" + name + "' has no \"file\" (a raw disk image)");
-            bool w = d.get("write") && d.get("write")->b;
-            bool ro = d.get("readonly") && d.get("readonly")->b;
-            v->open(rel(d.get("file")->str()), w || o.diskWrite, ro);
-            return std::unique_ptr<VirtioMmio>(std::move(v));
-        } else if (t == "virtio-console") {
-            auto v = std::make_unique<VirtioConsole>();
-            v->name = name;
-            v->base = at;
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            for (char c : d.get("input") ? d.get("input")->str() : std::string()) v->held.push_back((uint8_t)c);
-            if (d.get("output")) v->outputTo(d.get("output")->str() == "none" ? "none" : rel(d.get("output")->str()));
-            if (d.get("socket")) v->connectTo(rel(d.get("socket")->str()));
-            return std::unique_ptr<VirtioMmio>(std::move(v));
-        } else if (t == "virtio-rng") {
-            auto v = std::make_unique<VirtioRng>();
-            v->name = name;
-            v->base = at;
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            if (d.get("seed")) v->seed = d.get("seed")->u64();
-            return std::unique_ptr<VirtioMmio>(std::move(v));
-        } else if (t == "virtio-gpu") {
-            auto v = std::make_unique<VirtioGpu>();
-            v->name = name;
-            v->base = at;
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            if (d.get("width")) v->width = (uint32_t)d.get("width")->u64();
-            if (d.get("height")) v->height = (uint32_t)d.get("height")->u64();
-            if (v->width < 16 || v->width > 8192 || v->height < 16 || v->height > 8192)
-                throw std::runtime_error(d.where() + "'" + name + "': width and height are 16 to 8192");
-            if (d.get("screen")) v->screen = rel(d.get("screen")->str());
-            return std::unique_ptr<VirtioMmio>(std::move(v));
-        } else if (t == "virtio-net") {
-            auto v = std::make_unique<VirtioNet>();
-            v->name = name;
-            v->base = at;
-            v->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
-            if (d.get("mac")) setMac(*v, d.get("mac")->str(), d.where());
-            std::string be = d.get("backend") ? d.get("backend")->str() : "user";
-            if (be == "dgram") {
-                if (!d.get("local") || !d.get("remote"))
-                    throw std::runtime_error(d.where() + "'" + name + "': the dgram back end needs \"local\" and \"remote\"");
-                v->useDgram(rel(d.get("local")->str()), rel(d.get("remote")->str()));
-            } else if (be != "user") {
-                throw std::runtime_error(d.where() + "'" + name + "': unknown back end '" + be + "' (user, dgram)");
-            }
-            if (d.get("pcap")) v->capture(rel(d.get("pcap")->str()));
-            return std::unique_ptr<VirtioMmio>(std::move(v));
-        }
-        return nullptr;
+    auto makeVirtio = [&](const json::Value& d, const std::string& t, const std::string& name, uint64_t at) {
+        return makeVirtioDev(d, t, name, at, o, dir);
     };
     bool firstUart = true;
     for (auto& d : devs->a) {
