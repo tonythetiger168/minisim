@@ -301,7 +301,16 @@ public:
             const size_t outMin = om ? std::strtoull(om, nullptr, 10) : kOutlineMin;
             for (auto& c : chunks) {
                 if (c.size() > outMin) for (auto& h : splitSeq(c)) out.push_back(std::move(h));
-                if (c.size() > outMin) for (auto& h : outlineRuns(c, [this](const std::string& st) { return stmtKey(st); })) out.push_back(std::move(h));
+                // The time-0 process (variable initializers, the first
+                // evaluation): its helpers run once, so gcc need not optimize
+                // them. OpenC910's are 1.5 MB, and every variable added by an
+                // edit lands in one: its part took 91 s, 64 s with this.
+                const bool once = c.compare(0, 11, "// process ") == 0 && c.find(" (init)") < c.find('\n');
+                if (c.size() > outMin)
+                    for (auto& h : outlineRuns(c, [this](const std::string& st) { return stmtKey(st); })) {
+                        if (once && h.compare(0, 12, "static void ") == 0) h.insert(12, "__attribute__((optimize(\"O0\"))) ");
+                        out.push_back(std::move(h));
+                    }
                 if (!c.empty()) out.push_back(std::move(c));
             }
             chunks = std::move(out);
@@ -691,7 +700,7 @@ public:
                             size_t j = i;
                             while (j < ln.size() && (std::isalnum((unsigned char)ln[j]) || ln[j] == '_')) j++;
                             std::string id = ln.substr(i, j - i);
-                            if (j < ln.size() && ln[j] == '(' && id != "__attribute__" && id != "noinline" && id != "cold" && id != "used") { name = id; break; }
+                            if (j < ln.size() && ln[j] == '(' && id != "__attribute__" && id != "optimize" && id != "noinline" && id != "cold" && id != "used") { name = id; break; }
                             i = j;
                         } else i++;
                     }
