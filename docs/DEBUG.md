@@ -515,7 +515,7 @@ leave the rest of the run alone.
 The commands run on the tool line's Tcl interpreter (`src/tcl.hpp`), so
 `set`, `if`, `foreach`, `while`, `proc`, `expr`, `source`, `puts` and
 `[command]` substitution work around them, and a command's result (`get`,
-`scope`, `describe`, `senv`) can be used in a script:
+`scope`, `describe`, `env`) can be used in a script:
 
 ```
 msim design.sv -i
@@ -551,22 +551,22 @@ tb.head.next.id = 32'h2
 | `stop`, `stop -show` | list the stops |
 | `stop -delete/-disable/-enable N ... \| all`, `delete N` | remove, turn off, turn on |
 | `get SIG ... [-radix hex\|dec\|sdec\|bin\|oct]` | the value as the command's result, for scripts |
-| `print NAME ...`, `value NAME` | a signal, a class handle (class name, object id and every property, inherited ones included) or a path through handles such as `tb.head.next.id` |
+| `print NAME ...` | a signal, a class handle (class name, object id and every property, inherited ones included) or a path through handles such as `tb.head.next.id` |
 | `force SIG VALUE`, `release SIG` | as the `force` and `release` statements |
-| `deposit SIG VALUE`, `change SIG VALUE`, `deposit SIG = VALUE` | set the value once; the design's next assignment overwrites it |
+| `change SIG VALUE`, `change SIG = VALUE` | set the value once; the design's next assignment overwrites it |
 | `scope [PATH]`, `scope -up`, `scope -set PATH` | the current scope: names are looked up there first, then from the top |
 | `show [-scopes\|-signals\|-ports] [-value] [SCOPE]` | the instances, generate blocks, signals or ports of a scope |
 | `describe NAME ...` | kind, type, width, parameter value and where it is declared |
 | `search PATTERN`, `signals [TEXT]` | the signals whose path matches the glob, or contains the text |
 | `where`, `stack` | the statement stopped at (or last run) and its process |
 | `listing [N]`, `listing -file F -line L` | the source around the current statement |
-| `dump -file F`, `dump -add NAMES [-depth N]`, `probe -create NAMES`, `dump -off/-on/-flush/-close` | write a VCD from the next time slot: scopes (everything below, `-depth` levels) and signals, as `$dumpvars` |
+| `dump -file F`, `dump -add NAMES [-depth N]`, `dump -off/-on/-flush/-close` | write a VCD from the next time slot: scopes (everything below, `-depth` levels) and signals, as `$dumpvars` |
 | `drivers SIG ...`, `loads SIG ...` | the statements of the simulation that write or read the signal: file, line, source and process (an `assign`, a port, an `always`, a task) |
 | `call TASK(ARGS)`, `call TASK ARG ...` | run a task or function of the design (static or automatic) from the current scope; prints what it returns and its `output` arguments. While stopped at a line it runs when the simulation goes on |
-| `save FILE` (`checkpoint FILE`) | write a checkpoint: as `$save`, by replay; it records the commands given so far |
+| `save FILE` | write a checkpoint: as `$save`, by replay; it records the commands given so far |
 | `restore FILE` | go back to a `save` checkpoint: msim starts again, runs the saved command line and commands quietly up to it, and reads the next command after `restore` (from the same `-do` file, or the standard input) |
 | `restart` | start the simulation again from time 0, reading the next command after `restart` |
-| `senv [time\|scope\|top\|timescale\|file\|line\|stopped]` | the state of the simulation |
+| `env [time\|scope\|top\|timescale\|file\|line\|stopped]` | the state of the simulation |
 | `alias NAME COMMAND ...` | a new command |
 | `time`, `help`, `quit`, `exit`, `finish` | `quit` ends the simulation now; final blocks still run |
 
@@ -574,7 +574,9 @@ Values are decimal or sized literals (`8'h40`, `4'b10x1`). Names can leave
 out the top module (`cnt` for `tb.cnt`). `-i` and `-do` use the
 interpreter, so they turn off `-compile`, and they run on one thread so that
 a stop can pause a process in the middle. Lines that start with `#` are
-comments.
+comments. In a vendor-layer build the other simulators' names work too
+(`value`, `deposit`, `probe`, `senv`, `checkpoint`, Verdi's `fsdbDump*`;
+docs/compat/UCLI.md).
 
 `msim -restore FILE` also takes a checkpoint written by `save`; the commands
 then come from the standard input. A restore costs a run up to the
