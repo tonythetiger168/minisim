@@ -324,10 +324,16 @@ public:
         // files < 0: exactly that many (msim -cfiles), else only for a large design.
         // A large design gets more files than cores: the compiler takes about
         // 0.25 GB per MB of generated code, so 1024 PicoRV32 cores in four
-        // 35 MB files ran a 16 GB machine out of memory. At most 2 MB a file:
+        // 35 MB files ran a 16 GB machine out of memory. At most 1 MB a file:
         // OpenTitan's 4 MB parts took 2.6 GB each at -O2, two at a time on
         // 16 GB beside msim; the header comes precompiled (design.hpp.gch).
-        size_t want = std::max<size_t>(files, (chunkBytes + (2u << 20) - 1) / (2u << 20));
+        // Counted before relocText, which makes the parts about three times
+        // larger: OpenC910's 2 MB became 6 MB parts of 60 to 100 s each, and
+        // a one-module edit waited for four of them. 1 MB (MSIM_PARTKB, in KB):
+        // C910 full build 569 -> 514 s, one-module edit 179 -> 147 s; 512 KB
+        // made the full build slower (654 s).
+        static const size_t partB = [] { const char* e = std::getenv("MSIM_PARTKB"); return (e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)1024) << 10; }();
+        size_t want = std::max<size_t>(files, (chunkBytes + partB - 1) / partB);
         int nf = files < 0 ? (int)std::min<size_t>(-files, nChunks)
                : files > 1 ? (int)std::min({want, chunkBytes / 65536, nChunks}) : 1;
         nf = std::max(nf, 1);
