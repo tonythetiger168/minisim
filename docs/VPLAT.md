@@ -646,7 +646,12 @@ core: `MIDR_EL1` has implementer 0. It implements Armv8.0-A at EL0 and EL1:
 - **Devices.** A GICv3 (distributor and one redistributor per processor,
   affinity routing, single security state, the system-register CPU
   interface; no ITS or LPIs), the generic timer (physical and virtual, PPIs
-  30 and 27), a PL011 UART, the test finisher and the goldfish RTC.
+  30 and 27), a PL011 UART, the test finisher, the goldfish RTC, and the
+  same virtio devices as on RISC-V (block, network, console, entropy, GPU),
+  on virtio-mmio or behind a `pcie` host (generic ECAM, INTx on four SPIs
+  from its `"irq"`). `-disk`, `-net` and `-vcon` add virtio-mmio devices at
+  `0x0a000000` up, `0x1000` apart, on SPIs 16 up. `tests/vplat/a64/pcie.json`
+  is the built-in board with a PCIe host.
 
 The built-in arm board:
 
@@ -682,7 +687,7 @@ as a separate program; `tests/mvplat.sh` runs 1500 blocks when
 kernel and BusyBox for the Linux test.
 
 Not yet on AArch64: `-mt` and the translator (the processors take turns on
-one thread), PCIe and virtio, the commit log, and the extension's features.
+one thread), the commit log, and the extension's features.
 
 ## Limits / Not yet
 

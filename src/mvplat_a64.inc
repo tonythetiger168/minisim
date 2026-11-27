@@ -92,9 +92,9 @@ void buildA64(A64Board& b, const json::Value& pl, const fs::path& dir, const Opt
             u->base = base();
             u->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             std::string in = d.get("input") ? d.get("input")->str() : "";
-            if (firstUart && o.haveInput) in = o.input;
+            if (firstUart && o.haveInput && !o.vcon) in = o.input;
             for (char ch : in) u->held.push_back((uint8_t)ch);
-            if (firstUart) {
+            if (firstUart && !o.vcon) {
                 for (auto& [t, text] : o.inputAt) u->timed.push_back({(uint64_t)(t * 1e12), text});
                 std::stable_sort(u->timed.begin(), u->timed.end(), [](auto& a, auto& c) { return a.first < c.first; });
                 if (o.stdinInput) {
@@ -115,14 +115,87 @@ void buildA64(A64Board& b, const json::Value& pl, const fs::path& dir, const Opt
             r->base = base();
             r->irq = d.get("irq") ? (unsigned)d.get("irq")->u64() : 0;
             dev = std::move(r);
+        } else if (type.rfind("virtio-", 0) == 0) {
+            dev = makeVirtioDev(d, type, name, base(), o, dir);
+            if (!dev) throw std::runtime_error(d.where() + "unknown device type '" + type + "'");
+        } else if (type == "pcie") {
+            auto h = std::make_unique<PcieHost>();
+            h->name = name;
+            h->base = base();
+            h->buses = d.get("buses") ? (unsigned)d.get("buses")->u64() : 1;
+            if (h->buses < 1 || h->buses > 256) throw std::runtime_error(d.where() + "PCIe buses must be 1 to 256");
+            h->size = (uint64_t)h->buses << 20;
+            h->mmioBase = d.get("mmio") ? d.get("mmio")->u64() : 0x10000000;
+            h->mmioSize = d.get("mmio_size") ? d.get("mmio_size")->u64() : 0x2eff0000;
+            if (!d.get("irq")) throw std::runtime_error(d.where() + "'" + name + "' has no \"irq\" (the first of four SPIs for INTA to INTD)");
+            h->irq = (unsigned)d.get("irq")->u64();
+            if (const json::Value* fs_ = d.get("devices")) {
+                for (auto& cd : fs_->a) {
+                    std::string ct = cd.get("type") ? cd.get("type")->str() : "";
+                    std::string cn = cd.get("name") ? cd.get("name")->str() : name + "." + ct;
+                    auto v = makeVirtioDev(cd, ct, cn, 0, o, dir);
+                    if (!v) throw std::runtime_error(cd.where() + "a PCIe device is virtio-blk, virtio-net, virtio-console, virtio-rng or virtio-gpu, not '" + ct + "'");
+                    if (h->count() >= 31) throw std::runtime_error(cd.where() + "at most 31 devices behind a PCIe host");
+                    v->p = &m;
+                    h->addVirtio(std::move(v));
+                }
+            }
+            auto w = h->window();
+            w->p = &m;
+            m.bus.add(std::move(w));
+            dev = std::move(h);
         } else {
             throw std::runtime_error(d.where() + "'" + name + "': type '" + type +
-                                     "' is not one an AArch64 platform has yet (ram, rom, gicv3, pl011, finisher, goldfish-rtc)");
+                                     "' is not one an AArch64 platform has (ram, rom, gicv3, pl011, finisher, goldfish-rtc, virtio-*, pcie)");
         }
         dev->p = &m;
         m.bus.add(std::move(dev));
     }
     if (!haveGic) throw std::runtime_error("an AArch64 platform needs a \"gicv3\"");
+    // -disk, -net, -vcon: virtio-mmio devices from 0x0a000000, 0x1000 apart,
+    // on SPIs 16 up, after any the platform already has
+    unsigned slot = 0;
+    auto next = [&](VirtioMmio& v, const char* what) {
+        uint64_t a;
+        do a = 0x0a000000ull + 0x1000ull * slot++; while (m.bus.find(a) && slot < 64);
+        v.base = a;
+        v.irq = 16 + slot - 1;
+        if (v.irq >= spis) throw std::runtime_error(std::string(what) + ": no SPI left");
+        v.p = &m;
+    };
+    for (const std::string& img : o.disks) {
+        auto v = std::make_unique<VirtioBlk>();
+        v->name = "virtio" + std::to_string(slot);
+        next(*v, "-disk");
+        v->open(img, o.diskWrite, false);
+        m.bus.add(std::move(v));
+    }
+    unsigned nic = 0;
+    for (const std::string& spec : o.nets) {
+        auto v = std::make_unique<VirtioNet>();
+        v->name = "net" + std::to_string(nic);
+        next(*v, "-net");
+        v->mac[5] = (uint8_t)(0x56 + nic);
+        if (spec.rfind("dgram:", 0) == 0) {
+            std::string rest = spec.substr(6);
+            size_t cm = rest.find(',');
+            if (cm == std::string::npos) throw std::runtime_error("-net dgram:LOCAL,REMOTE: no comma in '" + spec + "'");
+            v->useDgram(rest.substr(0, cm), rest.substr(cm + 1));
+        } else if (spec != "user") {
+            throw std::runtime_error("-net: unknown back end '" + spec + "' (user, dgram:LOCAL,REMOTE)");
+        }
+        if (nic == 0 && !o.netPcap.empty()) v->capture(o.netPcap);
+        m.bus.add(std::move(v));
+        nic++;
+    }
+    if (!o.netPcap.empty() && !nic) throw std::runtime_error("-net-pcap needs -net");
+    if (o.vcon) {
+        auto v = std::make_unique<VirtioConsole>();
+        v->name = "vcon";
+        next(*v, "-vcon");
+        if (o.haveInput) for (char ch : o.input) v->held.push_back((uint8_t)ch);
+        m.bus.add(std::move(v));
+    }
 }
 
 // The device tree Linux's arm64 kernel reads (the bindings in its
@@ -167,6 +240,8 @@ std::vector<uint8_t> a64DeviceTree(A64Board& b, const std::string& bootargs, uin
     f.begin(nm);
     f.propStr("compatible", {"arm,gic-v3"});
     f.propU32("#interrupt-cells", {3});
+    f.propU32("#address-cells", {2});
+    f.propU32("#size-cells", {2});
     f.propEmpty("interrupt-controller");
     const uint64_t rs = 0x20000ull * m.cpus.size();
     f.propU32("reg", {(uint32_t)(b.gicBase >> 32), (uint32_t)b.gicBase, 0, 0x10000,
@@ -201,6 +276,38 @@ std::vector<uint8_t> a64DeviceTree(A64Board& b, const std::string& bootargs, uin
             f.propStr("clock-names", {"uartclk", "apb_pclk"});
             f.end();
             if (stdoutPath.empty()) stdoutPath = "/" + node;
+        } else if (d->type.rfind("virtio-", 0) == 0) {
+            auto* v = static_cast<VirtioMmio*>(d.get());
+            f.begin(std::string("virtio_mmio@") + nm);
+            f.propStr("compatible", {"virtio,mmio"});
+            f.reg(d->base, d->size);
+            f.propU32("interrupts", {0, v->irq, 4});
+            f.propEmpty("dma-coherent");
+            f.end();
+        } else if (d->type == "pcie") {
+            // a generic ECAM host, one 32-bit memory window, INTx through an
+            // interrupt-map (swizzled by slot) onto four SPIs
+            auto* h = static_cast<PcieHost*>(d.get());
+            f.begin(std::string("pcie@") + nm);
+            f.propStr("compatible", {"pci-host-ecam-generic"});
+            f.propStr("device_type", {"pci"});
+            f.propU32("#address-cells", {3});
+            f.propU32("#size-cells", {2});
+            f.propU32("#interrupt-cells", {1});
+            f.propU32("bus-range", {0, h->buses - 1});
+            f.propU32("linux,pci-domain", {0});
+            f.propEmpty("dma-coherent");
+            f.reg(d->base, d->size);
+            const uint32_t sp = h->mmioBase + h->mmioSize > (1ull << 32) ? 0x03000000u : 0x02000000u;
+            f.propU32("ranges", {sp, (uint32_t)(h->mmioBase >> 32), (uint32_t)h->mmioBase, (uint32_t)(h->mmioBase >> 32),
+                                 (uint32_t)h->mmioBase, (uint32_t)(h->mmioSize >> 32), (uint32_t)h->mmioSize});
+            std::vector<uint32_t> im;
+            for (uint32_t sl = 0; sl < 4; sl++)
+                for (uint32_t pin = 1; pin <= 4; pin++)
+                    for (uint32_t cell : {sl << 11, 0u, 0u, pin, GIC, 0u, 0u, 0u, h->irq + (sl + pin - 1) % 4, 4u}) im.push_back(cell);
+            f.propU32("interrupt-map", im);
+            f.propU32("interrupt-map-mask", {0x1800, 0, 0, 7});
+            f.end();
         } else if (d->type == "goldfish-rtc") {
             auto* r = static_cast<GoldfishRtc*>(d.get());
             f.begin(std::string("rtc@") + nm);

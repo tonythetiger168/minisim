@@ -1,0 +1,18 @@
+{
+  "arch": "aarch64",
+  "name": "virt-arm64-pcie",
+  "harts": 2,
+  "devices": [
+    {"type": "finisher", "base": "0x00100000"},
+    {"type": "gicv3", "name": "gic", "base": "0x08000000", "redist": "0x080a0000", "spis": 96},
+    {"type": "pl011", "name": "uart0", "base": "0x09000000", "irq": 1},
+    {"type": "goldfish-rtc", "name": "rtc", "base": "0x09010000", "irq": 2},
+    {"type": "pcie", "name": "pcie", "base": "0x3f000000", "buses": 16, "irq": 3,
+     "mmio": "0x10000000", "mmio_size": "0x2eff0000",
+     "devices": [
+       {"type": "virtio-blk", "file": "disk.img"},
+       {"type": "virtio-rng"}
+     ]},
+    {"type": "ram", "name": "dram", "base": "0x40000000", "size": "1G"}
+  ]
+}

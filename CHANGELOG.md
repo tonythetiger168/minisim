@@ -51,6 +51,9 @@ Spec references are IEEE 1800-2023 clauses.
   reference; tests in `tests/vplat/a64`, including random instruction
   blocks compared with qemu-aarch64 run as a separate program
   (docs/VPLAT.md, "Arm (AArch64)").
+- mvplat's AArch64 platforms take the virtio devices on virtio-mmio and
+  behind a PCIe host, and `-disk`, `-net` and `-vcon`; Linux arm64 reads a
+  disk, pings over virtio-net and runs a shell on hvc0.
 - mvplat: the Android riscv64 Cuttlefish image boots to `sys.boot_completed`
   (lock screen and launcher, about 1570 simulated seconds on 4 harts):
   `run.sh` starts `cfhost.py` on 20 console ports, `cfhost.py` also answers
