@@ -51,6 +51,10 @@ Spec references are IEEE 1800-2023 clauses.
   reference; tests in `tests/vplat/a64`, including random instruction
   blocks compared with qemu-aarch64 run as a separate program
   (docs/VPLAT.md, "Arm (AArch64)").
+- mvplat's AArch64 processors keep the instructions of each code page
+  decoded and cache recent translations for loads, stores and fetches:
+  Linux arm64 boots at about 115 MIPS instead of 61, with the same
+  instruction count; pages written are decoded again.
 - mvplat's AArch64 platforms take the virtio devices on virtio-mmio and
   behind a PCIe host, and `-disk`, `-net` and `-vcon`; Linux arm64 reads a
   disk, pings over virtio-net and runs a shell on hvc0.

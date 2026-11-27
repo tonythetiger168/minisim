@@ -11,12 +11,14 @@
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
 #include "a64.hpp"
 #include "a64gic.hpp"
 #include "bus.hpp"
+#include "wtrack.hpp"
 
 namespace vp {
 namespace a64 {
@@ -179,6 +181,7 @@ public:
     // Runs one processor up to cycle `end`. False when it only waited.
     bool runCpu(Cpu& c, uint64_t end) {
         bool ran = false;
+        dead_.clear();
         while (c.cycle < end && !exit_ && !c.off) {
             if (c.wfi) {
                 if (!c.irqLine && !wakeTimer(c)) { c.cycle = end; break; }
@@ -186,6 +189,20 @@ public:
             }
             ran = true;
             if (c.irqLine && !(c.daif & 0x80)) { exception(c, 0, 0, c.pc, 1); }
+            {  // decoded already
+                if (WriteWatch::writes() != codeWrites_) codeSync();
+                const uint64_t pc0 = c.pc;
+                const Cpu::Fast& f = c.fastX[(pc0 >> 12) & (Cpu::FAST_N - 1)];
+                if (f.key == ((pc0 >> 12) << 1 | (c.el == 0)) && f.code && !(pc0 & 3)) {
+                    const Op& op = f.code->op[(pc0 & 0xfff) >> 2];
+                    curPc_ = pc0;
+                    c.pc = pc0 + 4;
+                    op.fn(*this, c, op, pc0);
+                    c.cycle++;
+                    c.insns++;
+                    continue;
+                }
+            }
             uint32_t insn;
             if (!fetch(c, insn)) { c.cycle++; continue; }
             const uint64_t pc0 = c.pc;
@@ -357,10 +374,13 @@ public:
     uint64_t curPc_ = 0;  // the instruction being executed (data aborts return to it)
     bool fetch(Cpu& c, uint32_t& insn) {
         if (c.pc & 3) { c.far = c.pc; exception(c, EC_PC_ALIGN, 0, c.pc); return false; }
+        const uint64_t key = (c.pc >> 12) << 1 | (c.el == 0);
+        Cpu::Fast& f = c.fastX[(c.pc >> 12) & (Cpu::FAST_N - 1)];
+        if (f.key == key) { memcpy(&insn, f.host + (c.pc & 0xfff), 4); return true; }
         uint64_t pa;
         uint8_t* h;
         if (!xlate(c, c.pc, 2, false, pa, h)) return false;
-        if (h) { memcpy(&insn, h + (pa & 0xfff), 4); return true; }
+        if (h) { f = {key, h, pa & ~0xfffull, codePage(pa, h)}; memcpy(&insn, h + (pa & 0xfff), 4); return true; }
         uint64_t v;
         Device* d = bus.find(pa);
         if (!d || d->read(pa - d->base, 4, v, Who{c.id, c.cycle, true}) != Acc::Ok) {
@@ -398,10 +418,18 @@ public:
             v = r;
             return true;
         }
+        const uint64_t key = (va >> 12) << 1 | (c.el == 0 || asEl0);
+        Cpu::Fast& f = c.fastR[(va >> 12) & (Cpu::FAST_N - 1)];
+        if (f.key == key) { v = 0; memcpy(&v, f.host + (va & 0xfff), n); return true; }
         uint64_t pa;
         uint8_t* h;
         if (!xlate(c, va, 0, asEl0, pa, h)) return false;
-        if (h) { v = 0; memcpy(&v, h + (pa & 0xfff), n); return true; }
+        if (h) {
+            f = {key, h, pa & ~0xfffull};
+            v = 0;
+            memcpy(&v, h + (pa & 0xfff), n);
+            return true;
+        }
         v = 0;
         return devAccess(c, va, pa, n, v, false);
     }
@@ -415,11 +443,22 @@ public:
                 if (!wr(c, va + i, 1, v >> (8 * i) & 0xff, asEl0)) return false;
             return true;
         }
+        const uint64_t key = (va >> 12) << 1 | (c.el == 0 || asEl0);
+        Cpu::Fast& f = c.fastW[(va >> 12) & (Cpu::FAST_N - 1)];
+        if (f.key == key) {
+            if (monitors_) clearMonitors(c, f.pa | (va & 0xfff), n);
+            memcpy(f.host + (va & 0xfff), &v, n);
+            return true;
+        }
         uint64_t pa;
         uint8_t* h;
         if (!xlate(c, va, 1, asEl0, pa, h)) return false;
         if (monitors_) clearMonitors(c, pa, n);
-        if (h) { memcpy(h + (pa & 0xfff), &v, n); return true; }
+        if (h) {
+            f = {key, h, pa & ~0xfffull};
+            memcpy(h + (pa & 0xfff), &v, n);
+            return true;
+        }
         return devAccess(c, va, pa, n, v, true);
     }
     // The exclusives monitors: a store to a granule another processor holds
@@ -551,6 +590,14 @@ public:
     }
 
     // ------------------------------------------------------ the decoder
+    // Pages of decoded instructions (a64dec.inc), by physical page.
+    std::unordered_map<uint64_t, std::unique_ptr<CodePage>> code_;
+    std::vector<std::unique_ptr<CodePage>> dead_;  // dropped, freed before the next instruction
+    std::unordered_map<Device*, int> watchIds_;    // RAM as WriteWatch regions
+    uint64_t codeWrites_ = 0;
+    bool decodeAhead_ = !getenv("MVPLAT_NO_DECODE");
+    CodePage* codePage(uint64_t pa, uint8_t* host);
+    void codeSync();
     void exec(Cpu& c, uint32_t i, uint64_t pc);
     void dpImm(Cpu& c, uint32_t i, uint64_t pc);
     void branchSys(Cpu& c, uint32_t i, uint64_t pc);
@@ -891,3 +938,4 @@ inline void Machine::dpReg(Cpu& c, uint32_t i, uint64_t pc) {
 #include "a64ldst.inc"
 #include "a64sys.inc"
 #include "a64simd.inc"
+#include "a64dec.inc"

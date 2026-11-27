@@ -122,13 +122,14 @@ inline bool Machine::sysReg(Cpu& c, uint32_t reg, bool write, uint64_t& v, uint3
         case SR(3, 0, 1, 0, 0):  // SCTLR_EL1
             if (write) {
                 if ((c.sctlr ^ v) & 1) c.flushTlb();
+                c.flushFast();
                 c.sctlr = v;
             } else v = c.sctlr;
             break;
         case SR(3, 0, 1, 0, 1): ok = rw(c.actlr); break;
         case SR(3, 0, 1, 0, 2): ok = rw(c.cpacr, 3u << 20); break;     // CPACR_EL1: FPEN only
-        case SR(3, 0, 2, 0, 0): ok = rw(c.ttbr0); break;
-        case SR(3, 0, 2, 0, 1): ok = rw(c.ttbr1); break;
+        case SR(3, 0, 2, 0, 0): ok = rw(c.ttbr0); if (write) c.flushFast(); break;
+        case SR(3, 0, 2, 0, 1): ok = rw(c.ttbr1); if (write) c.flushFast(); break;
         case SR(3, 0, 2, 0, 2): if (write) { c.tcr = v; c.flushTlb(); } else v = c.tcr; break;
         case SR(3, 0, 4, 0, 0): ok = rw(c.spsr); break;
         case SR(3, 0, 4, 0, 1): ok = rw(c.elr); break;
@@ -243,6 +244,7 @@ inline void Machine::sysOp(Cpu& c, uint32_t i, uint64_t pc) {
         const bool asidOnly = op2 == 2;
         for (auto& o : cpus) {
             if (!(crm == 3 || o.get() == &c)) continue;  // CRm 3: inner shareable
+            o->flushFast();
             if (va) {
                 const uint64_t page = (v & 0xfffffffffffull);
                 for (auto& e : o->tlb) {

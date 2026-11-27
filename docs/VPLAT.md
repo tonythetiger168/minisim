@@ -673,8 +673,21 @@ starts at its entry point. Received characters on the PL011 (`-input`,
 it).
 
 Ubuntu 24.04's stock arm64 kernel (6.8, the generic `Image`) boots to a
-BusyBox shell on the arm board, on one to four processors, in about 20
-seconds of host time; `poweroff` ends the run with exit code 0.
+BusyBox shell on the arm board, on one to four processors, in about 8
+(one processor) to 11 seconds (four) of host time; `poweroff` ends the run
+with exit code 0.
+
+Speed: each 4 KiB page of RAM that code runs from keeps its instructions
+decoded, the common integer, branch, load and store forms with a routine
+of their own; loads, stores and fetches go through small caches of recent
+translations to host memory. The boot above runs at about 115 MIPS on one
+processor (65 with nothing decoded ahead). Pages decoded from are watched:
+a store to one, by a processor or by a device, drops what was decoded
+from it before the next instruction, so code that rewrites itself runs as
+it would fetched afresh each time and runs are the same, instruction for
+instruction, as with nothing decoded ahead. `MVPLAT_NO_DECODE=1` turns
+the decoding off; where the host cannot watch pages (not 4 KiB pages, or
+no signals), nothing is decoded ahead.
 
 The tests are in `tests/vplat/a64` (`build.sh` builds them with clang);
 `calc` compares integer, floating-point and NEON results with the same
@@ -686,8 +699,8 @@ as a separate program; `tests/mvplat.sh` runs 1500 blocks when
 `qemu-aarch64` is installed. `tests/vplat/get-linux-arm64.sh` fetches the
 kernel and BusyBox for the Linux test.
 
-Not yet on AArch64: `-mt` and the translator (the processors take turns on
-one thread), the commit log, and the extension's features.
+Not yet on AArch64: `-mt` and a translator to host code (the processors
+take turns on one thread), the commit log, and the extension's features.
 
 ## Limits / Not yet
 
