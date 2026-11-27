@@ -95,7 +95,23 @@ struct Cpu {
     };
     static constexpr unsigned TLB_N = 1024;
     Tlb tlb[TLB_N];
-    void flushTlb() { for (auto& e : tlb) e.tag = ~0ull; }
+    // Translations recently used for reads, writes and fetches, keyed by the
+    // virtual page and whether the access is EL0's: a hit is RAM that the
+    // access may use. Emptied with the TLB and on any change of the
+    // translation regime (TTBR, TCR, SCTLR writes, TLBI).
+    struct Fast {
+        uint64_t key = ~0ull;      // (VA >> 12) << 1 | EL0
+        uint8_t* host = nullptr;   // the page in host memory
+        uint64_t pa = 0;           // the physical page
+    };
+    static constexpr unsigned FAST_N = 256;
+    Fast fastR[FAST_N], fastW[FAST_N], fastX[FAST_N];
+    void flushFast() {
+        for (auto& e : fastR) e.key = ~0ull;
+        for (auto& e : fastW) e.key = ~0ull;
+        for (auto& e : fastX) e.key = ~0ull;
+    }
+    void flushTlb() { for (auto& e : tlb) e.tag = ~0ull; flushFast(); }
 
     uint64_t& spRef() { return (el && spsel) ? sp[1] : sp[0]; }
     uint64_t pstate() const {  // as SPSR keeps it
