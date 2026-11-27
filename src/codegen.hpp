@@ -301,7 +301,7 @@ public:
             const size_t outMin = om ? std::strtoull(om, nullptr, 10) : kOutlineMin;
             for (auto& c : chunks) {
                 if (c.size() > outMin) for (auto& h : splitSeq(c)) out.push_back(std::move(h));
-                if (c.size() > outMin) for (auto& h : outlineRuns(c)) out.push_back(std::move(h));
+                if (c.size() > outMin) for (auto& h : outlineRuns(c, [this](const std::string& st) { return stmtKey(st); })) out.push_back(std::move(h));
                 if (!c.empty()) out.push_back(std::move(c));
             }
             chunks = std::move(out);
@@ -669,7 +669,7 @@ public:
             std::string globalCode;
             std::vector<std::string> kinds(chunks.size()), pkey(chunks.size());
             if (reloc) {
-                buildSymOf();
+                buildSymOf(&procs);
                 // Each chunk's function, by name; the code of one process or one
                 // shared template stays in the parts, the rest (combAll, twoNow,
                 // the calls of a template with an instance's distances, ...)
@@ -740,6 +740,30 @@ public:
                     char hx[24];
                     std::snprintf(hx, sizeof hx, "%012llx", (unsigned long long)(h & 0xffffffffffffULL));
                     rename[names[i]] = kinds[i] + "_" + hx;
+                    // The chunk's other functions (an assign's comb<n> and
+                    // combc<n> next to its combv): named after the same key,
+                    // or every part that holds one changed when a process was
+                    // added anywhere (OpenC910: one module edit rebuilt all
+                    // 24 parts).
+                    int other = 0;
+                    const std::string& c = chunks[i];
+                    for (size_t at = 0; at < c.size();) {
+                        size_t nl = c.find('\n', at);
+                        if (nl == std::string::npos) nl = c.size();
+                        if (at < nl && c[at] != ' ' && c[at] != '/' && c[at] != '#' && c.find(") {", at) < nl) {
+                            std::string fn = fnName(c.substr(at, nl - at));
+                            std::string fk = fn.empty() || fn == names[i] || rename.count(fn) ? std::string() : localKind(fn);
+                            if (!fk.empty()) {
+                                std::string k2 = key + "/" + std::to_string(other++);
+                                uint64_t h2 = 1469598103934665603ULL;
+                                for (char ch : k2) h2 = (h2 ^ (unsigned char)ch) * 1099511628211ULL;
+                                char hx2[24];
+                                std::snprintf(hx2, sizeof hx2, "%012llx", (unsigned long long)(h2 & 0xffffffffffffULL));
+                                rename[fn] = fk + "_" + hx2;
+                            }
+                        }
+                        at = nl + 1;
+                    }
                 }
                 auto ren = [&](const std::string& id) { auto it = rename.find(id); return it == rename.end() ? id : it->second; };
                 for (auto& c : chunks) c = mapIds(c, ren);
@@ -2526,11 +2550,30 @@ private:
         return false;
 #endif
     }
-    void buildSymOf() {
+    void buildSymOf(const std::vector<CodegenProc>* procs = nullptr) {
         symOf_.assign(sigName_.size(), "");
         std::unordered_map<std::string, int> used;
+        // An event expression's signal (lower.hpp: "__event<n>", numbered
+        // across the design, so any edit before it renumbers it): named
+        // after the signals of the expression that drives it instead.
+        std::unordered_map<int, std::string> evKey;
+        if (procs)
+            for (auto& p : *procs)
+                for (auto& in : p.prog->code) {
+                    if (in.k != IK::Assign || in.sig < 0 || (size_t)in.sig >= sigName_.size() || sigName_[(size_t)in.sig].compare(0, 7, "__event") != 0) continue;
+                    std::string k;
+                    std::function<void(const E&)> walk = [&](const E& e) {
+                        if (!e) return;
+                        if (e->op == Op::Ref && e->sig >= 0 && (size_t)e->sig < sigName_.size()) k += sigName_[(size_t)e->sig] + ",";
+                        walk(e->at);
+                        for (auto& c : e->kids) walk(c);
+                    };
+                    walk(in.e);
+                    if (!k.empty()) evKey.emplace(in.sig, "__event:" + k);
+                }
         for (size_t s = 0; s < sigName_.size(); s++) {
-            const std::string& n = sigName_[s];
+            auto ek = evKey.find((int)s);
+            const std::string& n = ek != evKey.end() ? ek->second : sigName_[s];
             if (n.empty()) continue;
             uint64_t h = 1469598103934665603ULL;
             for (char c : n) h = (h ^ (unsigned char)c) * 1099511628211ULL;
@@ -2584,7 +2627,14 @@ private:
                 size_t close = t.find(']', e);
                 if (close == std::string::npos) return;
                 std::string rest = t.substr(e, close - e);
-                if (rest.find_first_of("[(") != std::string::npos) return;
+                if (rest.find_first_of("[(") != std::string::npos) {   // an element at a run-time index: S.sigs[SNI(sym) + ...]
+                    std::string sym = "SN_" + *m;
+                    use(sym, std::to_string(n));
+                    r.append(t, last, at - last);
+                    r += "SNI(" + sym + ")";
+                    last = e;
+                    return;
+                }
                 std::string sym = "SO_" + *m;
                 use(sym, std::to_string(n) + "*%c0");
                 r.append(t, last, start - last);
@@ -2649,9 +2699,10 @@ private:
         }
         return r;
     }
-    // Text that names nothing by number: labels (p<proc>_<pc>, cb<proc>_<k>,
-    // cq<proc>_<k>) and cold counters numbered within the chunk, the process
-    // number left out of "// process N (...)" comments. Labels are local to
+    // Text that names nothing by number: labels (p<proc>_<pc>, c<proc>_<pc>,
+    // cS<proc>_<pc>, cb<proc>_<k>, cq<proc>_<k>) and cold counters numbered
+    // within the chunk, the process number left out of "// process N (...)"
+    // and "// process S<n> (...)" comments. Labels are local to
     // a function, so numbering them in order keeps them distinct.
     static std::string localNames(const std::string& t) {
         std::string r;
@@ -2662,6 +2713,7 @@ private:
         for (size_t i = 0; i < t.size();) {
             if (t.compare(i, 11, "// process ") == 0 && (i == 0 || t[i - 1] == '\n')) {
                 size_t e = i + 11;
+                if (e < t.size() && t[e] == 'S') e++;   // a shared template's ("// process S<n>")
                 while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
                 r += "// process";
                 i = e;
@@ -2672,8 +2724,9 @@ private:
                 while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
                 if (e > i + 5) { r += "COLD(" + std::to_string(cold++); i = e; continue; }
             }
-            if ((t[i] == 'p' || t.compare(i, 2, "cb") == 0 || t.compare(i, 2, "cq") == 0) && (i == 0 || !idc(t[i - 1]))) {
-                size_t a = i + (t[i] == 'p' ? 1 : 2), e = a;
+            const bool c1 = t[i] == 'c' && i + 1 < t.size() && std::isdigit((unsigned char)t[i + 1]);   // a comb process's c<n>_<pc>
+            if ((t[i] == 'p' || c1 || t.compare(i, 2, "cb") == 0 || t.compare(i, 2, "cq") == 0 || t.compare(i, 2, "cS") == 0) && (i == 0 || !idc(t[i - 1]))) {
+                size_t a = i + (t[i] == 'p' || c1 ? 1 : 2), e = a;
                 while (e < t.size() && std::isdigit((unsigned char)t[e])) e++;
                 if (e > a && e < t.size() && t[e] == '_') {
                     size_t f = e + 1;
@@ -3791,13 +3844,14 @@ private:
     // calls f(at, len, N) for each.
     template <class F> static void refScan(const std::string& t, F&& f) {
         static const char* pre[] = {"S.sigs[", "S.waiters[", "S.fwSlow(", "S.fwdv(", "S.fwv(", "S.fw(", "S.drive(",
-                                    "S.get(", "S.set(", "S.setOneBit(", "S.setBitsV(", "S.setPart(", "S.poke(", "S.pokeQ(", "S.nbaKeep(", "R(", "int s = ",   // dynTarget
+                                    "S.get(", "S.set(", "S.driveLater(", "S.setOneBit(", "S.setBitsV(", "S.setPart(", "S.poke(", "S.pokeQ(", "S.nbaKeep(", "R(", "int s = ",   // dynTarget
                                     "SIGN(",   // a commit list entry's signal (C1E)
-                                    "nb.push_back({"};   // an NBA of a clocked function (emitSeq)
+                                    "nb.push_back({",   // an NBA of a clocked function (emitSeq)
+                                    "co_await Wait{"};   // a process's wait on one signal
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
         for (size_t i = 0; i < t.size(); i++) {
             char c = t[i];
-            if (c != 'S' && c != 'R' && c != 'P' && c != 'A' && c != 'V' && c != 'H' && c != 'F' && c != 'C' && c != 'i' && c != 'n') continue;
+            if (c != 'S' && c != 'R' && c != 'P' && c != 'A' && c != 'V' && c != 'H' && c != 'F' && c != 'C' && c != 'i' && c != 'n' && c != 'c') continue;
             if (i > 0 && (idc(t[i - 1]) || t[i - 1] == '.')) continue;
             size_t at = std::string::npos;
             int kind = 0;   // 0 a signal number, 1 a private signal P<N>, 2 an array shape AS<N>, 3 an NBA slot
@@ -6889,7 +6943,28 @@ private:
         return helpers;
     }
     // Returns the helpers, one per element, and leaves t calling them.
-    static std::vector<std::string> outlineRuns(std::string& t) {
+    // A statement's hash with its signal numbers read as names (buildSymOf's
+    // order does not matter: the names), so it stays the same when signals
+    // are renumbered: outlineRuns cuts its runs where the content says.
+    uint64_t stmtKey(const std::string& st) const {
+        uint64_t h = 1469598103934665603ULL;
+        auto mix = [&](const char* a, size_t n) { for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)a[i]) * 1099511628211ULL; };
+        size_t last = 0;
+        refScan(st, [&](size_t, size_t at, size_t e, long long n, int kind) {
+            if (kind != 0 && kind != 1) return;
+            if (n < 0 || (size_t)n >= sigName_.size()) return;
+            mix(st.data() + last, at - last);
+            mix(sigName_[(size_t)n].data(), sigName_[(size_t)n].size());
+            last = e;
+        });
+        mix(st.data() + last, st.size() - last);
+        return h ^ (h >> 29);
+    }
+    // Runs are cut where a statement's key says (about one in kOutlineRun,
+    // at least a quarter and at most four times that many statements), not
+    // every kOutlineRun statements: a statement added near the start of an
+    // initial block of 100,000 then changes one helper, not all that follow.
+    static std::vector<std::string> outlineRuns(std::string& t, const std::function<uint64_t(const std::string&)>& key) {
         std::vector<std::string> helpers;
         if (t.find(" D_ = ") != std::string::npos) return helpers;   // shareEv's templates: the distances are locals
         auto idc = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
@@ -6960,10 +7035,12 @@ private:
             if (run.size() < 64) {
                 for (auto& [l, st] : run) body += l + ":" + st + "\n";
             } else
-                for (size_t k = 0; k < run.size(); k += kOutlineRun) {
+                for (size_t k = 0, e; k < run.size(); k = e) {
+                    e = k + 1;
+                    while (e < run.size() && e - k < 4 * kOutlineRun && !(e - k >= kOutlineRun / 4 && key(run[e - 1].second) % kOutlineRun == 0)) e++;
                     std::string h = name + "_o" + std::to_string(nh++);
                     std::string f = "static void " + h + (nbOk ? "(std::vector<Sim::NbaItem>& nb) {\n" : "() {\n");
-                    for (size_t j = k; j < std::min(run.size(), k + kOutlineRun); j++) f += run[j].second + "\n";
+                    for (size_t j = k; j < e; j++) f += run[j].second + "\n";
                     f += "}\n\n";
                     helpers.push_back(std::move(f));
                     body += run[k].first + ": " + h + (nbOk ? "(nb);\n" : "();\n");
