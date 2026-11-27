@@ -351,13 +351,13 @@ endif()
 # is off, and names the isolation on a port.
 set(SV ${SRC}/tests/upf/gating.sv)
 set(UPF ${SRC}/tests/upf/gating.upf)
-execute_process(COMMAND ${MSIM} ${SV} -top tb -upf ${UPF} -power_top u_dut -upf_verbose -vcd ${OUT}/upf.vcd
+execute_process(COMMAND ${MSIM} ${SV} -top tb -upf ${UPF} -upf_top u_dut -upf_verbose -vcd ${OUT}/upf.vcd
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out2)
 file(WRITE ${OUT}/upf.log "${out}${out2}")
 if(NOT "${out}${out2}" MATCHES "UPF: 45: power domain PD_CORE simstate CORRUPT")
   message(FATAL_ERROR "msim -upf -upf_verbose: no power-down of PD_CORE at 45 (${rc})\n${out}${out2}")
 endif()
-execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -power_top u_dut -power
+execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -upf_top u_dut -power
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 want("PD_TOP  " "elements: tb.u_dut  (1 instance)" "primary supply: SS_AON  ground=VSS  power=VDD"
      "PD_CORE  " "elements: tb.u_dut.u_core  (1 instance)"
@@ -366,7 +366,7 @@ want("PD_TOP  " "elements: tb.u_dut  (1 instance)" "primary supply: SS_AON  grou
 if(NOT rc EQUAL 0 OR out MATCHES "states:")
   message(FATAL_ERROR "-power without a log: rc ${rc}, or power states were reported:\n${out}${err}")
 endif()
-# Without -power_top the UPF's set_design_top finds the instance.
+# Without -upf_top the UPF's set_design_top finds the instance.
 execute_process(COMMAND ${MDEBUG} ${SV} -top tb -upf ${UPF} -log ${OUT}/upf.log -vcd ${OUT}/upf.vcd
                         -power PD_CORE -active tb.u_dut.u_core.cnt -at 60 -depth 1
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)

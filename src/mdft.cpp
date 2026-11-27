@@ -25,6 +25,7 @@
 // plan is built from.
 #include <functional>
 
+#include "compat.hpp"   // compat::kVendorCompat: other vendors' option spellings
 #include "lintir.hpp"
 #include "version.hpp"
 
@@ -318,7 +319,7 @@ int main(int argc, char** argv) {
         if (a == "-quiet" || a == "-q") { quiet = true; continue; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
-        if (a == "-sv" || a == "-sverilog") continue;
+        if (a == "-sv" || (compat::kVendorCompat && a == "-sverilog")) continue;
         if (fe.prot.take(argc, argv, i)) continue;
         fwd.push_back(a);
     }

@@ -224,7 +224,7 @@ def command(sim, exe, args, seed, rundir, threads=0):
     q = " ".join(shlex.quote(a) for a in args)
     if sim == "msim":
         th = f" -threads {threads}" if threads and "-threads" not in args else ""
-        return f"{shlex.quote(exe or 'msim')} {q}{th} +ntb_random_seed={seed}"
+        return f"{shlex.quote(exe or 'msim')} {q}{th} -seed {seed}"
     if sim == "vcs":
         return f"{shlex.quote(exe or 'vcs')} -sverilog -R -l /dev/null {q} +ntb_random_seed={seed}"
     if sim == "xrun":

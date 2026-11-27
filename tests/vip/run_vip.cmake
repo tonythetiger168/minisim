@@ -4,7 +4,7 @@
 # Pass: msim exits 0, the UVM summary shows no UVM_ERROR and no UVM_FATAL,
 # and the bench prints "SB_PASS checks=<n>" (its scoreboard made checks and
 # none failed).
-execute_process(COMMAND ${MSIM} -uvmhome ${UVM_HOME} -f ${F} -top ${TOP} +UVM_TESTNAME=${TEST}
+execute_process(COMMAND ${MSIM} -uvm_home ${UVM_HOME} -f ${F} -top ${TOP} +UVM_TESTNAME=${TEST}
                 OUTPUT_VARIABLE got ERROR_VARIABLE err RESULT_VARIABLE rc TIMEOUT 900
                 WORKING_DIRECTORY ${ROOT})
 if(NOT rc EQUAL 0)

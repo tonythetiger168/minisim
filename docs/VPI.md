@@ -9,9 +9,8 @@ long as it uses the parts listed below.
 
 ```
 msim top.sv myvpi.c                  # msim builds the C file and loads it
-msim top.sv -load ./myvpi.so         # a library built elsewhere
-msim top.sv -load ./myvpi.so:boot    # also call the routine `boot` (VCS form)
-msim top.sv -loadvpi ./myvpi.so:boot # the same (Xcelium form)
+msim top.sv -vpi ./myvpi.so          # a library built elsewhere
+msim top.sv -vpi ./myvpi.so:boot     # also call the routine `boot`
 ```
 
 Libraries load before elaboration. Each library's `vlog_startup_routines`
@@ -19,8 +18,8 @@ table runs in order (36.9.1), so the system tasks and functions it
 registers with `vpi_register_systf` can be called from the design. A C
 file given on the command line is built into one library with `vpi_user.h`
 and `svdpi.h` on the include path; the same library serves DPI-C imports.
-With `-dpiheader` the C files are built after elaboration instead, so their
-VPI system tasks are not known: build those separately and use `-load`.
+With `-dpi_header` the C files are built after elaboration instead, so their
+VPI system tasks are not known: build those separately and use `-vpi`.
 
 A design that uses VPI runs on one thread, in the interpreter (`-compile`
 and `-threads` are ignored), because callbacks and `calltf` routines may

@@ -8,19 +8,18 @@ example when a control signal is not reset.
 
 With `-xprop`, an `always` block treats an unknown control as "either
 could have happened". Every branch that might be taken runs, and each
-variable they assign gets the merge of the results, the way VCS xprop and
-Xcelium `-xprop` do.
+variable they assign gets the merge of the results.
 
 ```sh
-msim tb.sv dut.sv -top tb -xprop                 # tmerge
-msim tb.sv dut.sv -top tb -xprop=xmerge
+msim tb.sv dut.sv -top tb -xprop                 # merge
+msim tb.sv dut.sv -top tb -xprop=pessimistic
 msim tb.sv dut.sv -top tb -xprop -xprop-report xprop.log
 ```
 
 | Option | Meaning |
 |---|---|
-| `-xprop`, `-xprop=tmerge` | Bits on which all the possible branches agree keep their value; the others become `x`. This is what a real mux or flop could output. |
-| `-xprop=xmerge` | Every variable (or part of one) assigned in a possible branch becomes `x`. More pessimistic than hardware. |
+| `-xprop`, `-xprop=merge` | Bits on which all the possible branches agree keep their value; the others become `x`. This is what a real mux or flop could output. |
+| `-xprop=pessimistic` | Every variable (or part of one) assigned in a possible branch becomes `x`. More pessimistic than hardware. |
 | `-xprop=off` | Standard behavior (the default). |
 | `-xprop=<file>`, `-xprop-config <file>` | A configuration file: X-propagation on or off per instance, subtree or module, and the merge mode (below). |
 | `-xprop-report <file>` | Lists every `if`, `case` and clock edge with its source line, whether it is merged and, if not, why. |

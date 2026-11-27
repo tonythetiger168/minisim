@@ -2,7 +2,7 @@
 #   cmake -DMSIM=<msim> -DUVM_HOME=<uvm-core> -DSV=<test.sv> -P run_uvm.cmake
 # Each "//> " line of the test must appear in the output, in order, as part
 # of a line. A "//! args: ..." line adds simulator arguments (plusargs).
-# msim -uvmhome builds the library with its C code (regular expressions,
+# msim -uvm_home builds the library with its C code (regular expressions,
 # command line, HDL backdoor); a "//! nodpi" line builds it without
 # (-uvmnodpi, +define+UVM_NO_DPI).
 get_filename_component(dir ${SV} DIRECTORY)
@@ -20,7 +20,7 @@ foreach(l IN LISTS lines)
     set(mode -uvmnodpi)
   endif()
 endforeach()
-execute_process(COMMAND ${MSIM} -uvmhome ${UVM_HOME} ${mode} ${base} -top top ${args}
+execute_process(COMMAND ${MSIM} -uvm_home ${UVM_HOME} ${mode} ${base} -top top ${args}
                 OUTPUT_VARIABLE got ERROR_VARIABLE err RESULT_VARIABLE rc TIMEOUT 600
                 WORKING_DIRECTORY ${dir})
 if(NOT rc EQUAL 0)
