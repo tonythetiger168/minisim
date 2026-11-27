@@ -117,6 +117,7 @@ set(CASES
   "examples/nomix.sv"
   "examples/widebits.sv"
   "examples/wiresub.sv"
+  "examples/wiresubgate.sv"
   "examples/boxnet.sv"
   "examples/combring.sv"
   "examples/romfold.sv"
@@ -272,6 +273,15 @@ foreach(c IN LISTS CASES)
     execute_process(COMMAND ${CMAKE_COMMAND} -E env MSIM_WHYWIRESUB=1 ${MSIM} -compile -O1 -cc /bin/false -o ${OUT}/c${n}w ${files}
                     OUTPUT_QUIET ERROR_VARIABLE werr)
     if(NOT werr MATCHES "wire substitution: 16 of 19 copies")
+      message(FATAL_ERROR "${c}: copies not substituted as expected\n${werr}")
+    endif()
+  endif()
+  # Delayed gates elsewhere do not turn the substitution off; a copy of a
+  # delayed gate's output stays.
+  if(c STREQUAL "examples/wiresubgate.sv")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env MSIM_WHYWIRESUB=1 ${MSIM} -compile -O1 -cc /bin/false -o ${OUT}/c${n}w ${files}
+                    OUTPUT_QUIET ERROR_VARIABLE werr)
+    if(NOT werr MATCHES "wire substitution: 8 of 9 copies")
       message(FATAL_ERROR "${c}: copies not substituted as expected\n${werr}")
     endif()
   endif()
