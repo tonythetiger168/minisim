@@ -1,6 +1,6 @@
-// Transaction recording without UVM: Questa's API on one stream, Verdi's
-// FSDB transaction tasks on another (expr.hpp trrec). mdebug -tr reads the
-// file msim writes (msim -tr).
+// Transaction recording without UVM (expr.hpp trrec): a stream made with
+// $create_transaction_stream, and one named in $begin_transaction with a
+// parent transaction. mdebug -tr reads the file msim writes (msim -tr).
 module tb;
   logic clk = 0;
   logic [7:0] addr, data;
@@ -20,12 +20,11 @@ module tb;
       $end_transaction(t);
       $free_transaction(t);
     end
-    p = $fsdbTrans_begin("tb.mon.seen", "burst");
-    v = $fsdbTrans_begin("tb.mon.seen", "beat", p);
-    $fsdbTrans_set_label(v, "first");
-    $fsdbTrans_add_attribute(v, 8'h5a, "byte");
-    #10 $fsdbTrans_end(v);
-    #10 $fsdbTrans_end(p);
+    p = $begin_transaction("tb.mon.seen", "burst");
+    v = $begin_transaction("tb.mon.seen", "beat", 0, p);
+    $add_attribute(v, 8'h5a, "byte");
+    #10 $end_transaction(v);
+    #10 $end_transaction(p);
     #5 $finish;
   end
 endmodule

@@ -228,8 +228,7 @@ writes two counters for each assertion, assume and cover: `tb.u.a_gnt.passes`
 and `tb.u.a_gnt.fails` (32 bits), how many attempts have passed (a cover:
 matched) and failed so far. Each failure is a step in `.fails` at the time it
 is reported, so the wave shows where to look and `-active` / `-assert` say
-why. `$fsdbDumpSVA` in the testbench (or `"+sva"` in `$fsdbDumpvars`) turns
-it on as well. Assertions in protected code are left out. The counters are
+why. Assertions in protected code are left out. The counters are
 written at the end of each time slot; `-compile` runs the interpreter.
 
 ## Coverage
@@ -298,8 +297,7 @@ net's state and voltage:
 | `tb.upf.VDD_CORE.state` | 0 OFF, 1 FULL_ON, 2 PARTIAL_ON, 3 UNDETERMINED |
 | `tb.upf.VDD_CORE.mV` | the voltage in millivolts (0 while OFF) |
 
-so a switch-off is visible next to the signals it corrupts. `"+power"` in
-`$fsdbDumpvars` turns it on as well. A supply net is listed by the net that
+so a switch-off is visible next to the signals it corrupts. A supply net is listed by the net that
 drives its subnet (a switch output, a supply port).
 
 ## Large designs: the served viewer
@@ -428,37 +426,6 @@ automatic variables or only inside other objects (a UVM component tree;
 use `msim -i` and `print tb.h.next.id`, or `mdebug -tr` for transactions).
 `-compile` runs the interpreter when `-vcd-class` is given.
 
-## Verdi, VCS and Xcelium waveform tasks
-
-A testbench written for Verdi, VCS or Xcelium dumps with their own tasks.
-msim compiles them and writes FST: the vendors' formats (FSDB, VPD, SHM)
-are their own and closed, so the file of the same name with `.fst` is
-written instead, and msim says so once:
-
-    msim: wave.fsdb: FSDB, VPD and SHM are the vendors' own formats; writing wave.fst (open it with mdebug, GTKWave or Surfer)
-
-| Tasks | What msim does |
-|---|---|
-| `$fsdbDumpfile`, `$vcdplusfile`, `$shm_open`, `$fsdbAutoSwitchDumpfile`, `$recordfile` | name the file (`.fst`); without one, `novas.fst`, `vcdplus.fst` or `waves.fst` |
-| `$fsdbDumpvars`, `$fsdbDumpvarsES`, `$fsdbDumpSingle`, `$vcdpluson`, `$shm_probe`, `$recordvars` | as `$dumpvars`: a depth, instances or signals (by name or as strings, `"tb.dut"`); `+fsdbfile+NAME` names the file, `+all` and `+mda` add memories, `+sva` and `+power` add assertions and power states (`-vcd-sva`, `-vcd-power` above), other `+` options are accepted |
-| `$fsdbDumpMDA`, `$fsdbDumpMem`, `$vcdplusmemon` | memories too, as `-vcd-arrays` |
-| `$fsdbDumpon` / `off`, `$vcdpluson` / `off`, `$recordon` / `off` | as `$dumpon` / `$dumpoff` |
-| `$fsdbDumpflush`, `$vcdplusflush` | as `$dumpflush` |
-| `$fsdbDumpFinish`, `$vcdplusclose`, `$shm_close`, `$recordclose` | flush and stop |
-| `$fsdbDumpSVA` | assertions in the waveform, as `-vcd-sva` |
-| `$fsdbSuppress`, `$fsdbLog`, `$vcdplusautoflushon`, ... | accepted, nothing to do |
-
-`msim -i` and `-do` take Verdi's UCLI commands the same way:
-`fsdbDumpfile`, `fsdbDumpvars [DEPTH] [SCOPES] [+all]`, `fsdbDumpon`,
-`fsdbDumpoff`, `fsdbDumpflush`, `fsdbDumpFinish`, `fsdbDumpMDA`. `-vcd` /
-`-fst` on the command line wins over all of them, as over `$dumpvars`.
-mdebug, mlint and the other tools compile the same sources.
-
-A Verdi PLI library loaded with `-vpi` that registers these
-names itself keeps them. A second `$fsdbDumpvars` with more scopes after the
-dump has started adds none (an FST's signals are fixed when it starts);
-msim says so once.
-
 ## Tasks, calls and force
 
 A task or function declared in a module drives the signals it assigns, as
@@ -504,8 +471,8 @@ same as the waveform's. In `-script`: `trans [STREAM] [T]`.
 
 ### Transactions without UVM
 
-A testbench without UVM can record transactions with Questa's recording
-API or Verdi's FSDB transaction tasks. msim writes them in the same text
+A testbench without UVM can record transactions with the recording API
+(`$create_transaction_stream`, `$begin_transaction` and the rest). msim writes them in the same text
 format as UVM's database, to `transactions.log` (or `msim -tr FILE`), and
 mdebug reads them with `-tr` as above:
 
@@ -517,11 +484,10 @@ $add_attribute(t, data, "wdata");
 $end_transaction(t);
 $free_transaction(t);
 
-p = $fsdbTrans_begin("tb.mon.seen", "burst");     // Verdi: a stream by its name
-v = $fsdbTrans_begin("tb.mon.seen", "beat", p);   // a child of p
-$fsdbTrans_add_attribute(v, 8'h5a, "byte");
-$fsdbTrans_set_label(v, "first");
-$fsdbTrans_end(v);
+p = $begin_transaction("tb.mon.seen", "burst");      // a stream by its name
+v = $begin_transaction("tb.mon.seen", "beat", 0, p); // a child of p
+$add_attribute(v, 8'h5a, "byte");
+$end_transaction(v);
 ```
 
 ```
@@ -533,9 +499,8 @@ tb.mon.seen at 60:
 ```
 
 The stream's name up to its last dot is the scope it is listed under.
-Values are recorded in hex, strings as text. `$add_relation(a, b, "rel")` and
-`$fsdbTrans_add_relation` record a link. `$add_color` and
-`$fsdbTrans_add_tag` are accepted and ignored. An explicit begin or end
+Values are recorded in hex, strings as text. `$add_relation(a, b, "rel")`
+records a link. `$add_color` is accepted and ignored. An explicit begin or end
 time is not used: each record has the simulation time of the call.
 `-compile` writes the same records.
 
