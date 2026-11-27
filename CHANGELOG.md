@@ -51,6 +51,10 @@ Spec references are IEEE 1800-2023 clauses.
   reference; tests in `tests/vplat/a64`, including random instruction
   blocks compared with qemu-aarch64 run as a separate program
   (docs/VPLAT.md, "Arm (AArch64)").
+- mvplat `-mt` on AArch64: each processor on a host thread of its own,
+  with the host's atomics for exclusives, CAS and LSE; Linux arm64 boots
+  with it. A timer that has already fired no longer cuts the quantum to
+  one cycle. Test `tests/vplat/a64/smpmt.c`.
 - mvplat's AArch64 processors have the Armv8.1 atomics (LDADD and the
   rest, SWP, CAS, CASP) and CRC32 / CRC32C; Linux arm64 uses them. Test
   `tests/vplat/a64/lse.c`.

@@ -429,16 +429,22 @@ inline void first(M& m, Cpu& c, const Op& op, uint64_t pc) {
 
 }  // namespace dec
 
-inline CodePage* Machine::codePage(uint64_t pa, uint8_t* host) {
+inline CodePage* Machine::codePage(Cpu& c, uint64_t pa, uint8_t* host) {
     pa &= ~0xfffull;
-    auto it = code_.find(pa);
-    if (it != code_.end()) return it->second.get();
+    auto it = c.code.find(pa);
+    if (it != c.code.end()) return it->second.get();
     if (!decodeAhead_) return nullptr;
+    if (c.code.size() >= CODE_PAGES) {  // enough: start again
+        for (auto& e : c.code) c.deadCode.push_back(std::move(e.second));
+        c.code.clear();
+        for (auto& e : c.fastX) e.key = ~0ull;
+    }
     Device* d = bus.find(pa);
     if (!d || !d->memory()) return nullptr;
     int wr = -2;
     uint32_t seen = 0;
     if (d->writable()) {
+        std::lock_guard<std::mutex> l(watchMu_);
         auto r = watchIds_.find(d);
         if (r == watchIds_.end())
             r = watchIds_.emplace(d, (d->base & 4095) || (d->size & 4095) ? -1 : WriteWatch::add(d->memory(), d->size)).first;
@@ -457,23 +463,23 @@ inline CodePage* Machine::codePage(uint64_t pa, uint8_t* host) {
         p->op[k] = Op{&dec::first, insn, 0, 0, 0, 0, 0, 0};
     }
     CodePage* r = p.get();
-    code_.emplace(pa, std::move(p));
+    c.code.emplace(pa, std::move(p));
     return r;
 }
 
 // Something was written to a watched page: the pages written since they
 // were decoded are dropped.
-inline void Machine::codeSync() {
-    codeWrites_ = WriteWatch::writes();
+inline void Machine::codeSync(Cpu& c) {
+    c.codeWrites = WriteWatch::writes();
     bool dropped = false;
-    for (auto it = code_.begin(); it != code_.end();) {
+    for (auto it = c.code.begin(); it != c.code.end();) {
         CodePage& p = *it->second;
         if (p.wr >= 0) {
             const size_t wp = (size_t)(p.host - WriteWatch::base(p.wr)) >> 12;
             if (!WriteWatch::readOnly(p.wr, wp) || WriteWatch::gen(p.wr, wp) != p.seen) {
                 // the instruction running may be on it: freed between instructions
-                dead_.push_back(std::move(it->second));
-                it = code_.erase(it);
+                c.deadCode.push_back(std::move(it->second));
+                it = c.code.erase(it);
                 dropped = true;
                 continue;
             }
@@ -481,8 +487,7 @@ inline void Machine::codeSync() {
         ++it;
     }
     if (dropped)
-        for (auto& o : cpus)
-            for (auto& e : o->fastX) e.key = ~0ull;
+        for (auto& e : c.fastX) e.key = ~0ull;
 }
 
 }  // namespace a64
