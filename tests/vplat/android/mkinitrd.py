@@ -75,6 +75,10 @@ MVPLAT = [
     # The lights HAL listens on this vsock port; unset, it asks for port 0,
     # which only root may bind, aborts, and system_server waits for it.
     'androidboot.vsock_lights_port=6900',
+    # The Thread network HAL runs a simulated radio numbered by this; unset
+    # (0), it aborts, and a service in an APEX that crashes 4 times before
+    # the boot completes makes apexd roll back and reboot.
+    'androidboot.openthread_node_id=1',
 ]
 
 
