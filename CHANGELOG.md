@@ -51,6 +51,9 @@ Spec references are IEEE 1800-2023 clauses.
   reference; tests in `tests/vplat/a64`, including random instruction
   blocks compared with qemu-aarch64 run as a separate program
   (docs/VPLAT.md, "Arm (AArch64)").
+- mvplat's AArch64 processors have the Armv8.1 atomics (LDADD and the
+  rest, SWP, CAS, CASP) and CRC32 / CRC32C; Linux arm64 uses them. Test
+  `tests/vplat/a64/lse.c`.
 - mvplat's AArch64 processors keep the instructions of each code page
   decoded and cache recent translations for loads, stores and fetches:
   Linux arm64 boots at about 115 MIPS instead of 61, with the same

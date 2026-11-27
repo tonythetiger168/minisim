@@ -631,9 +631,12 @@ core: `MIDR_EL1` has implementer 0. It implements Armv8.0-A at EL0 and EL1:
   the alternative half-precision format (FPCR.AHP), round-to-odd for FCVTXN,
   and the reciprocal and reciprocal-square-root estimates bit for bit; the
   saturating integer operations set FPSR.QC. Half precision is there for
-  conversions only (no FP16 arithmetic). Not yet: the large-system
-  extensions (LSE atomics, CAS), the crypto extensions, SVE and SME, pointer
-  authentication, MTE, and AArch32.
+  conversions only (no FP16 arithmetic). From Armv8.1: the large-system
+  extension atomics (LDADD and the rest, SWP, CAS, CASP) and CRC32 /
+  CRC32C, as `ID_AA64ISAR0_EL1` says. `ID_AA64PFR0_EL1` reports CSV2 and
+  CSV3 (the model does not speculate), so Linux needs no page-table
+  isolation. Not yet: the crypto extensions, PAN and the rest of Armv8.1,
+  SVE and SME, pointer authentication, MTE, and AArch32.
 - **Exceptions.** Synchronous exceptions with ESR_EL1, FAR_EL1 and ELR_EL1,
   IRQs, SP_EL0/SP_EL1 selection, EL0 traps of system registers. HVC and SMC
   from EL1 go to a built-in firmware with PSCI 1.1 (`CPU_ON`, `CPU_OFF`,
