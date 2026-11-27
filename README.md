@@ -104,13 +104,13 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `+incdir+<dir>`, `-I <dir>` | Include directory |
 | `-vcd [<file>]`, `+vcd` | Write a VCD waveform (default `dump.vcd`). No waveform is written without it or `-fst` |
 | `-cov [<file>]` | Write line / branch / toggle / condition / FSM coverage (default `cov.json`); see `mcov` |
-| `-cm <metrics>` | The same, with only these code coverage metrics: `line+branch+cond+tgl+fsm` (as VCS), `b:e:t:f` or `all` (as Xcelium `-coverage`), `bcesftx` (as Questa `+cover`). Covergroups and assertions are always written |
-| `-cm_hier <file>` | The part of the design whose code coverage is written: `+tree`/`-tree <inst> [depth]`, `+module`/`-module`, `+file`/`-file` lines (as VCS `-cm_hier`), or `select_coverage` / `deselect_coverage -block -expr -toggle -fsm -instance <inst>[...] -module <m>` (as an Xcelium covfile). The last line that matches decides |
+| `-cov_metrics=<m>` | The same, with only these code coverage metrics, joined by commas: `line`, `branch`, `cond`, `toggle`, `fsm`, or `all`. Covergroups and assertions are always written |
+| `-cov_scope <file>` | The part of the design whose code coverage is written: `+tree`/`-tree <inst> [depth]`, `+module`/`-module`, `+file`/`-file` lines, or `select_coverage` / `deselect_coverage -block -expr -toggle -fsm -instance <inst>[...] -module <m>` lines. The last line that matches decides |
 | `-fst [<file>]`, `+fst` | Write an FST waveform (default `dump.fst`); `-vcd x.fst` does the same. About 7x smaller than VCD and faster to write; GTKWave and Surfer open it |
 | `-vcd-class [N]` | Also write class objects: each property of the object a module's class handle variable points to, as `tb.p.addr` (x while the handle is null), following handle properties N levels (default 1). See `docs/DEBUG.md` |
 | `-vcd-arrays [N]` | Also write the elements of unpacked arrays (memories) with at most N elements (default 1024) to the VCD or FST, as `mem[3]`. Off by default: memories are left out, as `$dumpvars` does. `mdebug` uses them to trace through a memory |
 | `-maxtime <n>` | Stop after simulation time `n`: time-precision ticks, or with a unit (`3ms`, `500ns`). Without it, run until `$finish` or no events remain |
-| `-sv`, `-sverilog` | Accepted and ignored |
+| `-sv` | Accepted and ignored |
 | `+<arg>` | Any other plusarg is accepted (not yet visible to `$test$plusargs`) |
 | `-compile` | Compiled mode: generate C++ for the design, build `<dir>/simv`, run it |
 | `-o <dir>` | Build directory for `-compile` (default `msim.d`); `simv` can be rerun with `-maxtime` / `-vcd` |
@@ -123,18 +123,18 @@ command in the style of `irun` / `xrun` or `vcs -R`:
 | `-no-cycle` | `-compile` without the cycle domain (Verilator-style eval of clocked + comb logic) |
 | `-cc <cxx>`, `-O<n>` | C++ compiler (default `$CXX`, else `c++`) and its optimization level (default `-O2`) |
 | `-pgo-gen`, `-pgo-use` | Profile-guided `-compile` build (gcc). `-pgo-gen` builds a `simv` that writes profiles into `<dir>/pgo` when it runs; a second `-compile -pgo-use` with the same `-o <dir>` rebuilds the design with them. Ibex: 105 ms -> 92 ms, Verilator 5.054 -O3 93 ms on the same machine |
-| `-xprop[=tmerge\|xmerge\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
+| `-xprop[=merge\|pessimistic\|off\|<config file>]`, `-xprop-report <file>` | X-propagation: an unknown `if` / `case` condition or clock edge merges the branches instead of picking one; see [`docs/XPROP.md`](docs/XPROP.md) |
 | `-restore <checkpoint> [+plusargs]` | Go back to a `$save` checkpoint: run the saved command line again quietly up to it, check the state, and carry on; see [`docs/CHECKPOINT.md`](docs/CHECKPOINT.md) |
 | `-xrun ...` (or msim run as `xrun` / `irun`) | The rest of the command line is an xrun / irun one: `-f`, `-incdir`, `-define`, `-l`, `-input`, `-access`, ... translated to msim options; see [`docs/compat/XRUN.md`](docs/compat/XRUN.md). Vendor layer: only in builds with `-DMINISIM_VENDOR_COMPAT=ON` |
 | `-elab` | Stop after elaboration, before the run |
 | `-strict-drivers` | Illegal variable drivers (several continuous assignments, an always_ff variable written elsewhere; IEEE 1800 6.5, 9.2.2) are errors |
 | `-profile [<file>]` | Simulation profile: time and activations per process, instance, source file and kind, plus scheduler regions (default `simprofile.txt`); see [`docs/PROFILE.md`](docs/PROFILE.md) |
 | `-upf <file>` | Power-aware simulation with this UPF (IEEE 1801) power intent; see [`docs/LOWPOWER.md`](docs/LOWPOWER.md) |
-| `-power_top <inst>`, `-upf_verbose` | The instance the UPF describes; print supply, power state and simstate changes |
+| `-upf_top <inst>`, `-upf_verbose` | The instance the UPF describes; print supply, power state and simstate changes |
 | `<file>.c`, `.cpp`, `.o`, `.a` | DPI-C code: msim builds it (with `svdpi.h` on the include path) and loads it |
 | `<file>.so`, `-sv_lib <name>`, `-sv_root <dir>`, `-sv_liblist <file>` | DPI-C libraries to load (IEEE 1800-2023 annex J) |
-| `-dpiheader <file>` | Write the C prototypes of every DPI import and export |
-| `-load <lib>[:<boot>]`, `-loadvpi <lib>:<boot>` | Load a VPI library before elaboration; its `vlog_startup_routines` run (the C files and `.so` files above are VPI libraries too) |
+| `-dpi_header <file>` | Write the C prototypes of every DPI import and export |
+| `-vpi <lib>[:<boot>]` | Load a VPI library before elaboration; its `vlog_startup_routines` run (the C files and `.so` files above are VPI libraries too) |
 | `-CFLAGS <s>`, `-LDFLAGS <s>` | Extra flags for building the DPI C files |
 | `-version` | Print the version and git commit |
 | `-keyfile [[<owner>:]<keyname>=]<priv.pem>` | RSA private key for protected envelopes (repeatable); `-keyring <file>` reads several, `-license <feature>` grants a licensed right; see below |
@@ -148,7 +148,7 @@ Give the C files on the command line, or a prebuilt library with `-sv_lib`:
 ```sh
 ./build/msim tb.sv model.c                     # builds model.c, then runs
 ./build/msim tb.sv -sv_lib libmodel            # loads libmodel.so
-./build/msim tb.sv model.c -dpiheader dpi.h    # also writes the C prototypes
+./build/msim tb.sv model.c -dpi_header dpi.h    # also writes the C prototypes
 ```
 
 C code includes `svdpi.h` (installed in `include/`, and in `include/` of the
@@ -226,7 +226,7 @@ The LCOV file works with `genhtml` and with editor and CI coverage plugins.
 `-cov` works in the interpreter and with `-compile`, with any `-threads`;
 the database is the same in each.
 
-**Condition coverage** (as VCS `-cm cond`). A condition `a && b && c`,
+**Condition coverage**. A condition `a && b && c`,
 `a || b || c`, or the condition of `?:`, with n terms has n + 1 vectors: the
 one where no term decides alone (all 1 for `&&`, all 0 for `||`) and, for each
 term, the one where only that term has the deciding value. A vector with an
@@ -238,7 +238,7 @@ evaluated, so a condition with a term that `&&` or `||` must be able to skip
 counted as it runs instead: vector i is "term i is the first that decides",
 and the report shows the terms after it as `-`.
 
-**FSM coverage** (as VCS `-cm fsm`). msim finds the state registers itself: a
+**FSM coverage**. msim finds the state registers itself: a
 variable that one clocked procedure assigns, whose next value is always a
 constant (literal, parameter or enum name), itself, or a next-state variable
 assigned that way by one combinational procedure, where that logic branches
@@ -247,7 +247,7 @@ constants compared with or assigned to the register; the transitions are the
 ones the next-state logic can make. A constant assigned under an `if` outside
 any branch on the state is taken as the reset, and transitions that only the
 reset makes are marked `(reset)`; `mcov report -fsm-reset-filter` leaves them
-out (VCS `-cm_fsmresetfilter`). A change the logic does not show (a forced
+out. A change the logic does not show (a forced
 value, say) is listed as "not in the next-state logic". One-hot registers
 tested bit by bit are extracted too (`case (1'b1)` with items `state[K]`,
 `if (state[K])`, next-state logic that clears the vector and sets
@@ -284,11 +284,11 @@ that removes items the tests did cover, and one without a reason. Kinds:
 `file`, `line`, `branch`, `cond`, `toggle`, `fsm`, `state`, `trans`, `cg`,
 `assert`; names take `*` and `?`.
 
-**Condition modes** (as VCS `-cm_cond`): `msim -cm_cond full` records every
+**Condition modes**: `msim -cov_cond full` records every
 combination of the term values of a condition of up to 8 terms (2^n vectors)
-instead of the n + 1 sensitized ones; `-cm_cond allops` also covers `&` and
+instead of the n + 1 sensitized ones; `-cov_cond allops` also covers `&` and
 `|` of one-bit operands (`assign y = (a & b) | c;`). Join them as
-`-cm_cond full+allops`. Both work with `-compile`.
+`-cov_cond full,allops`. Both work with `-compile`.
 
 **Per instance.** The database also keeps each module instance's own lines,
 decisions and condition vectors. `mcov report -instances` prints one row per
@@ -831,7 +831,7 @@ isolation or level shifters, names not in the design, ...). See
 [`docs/LOWPOWER.md`](docs/LOWPOWER.md).
 
 ```sh
-msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut [-upf_verbose]
+msim tb.sv dut.sv -top tb -upf dut.upf -upf_top u_dut [-upf_verbose]
 mlint tb.sv dut.sv -top tb -upf dut.upf
 ```
 

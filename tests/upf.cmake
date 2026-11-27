@@ -165,7 +165,7 @@ endif()
 foreach(pt "" "tb/u_dut")
   set(args ${D}/gating.sv -upf ${D}/find.upf)
   if(pt)
-    list(APPEND args -power_top ${pt})
+    list(APPEND args -upf_top ${pt})
   endif()
   execute_process(COMMAND ${MSIM} ${args} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
   file(READ ${D}/gating.out want)
@@ -373,12 +373,12 @@ upf_error_in(source e_ps5 "create_abstract_power_source PS -update -ack_port {a 
 upf_error_in(source e_ps6 "create_abstract_power_source P5 -output_supply_set {out} -input_supply_set {i SS_HI}" "supply set handle out is not associated with a supply set that has functions (6.16)")
 upf_error_in(source e_ps7 "create_power_switch SW -output_supply_port {o VCORE} -input_supply_port {i VHI} -control_port {c lo} -on_state {on i {c}}\ncreate_abstract_power_source PS -update -power_switch SW" "power switch SW of power source PS does not use its control hi (6.16)")
 
-# -power_top names the instance the UPF describes; it wins over set_design_top.
-execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -power_top tb/u_dut
+# -upf_top names the instance the UPF describes; it wins over set_design_top.
+execute_process(COMMAND ${MSIM} ${D}/gating.sv -upf ${D}/gating.upf -upf_top tb/u_dut
                 RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 file(READ ${D}/gating.out want)
 if(NOT rc EQUAL 0 OR NOT out STREQUAL want)
-  message(FATAL_ERROR "-power_top tb/u_dut: ${rc}\n${out}${err}")
+  message(FATAL_ERROR "-upf_top tb/u_dut: ${rc}\n${out}${err}")
 endif()
 
 # A UPF error stops before simulation, with the file and line.

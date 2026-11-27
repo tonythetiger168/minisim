@@ -288,12 +288,14 @@ if(MINISIM_WITH_SLANG)
                      -P ${CMAKE_SOURCE_DIR}/tests/compat/msim_xrun.cmake)
     set_tests_properties(msim_xrun PROPERTIES LABELS compat)
   endif()
-  # VCS partition compile spellings (-partcomp, -partcomp_dir, -Mdir).
-  add_test(NAME msim_partcomp
-           COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
-                   -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_partcomp -DCOMPAT=${MINISIM_VENDOR_COMPAT}
-                   -P ${CMAKE_SOURCE_DIR}/tests/msim_partcomp.cmake)
-  set_tests_properties(msim_partcomp PROPERTIES LABELS compat)
+  # Partition compile spellings (-partcomp, -partcomp_dir, -Mdir): vendor layer.
+  if(MINISIM_VENDOR_COMPAT)
+    add_test(NAME msim_partcomp
+             COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
+                     -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_partcomp -DCOMPAT=${MINISIM_VENDOR_COMPAT}
+                     -P ${CMAKE_SOURCE_DIR}/tests/compat/msim_partcomp.cmake)
+    set_tests_properties(msim_partcomp PROPERTIES LABELS compat)
+  endif()
   # Profile-guided compiled builds (-pgo-gen, then -pgo-use).
   add_test(NAME msim_pgo
            COMMAND ${CMAKE_COMMAND} -DMSIM=$<TARGET_FILE:msim> -DSRC=${CMAKE_SOURCE_DIR}
@@ -405,7 +407,7 @@ if(MINISIM_WITH_SLANG)
     add_test(NAME msim_cov_select
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_select
-                     -P ${CMAKE_SOURCE_DIR}/tests/msim_cov_select.cmake)
+                     -DCOMPAT=${MINISIM_VENDOR_COMPAT} -P ${CMAKE_SOURCE_DIR}/tests/msim_cov_select.cmake)
     add_test(NAME msim_cov_inst
              COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DMSIM=$<TARGET_FILE:msim>
                      -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/msim_cov_inst
