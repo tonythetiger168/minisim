@@ -28,7 +28,7 @@ proc twice {} { run 5; run 5 }
 twice
 alias rr run 10
 rr
-senv time
+env time
 search *lane*
 stop -posedge clk -continue -command {puts "edge q=[get q -radix dec]"}
 run 20

@@ -1,12 +1,15 @@
 # Transaction recording without UVM (expr.hpp trrec): Questa's
 # $create_transaction_stream / $begin_transaction / $add_attribute /
-# $end_transaction and Verdi's $fsdbTrans_* write the text format of UVM's
+# $end_transaction (and, with -DSV=tests/compat/debug/tr_record_fsdb.sv in a
+# vendor-layer build, Verdi's $fsdbTrans_*) write the text format of UVM's
 # uvm_text_tr_database, so mdebug -tr reads them as it reads tr_db.log.
 # The interpreter and -compile write the same file.
 #   cmake -DMSIM=<msim> -DMDEBUG=<mdebug> -DSRC=<source dir> -DOUT=<dir> -P msim_tr.cmake
 file(REMOVE_RECURSE ${OUT})
 file(MAKE_DIRECTORY ${OUT})
-set(SV ${SRC}/tests/debug/tr_record.sv)
+if(NOT SV)
+  set(SV ${SRC}/tests/debug/tr_record.sv)
+endif()
 execute_process(COMMAND ${MSIM} ${SV} WORKING_DIRECTORY ${OUT} RESULT_VARIABLE rc OUTPUT_QUIET ERROR_VARIABLE err)
 if(NOT rc EQUAL 0 OR NOT EXISTS ${OUT}/transactions.log)
   message(FATAL_ERROR "msim exited ${rc} or wrote no transactions.log\n${err}")

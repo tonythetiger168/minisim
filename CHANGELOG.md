@@ -8,6 +8,16 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Changed
+- `msim -i` and `-do` use minisim's own command names: `print`, `change`,
+  `dump -add`, `save` and the new `env` (for `senv`). `value`, `deposit`,
+  `probe`, `senv`, `checkpoint`, Verdi's `fsdbDump*` and the ignored xrun
+  commands (`database`, `simvision`, `dumptcf`, `assertion`) work only in a
+  `-DMINISIM_VENDOR_COMPAT=ON` build (docs/compat/UCLI.md).
+- The Verdi, VCS and Xcelium waveform tasks (`$fsdbDump*`, `$vcdplus*`,
+  `$shm_*`, `$record*`) and Verdi's `$fsdbTrans_*` transaction tasks are
+  known only in a `-DMINISIM_VENDOR_COMPAT=ON` build (docs/compat/WAVES.md).
+  Use `$dumpfile` / `$dumpvars`, `-vcd-sva`, `-vcd-power` and
+  `$begin_transaction` and the rest of the recording API.
 - msim's options take minisim's own names: `-cov_metrics=`, `-cov_scope`,
   `-cov_cond`, `-upf_top`, `-dpi_header`, `-vpi`, `-uvm_home`,
   `-xprop=merge|pessimistic|off`, and `-compile` / `-o` for partition

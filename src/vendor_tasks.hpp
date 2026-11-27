@@ -9,6 +9,7 @@
 // maps them onto msim's own dump (VCD or FST, 21.7). A name a VPI library
 // registers itself (a real Verdi PLI) wins: declare() runs after VPI's.
 #include <memory>
+#include "compat.hpp"
 #include <string>
 #include "slang/ast/Compilation.h"
 #include "slang/ast/SystemSubroutine.h"
@@ -87,13 +88,20 @@ private:
     bool fn;
 };
 
+// The other vendors' tasks ($fsdb*, $vcdplus*, $shm_*, $record*) are part of
+// the vendor layer: declared only in a -DMINISIM_VENDOR_COMPAT=ON build.
+// Without it a testbench uses $dumpfile / $dumpvars (21.7) and msim -vcd-sva.
+inline bool vendorName(const std::string& n) { return n.starts_with("$fsdb"); }
 inline void declare(slang::ast::Compilation& comp) {
-    for (const std::string& n : waveTasks())
-        if (!comp.getSystemSubroutine(n)) comp.addSystemSubroutine(std::make_shared<WaveTask>(n));
+    if (compat::kVendorCompat)
+        for (const std::string& n : waveTasks())
+            if (!comp.getSystemSubroutine(n)) comp.addSystemSubroutine(std::make_shared<WaveTask>(n));
     for (const std::string& n : trFunctions())
-        if (!comp.getSystemSubroutine(n)) comp.addSystemSubroutine(std::make_shared<TrCall>(n, true));
+        if ((compat::kVendorCompat || !vendorName(n)) && !comp.getSystemSubroutine(n))
+            comp.addSystemSubroutine(std::make_shared<TrCall>(n, true));
     for (const std::string& n : trTasks())
-        if (!comp.getSystemSubroutine(n)) comp.addSystemSubroutine(std::make_shared<TrCall>(n, false));
+        if ((compat::kVendorCompat || !vendorName(n)) && !comp.getSystemSubroutine(n))
+            comp.addSystemSubroutine(std::make_shared<TrCall>(n, false));
 }
 
 }   // namespace vendor
