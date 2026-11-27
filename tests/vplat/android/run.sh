@@ -5,7 +5,8 @@
 # bootloader/opensbi-riscv64-generic-fw_dynamic.bin (or set MVPLAT_SBI).
 # WORK gets the disk (sparse, about 9 GiB apparent), the initrd, the kernel,
 # the console log (console.log) and, when the run ends, the screen
-# (screen.ppm). See docs/ANDROID.md.
+# (screen.ppm), and cf/ the host end of the console ports and what the
+# guest wrote to them (cf/hvc2.log is logcat). See docs/ANDROID.md.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 img=$(cd "$1" && pwd); mkdir -p "$2"; work=$(cd "$2" && pwd); shift 2
@@ -24,6 +25,22 @@ n, = struct.unpack_from('<I', b, 8)
 open('kernel', 'wb').write(b[4096:4096 + n])
 P
 cp "$here/android.json" .
-exec "$mvplat" -platform android.json -harts ${HARTS:-2} -mt -bios "$sbi" -kernel kernel -initrd android.initrd \
-  -append "printk.devkmsg=on audit=1 panic=-1 8250.nr_uarts=1 binder.impl=rust cma=0 firmware_class.path=/vendor/etc/ loop.max_part=7 init=/init bootconfig console=ttyS0 earlycon=sbi" \
+# The host end of the console ports the HALs talk to (cfhost.py).
+mkdir -p cf
+python3 -I "$here/cfhost.py" "$work/cf" > cf/cfhost.log 2>&1 &
+host=$!
+trap 'kill $host 2> /dev/null' EXIT
+for i in $(seq 50); do [ -S cf/hvc19.sock ] && break; sleep 0.1; done
+# HALs whose host programs are not there (the radio, Bluetooth, UWB) crash
+# and are restarted; one in an APEX that crashes 4 times before the boot
+# completes makes apexd roll back and reboot. Stop what is being restarted,
+# from the shell, every 25 simulated seconds until system_server is up
+# (STOP_LOOP=0 to leave them).
+stop='for p in $(getprop | grep -E "^.init.svc.[^]]*.: .restarting" | sed -E "s/^.init.svc.([^]]*).*/\1/"); do su 0 setprop ctl.stop $p; echo stopped $p; done
+'
+if [ "${STOP_LOOP:-1}" != 0 ]; then
+  for s in $(seq 400 25 2000); do set -- -input-at "$s:$stop" "$@"; done
+fi
+"$mvplat" -platform android.json -harts ${HARTS:-4} -mt -bios "$sbi" -kernel kernel -initrd android.initrd \
+  -append "printk.devkmsg=on audit=0 panic=-1 8250.nr_uarts=1 binder.impl=rust cma=0 firmware_class.path=/vendor/etc/ loop.max_part=7 init=/init bootconfig console=ttyS0 earlycon=sbi" \
   "$@" > console.log 2>&1

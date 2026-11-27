@@ -2,7 +2,7 @@
 
 mvplat boots an unmodified Android build: the riscv64 Cuttlefish phone image
 that AOSP's continuous integration publishes (`aosp_cf_riscv64_phone-userdebug`,
-checked with build 16968706, kernel 6.12). Nothing in the image is changed:
+checked with build 16968706, kernel 6.19). Nothing in the image is changed:
 the disk holds the build's own partitions, the kernel and ramdisks are the
 build's own, and what a bootloader would add (the bootconfig) is made by a
 script.
@@ -31,12 +31,13 @@ tests/vplat/android/run.sh IMAGES WORK -max-cycles 300000000000
 | `android.disk` | a GPT disk (sparse, 16 GiB apparent, about 1.4 GiB used) with the partitions Cuttlefish's composite disk has: `misc`, `frp`, `boot_a`, `init_boot_a`, `vendor_boot_a`, the `vbmeta*_a`, `super`, `metadata`, `userdata` (`mkdisk.py`; sparse images are expanded) |
 | `android.initrd` | vendor ramdisk + generic ramdisk + bootconfig trailer, as a boot image v4 bootloader would load them (`mkinitrd.py`) |
 | `kernel` | the kernel `Image` out of `boot.img` |
-| `android.json` | the platform: 2 harts, 4 GiB, 16550 UART, goldfish RTC, a PCIe host with virtio-blk (the disk), virtio-rng and virtio-gpu (720 x 1280) |
+| `android.json` | the platform: 4 GiB, 16550 UART, goldfish RTC, a PCIe host with virtio-blk (the disk), virtio-rng, virtio-gpu (720 x 1280) and 20 virtio-console ports (`/dev/hvc0` to `hvc19`) |
+| `cf/` | the host end of the console ports (`cfhost.py`) and what the guest wrote to each (`cf/hvc2.log` is logcat) |
 | `console.log` | the serial console |
 | `screen.ppm` | the display when the run ends |
 
 Extra arguments go to mvplat: `-max-cycles`, `-input-at S:TEXT` to type at
-the shell at a simulated time, `-harts N` (or `HARTS=N`). The disk and
+the shell at a simulated time, `-harts N` (or `HARTS=N`, default 4). The disk and
 initrd are kept between runs; delete them to remake them.
 
 `mkinitrd.py OUT - - key=value...` rewrites only the bootconfig of an
@@ -62,34 +63,58 @@ What the bootconfig sets, besides the vendor_boot image's own entries:
 | `hardware.gralloc=minigbm`, `hardware.hwcomposer=ranchu`, `hwcomposer.mode=guest`, `display_finder_mode=drm`, `egl=angle`, `vulkan=pastel` | software rendering on the virtio-gpu DRM device |
 | `hw_timeout_multiplier=20` | a simulated CPU is slower than a phone: the framework's watchdogs wait 20 times longer |
 | `vsock_lights_port=6900` | the lights HAL listens on a vsock port; without one it stops, and `system_server` waits for it until its watchdog restarts it |
+| `openthread_node_id=1` | the Thread network HAL's simulated radio; without it the HAL aborts |
+
+## The host side
+
+A Cuttlefish guest's emulated HALs talk to programs on the host over
+virtio-console ports, numbered in the order the devices are found. mvplat
+connects each port to a Unix socket (`"socket"` in the platform file) and
+`cfhost.py`, which `run.sh` starts first, listens on them. It answers what
+the boot waits for and logs the rest:
+
+| Port | HAL | What `cfhost.py` does |
+|---|---|---|
+| `hvc18` | sensors (control) | answers `list-sensors` with no sensors, so `SensorService` starts instead of waiting |
+| `hvc10` | OEM lock | keeps the four lock fields in memory and answers reads and writes |
+| `hvc2` | logcat | written to `cf/hvc2.log` |
+
+The radio (RIL), Bluetooth and UWB HALs need host programs `cfhost.py` does
+not have, so they crash and are restarted. A service in an APEX that crashes
+4 times before the boot completes makes apexd roll back and reboot
+(`reboot: Restarting system with command 'apexd-failed'`), so `run.sh` types a
+loop at the shell every 25 simulated seconds from 400 s to 2000 s that stops
+the services being restarted (`STOP_LOOP=0` leaves them).
 
 ## How far it gets
 
-With `-harts 2 -mt` mvplat runs about 1 simulated second per second (145 to
-185 million instructions per second).
+With `-harts 4 -mt` mvplat runs at 130 to 225 million instructions per
+second; the boot below took 1.8 hours.
 
 | Simulated time | Stage |
 |---|---|
 | 0.5 s | OpenSBI, then the kernel |
 | 17 s | first-stage init; the `super` partitions mapped through device-mapper, `system` verified (dm-verity) |
 | 45 s | second-stage init, SELinux policy, apexd |
-| 190 s | the serial shell (`console:/ $`) |
-| 330 s | `/data` (f2fs) mounted, `odsign` (done at 417 s) |
+| 185 s | the serial shell (`console:/ $`) |
+| 330 s | `/data` (f2fs) mounted, `odsign` |
 | 520 s | `surfaceflinger` and the HWC3 composer up |
 | 600 s | boot animation on screen |
-| 900 s | zygote preloads, `system_server` starts its services |
+| 745 s | `system_server` starts its services |
+| 1570 s | `sys.boot_completed=1`: SystemUI and the launcher, the lock screen |
 
 The boot animation as mvplat's `virtio-gpu` shows it, `screen.ppm` at 3000 s:
 
 ![boot animation](images/android-bootanimation-riscv64.png)
 
+The lock screen once the boot has completed, `screen.ppm` at 2700 s:
+
+![lock screen](images/android-lockscreen-riscv64.png)
+
 Not yet:
 
-- `sys.boot_completed` (the home screen) is not reached yet: `system_server`
-  is the step being worked on.
-- The Cuttlefish host services are not there, so the HALs that talk to them
-  stop and are restarted: sensors, radio (RIL), Bluetooth, UWB, Thread, the
-  OEM lock (`/dev/hvc10`), lights. None of them is needed to boot.
+- The radio, Bluetooth and UWB host programs (the HALs are stopped, above).
+- One 4-hart run in five stopped with a kernel oops at 637 s; being looked at.
 - No `adb` over the network (the virtio-net `user` back end has no NAT), no
   touch or keyboard input device, no audio.
 - 3D: only CPU rendering (ANGLE on SwiftShader), no virgl.
