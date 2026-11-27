@@ -1,8 +1,10 @@
 # Android on mvplat
 
-mvplat boots an unmodified Android build: the riscv64 Cuttlefish phone image
-that AOSP's continuous integration publishes (`aosp_cf_riscv64_phone-userdebug`,
-checked with build 16968706, kernel 6.19). Nothing in the image is changed:
+mvplat boots an unmodified Android build: the Cuttlefish phone images that
+AOSP's continuous integration publishes, riscv64
+(`aosp_cf_riscv64_phone-userdebug`, kernel 6.19) and AArch64
+(`aosp_cf_arm64_only_phone-userdebug`, GKI kernel 6.12), both checked with
+build 16968706. Nothing in the image is changed:
 the disk holds the build's own partitions, the kernel and ramdisks are the
 build's own, and what a bootloader would add (the bootconfig) is made by a
 script.
@@ -14,7 +16,7 @@ From the build's artifacts:
 - `boot.img`, `init_boot.img`, `vendor_boot.img`, `vbmeta.img`,
   `vbmeta_system.img`, `vbmeta_system_dlkm.img`, `vbmeta_vendor_dlkm.img`,
   `super.img`, `userdata.img` (in the `*-img-*.zip` and the target files);
-- OpenSBI's `opensbi-riscv64-generic-fw_dynamic.bin` from the host package
+- for riscv64 only, OpenSBI's `opensbi-riscv64-generic-fw_dynamic.bin` from the host package
   (`cvd-host_package.tar.gz`, under `bootloader/` or `host/`). Any OpenSBI
   1.x `fw_dynamic` works; set `MVPLAT_SBI` to use another.
 
@@ -31,7 +33,7 @@ tests/vplat/android/run.sh IMAGES WORK -max-cycles 300000000000
 | `android.disk` | a GPT disk (sparse, 16 GiB apparent, about 1.4 GiB used) with the partitions Cuttlefish's composite disk has: `misc`, `frp`, `boot_a`, `init_boot_a`, `vendor_boot_a`, the `vbmeta*_a`, `super`, `metadata`, `userdata` (`mkdisk.py`; sparse images are expanded) |
 | `android.initrd` | vendor ramdisk + generic ramdisk + bootconfig trailer, as a boot image v4 bootloader would load them (`mkinitrd.py`) |
 | `kernel` | the kernel `Image` out of `boot.img` |
-| `android.json` | the platform: 4 GiB, 16550 UART, goldfish RTC, a PCIe host with virtio-blk (the disk), virtio-rng, virtio-gpu (720 x 1280) and 20 virtio-console ports (`/dev/hvc0` to `hvc19`) |
+| `android.json` or `android-arm64.json` | the platform (`run.sh` picks it from the kernel in `boot.img`): 4 GiB, 16550 UART, goldfish RTC, a PCIe host with virtio-blk (the disk), virtio-rng, virtio-gpu (720 x 1280) and 20 virtio-console ports (`/dev/hvc0` to `hvc19`) |
 | `cf/` | the host end of the console ports (`cfhost.py`) and what the guest wrote to each (`cf/hvc2.log` is logcat) |
 | `console.log` | the serial console |
 | `screen.ppm` | the display when the run ends |
@@ -119,5 +121,37 @@ Not yet:
   touch or keyboard input device, no audio.
 - 3D: only CPU rendering (ANGLE on SwiftShader), no virgl.
 
-The real target is AArch64 (phones, TVs); riscv64 comes first because
-mvplat's RISC-V cores exist today.
+## AArch64
+
+`run.sh` sees an arm64 kernel in `boot.img` and boots it on mvplat's arm
+board instead (`android-arm64.json`): the Armv8-A cores with the Armv8.1
+atomics and CRC32, a GICv3, the PL011 UART as the console (`ttyAMA0`), the
+goldfish RTC, and the same PCIe host and virtio devices as riscv64, with its
+ECAM at 0x3f000000 and 4 GiB of RAM at 0x40000000. The kernel is started
+directly at EL1 with PSCI firmware in mvplat (no bootloader, no OpenSBI);
+the bootconfig differs only in `console=ttyAMA0` and the disk's PCI path
+(`3f000000.pcie`). The host side and the service loop are the same.
+
+With `-harts 4 -mt` the boot reached `sys.boot_completed=1` in 42 minutes of
+host time (on a 2-core host; 1000 simulated seconds took 63 minutes):
+
+| Simulated time | Stage |
+|---|---|
+| 0 s | the kernel, at EL1 |
+| 5 s | first-stage init; `super` mapped, `system` verified |
+| 11 s | second-stage init |
+| 35 s | the serial shell (`console:/ $`) |
+| 41 s | `/data` (f2fs, metadata encryption) |
+| 135 s | `zygote` |
+| 153 s | `surfaceflinger` |
+| 205 s | boot animation |
+| 267 s | `system_server` starts its services |
+| 600 s | `sys.boot_completed=1` |
+
+The lock screen, `screen.ppm` at 1000 s (a second run, which completed the
+boot at 592 s):
+
+![lock screen](images/android-lockscreen-arm64.png)
+
+As on riscv64, the radio, Bluetooth and UWB HALs crash for want of their
+host programs; nothing else does.
