@@ -15,7 +15,7 @@ force tb.en 0
 run 30
 print tb.cnt tb.en
 release tb.en
-deposit tb.cnt 8'h40
+change tb.cnt 8'h40
 run 20
 print tb.cnt
 bogus

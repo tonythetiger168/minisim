@@ -7,7 +7,8 @@
 > lines (`tools/compat/mcov_compat.py`, installed beside mcov only then) and
 > mlint's `lint_rtl` goal name (the native name is `rtl`), msim's vendor
 > option spellings, and the vendor waveform and transaction tasks
-> ([WAVES.md](WAVES.md)).
+> ([WAVES.md](WAVES.md)), and the other simulators' names for `msim -i`
+> commands ([UCLI.md](UCLI.md)).
 
 Every minisim tool has one engine. Users moving from Synopsys, Cadence or
 Siemens tools keep their command lines: the tool translates the other

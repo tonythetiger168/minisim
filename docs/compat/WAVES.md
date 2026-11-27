@@ -24,11 +24,9 @@ written instead, and msim says so once:
 | `$fsdbDumpSVA` | assertions in the waveform, as `-vcd-sva` |
 | `$fsdbSuppress`, `$fsdbLog`, `$vcdplusautoflushon`, ... | accepted, nothing to do |
 
-`msim -i` and `-do` take Verdi's UCLI commands the same way (for now in
-both builds):
-`fsdbDumpfile`, `fsdbDumpvars [DEPTH] [SCOPES] [+all]`, `fsdbDumpon`,
-`fsdbDumpoff`, `fsdbDumpflush`, `fsdbDumpFinish`, `fsdbDumpMDA`. `-vcd` /
-`-fst` on the command line wins over all of them, as over `$dumpvars`.
+`msim -i` and `-do` take Verdi's UCLI commands the same way
+([UCLI.md](UCLI.md)). `-vcd` / `-fst` on the command line wins over all of
+them, as over `$dumpvars`.
 mdebug, mlint and the other tools compile the same sources.
 
 A Verdi PLI library loaded with `-vpi` that registers these
