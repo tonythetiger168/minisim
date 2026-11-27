@@ -29,6 +29,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "compat.hpp"   // compat::kVendorCompat: other vendors' option spellings
 #include "fsm_extract.hpp"
 #include "lintir.hpp"
 #include "slang/ast/expressions/ConversionExpression.h"
@@ -2929,7 +2930,7 @@ void usage() {
                  "  -serve [PORT]    the viewer from a web server on this machine (127.0.0.1, port 8765 or\n"
                  "                   PORT, 0 for a free one): waves are sent per signal when the page shows\n"
                  "                   it, so a large waveform does not have to fit in one page\n"
-                 "  -upf FILE        the power intent (IEEE 1801); -power_top INST as for msim\n"
+                 "  -upf FILE        the power intent (IEEE 1801); -upf_top INST as for msim\n"
                  "  -power [DOMAIN]  with -upf: the power domains, what is in each, their supplies and their\n"
                  "                   isolation, level-shifter and retention strategies; with -log (the output\n"
                  "                   of msim -upf ... -upf_verbose) their power states over time, and -active\n"
@@ -3009,7 +3010,7 @@ int main(int argc, char** argv) {
         }
         if (a == "-serve-requests") { serveRequests = std::atol(next("a number").c_str()); continue; }
         if (a == "-upf") { upfPath = next("a UPF file"); continue; }
-        if (a == "-power_top") { powerTop = next("an instance"); powerTopSet = true; continue; }
+        if (a == "-upf_top" || (compat::kVendorCompat && a == "-power_top")) { powerTop = next("an instance"); powerTopSet = true; continue; }
         if (a == "-power") {
             std::string arg;
             if (i + 1 < argc && argv[i + 1][0] != '-' && argv[i + 1][0] != '+' && !std::filesystem::exists(argv[i + 1])) arg = argv[++i];
@@ -3048,7 +3049,7 @@ int main(int argc, char** argv) {
         if (a == "-max-changes") { maxChanges = std::strtoull(next("a number").c_str(), nullptr, 10); continue; }
         if (a == "--help-slang") { fwd.push_back("--help"); continue; }
         if (a == "-top") { fwd.push_back("--top"); fwd.push_back(next("a module name")); continue; }
-        if (a == "-sv" || a == "-sverilog") continue;
+        if (a == "-sv" || (compat::kVendorCompat && a == "-sverilog")) continue;
         fwd.push_back(a);
     }
     if (queries.empty() && htmlPath.empty() && jsonPath.empty() && scriptPath.empty() && !serve && fwd.size() == 1) { usage(); return 2; }

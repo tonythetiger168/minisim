@@ -5,12 +5,12 @@
 the design without simulating. Clause numbers below are 1801-2024.
 
 ```sh
-msim tb.sv dut.sv -top tb -upf dut.upf -power_top u_dut     # power-aware simulation
+msim tb.sv dut.sv -top tb -upf dut.upf -upf_top u_dut     # power-aware simulation
 msim tb.sv dut.sv -top tb -upf dut.upf -upf_verbose         # print supply / state changes
 mlint tb.sv dut.sv -top tb -upf dut.upf                     # static power-intent checks
 ```
 
-`-power_top` names the instance the UPF file was written for, as a path from
+`-upf_top` names the instance the UPF file was written for, as a path from
 the simulation top (`u_dut`, `tb/u_dut` or `tb.u_dut`). Without it, msim
 uses the UPF's `set_design_top` (a module name is looked up in the design),
 and otherwise the simulation top. Everything outside the power top's

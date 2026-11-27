@@ -1,5 +1,5 @@
 # DPI-C command line (IEEE 1800-2023 annex J): a prebuilt library through
-# -sv_lib / -sv_root and through -sv_liblist, -dpiheader, -o keeping the
+# -sv_lib / -sv_root and through -sv_liblist, -dpi_header, -o keeping the
 # build, and an import with no C function failing with a clear message.
 set(dir ${CMAKE_CURRENT_BINARY_DIR}/msim_dpi_test)
 file(REMOVE_RECURSE ${dir})
@@ -25,9 +25,9 @@ expect_run("-sv_lib with .so" "hello from C\n6\n" ${spec}/35.5.4-import-decl.sv 
 file(WRITE ${dir}/boot "#!SV_LIBRARIES\n# a comment\nlib/decl\n")
 expect_run("-sv_liblist" "hello from C\n6\n" ${spec}/35.5.4-import-decl.sv -sv_liblist boot)
 
-# -dpiheader and -o
-expect_run("-dpiheader" "C: step 2" ${spec}/35.8-export-tasks.sv ${spec}/data/dpi/tasks.c
-           -dpiheader hdr.h -o build)
+# -dpi_header and -o
+expect_run("-dpi_header" "C: step 2" ${spec}/35.8-export-tasks.sv ${spec}/data/dpi/tasks.c
+           -dpi_header hdr.h -o build)
 file(READ ${dir}/hdr.h h)
 foreach(want "extern int run_seq(int n);" "extern int sv_drive(int v, int* echo);" "extern int sv_now(void);")
   string(FIND "${h}" "${want}" pos)

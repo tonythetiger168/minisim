@@ -1,4 +1,4 @@
-// msim -cm_cond modes (as VCS): std (sensitized vectors), full (every
+// msim -cov_cond modes: std (sensitized vectors), full (every
 // combination of the term values) and allops (also & and | of one-bit operands).
 module tb;
   logic a = 0, b = 0, c = 0, y, z;
