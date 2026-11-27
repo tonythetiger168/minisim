@@ -169,7 +169,7 @@ public:
         std::vector<int> byRank;
         // A design past the domain's size limit (below) stays event-driven:
         // its analysis is skipped (OpenPiton 4x4: 25 s).
-        static const size_t combMax = [] { const char* e = std::getenv("MSIM_CYCMAX"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)300000; }();
+        static const size_t combMax = [] { const char* e = std::getenv("MSIM_CYCMAX"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)200000; }();
         size_t combAll = 0;
         for (auto& p : procs)
             if (p.combRank >= 0)
@@ -202,7 +202,10 @@ public:
             // 2-state copy, without the per-module sharing of event mode:
             // NVDLA (1.1M comb statements) runs out of 16 GB while emitting
             // it, XiangShan (394k) too, where event mode builds in 13 GB.
-            // MSIM_CYCMAX=<n> moves the limit (tooBig, above).
+            // OpenC910 (299k after wire substitution) built in 2,923 s / 9.6 GB
+            // with the domain and 502 s / 6.1 GB without, and its testbench's
+            // undriven JTAG pad kept the domain 4-state, slower than event
+            // mode (1,004 s). MSIM_CYCMAX=<n> moves the limit (tooBig, above).
             // Many clock groups (an SoC's gated and divided clocks, ticking at
             // different times): each group's commit evaluates every comb
             // statement. OpenTitan Earl Grey, 779 groups, ran 4.6x slower in
