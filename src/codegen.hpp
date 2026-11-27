@@ -167,7 +167,17 @@ public:
         std::string cyc;                   // the cycle domain, kept with main()
         auto chunk = [&](auto&& emit) { std::ostringstream c; emit(c); chunks.push_back(c.str()); };
         std::vector<int> byRank;
-        std::vector<int> dom = cycle && !cov ? cycleDomain(procs, sigs) : std::vector<int>{};
+        // A design past the domain's size limit (below) stays event-driven:
+        // its analysis is skipped (OpenPiton 4x4: 25 s).
+        static const size_t combMax = [] { const char* e = std::getenv("MSIM_CYCMAX"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)300000; }();
+        size_t combAll = 0;
+        for (auto& p : procs)
+            if (p.combRank >= 0)
+                for (auto& in : p.prog->code) { if (in.k == IK::WaitEdge) break; combAll += in.k == IK::Assign; }
+        const bool tooBig = combAll > combMax && !getenv("MSIM_XCYC");
+        if (tooBig && cycle && !cov && std::getenv("MSIM_WHYCYCLE"))
+            std::fprintf(stderr, "cycle domain off: %zu comb statements, more than %zu\n", combAll, combMax);
+        std::vector<int> dom = cycle && !cov && !tooBig ? cycleDomain(procs, sigs) : std::vector<int>{};
         run_ = dom;
         orderDomain(procs, sigs, run_);   // the order they run in; dom keeps the code layout
         {
@@ -178,12 +188,9 @@ public:
             // and runs 1.5x faster in the domain than with only the changed
             // ranks evaluated. A design that is nearly all comb logic stays
             // out. MSIM_XCYC=1 forces the domain, MSIM_WHYCYCLE=1 prints the counts.
-            size_t nba = 0, comb = 0;
+            size_t nba = 0, comb = combAll;
             for (int i : dom)
                 for (auto& in : procs[i].prog->code) nba += in.k == IK::Nba;
-            for (auto& p : procs)
-                if (p.combRank >= 0)
-                    for (auto& in : p.prog->code) { if (in.k == IK::WaitEdge) break; comb += in.k == IK::Assign; }
             if (std::getenv("MSIM_WHYCYCLE")) {
                 size_t nseq = 0;
                 for (auto& p : procs) nseq += p.seq && p.combRank < 0;
@@ -195,12 +202,7 @@ public:
             // 2-state copy, without the per-module sharing of event mode:
             // NVDLA (1.1M comb statements) runs out of 16 GB while emitting
             // it, XiangShan (394k) too, where event mode builds in 13 GB.
-            // MSIM_CYCMAX=<n> moves the limit.
-            static const size_t combMax = [] { const char* e = std::getenv("MSIM_CYCMAX"); return e ? (size_t)std::strtoull(e, nullptr, 10) : (size_t)300000; }();
-            if (!dom.empty() && comb > combMax && !getenv("MSIM_XCYC")) {
-                if (std::getenv("MSIM_WHYCYCLE")) std::fprintf(stderr, "cycle domain off: %zu comb statements, more than %zu\n", comb, combMax);
-                dom.clear();
-            }
+            // MSIM_CYCMAX=<n> moves the limit (tooBig, above).
             // Many clock groups (an SoC's gated and divided clocks, ticking at
             // different times): each group's commit evaluates every comb
             // statement. OpenTitan Earl Grey, 779 groups, ran 4.6x slower in
