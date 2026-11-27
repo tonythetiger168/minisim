@@ -590,10 +590,38 @@ private:
 class VirtioConsole : public VirtioMmio {
 public:
     VirtioConsole() : VirtioMmio(2) { type = "virtio-console"; }
+    ~VirtioConsole() override {
+        if (outFd_ >= 0 && outFd_ != sockFd_) ::close(outFd_);
+        if (sockFd_ >= 0) ::close(sockFd_);
+    }
     std::deque<uint8_t> rx, held;
     uint64_t transmitted() const { return tx_; }
 
-    bool live() const override { return !held.empty(); }
+    // Where the guest's output goes: the run's output (the default), nowhere
+    // ("none"), or a file.
+    void outputTo(const std::string& where) {
+        if (where == "none") { outFd_ = -1; return; }
+        outFd_ = ::open(where.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (outFd_ < 0) throw std::runtime_error("'" + name + "': cannot write '" + where + "': " + strerror(errno));
+    }
+    // A Unix stream socket another program listens on: the guest's output is
+    // sent to it and what it sends is the guest's input, whenever it comes
+    // (read between quanta: a run is not the same twice). A host side for
+    // the guest's services (Android's emulated HALs talk to their host over
+    // console ports).
+    void connectTo(const std::string& path) {
+        sockFd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_un a{};
+        a.sun_family = AF_UNIX;
+        if (sockFd_ < 0 || path.size() >= sizeof a.sun_path) throw std::runtime_error("'" + name + "': bad socket path '" + path + "'");
+        memcpy(a.sun_path, path.c_str(), path.size());
+        if (::connect(sockFd_, (sockaddr*)&a, sizeof a) != 0)
+            throw std::runtime_error("'" + name + "': cannot connect to '" + path + "': " + strerror(errno));
+        ::fcntl(sockFd_, F_SETFL, ::fcntl(sockFd_, F_GETFL) | O_NONBLOCK);
+        outFd_ = sockFd_;
+    }
+
+    bool live() const override { return !held.empty() || sockFd_ >= 0; }
     uint64_t nextEventPs(uint64_t now) const override {
         if (held.empty() || !tx_) return held.empty() ? UINT64_MAX : now + IDLE_PS;
         return std::max(now + 1, lastTxPs_ + IDLE_PS);
@@ -604,6 +632,17 @@ public:
             rx.insert(rx.end(), held.begin(), held.end());
             held.clear();
             deliver();
+        }
+        if (sockFd_ >= 0) {
+            uint8_t b[4096];
+            bool got = false;
+            for (;;) {
+                ssize_t k = ::read(sockFd_, b, sizeof b);
+                if (k > 0) { rx.insert(rx.end(), b, b + k); got = true; continue; }
+                if (k == 0) { ::close(sockFd_); if (outFd_ == sockFd_) outFd_ = -1; sockFd_ = -1; }
+                break;
+            }
+            if (got) deliver();
         }
     }
 
@@ -618,7 +657,7 @@ protected:
             while (pop(1, head, chain)) {
                 std::vector<uint8_t> b = gather(chain);
                 push(1, head, 0);
-                if (!b.empty()) { p->out(std::string(b.begin(), b.end())); lastTxPs_ = now_; }
+                if (!b.empty()) { emit(b); lastTxPs_ = now_; }
                 tx_ += b.size();
             }
             kick(1);
@@ -641,6 +680,17 @@ protected:
     }
 
 private:
+    void emit(const std::vector<uint8_t>& b) {
+        if (outFd_ == -2) { p->out(std::string(b.begin(), b.end())); return; }
+        if (outFd_ < 0) return;
+        if (outFd_ == sockFd_) ::fcntl(sockFd_, F_SETFL, ::fcntl(sockFd_, F_GETFL) & ~O_NONBLOCK);
+        for (size_t o = 0; o < b.size();) {
+            ssize_t k = ::write(outFd_, b.data() + o, b.size() - o);
+            if (k <= 0) break;
+            o += (size_t)k;
+        }
+        if (outFd_ == sockFd_) ::fcntl(sockFd_, F_SETFL, ::fcntl(sockFd_, F_GETFL) | O_NONBLOCK);
+    }
     void deliver() {
         uint16_t head;
         std::vector<Buf> chain;
@@ -655,6 +705,8 @@ private:
     }
     static constexpr uint64_t IDLE_PS = 100000000000ull;  // 100 ms
     uint64_t tx_ = 0, lastTxPs_ = 0, now_ = 0;
+    int outFd_ = -2;   // -2: the run's output; -1: nowhere
+    int sockFd_ = -1;
 };
 
 // virtio-rng (5.4): one request queue, filled with random bytes. The bytes

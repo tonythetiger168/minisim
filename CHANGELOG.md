@@ -31,6 +31,11 @@ Spec references are IEEE 1800-2023 clauses.
   move to `tests/compat/` and their manuals to `docs/compat/`.
 
 ### Added
+- mvplat: a `virtio-console` in a platform file takes `output` (a file, or
+  `none`) and `socket` (a Unix stream socket a host program listens on), and
+  `tests/vplat/android/cfhost.py` is the host end of an Android guest's
+  console ports, answering the sensors HAL so that system_server does not
+  wait for sensors forever.
 - `mvplat`: Android. `tests/vplat/android/run.sh` boots an unmodified AOSP
   riscv64 Cuttlefish build: `mkdisk.py` makes the GPT disk from the build's
   images, `mkinitrd.py` the ramdisks plus the bootconfig a bootloader would
