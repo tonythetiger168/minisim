@@ -18,7 +18,9 @@ module wiresubgate;
   and #2 ga(g, cnt[0], cnt[1]);
   assign #1 gd = cnt[2];
   assign gcopy = g;
-  always @(gcopy or gd) $display("%0t g=%b gd=%b cnt=%0d", $time, gcopy, gd, cnt);
+  // (time 0 left out: whether the copy's first write is an event there differs
+  // between schedules)
+  always @(gcopy or gd) if ($time > 0) $display("%0t g=%b gd=%b cnt=%0d", $time, gcopy, gd, cnt);
   always #5 clk = ~clk;
   initial begin
     #120;
