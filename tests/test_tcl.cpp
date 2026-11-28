@@ -133,6 +133,18 @@ int main() {
         assert(*t.get("r2") == "1" && *t.get("m2") == "inner" && *t.get("errorInfo") == "my info" && *t.get("errorCode") == "UPF BAD");
         assert(t.diags.empty());
     }
+    {
+        // Synopsys shell words: ignored only in the vendor build; elsewhere
+        // unknown commands. package and pid are Tcl's own.
+        Interp t;
+        t.parse("package require Tcl\npid\nsuppress_message X-1\nredirect -file f {puts x}\ndate\n", "vendor.tcl");
+#if MINISIM_VENDOR_COMPAT
+        assert(t.diags.empty());
+#else
+        assert(t.diags.size() == 3);
+        for (auto& d : t.diags) assert(d.code == "unknown-command");
+#endif
+    }
     std::cout << "test_tcl: ok\n";
     return 0;
 }

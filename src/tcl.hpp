@@ -1302,8 +1302,13 @@ protected:
             try { eval(ss.str(), 1); } catch (const Ret&) {}
             return "";
         }
-        if (c == "package" || c == "suppress_message" || c == "unsuppress_message" ||
-            c == "set_message_info" || c == "redirect" || c == "date" || c == "pid") return "";
+        if (c == "package" || c == "pid") return "";
+#if MINISIM_VENDOR_COMPAT
+        // Synopsys shell words some scripts carry; accepted and ignored only
+        // in the vendor build (docs/compat/).
+        if (c == "suppress_message" || c == "unsuppress_message" || c == "set_message_info" || c == "redirect" ||
+            c == "date") return "";
+#endif
         if (onUnknown) {
             std::string res;
             if (onUnknown(w, res)) return res;
