@@ -38,6 +38,10 @@ tests/vplat/android/run.sh IMAGES WORK -max-cycles 300000000000
 | `console.log` | the serial console |
 | `screen.ppm` | the display when the run ends |
 
+`FRAMES=MS` also writes the screen to `frames/screen-<simulated ms>.ppm`
+every `MS` of simulated time while it changes, for a film of the boot
+(`ffmpeg -pattern_type glob -i 'frames/*.ppm' boot.mp4`).
+
 Extra arguments go to mvplat: `-max-cycles`, `-input-at S:TEXT` to type at
 the shell at a simulated time, `-harts N` (or `HARTS=N`, default 4). The disk and
 initrd are kept between runs; delete them to remake them.

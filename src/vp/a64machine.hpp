@@ -46,6 +46,10 @@ public:
     int exitCode = 0;
     bool quiet = false;
     unsigned undefReports = 0;          // undefined instructions reported so far
+    // -profile (set by the extension library before the run): count every
+    // instruction in Cpu::prof (a64prof.hpp). program: what was loaded.
+    bool profile = false;
+    std::string program;
     std::function<void(const std::string&)> output = [](const std::string& s) { std::cout << s << std::flush; };
 
     // Platform
@@ -269,6 +273,7 @@ public:
                     const Op& op = f.code->op[(pc0 & 0xfff) >> 2];
                     c.curPc = pc0;
                     c.pc = pc0 + 4;
+                    if (profile) profCount(c, op.insn, pc0);
                     op.fn(*this, c, op, pc0);
                     c.cycle++;
                     c.insns++;
@@ -279,11 +284,21 @@ public:
             if (!fetch(c, insn)) { c.cycle++; continue; }
             const uint64_t pc0 = c.pc;
             c.pc += 4;
+            if (profile) profCount(c, insn, pc0);
             exec(c, insn, pc0);
             c.cycle++;
             c.insns++;
         }
         return ran;
+    }
+    void profCount(Cpu& c, uint32_t insn, uint64_t pc) {
+        Prof& p = *c.prof;
+        const unsigned el = c.el ? 1 : 0;
+        p.cls[el][profClass(insn)]++;
+        if (--p.left == 0) {
+            p.left = PROF_PERIOD;
+            p.pcs[el][pc]++;
+        }
     }
     bool wakeTimer(Cpu& c) {
         // a WFI wakes on a pending interrupt, masked or not
@@ -293,6 +308,7 @@ public:
     // ------------------------------------------------------- exceptions
     // kind: 0 synchronous, 1 IRQ, 2 FIQ, 3 SError. ret: ELR_EL1.
     void exception(Cpu& c, uint32_t ec, uint32_t iss, uint64_t ret, int kind = 0) {
+        if (profile) c.prof->exc[c.el ? 1 : 0][kind ? 64 + kind : (ec & 63)]++;
         c.spsr = c.pstate();
         c.elr = ret;
         if (kind == 0) c.esr = (uint64_t)ec << 26 | 1u << 25 | (iss & 0x1ffffff);

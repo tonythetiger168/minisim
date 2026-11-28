@@ -41,6 +41,12 @@ Spec references are IEEE 1800-2023 clauses.
   move to `tests/compat/` and their manuals to `docs/compat/`.
 
 ### Added
+- mvplat: `virtio-gpu` `"frames"` and `"frame_ms"` write the screen every
+  so much simulated time while it changes (`FRAMES=MS` in the Android
+  recipe). The AArch64 engine counts for `-profile` (instruction classes at
+  EL0 and EL1, exceptions by class, sampled addresses; the report is the
+  extension's); the extension interface gains `prepareA64`/`finishedA64`
+  (EXT_ABI 18) and the AArch64 headers are installed.
 - mvplat boots the AArch64 Android Cuttlefish image
   (`aosp_cf_arm64_only_phone-userdebug`, GKI 6.12) to `sys.boot_completed`
   in 600 simulated seconds with `-mt`: `tests/vplat/android/run.sh` picks

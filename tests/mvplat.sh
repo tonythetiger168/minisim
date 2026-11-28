@@ -186,6 +186,15 @@ for y in range(32):
 P
 fi
 
+# "frames": the screen every frame_ms of simulated time while it changes.
+sed 's/"height": 32}/"height": 32, "frames": "fr\/s", "frame_ms": 1}/' "$T/gpu.json" > gpuf.json
+rm -rf fr; mkdir fr
+"$MVPLAT" -platform gpuf.json "$E/gpu.elf" -q > gpuf.out 2>&1; rc=$?
+expect "virtio-gpu frames: the run" 0 gpuf.out "gpu: all checks passed"
+nf=$(ls fr | grep -c '^s-[0-9]\{9\}\.ppm$')
+[ "$nf" -ge 1 ] && cmp -s "fr/$(ls fr | tail -1)" gpu.ppm && ok "virtio-gpu frames: $nf frame(s), the last one the final picture" \
+  || { bad "virtio-gpu frames"; ls fr; }
+
 # The Android recipe's image tools (tests/vplat/android), on small made-up
 # images: the initrd is vendor ramdisk + ramdisk + a bootconfig trailer, and
 # the disk is a GPT with the images at their partitions.

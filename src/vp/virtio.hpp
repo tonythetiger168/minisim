@@ -752,7 +752,10 @@ private:
 // copies pages into them (TRANSFER_TO_HOST_2D), shows one on the scanout
 // (SET_SCANOUT) and says when a rectangle changed (RESOURCE_FLUSH). The
 // device keeps the scanout's image; `screen` names a PPM file it is written
-// to when the run ends. Linux's virtio_gpu driver (DRM, dumb buffers) works
+// to when the run ends; `frames` names a file prefix the image is also
+// written to every `framePs` of simulated time while it changes
+// (PREFIX-SSSSSS.ppm, the name holding the simulated time in milliseconds),
+// for watching a boot. Linux's virtio_gpu driver (DRM, dumb buffers) works
 // on it, which is what Android's minigbm allocator and hardware composer
 // need.
 class VirtioGpu : public VirtioMmio {
@@ -760,6 +763,8 @@ public:
     VirtioGpu() : VirtioMmio(2) { type = "virtio-gpu"; }
     uint32_t width = 720, height = 1280;
     std::string screen;          // PPM written by finish(), if set
+    std::string frames;          // prefix of the PPMs written while running
+    uint64_t framePs = 1000000000000ull;  // one frame a simulated second
     uint64_t maxBytes = 512ull << 20;  // host memory all resources may use
     uint64_t flushes() const { return flushes_; }
 
@@ -794,10 +799,25 @@ public:
     }
     void finish() override {
         if (!screen.empty()) writePpm(screen);
+        frame(now_);  // and the last picture, if it is new
+    }
+    void advance(uint64_t now) override {
+        now_ = now;
+        if (frames.empty() || now < nextFrame_) return;
+        nextFrame_ = (now / framePs + 1) * framePs;
+        frame(now);
     }
 
 protected:
     uint32_t deviceId() const override { return 16; }
+    uint64_t nextFrame_ = 0, framed_ = 0, now_ = 0;
+    void frame(uint64_t now) {
+        if (frames.empty() || flushes_ == framed_) return;  // nothing new on the screen
+        framed_ = flushes_;
+        char n[32];
+        snprintf(n, sizeof n, "-%09llu.ppm", (unsigned long long)(now / 1000000000ull));
+        writePpm(frames + n);
+    }
     uint64_t features() const override { return F_VERSION_1; }
     // events_read, events_clear, num_scanouts, num_capsets (5.7.4)
     uint8_t configByte(uint64_t o) const override {
