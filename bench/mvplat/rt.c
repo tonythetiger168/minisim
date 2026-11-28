@@ -3,7 +3,7 @@
 // counter, and the few C library functions they call. Written for minisim;
 // no outside code.
 //
-// Build with -DEXIT_HTIF to leave through the HTIF tohost word (mvplat and
+// On AArch64 see below (PL011, PSCI). On RISC-V, build with -DEXIT_HTIF to leave through the HTIF tohost word (mvplat and
 // Spike) and print nothing; without it the program prints on the 16550 UART
 // at 0x10000000 and leaves through the SiFive test finisher at 0x100000
 // (mvplat's built-in board and QEMU's virt machine).
@@ -12,7 +12,32 @@
 #include <stdarg.h>
 #include "inc/rt_bench.h"
 
-#ifdef EXIT_HTIF
+#if defined(__aarch64__)
+// AArch64: the PL011 UART at 0x09000000 and PSCI SYSTEM_OFF over HVC, which
+// mvplat's arm board and QEMU's virt machine (EL1, no firmware) both have.
+// A non-zero exit prints "[exit N]" first: SYSTEM_OFF carries no status.
+#define REG32(a) (*(volatile uint32_t*)(uintptr_t)(a))
+void bench_putc(char c) {
+    while (REG32(0x09000018) & 0x20) {}
+    REG32(0x09000000) = (uint8_t)c;
+}
+static void say(const char* s) { while (*s) bench_putc(*s++); }
+void exit(int code) {
+    if (code) {
+        char b[12]; int n = 0; unsigned v = (unsigned)code;
+        do { b[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+        say("\n[exit ");
+        while (n) bench_putc(b[--n]);
+        say("]\n");
+    }
+    register uint64_t x0 __asm__("x0") = 0x84000008;
+    __asm__ volatile("hvc #0" : "+r"(x0) :: "memory");
+    for (;;) {}
+}
+// what crt0.S (tests/vplat/a64) calls besides main
+void trap(int kind, void* frame) { (void)frame; exit(100 + kind); }
+void secondary(int cpu) { (void)cpu; for (;;) __asm__ volatile("wfi"); }
+#elif defined(EXIT_HTIF)
 volatile uint64_t tohost __attribute__((section(".tohost"), aligned(8)));
 volatile uint64_t fromhost __attribute__((section(".tohost"), aligned(8)));
 void bench_putc(char c) { (void)c; }
@@ -34,7 +59,13 @@ void exit(int code) {
 
 uint64_t bench_cycles(void) {
     uint64_t c;
-#if __riscv_xlen == 32
+#if defined(__aarch64__)
+    // the generic timer, scaled to BENCH_HZ (100 MHz) ticks
+    uint64_t f;
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(c));
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    c = c / f * 100000000u + c % f * 100000000u / f;
+#elif __riscv_xlen == 32
     uint32_t hi, lo, hi2;
     do {
         __asm__ volatile("csrr %0, mcycleh" : "=r"(hi));
@@ -133,7 +164,13 @@ char* strchr(const char* s, int c) {
     for (;; s++) { if (*s == (char)c) return (char*)s; if (!*s) return 0; }
 }
 void abort(void) { exit(134); }
-#if defined(__riscv_flen) && __riscv_flen >= 64
+#if defined(__aarch64__)
+double sqrt(double x) {
+    double r;
+    __asm__("fsqrt %d0, %d1" : "=w"(r) : "w"(x));
+    return r;
+}
+#elif defined(__riscv_flen) && __riscv_flen >= 64
 double sqrt(double x) {
     double r;
     __asm__("fsqrt.d %0, %1" : "=f"(r) : "f"(x));

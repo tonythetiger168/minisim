@@ -5,6 +5,10 @@
 #
 #   bench/mvplat/run.sh MVPLAT [WORKDIR]
 #     SPIKE=path  QEMU=path (qemu-system-riscv64)  RUNS=3
+#     ARCH=aarch64: the same programs for an AArch64 processor (MARCH
+#     default armv8-a), on mvplat's arm board and QEMU's virt machine
+#     (QEMU=qemu-system-aarch64, -cpu max); printing on the PL011, leaving
+#     through PSCI SYSTEM_OFF
 #     MARCH=rv64imac (CoreMark, Dhrystone; Embench uses rv64gc: some of it
 #     is floating point)
 #
@@ -22,11 +26,16 @@ set -e
 MVPLAT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 W=${2:-bench-mvplat}
 RUNS=${RUNS:-3}
-MARCH=${MARCH:-rv64imac}
+ARCH=${ARCH:-riscv64}
+if [ "$ARCH" = aarch64 ]; then MARCH=${MARCH:-armv8-a}; else MARCH=${MARCH:-rv64imac}; fi
 HERE=$(cd "$(dirname "$0")" && pwd)
 VPLAT=$HERE/../../tests/vplat
 SPIKE=${SPIKE:-$(command -v spike || true)}
-QEMU=${QEMU:-$(command -v qemu-system-riscv64 || true)}
+if [ "$ARCH" = aarch64 ]; then
+  SPIKE=; QEMU=${QEMU:-$(command -v qemu-system-aarch64 || true)}
+else
+  QEMU=${QEMU:-$(command -v qemu-system-riscv64 || true)}
+fi
 COREMARK_REV=1f483d5b8316753a742cbf5590caf5bd0a4e4777
 EMBENCH_REV=09c2ed8c3b7008c95d08b038de4a3f6dc103ed70
 RVTESTS_REV=3df703cd52d5f0d8224e3c50bf03c6cb70efff98
@@ -43,17 +52,27 @@ fetch coremark https://github.com/eembc/coremark.git $COREMARK_REV
 fetch embench https://github.com/embench/embench-iot.git $EMBENCH_REV
 fetch riscv-tests https://github.com/riscv-software-src/riscv-tests.git $RVTESTS_REV
 
-CC="${CLANG:-clang} --target=riscv64-unknown-elf -mabi=lp64 -mcmodel=medany -O2 -g0 -nostdlib -ffreestanding -fno-builtin"
-CC="$CC -fuse-ld=lld -static -Wl,-T,$HERE/link.ld -Wl,--build-id=none -w -I$HERE/inc"
-RT="$VPLAT/crt0.S $HERE/rt.c"
+if [ "$ARCH" = aarch64 ]; then
+  CC="${CLANG:-clang} --target=aarch64-none-elf -O2 -g0 -nostdlib -ffreestanding -fno-builtin"
+  CC="$CC -fuse-ld=lld -static -Wl,-T,$HERE/link-a64.ld -Wl,--build-id=none -w -I$HERE/inc"
+  RT="$VPLAT/a64/crt0.S $HERE/rt.c"
+  VARIANTS=uart; EMARCH="-march=$MARCH"
+else
+  CC="${CLANG:-clang} --target=riscv64-unknown-elf -mabi=lp64 -mcmodel=medany -O2 -g0 -nostdlib -ffreestanding -fno-builtin"
+  CC="$CC -fuse-ld=lld -static -Wl,-T,$HERE/link.ld -Wl,--build-id=none -w -I$HERE/inc"
+  RT="$VPLAT/crt0.S $HERE/rt.c"
+  VARIANTS="uart htif"; EMARCH="-march=rv64gc -mabi=lp64d"
+fi
 # Dhrystone's header fixes its run count; let the build set it.
 mkdir -p "$W/dhrystone"
 cp "$W/riscv-tests/benchmarks/dhrystone/"* "$W/dhrystone/"
 sed -i 's/^#define NUMBER_OF_RUNS.*/#ifndef NUMBER_OF_RUNS\n#define NUMBER_OF_RUNS 500\n#endif/' "$W/dhrystone/dhrystone.h"
+# its timer is riscv-tests' cycle CSR; on AArch64 the same macros (inc/util.h)
+sed -i 's/^#elif defined(__riscv)$/#elif defined(__riscv) || defined(__aarch64__)/' "$W/dhrystone/dhrystone.h"
 
 EMB="aha-mont64 crc32 edn huffbench matmult-int md5sum nettle-aes nettle-sha256 nsichneu picojpeg qrduino
      sglib-combined slre statemate tarfind ud wikisort"
-for v in uart htif; do
+for v in $VARIANTS; do
   X=""; [ $v = htif ] && X=-DEXIT_HTIF
   C=$W/coremark
   $CC -march=$MARCH $X -I"$HERE/coremark" -I"$C" -DITERATIONS=${COREMARK_ITERATIONS:-4000} -DPERFORMANCE_RUN=1 \
@@ -63,7 +82,7 @@ for v in uart htif; do
     "$W/dhrystone/dhrystone_main.c" "$W/dhrystone/dhrystone.c" -o "$W/elf/dhrystone.$v.elf"
   E=$W/embench
   for b in $EMB; do
-    $CC -march=rv64gc -mabi=lp64d $X -DHAVE_BOARDSUPPORT_H -I"$HERE/embench" -I"$E/support" -I"$E/src/$b" \
+    $CC $EMARCH $X -DHAVE_BOARDSUPPORT_H -I"$HERE/embench" -I"$E/support" -I"$E/src/$b" \
       -DCPU_MHZ=${EMBENCH_MHZ:-100} -DGLOBAL_SCALE_FACTOR=${EMBENCH_MHZ:-100} $RT "$HERE/embench/boardsupport.c" \
       "$E/support/main.c" "$E/support/beebsc.c" "$E/src/$b/"*.c -o "$W/elf/$b.$v.elf"
   done
@@ -78,6 +97,8 @@ best() {
   i=0
   while [ $i -lt "$RUNS" ]; do
     t0=$(now); set +e; "$@" > "$W/$prog.$sim.out" 2>&1; st=$?; set -e; t1=$(now)
+    # AArch64: SYSTEM_OFF has no status; rt.c prints it
+    if [ $st = 0 ] && grep -q '^\[exit [0-9]*\]' "$W/$prog.$sim.out"; then st=1; fi
     t=$(echo "$t1 - $t0" | bc)
     if [ -z "$b" ] || [ "$(echo "$t < $b" | bc)" = 1 ]; then b=$t; fi
     i=$((i + 1))
@@ -85,6 +106,11 @@ best() {
   printf '%s\t%s\t%.3f\t%s\n' "$prog" "$sim" "$b" "$st" >> "$W/results.tsv"
 }
 for p in coremark dhrystone $EMB; do
+  if [ "$ARCH" = aarch64 ]; then
+    best mvplat "$p" "$MVPLAT" "$W/elf/$p.uart.elf" -q
+    [ -n "$QEMU" ] && best qemu "$p" "$QEMU" -machine virt -cpu max -nographic -kernel "$W/elf/$p.uart.elf"
+    continue
+  fi
   best mvplat "$p" "$MVPLAT" "$W/elf/$p.htif.elf" -q
   [ -n "$SPIKE" ] && best spike "$p" "$SPIKE" --isa=rv64gc "$W/elf/$p.htif.elf"
   [ -n "$QEMU" ] && best qemu "$p" "$QEMU" -machine virt -nographic -bios none -kernel "$W/elf/$p.uart.elf"
