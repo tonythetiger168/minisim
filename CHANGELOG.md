@@ -41,6 +41,12 @@ Spec references are IEEE 1800-2023 clauses.
   move to `tests/compat/` and their manuals to `docs/compat/`.
 
 ### Added
+- mvplat: AArch64 code is translated to x86-64 host code (`src/vp/a64jit.inc`):
+  hot blocks of decoded instructions, with the integer, branch and
+  general-register load and store forms as host instructions and the rest
+  called. Runs are the same instruction for instruction as with `-nojit`
+  (now also for AArch64). CoreMark 4.7x and Dhrystone 4.2x as fast, the
+  arm64 Linux boot to a shell 1.7x.
 - mvplat: `virtio-gpu` `"frames"` and `"frame_ms"` write the screen every
   so much simulated time while it changes (`FRAMES=MS` in the Android
   recipe). The AArch64 engine counts for `-profile` (instruction classes at
