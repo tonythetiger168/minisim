@@ -182,6 +182,12 @@ std::unique_ptr<VirtioMmio> makeVirtioDev(const json::Value& d, const std::strin
         if (v->width < 16 || v->width > 8192 || v->height < 16 || v->height > 8192)
             throw std::runtime_error(d.where() + "'" + name + "': width and height are 16 to 8192");
         if (d.get("screen")) v->screen = rel(d.get("screen")->str());
+        if (d.get("frames")) v->frames = rel(d.get("frames")->str());
+        if (d.get("frame_ms")) {
+            uint64_t ms = d.get("frame_ms")->u64();
+            if (ms == 0) throw std::runtime_error(d.where() + "'" + name + "': frame_ms must be at least 1");
+            v->framePs = ms * 1000000000ull;
+        }
         return std::unique_ptr<VirtioMmio>(std::move(v));
     } else if (t == "virtio-net") {
         auto v = std::make_unique<VirtioNet>();

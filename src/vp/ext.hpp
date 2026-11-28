@@ -16,13 +16,14 @@
 #include <string>
 
 #include "json.hpp"
+#include "a64machine.hpp"
 #include "machine.hpp"
 
 namespace vp {
 
 // Changes whenever Ext, Machine, Hart or Device change shape, so a library
 // built against other headers is refused rather than misread.
-constexpr int EXT_ABI = 17;
+constexpr int EXT_ABI = 18;
 
 struct Ext {
     virtual ~Ext() = default;
@@ -46,6 +47,10 @@ struct Ext {
     // After the run, with the exit code it would end with; returns the one
     // it ends with. Throws std::runtime_error to fail with exit code 2.
     virtual int finished(Machine& m, int code) = 0;
+    // The same two for an AArch64 platform (a64machine.hpp): before the run
+    // (set m.profile here) and after it.
+    virtual void prepareA64(a64::Machine& m) { (void)m; }
+    virtual int finishedA64(a64::Machine& m, int code) { (void)m; return code; }
     // Lines for mvplat -h.
     virtual std::string usage() const { return ""; }
 };

@@ -252,7 +252,7 @@ it). It is the address map most RISC-V bare-metal software already targets.
 | `virtio-console` | virtio over MMIO, version 2, one port | a console (Linux's `hvc0`): output to stdout, `input` typed once the guest has printed and been quiet for 100 ms of simulated time. `output`: a file for the output instead, or `none`. `socket`: a Unix stream socket a host program already listens on (relative to the platform file); the output is sent to it and what it sends is the guest's input, read between quanta, so such a run is not repeatable. Android's emulated HALs reach their host this way (`tests/vplat/android/cfhost.py`) |
 | `virtio-rng` | virtio over MMIO, version 2, one queue (5.4) | random bytes (Linux's `hw_random`, Android's entropy): the same every run for a `seed` |
 | `goldfish-rtc` | `TIME_LOW` / `TIME_HIGH` at 0x00 / 0x04, alarm at 0x08 / 0x0c, `IRQ_ENABLED` 0x10, `CLEAR_ALARM` 0x14, `ALARM_STATUS` 0x18, `CLEAR_INTERRUPT` 0x1c | the real-time clock of Android's emulator boards (Linux's `rtc-goldfish`, device tree `google,goldfish-rtc`): nanoseconds since 1970, `epoch` (seconds, default 2026-01-01) plus simulated time; `irq` for the alarm |
-| `virtio-gpu` | virtio over MMIO, version 2, a control and a cursor queue (5.7, 2D only: no 3D capability sets, no blobs, no EDID) | a display of `width` x `height` (default 720 x 1280), one scanout: GET_DISPLAY_INFO, RESOURCE_CREATE_2D / UNREF, ATTACH / DETACH_BACKING, TRANSFER_TO_HOST_2D, SET_SCANOUT, RESOURCE_FLUSH, fences; cursor commands are taken and not drawn. `screen`: a PPM file the scanout is written to when the run ends. Linux's `virtio_gpu` (DRM, dumb buffers), so Android's minigbm allocator and composer |
+| `virtio-gpu` | virtio over MMIO, version 2, a control and a cursor queue (5.7, 2D only: no 3D capability sets, no blobs, no EDID) | a display of `width` x `height` (default 720 x 1280), one scanout: GET_DISPLAY_INFO, RESOURCE_CREATE_2D / UNREF, ATTACH / DETACH_BACKING, TRANSFER_TO_HOST_2D, SET_SCANOUT, RESOURCE_FLUSH, fences; cursor commands are taken and not drawn. `screen`: a PPM file the scanout is written to when the run ends. `frames`: a file prefix the scanout is also written to every `frame_ms` (default 1000) of simulated time while it changes, as `PREFIX-<simulated ms>.ppm` (for watching a boot). Linux's `virtio_gpu` (DRM, dumb buffers), so Android's minigbm allocator and composer |
 | `pcie` | PCI Express host, ECAM (PCIe 6.0, 7.2.2), `buses` × 1 MiB at `base`; a memory window `mmio` / `mmio_size` (default 0x40000000, 1 GiB) | `devices`: virtio-blk, virtio-net, virtio-console, virtio-rng or virtio-gpu entries (no `base`), on bus 0 at 01.0 up, each with a 64-bit 16 KiB BAR0 holding the virtio PCI structures (VIRTIO 1.2, 4.1, modern only: common configuration, ISR, device configuration, notifications); INTx level interrupts, INTA of device *d* on PLIC source `irq` + *d* % 4, given to the kernel as an `interrupt-map`. What Android's kernels (no virtio-mmio) need |
 | `mvp` | the library's own map (`mvp_add_device`) | see below |
 | `rtl` | whatever the RTL decodes | see below |
@@ -403,7 +403,12 @@ checkpoint restores only at the VLEN it was saved with.
 
 *(extension)* `-profile FILE` (or `-` for stdout) writes the instruction mix of every hart,
 the hot functions (from the ELF symbols), and the accesses each peripheral
-received.
+received. On AArch64 it counts every instruction by encoding class (loads,
+stores, pairs, exclusives, LSE atomics, branches, ALU, SIMD and FP, system),
+at EL0 and EL1 apart, the exceptions taken by class (system calls, page
+faults, interrupts), and samples one instruction address in 97 for the hot
+functions: from the ELF, or for a kernel from `-profile-syms FILE` (a
+`/proc/kallsyms` or `System.map`).
 
 ## Checkpoints *(extension)*
 
@@ -715,7 +720,7 @@ on three processors ran 1.7 times as fast on a host with two physical
 cores.
 
 Not yet on AArch64: a translator to host code, the commit log, and the
-extension's features.
+extension's gdb server and checkpoints (`-profile` works).
 
 ## Limits / Not yet
 

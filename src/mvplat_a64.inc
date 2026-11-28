@@ -405,6 +405,10 @@ int runA64(const Options& o, const std::string& text, const fs::path& dir) {
     }
     c0.x[0] = dtbAddr;
     c0.off = false;
+    m.program = prog;
+    if (g_ext) g_ext->prepareA64(m);
+    if (m.profile)
+        for (auto& c : m.cpus) c->prof = std::make_unique<a64::Prof>();
     if (o.map) {
         std::cout << "mvplat: " << m.cpus.size() << " AArch64 processor" << (m.cpus.size() == 1 ? "" : "s") << ", "
                   << 1e6 / (double)m.cyclePs_ << " MHz\n";
@@ -434,5 +438,6 @@ int runA64(const Options& o, const std::string& text, const fs::path& dir) {
                  s > 0 ? (double)n / s / 1e6 : 0.0, code);
         std::cerr << buf;
     }
+    if (g_ext) code = g_ext->finishedA64(m, code);
     return code;
 }

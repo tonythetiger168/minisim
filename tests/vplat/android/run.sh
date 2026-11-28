@@ -35,6 +35,11 @@ n, = struct.unpack_from('<I', b, 8)
 open('kernel', 'wb').write(b[4096:4096 + n])
 P
 cp "$here/$plat" .
+# FRAMES=MS: the screen to frames/screen-<simulated ms>.ppm every MS while it changes
+if [ -n "${FRAMES:-}" ]; then
+  mkdir -p frames
+  sed -i "s|\"screen\": \"screen.ppm\"|&, \"frames\": \"frames/screen\", \"frame_ms\": $FRAMES|" "$plat"
+fi
 # The host end of the console ports the HALs talk to (cfhost.py).
 mkdir -p cf
 rm -f cf/hvc*.sock  # a previous run's, which nothing listens on

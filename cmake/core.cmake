@@ -115,6 +115,15 @@ endif()
 # directory, and "parallel.hpp", which resolves through the package's include
 # directory above.
 set(MINISIM_CORE_VP_HEADERS
+    a64.hpp
+    a64dec.inc
+    a64fp.hpp
+    a64gic.hpp
+    a64ldst.inc
+    a64machine.hpp
+    a64prof.hpp
+    a64simd.inc
+    a64sys.inc
     bus.hpp
     devices.hpp
     elf.hpp
@@ -125,6 +134,7 @@ set(MINISIM_CORE_VP_HEADERS
     json.hpp
     machine.hpp
     pci.hpp
+    pl011.hpp
     rv32.hpp
     vector.inc
     vcrypto.inc

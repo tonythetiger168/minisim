@@ -21,6 +21,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,8 @@
 #include <vector>
 
 #include "bus.hpp"
+
+#include "a64prof.hpp"
 
 namespace vp {
 namespace a64 {
@@ -114,6 +117,7 @@ struct Cpu {
     std::unordered_map<uint64_t, std::unique_ptr<CodePage>> code;
     std::vector<std::unique_ptr<CodePage>> deadCode;  // dropped, freed before the next instruction
     uint64_t codeWrites = 0;
+    std::unique_ptr<Prof> prof;     // -profile: the counts (a64prof.hpp)
 
     // The TLB: virtual page -> physical page, permissions, the host page.
     struct Tlb {
