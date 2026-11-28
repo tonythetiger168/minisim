@@ -720,7 +720,8 @@ public:
     bool decodeAhead_ = !getenv("MVPLAT_NO_DECODE");
     // a64jit.inc: blocks translated to host code, per processor
     using JitSlot = CodePage::JitSlot;
-    static constexpr uint32_t JIT_HOT = 32;
+    // starts of a block before it is translated (MVPLAT_JIT_HOT: for tests)
+    const uint32_t jitHot_ = getenv("MVPLAT_JIT_HOT") ? (uint32_t)std::max(1, atoi(getenv("MVPLAT_JIT_HOT"))) : 32;
     static constexpr unsigned JIT_MAX = 64;
     bool jitOn_ = MVPLAT_JIT && !getenv("MVPLAT_NO_JIT");
     std::vector<std::unique_ptr<Jit>> jit_;
