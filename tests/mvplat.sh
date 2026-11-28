@@ -422,6 +422,17 @@ expect "aarch64: the same with -mt (4 host threads, the host's atomics)" 0 a64sm
 expect "aarch64: PSCI, exclusives and WFE/SEV with -mt" 0 a64smp2.out "smp: all passed"
 "$MVPLAT" "$A/lse.elf" -q > a64lse.out 2>&1; rc=$?
 expect "aarch64: Armv8.1 atomics (LDADD .. SWP, CAS, CASP) and CRC32" 0 a64lse.out "lse: all passed"
+# Every block translated to host code at its first run (MVPLAT_JIT_HOT=1):
+# the same results and the same instruction counts as with -nojit.
+jitok=1
+for t in calc trap mmu irq smc lse; do
+  MVPLAT_JIT_HOT=1 "$MVPLAT" "$A/$t.elf" > a64jit-$t.out 2>&1 || jitok=0
+  "$MVPLAT" "$A/$t.elf" -nojit > a64nojit-$t.out 2>&1 || jitok=0
+  [ "$(sed 's/ in [0-9.]* s.*//' a64jit-$t.out)" = "$(sed 's/ in [0-9.]* s.*//' a64nojit-$t.out)" ] || { jitok=0; echo "      $t differs"; }
+done
+MVPLAT_JIT_HOT=1 "$MVPLAT" "$A/smpmt.elf" -harts 4 -mt -q > a64jit-smpmt.out 2>&1 && grep -q "smpmt: all passed" a64jit-smpmt.out || jitok=0
+[ $jitok = 1 ] && ok "aarch64: translated to host code, the same results and instruction counts as -nojit" ||
+  bad "aarch64: translated blocks differ from -nojit"
 MVPLAT_NO_DECODE=1 "$MVPLAT" "$A/smc.elf" -q > a64smc2.out 2>&1; rc=$?
 expect "aarch64: the same with nothing decoded ahead (MVPLAT_NO_DECODE)" 0 a64smc2.out "smc: all passed"
 "$MVPLAT" "$A/hello.elf" -bios "$A/hello.elf" -q > a64bios.out 2>&1; rc=$?
@@ -433,6 +444,9 @@ if [ -n "$QEMU_A64" ] && command -v clang > /dev/null 2>&1 && command -v ld.lld 
   if bash "$T/a64/difftest/difftest.sh" "$MVPLAT" "$QEMU_A64" difftest 1 1500 4 > difftest.out 2>&1; then
     ok "aarch64: 1500 random integer, NEON and floating-point blocks agree with qemu-aarch64"
   else bad "aarch64: random blocks differ from qemu-aarch64"; tail -30 difftest.out | sed 's/^/      /'; fi
+  if MVPLAT_JIT_HOT=1 bash "$T/a64/difftest/difftest.sh" "$MVPLAT" "$QEMU_A64" difftest-jit 2 500 4 > difftest-jit.out 2>&1; then
+    ok "aarch64: 500 random blocks translated to host code agree with qemu-aarch64"
+  else bad "aarch64: translated random blocks differ from qemu-aarch64"; tail -30 difftest-jit.out | sed 's/^/      /'; fi
 else
   echo "skip  aarch64 random blocks: needs qemu-aarch64, clang and ld.lld"
 fi

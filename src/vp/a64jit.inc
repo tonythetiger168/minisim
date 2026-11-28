@@ -130,12 +130,13 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
                   OCUR = (int32_t)offsetof(Cpu, curPc), OCW = (int32_t)offsetof(Cpu, codeWrites),
                   ONZCV = (int32_t)offsetof(Cpu, nzcv), OFR = (int32_t)offsetof(Cpu, fastR),
                   OFW = (int32_t)offsetof(Cpu, fastW), OEL = (int32_t)offsetof(Cpu, el),
-                  OSPSEL = (int32_t)offsetof(Cpu, spsel),
+                  OCYC = (int32_t)offsetof(Cpu, cycle),
+                  OSPSEL = (int32_t)offsetof(Cpu, spsel), OIRQ = (int32_t)offsetof(Cpu, irqLine),
                   OSP = (int32_t)offsetof(Cpu, sp) + ((el && spsel) ? 8 : 0);
     const int32_t OEXIT = (int32_t)offsetof(Machine, exit_), OMON = (int32_t)offsetof(Machine, monitors_);
 
     // ---- emitting helpers (rbx = the processor, rbp = the machine,
-    // r12 = the write counter's address; rax rcx rdx rsi rdi r8 r9 scratch)
+    // r12 = the write counter's address, r13 = the pc entered at; rax rcx rdx rsi rdi r8 r9 scratch)
     auto ldX = [&](int reg, unsigned r) {
         if (r == 31) { j.aluRR(R::A_XOR, reg, reg, false); return; }
         j.rex(true, reg, R::RBX); j.b(0x8b); j.mem(reg, R::RBX, OX + 8 * (int32_t)r);
@@ -154,7 +155,13 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
         if (!sf) j.movRR(reg, reg, false);
         stRaw(r == 31 ? OSP : OX + 8 * (int32_t)r, reg);
     };
-    auto stPc = [&](uint64_t v) { j.movI(R::RAX, v); stRaw(OPC, R::RAX); };
+    // An address in the block's page: r13 holds the virtual pc the block
+    // was entered at (the same physical page may run at several virtual
+    // addresses), the code only offsets from it.
+    auto pcAbs = [&](int reg, uint64_t v) {
+        j.rex(true, reg, R::R13); j.b(0x8d); j.mem(reg, R::R13, (int32_t)(int64_t)(v - pc));  // lea
+    };
+    auto stPc = [&](uint64_t v) { pcAbs(R::RAX, v); stRaw(OPC, R::RAX); };
     // NZCV from the host's flags after an add (C = CF), a subtract (C = !CF)
     // or a logical operation (CF = OF = 0)
     auto flags = [&](bool sub) {
@@ -226,27 +233,38 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
         j.movRR(R::RDI, R::RBP);
         j.movRR(R::RSI, R::RBX);
         j.movI(R::RDX, (uint64_t)(uintptr_t)&op);
-        j.movI(R::RCX, at);
+        pcAbs(R::RCX, at);
         j.movI(R::RAX, (uint64_t)(uintptr_t)op.fn);
         j.b(0xff); j.modrr(2, R::RAX);  // call rax
     };
     // leaving the block: how many ran, and the pc if the code has not set it
-    struct Exit { uint8_t* rel; unsigned count; bool setPc; uint64_t pc; };
+    struct Exit { uint8_t* rel; unsigned count; bool setPc; uint64_t pc; unsigned synced; };
+    // instructions already added to the processor's cycle count (it is kept
+    // up to date before anything that may look at it is called)
+    unsigned synced = 0;
+    auto addCyc = [&](int32_t d) {
+        if (!d) return;
+        j.rex(true, 0, R::RBX);
+        if (d >= -128 && d <= 127) { j.b(0x83); j.mem(0, R::RBX, OCYC); j.b((uint8_t)d); }
+        else { j.b(0x81); j.mem(0, R::RBX, OCYC); j.d32((uint32_t)d); }
+    };
     std::vector<Exit> exits;
     // a translated instruction's way out to its decoded function
-    struct Slow { std::vector<uint8_t*> rels; const Op* op; uint64_t at; unsigned i; uint8_t* back; };
+    struct Slow { std::vector<uint8_t*> rels; const Op* op; uint64_t at; unsigned i; uint8_t* back; unsigned synced; };
     std::vector<Slow> slows;
-    // after a call: leave if it did not go on, a stop was asked for, or a
-    // watched page was written
+    // after a call: leave if it did not go on, a stop or an interrupt was
+    // asked for, or a watched page was written
     auto afterCall = [&](uint64_t at, unsigned count) {
-        j.movI(R::RAX, at + 4);
+        pcAbs(R::RAX, at + 4);
         j.rex(true, R::RAX, R::RBX); j.b(0x3b); j.mem(R::RAX, R::RBX, OPC);
-        exits.push_back({j.jcc(R::CC_NE), count, false, 0});
+        exits.push_back({j.jcc(R::CC_NE), count, false, 0, synced});
         j.b(0x80); j.mem(7, R::RBP, OEXIT); j.b(0);
-        exits.push_back({j.jcc(R::CC_NE), count, false, 0});
+        exits.push_back({j.jcc(R::CC_NE), count, false, 0, synced});
+        j.b(0x80); j.mem(7, R::RBX, OIRQ); j.b(0);  // an interrupt asked for (a device written)
+        exits.push_back({j.jcc(R::CC_NE), count, false, 0, synced});
         j.rex(true, R::RAX, R::R12); j.b(0x8b); j.mem(R::RAX, R::R12, 0);
         j.rex(true, R::RAX, R::RBX); j.b(0x3b); j.mem(R::RAX, R::RBX, OCW);
-        exits.push_back({j.jcc(R::CC_NE), count, false, 0});
+        exits.push_back({j.jcc(R::CC_NE), count, false, 0, synced});
     };
     // The host address of an access of nb bytes at the address in rdi, in
     // r9, or a jump to the slow way (added to sl). Uses rcx rdx r8.
@@ -309,16 +327,18 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
     auto watchCheck = [&](unsigned count, uint64_t next) {
         j.rex(true, R::RAX, R::R12); j.b(0x8b); j.mem(R::RAX, R::R12, 0);
         j.rex(true, R::RAX, R::RBX); j.b(0x3b); j.mem(R::RAX, R::RBX, OCW);
-        exits.push_back({j.jcc(R::CC_NE), count, true, next});
+        exits.push_back({j.jcc(R::CC_NE), count, true, next, synced});
     };
 
     j.p = j.buf + j.used;
     uint8_t* start = j.p;
-    // uint32_t block(Machine* rdi, Cpu* rsi) (3 pushes: rsp 16-aligned)
-    j.b(0x53); j.b(0x55); j.b(0x41); j.b(0x54);
+    // uint32_t block(Machine* rdi, Cpu* rsi) (4 pushes and 8: rsp 16-aligned)
+    j.b(0x53); j.b(0x55); j.b(0x41); j.b(0x54); j.b(0x41); j.b(0x55);  // push rbx rbp r12 r13
+    j.aluI(R::A_SUB, R::RSP, 8);
     j.movRR(R::RBX, R::RSI);
     j.movRR(R::RBP, R::RDI);
     j.movI(R::R12, (uint64_t)(uintptr_t)WriteWatch::writesPtr());
+    j.rex(true, R::R13, R::RBX); j.b(0x8b); j.mem(R::R13, R::RBX, OPC);  // r13 = the pc
     // made for another exception level or stack pointer: none run
     std::vector<uint8_t*> wrong;
     j.b(0x83); j.mem(7, R::RBX, OEL); j.b((uint8_t)el);
@@ -339,16 +359,23 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
         switch (f.kind) {
             case K::NONE:
                 if (jitPure(op)) { callOp(op, at); break; }
+                addCyc((int32_t)(i - synced));
+                synced = i;
                 stPc(at + 4);
-                j.movI(R::RAX, at); stRaw(OCUR, R::RAX);
+                pcAbs(R::RAX, at); stRaw(OCUR, R::RAX);
                 callOp(op, at);
                 if (!last) afterCall(at, i + 1);
                 pcSet = true;
                 break;
             case K::NOP: break;
             case K::MOVC: j.movI(R::RAX, op.imm); stRaw(OX + 8 * op.rd, R::RAX); break;
-            case K::ADR: j.movI(R::RAX, at + op.imm); stRaw(OX + 8 * op.rd, R::RAX); break;
-            case K::ADRP: j.movI(R::RAX, (at & ~0xfffull) + op.imm); stRaw(OX + 8 * op.rd, R::RAX); break;
+            case K::ADR: pcAbs(R::RAX, at + op.imm); stRaw(OX + 8 * op.rd, R::RAX); break;
+            case K::ADRP:
+                j.movRR(R::RAX, R::R13); j.aluI(R::A_AND, R::RAX, -4096);
+                if ((int64_t)op.imm == (int32_t)op.imm) j.aluI(R::A_ADD, R::RAX, (int32_t)op.imm);
+                else { j.movI(R::RCX, op.imm); j.aluRR(R::A_ADD, R::RAX, R::RCX); }
+                stRaw(OX + 8 * op.rd, R::RAX);
+                break;
             case K::MOVK:
                 if (op.rd == 31) break;
                 j.rex(true, R::RAX, R::RBX); j.b(0x8b); j.mem(R::RAX, R::RBX, OX + 8 * op.rd);
@@ -416,29 +443,29 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
                 stX(op.rd, R::RAX, sf);
                 break;
             case K::B: stPc(at + op.imm); pcSet = true; break;
-            case K::BL: j.movI(R::RAX, at + 4); stRaw(OX + 8 * 30, R::RAX); stPc(at + op.imm); pcSet = true; break;
+            case K::BL: pcAbs(R::RAX, at + 4); stRaw(OX + 8 * 30, R::RAX); stPc(at + op.imm); pcSet = true; break;
             case K::BR: ldX(R::RAX, op.rn); stRaw(OPC, R::RAX); pcSet = true; break;
             case K::BLR:
                 ldX(R::RAX, op.rn);
-                j.movI(R::RCX, at + 4); stRaw(OX + 8 * 30, R::RCX);
+                pcAbs(R::RCX, at + 4); stRaw(OX + 8 * 30, R::RCX);
                 stRaw(OPC, R::RAX);
                 pcSet = true;
                 break;
             case K::BCOND: {
                 const int cc = cond(op.ra);
-                if (cc < 0) { exits.push_back({j.jmp(), i + 1, true, at + op.imm}); }
-                else exits.push_back({j.jcc((R::Cc)cc), i + 1, true, at + op.imm});
+                if (cc < 0) { exits.push_back({j.jmp(), i + 1, true, at + op.imm, synced}); }
+                else exits.push_back({j.jcc((R::Cc)cc), i + 1, true, at + op.imm, synced});
                 break;
             }
             case K::CBZ:
                 ldX(R::RAX, op.rd);
                 j.rex(sf, R::RAX, R::RAX); j.b(0x85); j.modrr(R::RAX, R::RAX);
-                exits.push_back({j.jcc(f.a ? R::CC_NE : R::CC_E), i + 1, true, at + op.imm});
+                exits.push_back({j.jcc(f.a ? R::CC_NE : R::CC_E), i + 1, true, at + op.imm, synced});
                 break;
             case K::TBZ:
                 ldX(R::RAX, op.rd);
                 j.rex(true, 0, R::RAX); j.b(0x0f); j.b(0xba); j.modrr(4, R::RAX); j.b((uint8_t)op.ra);  // bt
-                exits.push_back({j.jcc(f.a ? R::CC_B : R::CC_AE), i + 1, true, at + op.imm});
+                exits.push_back({j.jcc(f.a ? R::CC_B : R::CC_AE), i + 1, true, at + op.imm, synced});
                 break;
             case K::BFM: {
                 // UBFM: ror(src) & wmask & tmask; SBFM: that, and the sign
@@ -559,31 +586,39 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
                 break;
             }
         }
-        if (!sl.empty()) slows.push_back({std::move(sl), &op, at, i, j.p});
+        if (!sl.empty()) slows.push_back({std::move(sl), &op, at, i, j.p, synced});
     }
     if (!pcSet) stPc(pc + 4ull * n);
+    addCyc((int32_t)(n - synced));
     j.movI(R::RAX, n);
     uint8_t* tail = j.p;
-    j.b(0x41); j.b(0x5c); j.b(0x5d); j.b(0x5b); j.b(0xc3);  // pop r12, rbp, rbx; ret
+    j.aluI(R::A_ADD, R::RSP, 8);
+    j.b(0x41); j.b(0x5d); j.b(0x41); j.b(0x5c); j.b(0x5d); j.b(0x5b); j.b(0xc3);  // pop r13 r12 rbp rbx; ret
     for (uint8_t* r : wrong) Jit::fix(r, j.p);
     j.aluRR(R::A_XOR, R::RAX, R::RAX, false);
     Jit::fix(j.jmp(), tail);
     // the slow ways: the decoded function, then on as after a call
     for (auto& sw : slows) {
         for (uint8_t* r : sw.rels) Jit::fix(r, j.p);
+        const int32_t d = (int32_t)(sw.i - sw.synced);
+        addCyc(d);
+        synced = sw.i;
         stPc(sw.at + 4);
-        j.movI(R::RAX, sw.at); stRaw(OCUR, R::RAX);
+        pcAbs(R::RAX, sw.at); stRaw(OCUR, R::RAX);
         callOp(*sw.op, sw.at);
         if (sw.i + 1 < n) {
             afterCall(sw.at, sw.i + 1);
+            addCyc(-d);  // back to what the straight line has added
             Jit::fix(j.jmp(), sw.back);
         } else {
+            addCyc((int32_t)(n - sw.i));
             j.movI(R::RAX, n);
             Jit::fix(j.jmp(), tail);
         }
     }
     for (auto& e : exits) {
         Jit::fix(e.rel, j.p);
+        addCyc((int32_t)(e.count - e.synced));
         if (e.setPc) stPc(e.pc);
         j.movI(R::RAX, e.count);
         Jit::fix(j.jmp(), tail);
@@ -627,8 +662,7 @@ inline bool Machine::jitRun(Cpu& c, CodePage* cp, unsigned k, uint64_t pc, uint6
     for (unsigned hop = 0;; hop++) {
         const uint32_t ran = ((uint32_t (*)(Machine*, Cpu*))b->code)(this, &c);
         if (!ran) return hop > 0;  // made for another EL or SP
-        c.cycle += ran;
-        c.insns += ran;
+        c.insns += ran;  // (the block counts its cycles itself)
         const uint64_t npc = c.pc;
         if (((npc ^ pc) >> 12) || (npc & 3) || hop >= 255) return true;
         if (exit_ || c.irqLine || c.wfi || c.off || WriteWatch::writes() != c.codeWrites || (mt && c.flushReq))

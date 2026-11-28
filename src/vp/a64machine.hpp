@@ -723,7 +723,7 @@ public:
     // starts of a block before it is translated (MVPLAT_JIT_HOT: for tests)
     const uint32_t jitHot_ = getenv("MVPLAT_JIT_HOT") ? (uint32_t)std::max(1, atoi(getenv("MVPLAT_JIT_HOT"))) : 32;
     static constexpr unsigned JIT_MAX = 64;
-    bool jitOn_ = MVPLAT_JIT && !getenv("MVPLAT_NO_JIT");
+    bool jitOn_ = MVPLAT_JIT;  // -nojit: off
     std::vector<std::unique_ptr<Jit>> jit_;
     std::vector<uint32_t> jitGen_;
     bool jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc, JitSlot& s);
