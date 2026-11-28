@@ -35,7 +35,7 @@ namespace a64 {
 struct JitForm {
     enum Kind : uint8_t {
         NONE, NOP, MOVC, MOVK, ADR, ADRP, ADDI, LOGI, MOVR, LOGR, ADDR, CSEL, MADD,
-        B, BL, BCOND, CBZ, TBZ, BR, BLR, LDST, PAIR
+        B, BL, BCOND, CBZ, TBZ, BR, BLR, LDST, PAIR, LDSTR, BFM, EXTR, ADDX, CCMP
     } kind = NONE;
     bool sf = false;
     uint8_t a = 0, b = 0, c = 0;  // the template's other arguments
@@ -65,6 +65,13 @@ inline const std::unordered_map<Op::Fn, JitForm>& jitForms() {
         BOTH(csel, K::CSEL, 0); BOTH(csel, K::CSEL, 1); BOTH(csel, K::CSEL, 2); BOTH(csel, K::CSEL, 3);
         BOTH(madd, K::MADD, false); BOTH(madd, K::MADD, true);
         BOTH(cbz, K::CBZ, false); BOTH(cbz, K::CBZ, true);
+        BOTH(bitfield, K::BFM, 0); BOTH(bitfield, K::BFM, 2);  // SBFM, UBFM (BFM is called)
+        BOTH(extr, K::EXTR);
+        BOTH(addExt, K::ADDX, false, false); BOTH(addExt, K::ADDX, false, true);
+        BOTH(addExt, K::ADDX, true, false); BOTH(addExt, K::ADDX, true, true);
+        // a = sub, b = immediate form
+        BOTH(ccmp, K::CCMP, false, false); BOTH(ccmp, K::CCMP, false, true);
+        BOTH(ccmp, K::CCMP, true, false); BOTH(ccmp, K::CCMP, true, true);
 #undef BOTH
         // a = bytes, b = kind, c = mode
 #define LD(n, kd) add(&dec::ldst<n, kd, 0>, K::LDST, false, n, kd, 0); add(&dec::ldst<n, kd, 1>, K::LDST, false, n, kd, 1); \
@@ -72,6 +79,10 @@ inline const std::unordered_map<Op::Fn, JitForm>& jitForms() {
         LD(1, 0); LD(2, 0); LD(4, 0); LD(8, 0); LD(1, 1); LD(2, 1); LD(4, 1); LD(8, 1);
         LD(1, 2); LD(2, 2); LD(4, 2); LD(1, 3); LD(2, 3);
 #undef LD
+#define LR(n, kd) add(&dec::ldstReg<n, kd>, K::LDSTR, false, n, kd)
+        LR(1, 0); LR(2, 0); LR(4, 0); LR(8, 0); LR(1, 1); LR(2, 1); LR(4, 1); LR(8, 1);
+        LR(1, 2); LR(2, 2); LR(4, 2); LR(1, 3); LR(2, 3);
+#undef LR
         // a = bytes, b = load, c = mode
 #define PR(n, l) add(&dec::pair<n, l, 0>, K::PAIR, false, n, l, 0); add(&dec::pair<n, l, 1>, K::PAIR, false, n, l, 1); \
                  add(&dec::pair<n, l, 2>, K::PAIR, false, n, l, 2)
@@ -197,6 +208,19 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
         if (!amt) return;
         static const int ext[4] = {4, 5, 7, 1};  // shl shr sar ror
         j.shiftI(ext[type & 3], R::RCX, amt, sf);
+    };
+    // an extended register operand (option, then shift) on rcx
+    auto extend = [&](unsigned opt, unsigned sh) {
+        switch (opt) {
+            case 0: j.movzxb(R::RCX, R::RCX); break;
+            case 1: j.rex(false, R::RCX, R::RCX); j.b(0x0f); j.b(0xb7); j.modrr(R::RCX, R::RCX); break;
+            case 2: j.movRR(R::RCX, R::RCX, false); break;
+            case 4: j.rex(true, R::RCX, R::RCX); j.b(0x0f); j.b(0xbe); j.modrr(R::RCX, R::RCX); break;
+            case 5: j.rex(true, R::RCX, R::RCX); j.b(0x0f); j.b(0xbf); j.modrr(R::RCX, R::RCX); break;
+            case 6: j.movsxd(R::RCX, R::RCX); break;
+            default: break;
+        }
+        if (sh) j.shiftI(4, R::RCX, sh);
     };
     auto callOp = [&](const Op& op, uint64_t at) {
         j.movRR(R::RDI, R::RBP);
@@ -416,6 +440,85 @@ inline bool Machine::jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc,
                 j.rex(true, 0, R::RAX); j.b(0x0f); j.b(0xba); j.modrr(4, R::RAX); j.b((uint8_t)op.ra);  // bt
                 exits.push_back({j.jcc(f.a ? R::CC_B : R::CC_AE), i + 1, true, at + op.imm});
                 break;
+            case K::BFM: {
+                // UBFM: ror(src) & wmask & tmask; SBFM: that, and the sign
+                // (bit imms of src) outside tmask
+                const unsigned w = sf ? 64 : 32;
+                const uint64_t ones = sf ? ~0ull : 0xffffffffull;
+                ldX(R::RAX, op.rn);
+                if (!sf) j.movRR(R::RAX, R::RAX, false);
+                if (f.a == 0) j.movRR(R::RDX, R::RAX);
+                if (op.rm) j.shiftI(1, R::RAX, op.rm, sf);  // ror
+                j.movI(R::RCX, op.imm & op.imm2 & ones);
+                j.aluRR(R::A_AND, R::RAX, R::RCX);
+                if (f.a == 0) {
+                    j.shiftI(4, R::RDX, 63 - op.ra);
+                    j.shiftI(7, R::RDX, 63);
+                    j.movI(R::RCX, ~op.imm2 & ones);
+                    j.aluRR(R::A_AND, R::RDX, R::RCX);
+                    j.aluRR(R::A_OR, R::RAX, R::RDX);
+                }
+                (void)w;
+                stX(op.rd, R::RAX, sf);
+                break;
+            }
+            case K::EXTR: {
+                // (hi:lo) >> lsb: shrd lo, hi, lsb
+                ldX(R::RAX, op.rm);
+                ldX(R::RCX, op.rn);
+                if (op.ra) { j.rex(sf, R::RCX, R::RAX); j.b(0x0f); j.b(0xac); j.modrr(R::RCX, R::RAX); j.b(op.ra); }
+                stX(op.rd, R::RAX, sf);
+                break;
+            }
+            case K::ADDX: {
+                const bool sub = f.a, setf = f.b;
+                ldX(R::RCX, op.rm);
+                extend(op.ra, (unsigned)op.imm);
+                ldXS(R::RAX, op.rn);
+                j.aluRR(sub ? R::A_SUB : R::A_ADD, R::RAX, R::RCX, sf);
+                if (setf) { flags(sub); stX(op.rd, R::RAX, sf); }
+                else stXS(op.rd, R::RAX, sf);
+                break;
+            }
+            case K::CCMP: {
+                const bool sub = f.a, immF = f.b;
+                const int cc = cond(op.ra);
+                uint8_t* no = cc >= 0 ? j.jcc((R::Cc)(cc ^ 1)) : nullptr;
+                ldX(R::RAX, op.rn);
+                if (immF) j.aluI(sub ? R::A_SUB : R::A_ADD, R::RAX, (int32_t)op.rm, sf);
+                else { ldX(R::RCX, op.rm); j.aluRR(sub ? R::A_SUB : R::A_ADD, R::RAX, R::RCX, sf); }
+                flags(sub);
+                if (no) {
+                    uint8_t* done = j.jmp();
+                    Jit::fix(no, j.p);
+                    j.rex(false, 0, R::RBX); j.b(0xc7); j.mem(0, R::RBX, ONZCV); j.d32((uint32_t)op.imm);
+                    Jit::fix(done, j.p);
+                }
+                break;
+            }
+            case K::LDSTR: {
+                const unsigned nb = f.a;
+                const int kind = f.b;
+                ldXS(R::RSI, op.rn);
+                if (op.rn == 31) {
+                    j.b(0xf7); j.modrr(0, R::RSI); j.d32(15);
+                    sl.push_back(j.jcc(R::CC_NE));
+                }
+                ldX(R::RCX, op.rm);
+                extend(op.ra, (unsigned)op.imm);
+                j.movRR(R::RDI, R::RSI);
+                j.aluRR(R::A_ADD, R::RDI, R::RCX);
+                fastAddr(kind == 0, nb, sl);
+                if (kind == 0) {
+                    ldX(R::RAX, op.rd);
+                    store(R::RAX, nb, 0);
+                    if (!last) watchCheck(i + 1, at + 4);
+                } else {
+                    load(R::RAX, nb, kind, 0);
+                    stX(op.rd, R::RAX, true);
+                }
+                break;
+            }
             case K::LDST: {
                 const unsigned nb = f.a;
                 const int kind = f.b, mode = f.c;
@@ -518,11 +621,23 @@ inline bool Machine::jitRun(Cpu& c, CodePage* cp, unsigned k, uint64_t pc, uint6
         if (!jitTranslate(c, cp, k, pc, s)) return false;
     }
     if (c.cycle + s.n > end) return false;
-    const uint32_t ran = ((uint32_t (*)(Machine*, Cpu*))s.code)(this, &c);
-    if (!ran) return false;  // made for another EL or SP
-    c.cycle += ran;
-    c.insns += ran;
-    return true;
+    // then the blocks that follow on the same page, while nothing the run
+    // loop looks at between instructions has happened
+    JitSlot* b = &s;
+    for (unsigned hop = 0;; hop++) {
+        const uint32_t ran = ((uint32_t (*)(Machine*, Cpu*))b->code)(this, &c);
+        if (!ran) return hop > 0;  // made for another EL or SP
+        c.cycle += ran;
+        c.insns += ran;
+        const uint64_t npc = c.pc;
+        if (((npc ^ pc) >> 12) || (npc & 3) || hop >= 255) return true;
+        if (exit_ || c.irqLine || c.wfi || c.off || WriteWatch::writes() != c.codeWrites || (mt && c.flushReq))
+            return true;
+        const Cpu::Fast& f = c.fastX[(npc >> 12) & (Cpu::FAST_N - 1)];
+        if (f.key != ((npc >> 12) << 1 | (c.el == 0)) || f.code != cp || cp->jitGen != jitGen_[c.id]) return true;
+        b = &cp->jit[(npc & 0xfff) >> 2];
+        if (!b->code || c.cycle + b->n > end) return true;
+    }
 }
 #endif
 
