@@ -68,6 +68,8 @@ public:
     // Writes to watched pages so far, in every region: unchanged, no page
     // was written.
     static uint64_t writes() { return total().load(std::memory_order_acquire); }
+    // where that count is (translated code compares it)
+    static const std::atomic<uint64_t>* writesPtr() { return &total(); }
     // Make the page read-only (again); false if that failed.
     static bool watch(int id, size_t pg) {
 #if MVPLAT_WTRACK

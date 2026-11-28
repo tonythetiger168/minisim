@@ -697,6 +697,24 @@ instruction, as with nothing decoded ahead. `MVPLAT_NO_DECODE=1` turns
 the decoding off; where the host cannot watch pages (not 4 KiB pages, or
 no signals), nothing is decoded ahead.
 
+On x86-64 hosts the decoded instructions that start blocks often (32
+times) are translated to host code (`src/vp/a64jit.inc`): a block runs up
+to an unconditional branch, a system instruction or the end of its page,
+at most 64 instructions, and leaves where a conditional branch is taken.
+The integer forms (add and subtract with their flags, logical, moves,
+bitfield moves, EXTR, CSEL, CCMP, multiply-add), the branches, and the
+loads and stores of general registers (immediate and register offsets,
+pairs) become host instructions; loads and stores look up the same small
+caches of recent translations inline and call the decoded routine for
+anything else (a miss, a page crossing, an unaligned SP, a held exclusive
+monitor), and the other instructions are called. A store that writes a
+watched code page leaves the block, so the rule above still holds, and
+blocks that follow one another on a page run without going back to the
+run loop until an interrupt, a device event or the quantum's end is due.
+A run is the same, instruction for instruction, as with `-nojit`, which
+turns the translation off. On the standard benchmarks (`bench/mvplat`) it
+made CoreMark 4.7 times and Dhrystone 4.2 times as fast as decoding alone.
+
 The tests are in `tests/vplat/a64` (`build.sh` builds them with clang);
 `calc` compares integer, floating-point and NEON results with the same
 program built for the host. `tests/vplat/a64/difftest/difftest.sh`
@@ -719,8 +737,8 @@ another processor read. A run with `-mt` is not the same twice. Busy work
 on three processors ran 1.7 times as fast on a host with two physical
 cores.
 
-Not yet on AArch64: a translator to host code, the commit log, and the
-extension's gdb server and checkpoints (`-profile` works).
+Not yet on AArch64: the commit log, and the extension's gdb server and
+checkpoints (`-profile` works).
 
 ## Limits / Not yet
 

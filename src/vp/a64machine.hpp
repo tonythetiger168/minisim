@@ -20,6 +20,7 @@
 #include "a64gic.hpp"
 #include "bus.hpp"
 #include "wtrack.hpp"
+#include "jit.hpp"
 #include "parallel.hpp"
 
 namespace vp {
@@ -88,6 +89,8 @@ public:
             c->flushTlb();
             cpus.push_back(std::move(c));
         }
+        jit_.resize(cpus.size());
+        jitGen_.resize(cpus.size(), 1);
     }
     void makeGic(unsigned nspi) {
         std::vector<Cpu*> v;
@@ -270,6 +273,9 @@ public:
                 const uint64_t pc0 = c.pc;
                 const Cpu::Fast& f = c.fastX[(pc0 >> 12) & (Cpu::FAST_N - 1)];
                 if (f.key == ((pc0 >> 12) << 1 | (c.el == 0)) && f.code && !(pc0 & 3)) {
+#if MVPLAT_JIT
+                    if (jitOn_ && !profile && jitRun(c, f.code, (unsigned)(pc0 & 0xfff) >> 2, pc0, end)) continue;
+#endif
                     const Op& op = f.code->op[(pc0 & 0xfff) >> 2];
                     c.curPc = pc0;
                     c.pc = pc0 + 4;
@@ -712,6 +718,16 @@ public:
     std::unordered_map<Device*, int> watchIds_;    // RAM as WriteWatch regions
     std::mutex watchMu_;
     bool decodeAhead_ = !getenv("MVPLAT_NO_DECODE");
+    // a64jit.inc: blocks translated to host code, per processor
+    using JitSlot = CodePage::JitSlot;
+    // starts of a block before it is translated (MVPLAT_JIT_HOT: for tests)
+    const uint32_t jitHot_ = getenv("MVPLAT_JIT_HOT") ? (uint32_t)std::max(1, atoi(getenv("MVPLAT_JIT_HOT"))) : 32;
+    static constexpr unsigned JIT_MAX = 64;
+    bool jitOn_ = MVPLAT_JIT;  // -nojit: off
+    std::vector<std::unique_ptr<Jit>> jit_;
+    std::vector<uint32_t> jitGen_;
+    bool jitTranslate(Cpu& c, CodePage* cp, unsigned k, uint64_t pc, JitSlot& s);
+    bool jitRun(Cpu& c, CodePage* cp, unsigned k, uint64_t pc, uint64_t end);
     static constexpr size_t CODE_PAGES = 4096;     // per processor, at most
     CodePage* codePage(Cpu& c, uint64_t pa, uint8_t* host);
     void codeSync(Cpu& c);
@@ -1072,3 +1088,4 @@ inline void Machine::dpReg(Cpu& c, uint32_t i, uint64_t pc) {
 #include "a64sys.inc"
 #include "a64simd.inc"
 #include "a64dec.inc"
+#include "a64jit.inc"
