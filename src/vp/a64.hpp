@@ -73,6 +73,10 @@ struct CodePage {
     int wr;         // its WriteWatch region (-2: read-only memory)
     uint32_t seen;  // the page's write count when it was decoded
     Op op[1024];
+    // a64jit.inc: the blocks that start on this page, by instruction
+    struct JitSlot { void* code = nullptr; uint32_t hits = 0; uint16_t n = 0; };
+    std::unique_ptr<JitSlot[]> jit;
+    uint32_t jitGen = 0;
 };
 
 struct Cpu {
