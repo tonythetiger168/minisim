@@ -8,6 +8,10 @@ Spec references are IEEE 1800-2023 clauses.
 ## [Unreleased]
 
 ### Changed
+- The shared Tcl interpreter no longer ignores the Synopsys shell words
+  `suppress_message`, `unsuppress_message`, `set_message_info`, `redirect`
+  and `date` in the default build: they are unknown commands unless built
+  with `-DMINISIM_VENDOR_COMPAT=ON`.
 - `msim -i` and `-do` use minisim's own command names: `print`, `change`,
   `dump -add`, `save` and the new `env` (for `senv`). `value`, `deposit`,
   `probe`, `senv`, `checkpoint`, Verdi's `fsdbDump*` and the ignored xrun
